@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+    xmlns:com3="http://schemas.microsoft.com/appx/manifest/com/windows10/3"
+    xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+    xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+    xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+    xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+    IgnorableNamespaces="uap uap3 rescap com com3 desktop desktop4 desktop5">
+
+  <!-- Name + Publisher must match the signing certificate's subject (CN=Nimbo Dev). -->
+  <Identity Name="Nimbo" Publisher="CN=Nimbo Dev" Version="0.1.0.0" ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Nimbo</DisplayName>
+    <PublisherDisplayName>Otherworld</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <!-- windows.fileExplorerContextMenus requires Windows 11 (22000+). -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+  <Applications>
+    <Application Id="Nimbo" Executable="nimbo-gui.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+          DisplayName="Nimbo"
+          Description="Nextcloud desktop sync client"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png"
+          BackgroundColor="transparent">
+      </uap:VisualElements>
+
+      <Extensions>
+        <!-- Run at login (replaces the registry autostart when packaged). -->
+        <desktop:Extension Category="windows.startupTask" Executable="nimbo-gui.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="NimboAutostart" Enabled="true" DisplayName="Nimbo" />
+        </desktop:Extension>
+
+        <!-- Stable launcher alias (%LOCALAPPDATA%\Microsoft\WindowsApps\nimbo-app.exe):
+             Start-menu app shortcuts target this with an app-id argument so they
+             survive updates (the exe path under WindowsApps changes per version).
+             "-app" suffixed so it never shadows the nimbo CLI binary; must match
+             launcherAlias() in cmd/nimbo-gui/shortcut_windows.go. -->
+        <uap3:Extension Category="windows.appExecutionAlias" Executable="nimbo-gui.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap3:AppExecutionAlias>
+            <desktop:ExecutionAlias Alias="nimbo-app.exe" />
+          </uap3:AppExecutionAlias>
+        </uap3:Extension>
+
+        <!-- COM server hosting the IExplorerCommand handler (loaded in a surrogate),
+             plus the toast-activation ExeServer (nimbo-gui.exe itself, launched with
+             -ToastActivated when a toast is clicked while the app isn't running). -->
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="Nimbo context menu">
+              <com:Class Id="7E9C1A20-3B4D-4F8A-A1C2-9D5E0F7B6A11" Path="NimboCtxMenu.dll" ThreadingModel="STA" />
+            </com:SurrogateServer>
+            <com3:ExeServer Executable="nimbo-gui.exe" Arguments="-ToastActivated" DisplayName="Nimbo toast activator">
+              <com:Class Id="00EEDCE7-5C4E-4573-85C2-98790F8F98AE" />
+            </com3:ExeServer>
+          </com:ComServer>
+        </com:Extension>
+
+        <!-- Toast activation: clicking a toast (or its buttons) calls our
+             INotificationActivationCallback via the CLSID above. -->
+        <desktop:Extension Category="windows.toastNotificationActivation">
+          <desktop:ToastNotificationActivation ToastActivatorCLSID="00EEDCE7-5C4E-4573-85C2-98790F8F98AE" />
+        </desktop:Extension>
+
+        <!-- Windows 11 main context menu: the "Nimbo" command on files and folders. -->
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type="*">
+              <desktop5:Verb Id="Nimbo" Clsid="7E9C1A20-3B4D-4F8A-A1C2-9D5E0F7B6A11" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type="Directory">
+              <desktop5:Verb Id="Nimbo" Clsid="7E9C1A20-3B4D-4F8A-A1C2-9D5E0F7B6A11" />
+            </desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

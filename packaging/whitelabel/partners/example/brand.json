@@ -1,0 +1,11 @@
+{
+  "name": "AcmeCloud Sync",
+  "company": "Acme Hosting Ltd",
+  "tagline": "Your AcmeCloud, in sync",
+  "website": "https://acme.example",
+  "supportEmail": "support@acme.example",
+  "feedUrl": "https://downloads.acme.example/nimbo/AcmeCloud.appinstaller",
+  "apiBase": "https://api.github.com/repos/acme/cloud-sync",
+  "accentHex": "#C0322B",
+  "appId": "AcmeCloud"
+}

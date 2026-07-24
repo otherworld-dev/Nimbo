@@ -1,0 +1,8 @@
+{
+  "_comment": "Packaging identity for the white-label build. brand.json holds the embedded brand (name/accent/feed/appId); this holds the MSIX identity + signing + hosting. 'publisher' MUST equal the subject of the code-signing cert used to sign this partner's build (in Cert:\\CurrentUser\\My) and stays constant for the life of the app. For this example it is CN=Nimbo Dev so it signs with the dev cert; a real partner uses their own (e.g. CN=Acme Hosting Ltd).",
+  "identityName": "AcmeCloud",
+  "publisher": "CN=Nimbo Dev",
+  "displayName": "AcmeCloud Sync",
+  "publisherDisplayName": "Acme Hosting Ltd",
+  "feedBaseUrl": "https://downloads.acme.example/nimbo"
+}

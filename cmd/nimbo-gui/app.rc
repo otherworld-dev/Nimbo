@@ -1,0 +1,11 @@
+// Windows resource script for nimbo-gui: sets the executable/window icon.
+// Compiled to rsrc_windows_amd64.syso (which `go build` links automatically)
+// with: windres app.rc -O coff -o rsrc_windows_amd64.syso
+//
+// ID 1 is the lowest, so Explorer uses it as the .exe file icon. Wails v3 looks
+// up resource ID 3 specifically for window title-bar icons (webview_window_
+// windows.go), falling back to a generic icon if it's missing — so we expose the
+// same icon under ID 3 as well, otherwise the Settings/Status/etc. windows show
+// the wrong icon.
+1 ICON "assets/nimbo.ico"
+3 ICON "assets/nimbo.ico"

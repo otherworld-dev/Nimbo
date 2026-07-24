@@ -1,0 +1,6 @@
+# Normalize line endings; Go tooling expects LF.
+* text=auto eol=lf
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+*.exe binary

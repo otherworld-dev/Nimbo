@@ -1,0 +1,11 @@
+{
+  "name": "Nimbo",
+  "company": "Otherworld Dev Ltd",
+  "tagline": "Native Nextcloud sync for desktop",
+  "website": "https://www.nimbosync.com",
+  "supportEmail": "contact@otherworld.dev",
+  "feedUrl": "https://github.com/otherworld-dev/Nimbo/releases/latest/download/Nimbo.appinstaller",
+  "apiBase": "https://api.github.com/repos/otherworld-dev/Nimbo",
+  "accentHex": "#5856E0",
+  "appId": "Nimbo"
+}

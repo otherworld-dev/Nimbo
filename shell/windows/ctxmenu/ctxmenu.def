@@ -1,0 +1,4 @@
+LIBRARY NimboCtxMenu
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow   PRIVATE

@@ -1,0 +1,83 @@
+/* Minimal base — the flyout/window components own their own styling. */
+:root {
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+
+  /* Accent colour — overridden at runtime with the user's Nextcloud theme. */
+  --accent: #0082c9;
+  --accent-dark: #0073b3;
+
+  /* Semantic palette (light). Components reference these so dark mode is a
+     single override below. */
+  --bg: #ffffff;          /* window / panel background */
+  --panel: #fafafa;       /* cards, inputs, tiles */
+  --panel-2: #f7f7f7;     /* secondary buttons */
+  /* Hover/selected backgrounds are derived from the accent so they always match
+     the user's Nextcloud theme (green, blue, …). color-mix against --bg keeps
+     them subtle and adapts automatically to light/dark mode. */
+  --hover: color-mix(in srgb, var(--accent) 8%, var(--bg));   /* hover background */
+  --tint: color-mix(in srgb, var(--accent) 15%, var(--bg));   /* accent-tinted / selected */
+  --fg: #1b1b1b;          /* primary text */
+  --fg2: #555555;         /* secondary text */
+  --muted: #999999;       /* labels / tertiary text */
+  --border: #e6e6e6;      /* default borders */
+  --border-2: #d0d0d0;    /* stronger borders (inputs) */
+  --border-soft: #f3f3f3; /* faint dividers */
+
+  color: var(--fg);
+  background: var(--bg);
+}
+
+:root[data-theme="dark"] {
+  --bg: #1f2023;
+  --panel: #2a2c2f;
+  --panel-2: #303236;
+  /* --hover / --tint inherit the accent-derived color-mix from :root, resolved
+     against this dark --bg, so they stay themed in dark mode too. */
+  --fg: #e8e8e8;
+  --fg2: #b6b6b6;
+  --muted: #8c8f93;
+  --border: #3a3d42;
+  --border-2: #4a4e54;
+  --border-soft: #2e3034;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+button { font-family: inherit; }
+
+/* The UI chrome disables text selection (above) to feel native, but form fields
+   must stay editable/selectable or you can't type in or select their contents. */
+input, textarea {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Theme the WebView2 (Chromium) scrollbars so they don't clash with the panel.
+   The thumb sits inset (border in the bg colour) and uses the border palette,
+   so it adapts to light/dark and the accent-derived surfaces. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border-2);
+  border: 2px solid var(--bg);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+::-webkit-scrollbar-corner { background: transparent; }

@@ -1,0 +1,62 @@
+# Binaries
+/bin/
+/nimbo
+/nimbo-gui
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test / build artifacts
+*.test
+*.out
+/dist/
+
+# npm deps (regenerable via `npm install`); the built frontend dist + generated
+# Wails bindings ARE committed so `go build` works without a Node toolchain.
+node_modules/
+
+# MSIX packaging artifacts (staged files, package, dev certs — never commit certs)
+/packaging/msix/stage/
+/packaging/msix/*.msix
+/packaging/msix/*.appinstaller
+
+# White-label partner build outputs: the brand.json/partner.json specs ARE
+# committed (versioned, reproducible); the built MSIX/feed and any certs are not.
+/packaging/whitelabel/partners/*/dist/
+/packaging/whitelabel/partners/**/*.pfx
+/packaging/whitelabel/partners/**/*.cer
+/packaging/msix/*.cer
+/packaging/msix/*.pfx
+/packaging/msix/.build-rev
+/shell/windows/*/out/
+
+# Local state & config (never commit secrets or sync DBs)
+*.db
+*.db-shm
+*.db-wal
+/.nimbo/
+
+# Editor / OS cruft
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+/packaging/msix/dist/
+/packaging/msix/Nimbo-Setup-*.zip
+/packaging/msix/Nimbo-Setup-*.exe
+.icon-preview/
+
+# Licence signing private key (NEVER commit)
+/tools/licensegen/.signing-key
+
+# Claude Code local harness config
+/.claude/
+CLAUDE.md
+.claudeignore
+
+# Playwright MCP preview artifacts
+/.playwright-mcp/
+/website-preview-*.png

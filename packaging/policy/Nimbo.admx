@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Group Policy / Intune administrative template for Nimbo (managed deployments).
+  Install: copy Nimbo.admx to C:\Windows\PolicyDefinitions and Nimbo.adml to
+  C:\Windows\PolicyDefinitions\en-US (or the Central Store). Policies appear
+  under Computer Configuration > Administrative Templates > Nimbo and write to
+  HKLM\SOFTWARE\Policies\Nimbo. They apply only on machines with a Nimbo
+  business licence installed.
+-->
+<policyDefinitions revision="1.0" schemaVersion="1.0">
+  <policyNamespaces>
+    <target prefix="nimbo" namespace="OtherworldDev.Nimbo" />
+  </policyNamespaces>
+  <resources minRequiredRevision="1.0" />
+  <categories>
+    <category name="Nimbo" displayName="$(string.Nimbo)" />
+  </categories>
+  <policies>
+
+    <policy name="ServerURL" class="Machine" displayName="$(string.ServerURL)"
+            explainText="$(string.ServerURL_Help)" key="SOFTWARE\Policies\Nimbo"
+            presentation="$(presentation.ServerURL)">
+      <parentCategory ref="Nimbo" />
+      <supportedOn ref="windows:SUPPORTED_Windows10" />
+      <elements>
+        <text id="ServerURL_Text" valueName="ServerURL" required="true" />
+        <boolean id="LockServer_Bool" valueName="LockServer">
+          <trueValue><decimal value="1" /></trueValue>
+          <falseValue><decimal value="0" /></falseValue>
+        </boolean>
+      </elements>
+    </policy>
+
+    <policy name="DisableSignOut" class="Machine" displayName="$(string.DisableSignOut)"
+            explainText="$(string.DisableSignOut_Help)" key="SOFTWARE\Policies\Nimbo"
+            valueName="AllowSignOut">
+      <parentCategory ref="Nimbo" />
+      <supportedOn ref="windows:SUPPORTED_Windows10" />
+      <!-- Enabled => AllowSignOut=0 (sign-out disabled). -->
+      <enabledValue><decimal value="0" /></enabledValue>
+      <disabledValue><decimal value="1" /></disabledValue>
+    </policy>
+
+    <policy name="Bandwidth" class="Machine" displayName="$(string.Bandwidth)"
+            explainText="$(string.Bandwidth_Help)" key="SOFTWARE\Policies\Nimbo"
+            presentation="$(presentation.Bandwidth)">
+      <parentCategory ref="Nimbo" />
+      <supportedOn ref="windows:SUPPORTED_Windows10" />
+      <elements>
+        <enum id="LockBandwidth_Enum" valueName="LockBandwidth" required="true">
+          <item displayName="$(string.Enforce)"><value><decimal value="1" /></value></item>
+        </enum>
+        <decimal id="UploadKBps_Num" valueName="UploadKBps" minValue="0" maxValue="1000000" />
+        <decimal id="DownloadKBps_Num" valueName="DownloadKBps" minValue="0" maxValue="1000000" />
+      </elements>
+    </policy>
+
+    <policy name="SyncMode" class="Machine" displayName="$(string.SyncMode)"
+            explainText="$(string.SyncMode_Help)" key="SOFTWARE\Policies\Nimbo"
+            presentation="$(presentation.SyncMode)">
+      <parentCategory ref="Nimbo" />
+      <supportedOn ref="windows:SUPPORTED_Windows10" />
+      <elements>
+        <enum id="SyncMode_Enum" valueName="SyncMode" required="true">
+          <item displayName="$(string.Live)"><value><string>live</string></value></item>
+          <item displayName="$(string.OnDemand)"><value><string>ondemand</string></value></item>
+        </enum>
+      </elements>
+    </policy>
+
+  </policies>
+</policyDefinitions>

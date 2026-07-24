@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitionResources revision="1.0" schemaVersion="1.0">
+  <displayName>Nimbo administrative templates</displayName>
+  <description>Managed-deployment policies for the Nimbo Nextcloud sync client.</description>
+  <resources>
+    <stringTable>
+      <string id="Nimbo">Nimbo</string>
+
+      <string id="ServerURL">Enforce Nextcloud server</string>
+      <string id="ServerURL_Help">Presets the Nextcloud server address users sign in to. Tick "Lock the server" to prevent users connecting Nimbo to any other server (e.g. a personal Nextcloud).</string>
+
+      <string id="DisableSignOut">Disable sign out</string>
+      <string id="DisableSignOut_Help">When enabled, the Sign out option is hidden so users cannot disconnect the managed account. Disable this policy to allow sign out.</string>
+
+      <string id="Bandwidth">Enforce bandwidth limits</string>
+      <string id="Bandwidth_Help">Forces upload/download limits (KiB/s, 0 = unlimited) and prevents users changing them.</string>
+      <string id="Enforce">Enforce</string>
+
+      <string id="SyncMode">Enforce file availability mode</string>
+      <string id="SyncMode_Help">Forces the file-availability mode and prevents users changing it. "Live file system" keeps files on disk; "Virtual file system" makes them online-only placeholders.</string>
+      <string id="Live">Live file system</string>
+      <string id="OnDemand">Virtual file system (on-demand)</string>
+    </stringTable>
+    <presentationTable>
+      <presentation id="ServerURL">
+        <textBox refId="ServerURL_Text"><label>Server address (https://…)</label></textBox>
+        <checkBox refId="LockServer_Bool">Lock the server (users cannot change it)</checkBox>
+      </presentation>
+      <presentation id="Bandwidth">
+        <dropdownList refId="LockBandwidth_Enum" defaultItem="0">Enforcement</dropdownList>
+        <decimalTextBox refId="UploadKBps_Num" defaultValue="0">Upload limit (KiB/s)</decimalTextBox>
+        <decimalTextBox refId="DownloadKBps_Num" defaultValue="0">Download limit (KiB/s)</decimalTextBox>
+      </presentation>
+      <presentation id="SyncMode">
+        <dropdownList refId="SyncMode_Enum" defaultItem="0">Mode</dropdownList>
+      </presentation>
+    </presentationTable>
+  </resources>
+</policyDefinitionResources>

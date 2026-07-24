@@ -1,0 +1,6 @@
+LIBRARY NCOverlays
+EXPORTS
+    DllGetClassObject
+    DllCanUnloadNow
+    DllRegisterServer
+    DllUnregisterServer
