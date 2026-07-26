@@ -459,6 +459,18 @@
   let updateBusy = $state(false);
   let canApply = $state(false);      // true only in the packaged install
   (async () => { canApply = await App.CanApplyUpdate(); })();
+  // Pre-release channel. Only meaningful where we can self-update, so the UI
+  // below is gated on canApply — which is false on the Store build (the Store
+  // updates the app itself) and on loose dev builds.
+  let beta = $state(false);
+  (async () => { beta = await App.BetaUpdates(); })();
+  async function toggleBeta() {
+    beta = !beta;
+    await App.SetBetaUpdates(beta);
+    // Whatever the last check wrote described the channel we just left —
+    // clear it rather than leave a stale verdict on screen.
+    updateMsg = ""; updateURL = ""; updateNotes = ""; updateAvail = false;
+  }
   async function checkUpdate() {
     updateBusy = true; updateMsg = "Checking…"; updateURL = ""; updateNotes = ""; updateAvail = false;
     const u = await App.CheckForUpdate();
@@ -466,8 +478,12 @@
     if (u.err) { updateMsg = "Couldn't check: " + u.err; return; }
     // Show the latest release's notes either way: as "what you'd get" when an
     // update is available, or "what's new in this version" when up to date.
-    updateNotes = u.notes;
+    // Not when "ahead": u.notes there belongs to the older stable release,
+    // and showing it under "you're on a newer build" reads as if that older
+    // release is what the running build contains.
+    updateNotes = u.ahead ? "" : u.notes;
     if (u.available) { updateMsg = "Update available: " + u.latest; updateURL = u.url; updateAvail = true; }
+    else if (u.ahead) { updateMsg = "You're on a newer build than the current release" + (u.latest ? " (" + u.latest + ")" : ""); }
     else { updateMsg = "You're up to date" + (u.latest ? " (" + u.latest + ")" : ""); }
   }
   async function applyUpdate() {
@@ -890,6 +906,10 @@
           {/if}
         {/if}
       </div>
+      {#if canApply}
+        <label class="check"><input type="checkbox" checked={beta} onchange={toggleBeta} /> Get beta releases early</label>
+        <p class="fhint">Beta builds reach you before everyone else and are less tested. Turning this off stops future betas — it won't move you back, so you'll stay on your current build until a normal release overtakes it.</p>
+      {/if}
       {#if updateNotes}
         <div class="relnotes">{updateNotes}</div>
       {/if}

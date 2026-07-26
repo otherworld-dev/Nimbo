@@ -32,25 +32,34 @@ func TestDecideCloneFile(t *testing.T) {
 	}
 
 	cases := []struct {
-		name     string
-		takeover bool
-		local    os.FileInfo
-		remote   engine.RemoteState
-		want     cloneDecision
+		name       string
+		takeover   bool
+		local      os.FileInfo
+		dehydrated bool
+		remote     engine.RemoteState
+		want       cloneDecision
 	}{
-		{"absent -> download", false, nil, rem(10, t0), cloneDownload},
-		{"absent (takeover) -> download", true, nil, rem(10, t0), cloneDownload},
-		{"resume size match -> adopt", false, mk("a", 10, t0), rem(10, t0), cloneAdopt},
-		{"resume size mismatch -> refetch", false, mk("b", 9, t0), rem(10, t0), cloneDownload},
-		{"takeover exact match -> adopt", true, mk("c", 10, t0), rem(10, t0), cloneAdopt},
-		{"takeover within 2s -> adopt", true, mk("f", 10, t0.Add(time.Second)), rem(10, t0), cloneAdopt},
+		{"absent -> download", false, nil, false, rem(10, t0), cloneDownload},
+		{"absent (takeover) -> download", true, nil, false, rem(10, t0), cloneDownload},
+		{"resume size match -> adopt", false, mk("a", 10, t0), false, rem(10, t0), cloneAdopt},
+		{"resume size mismatch -> refetch", false, mk("b", 9, t0), false, rem(10, t0), cloneDownload},
+		{"takeover exact match -> adopt", true, mk("c", 10, t0), false, rem(10, t0), cloneAdopt},
+		{"takeover within 2s -> adopt", true, mk("f", 10, t0.Add(time.Second)), false, rem(10, t0), cloneAdopt},
 		// The data-loss-prevention cases: a differing local file is SKIPPED, never
 		// downloaded over (which would destroy the user's version).
-		{"takeover mtime differs -> skip", true, mk("d", 10, t0.Add(time.Hour)), rem(10, t0), cloneSkip},
-		{"takeover size differs -> skip", true, mk("e", 5, t0), rem(10, t0), cloneSkip},
+		{"takeover mtime differs -> skip", true, mk("d", 10, t0.Add(time.Hour)), false, rem(10, t0), cloneSkip},
+		{"takeover size differs -> skip", true, mk("e", 5, t0), false, rem(10, t0), cloneSkip},
+		// A dehydrated placeholder (e.g. the official client's virtual-files mode,
+		// left behind when it is uninstalled) reports the server's size and mtime
+		// but holds NO content, so it must never be adopted or skipped as "already
+		// present" — it is always fetched. Nothing local is lost: a file with no
+		// bytes on disk cannot hold local edits (writing to one hydrates it first).
+		{"takeover placeholder matching -> download", true, mk("g", 10, t0), true, rem(10, t0), cloneDownload},
+		{"takeover placeholder size differs -> download", true, mk("h", 5, t0), true, rem(10, t0), cloneDownload},
+		{"resume placeholder -> download", false, mk("i", 10, t0), true, rem(10, t0), cloneDownload},
 	}
 	for _, c := range cases {
-		if got := decideCloneFile(c.takeover, c.local, c.remote); got != c.want {
+		if got := decideCloneFile(c.takeover, c.local, c.dehydrated, c.remote); got != c.want {
 			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
 		}
 	}

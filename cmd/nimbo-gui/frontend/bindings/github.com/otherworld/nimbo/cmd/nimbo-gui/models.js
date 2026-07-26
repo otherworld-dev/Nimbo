@@ -182,6 +182,10 @@ export class ActivityItem {
 
 /**
  * AppInfo is a Nextcloud app for the flyout (with its pinned state).
+ * Shortcut reports a Start-menu shortcut for the app (Windows). NOTE: the field
+ * reaches the frontend through the generated bindings WITHOUT a regen — the
+ * model constructor's Object.assign passes unknown JSON fields through — so
+ * keep it additive and read it untyped ((a as any).shortcut) in Svelte.
  */
 export class AppInfo {
     /**
@@ -223,6 +227,13 @@ export class AppInfo {
              * @type {boolean}
              */
             this["pinned"] = false;
+        }
+        if (!("shortcut" in $$source)) {
+            /**
+             * @member
+             * @type {boolean}
+             */
+            this["shortcut"] = false;
         }
 
         Object.assign(this, $$source);
@@ -278,7 +289,9 @@ export class AttentionInfo {
 }
 
 /**
- * BlockedItem is a file that can't sync (server-forbidden name).
+ * BlockedItem is a file that can't sync (server-forbidden name), or — when
+ * Escaping is set — a synthetic row for an extension currently being escaped
+ * (its "Ext" is what a "stop escaping" action removes).
  */
 export class BlockedItem {
     /**
@@ -306,6 +319,30 @@ export class BlockedItem {
              * @type {string}
              */
             this["reason"] = "";
+        }
+        if (!("ext" in $$source)) {
+            /**
+             * file extension (for the escape opt-in label)
+             * @member
+             * @type {string}
+             */
+            this["ext"] = "";
+        }
+        if (!("escapable" in $$source)) {
+            /**
+             * opting Ext in would let this file sync
+             * @member
+             * @type {boolean}
+             */
+            this["escapable"] = false;
+        }
+        if (!("escaping" in $$source)) {
+            /**
+             * synthetic row: this Ext is currently escaped
+             * @member
+             * @type {boolean}
+             */
+            this["escaping"] = false;
         }
 
         Object.assign(this, $$source);
@@ -1710,6 +1747,16 @@ export class UpdateDTO {
              * @type {boolean}
              */
             this["available"] = false;
+        }
+        if (!("ahead" in $$source)) {
+            /**
+             * Ahead means the running build is NEWER than the newest release on this
+             * channel — what a beta build looks like after opting back out. Without it
+             * the UI would claim "you're up to date (v0.1.0.167)" while running .168.
+             * @member
+             * @type {boolean}
+             */
+            this["ahead"] = false;
         }
         if (!("url" in $$source)) {
             /**

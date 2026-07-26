@@ -78,3 +78,37 @@ func TestIgnoreRoundTrip(t *testing.T) {
 		t.Errorf("comments/blanks not filtered: got %v", pats)
 	}
 }
+
+// TestBetaUpdatesRoundTrip covers the update-channel opt-in: it must default to
+// the stable channel, survive a save/load, and stay false for a settings file
+// written before the field existed.
+func TestBetaUpdatesRoundTrip(t *testing.T) {
+	d := Dirs{Config: t.TempDir()}
+
+	got, err := d.LoadSettings()
+	if err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	if got.BetaUpdates {
+		t.Fatal("BetaUpdates should default to false (stable channel)")
+	}
+
+	if err := d.SaveSettings(Settings{BetaUpdates: true}); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	if got, err = d.LoadSettings(); err != nil || !got.BetaUpdates {
+		t.Fatalf("BetaUpdates did not survive a round-trip: %v / %+v", err, got)
+	}
+
+	// A settings file from before this field existed must still load, opted out.
+	if err := os.WriteFile(d.SettingsFile(), []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d.LoadSettings()
+	if err != nil {
+		t.Fatalf("LoadSettings (legacy file): %v", err)
+	}
+	if got.BetaUpdates || got.Theme != "dark" {
+		t.Fatalf("legacy settings mis-loaded: %+v", got)
+	}
+}

@@ -129,32 +129,33 @@ func removeShortcutFile(filename string) error {
 	if err := os.Remove(filepath.Join(d, filename)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	// Prune when empty. The hidden icon folder lives in here, so "empty" means
+	// "nothing but that" — and once the user has removed the last shortcut, the
+	// icons it held have nothing left to point at either.
+	if entries, err := os.ReadDir(d); err == nil {
+		spent := true
+		for _, e := range entries {
+			if e.Name() != appIconsFolder {
+				spent = false
+				break
+			}
+		}
+		if spent {
+			_ = os.RemoveAll(filepath.Join(d, appIconsFolder))
+		}
+	}
 	_ = os.Remove(d) // prune when empty (fails silently otherwise)
 	return nil
 }
 
-// physicalIconPath translates a path under MSIX AppData virtualization into
-// its real on-disk location. Inside the package, writes to %APPDATA%\nimbo are
-// redirected to ...\Packages\<PFN>\LocalCache\Roaming\nimbo — the app sees the
-// virtual path, but the .lnk icon is loaded by EXPLORER, outside the package,
-// where the virtual path resolves to nothing and the icon silently falls back
-// to the target exe's. Unpackaged builds pass through unchanged.
-func physicalIconPath(p string) string {
-	pfn := packageFamilyName()
-	if pfn == "" || p == "" {
-		return p
-	}
-	roaming := os.Getenv("APPDATA")
-	local := os.Getenv("LOCALAPPDATA")
-	if roaming == "" || local == "" {
-		return p
-	}
-	if !strings.HasPrefix(strings.ToLower(p), strings.ToLower(roaming)+`\`) {
-		return p
-	}
-	rel := p[len(roaming)+1:]
-	return filepath.Join(local, "Packages", pfn, "LocalCache", "Roaming", rel)
-}
+// A .lnk icon is loaded by EXPLORER, outside the package, so its path must be
+// one that resolves out there. That used to mean translating the config dir's
+// virtual %APPDATA%\<brand> path into its physical
+// ...\Packages\<PFN>\LocalCache\Roaming\<brand> location — correct, but it
+// baked the package identity into a file Windows then freezes forever, and a
+// re-signing changed that identity and blanked every pinned icon. Icons now
+// live in appIconsDir() instead, beside the shortcuts, where the path is
+// already physical and names no identity at all (see appshortcuts.go).
 
 // launcherAlias is the AppExecutionAlias filename for this brand. "-app"
 // suffixed so it can't collide with the CLI binary (nimbo.exe). Must match
@@ -237,8 +238,7 @@ func createAppShortcut(id, name, aumid, icoPath string) error {
 	}
 	_ = hrCall(link.lpVtbl.SetDescription, uintptr(unsafe.Pointer(link)), desc) // cosmetic
 	if icoPath != "" {
-		// Explorer resolves this path outside the package — it must be physical.
-		if ip, err := utf16Arg(physicalIconPath(icoPath)); err == nil {
+		if ip, err := utf16Arg(icoPath); err == nil {
 			_ = hrCall(link.lpVtbl.SetIconLocation, uintptr(unsafe.Pointer(link)), ip, 0) // cosmetic
 		}
 	}

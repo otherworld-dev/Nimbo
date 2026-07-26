@@ -534,15 +534,50 @@ type UpdateDTO struct {
 	Current   string `json:"current"`
 	Latest    string `json:"latest"`
 	Available bool   `json:"available"`
-	URL       string `json:"url"`
-	Notes     string `json:"notes"` // release notes ("what's in this update")
-	Err       string `json:"err"`
+	// Ahead means the running build is NEWER than the newest release on this
+	// channel — what a beta build looks like after opting back out. Without it
+	// the UI would claim "you're up to date (v0.1.0.167)" while running .168.
+	Ahead bool   `json:"ahead"`
+	URL   string `json:"url"`
+	Notes string `json:"notes"` // release notes ("what's in this update")
+	Err   string `json:"err"`
+}
+
+// betaUpdates reports whether this installation takes pre-release builds.
+// Read per check, so toggling it takes effect without a restart.
+func betaUpdates() bool {
+	d, err := config.Resolve()
+	if err != nil {
+		return false
+	}
+	s, err := d.LoadSettings()
+	if err != nil {
+		return false
+	}
+	return s.BetaUpdates
+}
+
+// BetaUpdates reports whether the pre-release (beta) update channel is on.
+func (a *App) BetaUpdates() bool { return betaUpdates() }
+
+// SetBetaUpdates opts this installation in or out of pre-release builds. The
+// next update check — manual or the daily one — uses the new channel. Opting
+// out never moves an already-installed beta backwards: MSIX won't install an
+// older version, so the build stands until a release overtakes it.
+func (a *App) SetBetaUpdates(on bool) {
+	if d, err := config.Resolve(); err == nil {
+		if s, e := d.LoadSettings(); e == nil {
+			s.BetaUpdates = on
+			_ = d.SaveSettings(s)
+		}
+	}
 }
 
 // CheckForUpdate queries the GitHub releases for a newer build.
 func (a *App) CheckForUpdate() UpdateDTO {
-	rel, avail, err := update.Check(a.ctx, version)
+	rel, avail, err := update.Check(a.ctx, version, betaUpdates())
 	dto := UpdateDTO{Current: version, Latest: rel.Tag, Available: avail, URL: rel.URL, Notes: strings.TrimSpace(rel.Body)}
+	dto.Ahead = !avail && rel.Tag != "" && update.Newer(version, rel.Tag)
 	if err != nil {
 		dto.Err = err.Error()
 	}
@@ -567,7 +602,7 @@ func (a *App) updateCheckLoop(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		if rel, avail, err := update.Check(ctx, version); err == nil && avail && rel.Tag != lastNotified {
+		if rel, avail, err := update.Check(ctx, version, betaUpdates()); err == nil && avail && rel.Tag != lastNotified {
 			lastNotified = rel.Tag
 			notify.RaiseActionable(brand.Current.Name+" update available",
 				rel.Tag+" is ready to install.", "action=settings",
@@ -596,7 +631,7 @@ func (a *App) ApplyUpdate() string {
 	if !canApplyUpdate() {
 		return "in-app update is only available in the installed app"
 	}
-	rel, avail, err := update.Check(a.ctx, version)
+	rel, avail, err := update.Check(a.ctx, version, betaUpdates())
 	if err != nil {
 		return "couldn't fetch the latest release: " + err.Error()
 	}

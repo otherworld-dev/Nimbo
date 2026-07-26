@@ -21,3 +21,11 @@ func removeShortcutFile(filename string) error { return errors.New("not supporte
 func createAppShortcut(id, name, aumid, icoPath string) error {
 	return errors.New("not supported on this platform")
 }
+
+// No Start menu, so icons stay in the config dir (appIconsDirFor falls back)
+// and there are no shortcut icon paths to go stale.
+func shortcutsDir() string { return "" }
+
+func hidePath(p string) {}
+
+func (a *App) repairAppShortcutIcons() {}

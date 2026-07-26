@@ -3,6 +3,7 @@
 # makeappx, and signs if a code-signing cert is available.
 #
 # Usage:  .\package.ps1 [-Version 0.1.0]
+#         .\package.ps1 -StoreChannel        # installable build that behaves as the Store one
 # Prereqs: Go + w64devkit gcc on PATH; Windows SDK (makeappx/signtool); a cert
 #          from make-cert.ps1 in Cert:\CurrentUser\My (CN=Nimbo Dev) to sign.
 param(
@@ -26,7 +27,31 @@ param(
     [switch]$Store,
     [string]$StoreIdentityName,            # Package/Identity Name, e.g. "1234Otherworld.Nimbo"
     [string]$StorePublisher,               # Store-assigned Publisher, e.g. "CN=ABCD1234-1234-..."
-    [string]$StorePublisherDisplay = "Otherworld Dev Ltd"  # Publisher display name (must match Partner Center exactly)
+    [string]$StorePublisherDisplay = "Otherworld Dev Ltd",  # Publisher display name (must match Partner Center exactly)
+    # Store listing title = the package's Properties>DisplayName, which must match a
+    # reserved app name in Partner Center. The keyworded name ranks in Store search
+    # ("nextcloud"/"sync"); VisualElements (Start menu) stays plain "Nimbo".
+    [string]$StoreDisplayName = "Nimbo - Nextcloud Sync Client",
+
+    # --- Testing the Store build's behaviour (-StoreChannel) ---
+    # Builds an ordinary, dev-signed, normally-installable package whose binary
+    # merely CLAIMS to be the Store build (channel=store) - the one flag a real
+    # Store package differs by, minus the Store identity and minus being unsigned.
+    #
+    # It exists because a real -Store package can't be inspected: Partner Center
+    # signs it, so it comes out unsigned and Windows won't install it. And a loose
+    # dev build proves nothing either - the Store-only UI is gated on
+    # CanApplyUpdate(), which is false on ANY unpackaged build, so the UI would
+    # hide for the wrong reason.
+    #
+    #   .\package.ps1 -StoreChannel      -> install it, then check Settings > About:
+    #                                       "Update now" and "Get beta releases
+    #                                       early" must BOTH be absent.
+    #
+    # Never ship one of these: it's dev-signed under the normal identity but
+    # self-update is disabled, so it can't update itself or be updated. Uninstall
+    # it and reinstall the real build when you're done.
+    [switch]$StoreChannel
 )
 $ErrorActionPreference = "Stop"
 
@@ -40,7 +65,10 @@ if ($AzureSign -and $SignSubject -eq "CN=Nimbo Dev") {
     # A Publisher that doesn't equal the Azure cert's subject is rejected at install.
     throw "-AzureSign needs -SignSubject set to the exact issued cert subject (portal: Trusted Signing account -> Certificate profiles -> $AzureCertProfile -> Subject). See SIGNING.md."
 }
-$msixName = if ($Store) { "Nimbo-Store.msix" } else { "Nimbo.msix" }
+# -StoreChannel gets its own filename deliberately: it must never be mistakable
+# for a release artifact, since `release.ps1 -SkipBuild` publishes whatever sits
+# at Nimbo.msix and this build has self-update disabled.
+$msixName = if ($Store) { "Nimbo-Store.msix" } elseif ($StoreChannel) { "Nimbo-StoreChannel.msix" } else { "Nimbo.msix" }
 $msix = Join-Path $here $msixName
 
 # Start from a clean stage so renamed/stale artifacts (e.g. an old
@@ -106,7 +134,14 @@ Write-Host "Building GUI exe..."
 $env:GOOS = "windows"; $env:CGO_ENABLED = "1"
 Push-Location $repo
 $ldflags = "-H windowsgui -X main.version=v$pkgVersion"
-if ($Store) { $ldflags += " -X main.channel=store" }  # Store build: disable in-app self-update
+# Store build: disable in-app self-update. -StoreChannel sets the same flag on an
+# otherwise-normal package so the Store-only UI gating can actually be tested.
+if ($Store -or $StoreChannel) {
+    $ldflags += " -X main.channel=store"
+    if ($StoreChannel -and -not $Store) {
+        Write-Host "-StoreChannel: building an installable package that behaves as the Store build (self-update disabled)" -ForegroundColor Yellow
+    }
+}
 & go build -ldflags $ldflags -o (Join-Path $stage "nimbo-gui.exe") ./cmd/nimbo-gui
 if ($LASTEXITCODE -ne 0) { Pop-Location; throw "go build failed" }
 Pop-Location
@@ -137,6 +172,9 @@ if ($Store) {
     # Name="Windows.Desktop" is left untouched.)
     $manifest = $manifest -replace '(<Identity Name=")[^"]*"', "`${1}$StoreIdentityName`""
     $manifest = $manifest -replace '<PublisherDisplayName>[^<]*</PublisherDisplayName>', "<PublisherDisplayName>$StorePublisherDisplay</PublisherDisplayName>"
+    # Element form only (Properties>DisplayName) - the VisualElements DisplayName is an
+    # attribute and deliberately untouched, so Start menu / taskbar keep showing "Nimbo".
+    $manifest = $manifest -replace '<DisplayName>[^<]*</DisplayName>', "<DisplayName>$StoreDisplayName</DisplayName>"
 }
 [System.IO.File]::WriteAllText(
     (Join-Path $stage "AppxManifest.xml"), $manifest, (New-Object System.Text.UTF8Encoding($false)))

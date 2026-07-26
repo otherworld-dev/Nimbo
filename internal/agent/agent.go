@@ -2107,7 +2107,7 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 			if info, serr := os.Stat(filepath.Join(p.LocalDir, filepath.FromSlash(rel))); serr == nil {
 				fi = info
 			}
-			switch decideCloneFile(takeover, fi, r) {
+			switch decideCloneFile(takeover, fi, isDehydratedPlaceholder(fi), r) {
 			case cloneAdopt:
 				_ = st.UpsertBaseline(pk, baselineForLocal(p.LocalDir, rel, r))
 			case cloneDownload:
@@ -2336,8 +2336,20 @@ const (
 // On a takeover it adopts only an exact match (size + mtime within 2s, since the
 // official client preserves server mtimes) and never overwrites — a differing file
 // is skipped so the first normal sync keeps both versions.
-func decideCloneFile(takeover bool, localFI os.FileInfo, r engine.RemoteState) cloneDecision {
+//
+// dehydrated marks a local file whose bytes are not actually on disk (a cloud
+// placeholder — see isDehydratedPlaceholder), which is always fetched instead.
+func decideCloneFile(takeover bool, localFI os.FileInfo, dehydrated bool, r engine.RemoteState) cloneDecision {
 	if localFI == nil || localFI.IsDir() {
+		return cloneDownload
+	}
+	// A placeholder reports the server's size and mtime while holding no content,
+	// so every comparison below would wrongly read it as "already present". Left
+	// adopted, it is recorded as synced and never repaired — and once the client
+	// that created it is uninstalled, nothing can hydrate it, so the user is left
+	// with files that cannot be opened. Fetching loses nothing: a file with no
+	// bytes on disk cannot hold local edits (writing to one hydrates it first).
+	if dehydrated {
 		return cloneDownload
 	}
 	if !takeover {

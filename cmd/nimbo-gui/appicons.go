@@ -25,9 +25,9 @@ import (
 // app (bundled + enabled by default) composes a 512×512 PNG per app at
 // /index.php/apps/theming/icon/<id> — ideal raster source, since the raw app
 // icons are SVGs Go can't rasterize without heavy deps. The PNG is downscaled
-// to the standard icon sizes and cached as <config>/appicons/<id>.ico; any
-// failure (theming disabled, no Imagick) falls back to writing the embedded
-// brand icon so the path always exists and everything stays functional.
+// to the standard icon sizes and cached in appIconsDir(); any failure (theming
+// disabled, no Imagick) falls back to writing the embedded brand icon so the
+// path always exists and everything stays functional.
 
 var icoSizes = []int{16, 24, 32, 48, 64, 256}
 
@@ -40,17 +40,40 @@ var icoSizes = []int{16, 24, 32, 48, 64, 256}
 //        as a blank page, even though LoadImageW copes.
 const appIconsRev = "3"
 
+// appIconsDir is the live icon folder: beside the Start-menu shortcuts, whose
+// path names no package identity, so a change of signing identity (or a move
+// to the Store build) can't strand the icon paths already written into
+// shortcuts and taskbar pins. See appshortcuts.go for the full story.
+func appIconsDir() string {
+	cfg := ""
+	if d, err := config.Resolve(); err == nil {
+		cfg = d.Config
+	}
+	return appIconsDirFor(shortcutsDir(), cfg)
+}
+
+// legacyAppIconsDir is where icons lived before that move — under the config
+// dir, which inside the package is redirected into the package data root.
+// Still read once, to carry existing icons over (migrateLegacyAppIcons).
+func legacyAppIconsDir() string {
+	d, err := config.Resolve()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(d.Config, "appicons")
+}
+
 // appIconPath is where an app's cached .ico lives. The rev is part of the
 // FILENAME: a style bump then regenerates at a fresh path with no directory
 // wipe (a wipe can silently fail while Explorer holds an icon for a pinned
 // shortcut — observed in the field), and Windows' icon cache, which happily
 // serves stale content for an unchanged path, is defeated outright.
 func (a *App) appIconPath(id string) string {
-	d, err := config.Resolve()
-	if err != nil {
+	d := appIconsDir()
+	if d == "" {
 		return ""
 	}
-	return filepath.Join(d.Config, "appicons", sanitizeFileName(id)+"."+appIconsRev+".ico")
+	return filepath.Join(d, sanitizeFileName(id)+"."+appIconsRev+".ico")
 }
 
 // brandBadge returns the Nimbo tile as an image for corner-badging, decoded
@@ -124,7 +147,7 @@ func (a *App) migrateAppIcons(dir string) {
 	if b, err := os.ReadFile(revFile); err == nil && strings.TrimSpace(string(b)) == appIconsRev {
 		return
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensureAppIconsDir(dir); err != nil {
 		return
 	}
 	cur := "." + appIconsRev + ".ico"
@@ -169,7 +192,7 @@ func (a *App) ensureAppIcon(id string, wait bool) {
 		// transient server error can't brand-icon the app forever.
 	}
 	fetch := func() {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		if err := ensureAppIconsDir(filepath.Dir(path)); err != nil {
 			return
 		}
 		if err := a.fetchAppIcon(id, path); err != nil {

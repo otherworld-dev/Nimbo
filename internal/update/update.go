@@ -54,11 +54,21 @@ func (r Release) Asset(sub string) Asset {
 	return Asset{}
 }
 
-// Latest returns the newest published (non-draft, non-prerelease) release.
-func Latest(ctx context.Context) (Release, error) { return latest(ctx, apiBaseURL()) }
+// Latest returns the newest release. Drafts are always skipped — their assets
+// need auth — and pre-releases are skipped unless the caller has opted into the
+// beta channel.
+func Latest(ctx context.Context, includePrerelease bool) (Release, error) {
+	return latest(ctx, apiBaseURL(), includePrerelease)
+}
 
-func latest(ctx context.Context, base string) (Release, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/releases?per_page=10", nil)
+func latest(ctx context.Context, base string, includePrerelease bool) (Release, error) {
+	// The window has to comfortably exceed the number of pre-releases that can
+	// pile up between promotions: on the stable channel this loop skips every
+	// pre-release it sees, so if a run of unpromoted betas ever fills the whole
+	// page, it falls through to "no releases" (Release{}, nil) — indistinguishable
+	// downstream from "you're up to date" — and stable silently stops updating.
+	// 30 gives that a wide margin over the old 10.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/releases?per_page=30", nil)
 	if err != nil {
 		return Release{}, err
 	}
@@ -75,19 +85,35 @@ func latest(ctx context.Context, base string) (Release, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&rels); err != nil {
 		return Release{}, err
 	}
+	// Pick the highest VERSION, not the first match. GitHub orders /releases by
+	// created_at, which is the TAGGED COMMIT's date — and because our tags land
+	// on the snapshot branch's HEAD, releases routinely share one, leaving the
+	// order arbitrary under the tie. Taking the first eligible entry therefore
+	// returns whichever release GitHub happened to list first: it reported "up
+	// to date (v0.1.0.168)" to a beta-channel client while v0.1.0.169 sat third
+	// in the same response, and under a tie it can hand the stable channel an
+	// older release just as easily.
+	var best Release
 	for _, r := range rels {
-		if !r.Draft && !r.Prerelease {
-			return r, nil
+		if r.Draft || (!includePrerelease && r.Prerelease) {
+			continue
+		}
+		if best.Tag == "" || newer(r.Tag, best.Tag) {
+			best = r
 		}
 	}
-	return Release{}, nil // none published yet
+	return best, nil // zero value when none are published yet
 }
 
 // Check returns the latest release and whether it is newer than current. A
 // non-release current (e.g. "dev") is treated as up to date so dev builds aren't
 // nagged.
-func Check(ctx context.Context, current string) (Release, bool, error) {
-	rel, err := Latest(ctx)
+func Check(ctx context.Context, current string, includePrerelease bool) (Release, bool, error) {
+	return checkAt(ctx, apiBaseURL(), current, includePrerelease)
+}
+
+func checkAt(ctx context.Context, base, current string, includePrerelease bool) (Release, bool, error) {
+	rel, err := latest(ctx, base, includePrerelease)
 	if err != nil {
 		return Release{}, false, err
 	}
@@ -96,6 +122,11 @@ func Check(ctx context.Context, current string) (Release, bool, error) {
 	}
 	return rel, newer(rel.Tag, current), nil
 }
+
+// Newer reports whether release tag a is a higher version than b. Exported so
+// the UI can tell "up to date" from "running ahead of the published release",
+// which is what a build from the beta channel looks like after opting out.
+func Newer(a, b string) bool { return newer(a, b) }
 
 // newer reports whether release tag a is a higher version than b. Four
 // components are compared (major.minor.build.revision) because Nimbo's user

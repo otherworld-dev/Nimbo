@@ -4,6 +4,7 @@
 #   .\release.ps1                       # build+sign, publish to the 'github' remote's repo
 #   .\release.ps1 -Owner you -Repo Nimbo
 #   .\release.ps1 -SkipBuild            # reuse the existing signed Nimbo.msix
+#   .\release.ps1 -PreRelease           # publish as a pre-release (beta channel only)
 #
 # What it does:
 #   1. package.ps1 -> signed Nimbo.msix (bumps .build-rev for an in-place update)
@@ -28,6 +29,17 @@ param(
     [switch]$AzureSign,
     [string]$AzureCertProfile = "otherworld-dev-ltd",
     [switch]$SkipBuild,
+
+    # Publish as a GitHub PRE-RELEASE: the artefacts go up, but no installed copy
+    # sees them. Both update paths skip pre-releases - the in-app updater filters
+    # them (internal/update), and the .appinstaller feed points at
+    # releases/latest/download, which GitHub excludes them from. Only installs
+    # with the beta channel enabled in Settings pick it up. Promote later with
+    #   gh release edit <tag> --prerelease=false --latest
+    # which publishes the SAME signed artefacts - no rebuild, no re-sign. (--latest
+    # re-points GitHub's "latest" flag, which --prerelease=false alone does not
+    # reliably do - see the printed promotion command below for why.)
+    [switch]$PreRelease,
     [switch]$Force   # skip the clean-tree guard (deliberate WIP/test releases only)
 )
 $ErrorActionPreference = "Stop"
@@ -64,15 +76,36 @@ if (-not $Owner) { throw "no -Owner given and no 'github' remote configured" }
 Write-Host "Publishing to $Owner/$Repo"
 
 # --- 1. build + sign ---
-# Derive the next revision from the latest PUBLISHED release so versions are
-# monotonic no matter which machine builds (the local .build-rev can reset or
-# diverge across checkouts; a lower revision would silently stop auto-updates).
+# Derive the next revision from recent releases so versions are monotonic no
+# matter which machine builds (the local .build-rev can reset or diverge across
+# checkouts; a lower revision would silently stop auto-updates). Uses `release
+# list` (not `release view`, which resolves GitHub's "latest" and excludes
+# pre-releases) so pre-releases count too - but --exclude-drafts stays on,
+# since a hand-created draft would otherwise feed a bogus/missing tag into the
+# derivation.
+#
+# `release list` sorts by createdAt, which is the TAGGED COMMIT's date, not the
+# release's publish time. In this repo tags land on the github snapshot
+# branch HEAD, so many releases routinely share one createdAt (ties are the
+# norm here, not the exception) - position 0 under a tie is not guaranteed to
+# be the highest revision. Take the max revision across a window of recent
+# releases instead of trusting sort order, so a tie can never derive a
+# revision that collides with an existing release.
 if (-not $SkipBuild) {
     $nextRev = 0
-    $latestTag = (& $gh release view --repo "$Owner/$Repo" --json tagName --jq .tagName 2>$null)
-    if ($LASTEXITCODE -eq 0 -and $latestTag -match '\.(\d+)\s*$') {
-        $nextRev = [int]$Matches[1] + 1
-        Write-Host "Latest release is $latestTag -> building revision $nextRev"
+    # Same guard as the existence check below: under $ErrorActionPreference=Stop,
+    # redirecting a native exe's stderr in Windows PowerShell turns it into a
+    # terminating NativeCommandError - which would abort the release outright
+    # instead of reaching the .build-rev fallback this block documents.
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $tags = @(& $gh release list --repo "$Owner/$Repo" --limit 20 --exclude-drafts --json tagName --jq '.[].tagName' 2>$null)
+    $tagsOk = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $eap
+    $maxRev = ($tags | ForEach-Object { if ($_ -match '\.(\d+)\s*$') { [int]$Matches[1] } } |
+               Measure-Object -Maximum).Maximum
+    if ($tagsOk -and $null -ne $maxRev) {
+        $nextRev = $maxRev + 1
+        Write-Host "Highest revision among the last $($tags.Count) release(s) is $maxRev -> building revision $nextRev"
     } else {
         Write-Host "No prior release found; falling back to local .build-rev auto-bump"
     }
@@ -140,13 +173,55 @@ $ErrorActionPreference = $eap
 if ($exists) {
     Write-Host "Release $tag exists - replacing assets"
     & $gh release upload $tag @assets --repo "$Owner/$Repo" --clobber
+    if ($LASTEXITCODE -eq 0 -and $PreRelease) {
+        # Only ever promote-to-pre-release here, never demote: a plain re-run
+        # without -PreRelease must not silently make an existing pre-release
+        # public.
+        & $gh release edit $tag --repo "$Owner/$Repo" --prerelease
+    }
 } else {
+    $extra = @()
+    if ($PreRelease) { $extra += "--prerelease" }
     & $gh release create $tag @assets --repo "$Owner/$Repo" `
-        --title "Nimbo $tag" --notes-file $notesFile
+        --title "Nimbo $tag" --notes-file $notesFile @extra
 }
 if ($LASTEXITCODE -ne 0) { throw "gh release failed" }
 
+# Report the release's ACTUAL visibility, not the requested -PreRelease value:
+# the --clobber path above only flips it to pre-release when asked and never
+# demotes, so "requested" and "actual" can differ. gh's --jq prints the bare
+# JSON literal `true`/`false` as a STRING - PowerShell treats the string
+# "false" as truthy, so compare it explicitly rather than using it as a
+# condition on its own.
+#
+# This runs AFTER the release is already published, so a transient gh error
+# here must not blow up the whole script (same reasoning as the exists-check
+# above: redirecting a native command's stderr under $ErrorActionPreference =
+# "Stop" still turns it into a terminating error even when redirected to
+# $null) - save/restore ErrorActionPreference around the call, and if the
+# query itself fails, fall back to the requested -PreRelease value rather than
+# defaulting to "published, go ahead and tell the operator it's public".
+$eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+$isPrerelease = (& $gh release view $tag --repo "$Owner/$Repo" --json isPrerelease --jq .isPrerelease 2>$null)
+$queryOk = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $eap
+if (-not $queryOk) {
+    Write-Warning "Couldn't confirm $tag's published visibility; assuming the requested -PreRelease value."
+    $isPrerelease = if ($PreRelease) { "true" } else { "false" }
+}
+
 Write-Host ""
 Write-Host "Published $tag to https://github.com/$Owner/$Repo/releases"
-Write-Host "First-time install (so Windows tracks updates):"
-Write-Host "  Add-AppxPackage -AppInstallerFile `"$base/Nimbo.appinstaller`""
+if ($isPrerelease -eq "true") {
+    Write-Host "This is a PRE-RELEASE - only installs with the beta channel enabled will see it." -ForegroundColor Yellow
+    Write-Host "Promote it to everyone (same signed artefacts, no rebuild):"
+    # --latest is required alongside --prerelease=false: GitHub tracks "latest"
+    # as its own per-release flag, and a bare --prerelease=false does not
+    # reliably re-point it - without it, releases/latest/download (the App
+    # Installer feed and the website's download links) can keep serving the
+    # pre-promotion release indefinitely, with no error.
+    Write-Host "  gh release edit $tag --repo `"$Owner/$Repo`" --prerelease=false --latest"
+} else {
+    Write-Host "First-time install (so Windows tracks updates):"
+    Write-Host "  Add-AppxPackage -AppInstallerFile `"$base/Nimbo.appinstaller`""
+}

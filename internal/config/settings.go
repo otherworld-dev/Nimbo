@@ -40,6 +40,11 @@ type Settings struct {
 	MuteNotifications bool `json:"muteNotifications"`
 	// VerboseLog enables debug-level logging when true.
 	VerboseLog bool `json:"verboseLog"`
+	// BetaUpdates opts this installation into pre-release builds: update checks
+	// then offer GitHub pre-releases as well as stable releases. Default (false)
+	// is the stable channel. Per installation, not per account — and inert on
+	// builds that can't self-update (the Store build updates itself).
+	BetaUpdates bool `json:"betaUpdates"`
 	// KeepBaselineInMemory holds the whole sync baseline resident in RAM for faster
 	// warm syncs. Default (false) is "low memory mode": read it from disk per sync,
 	// keeping the footprint small (the UI presents the inverse as "Low memory mode").

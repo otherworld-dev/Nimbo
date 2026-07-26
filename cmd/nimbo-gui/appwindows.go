@@ -342,6 +342,10 @@ func (a *App) openAppWindow(id string) {
 			})
 		}
 		a.autoCreateAppShortcut(id, name)
+		// The icon may only just have landed; let any taskbar pin catch up too
+		// (nothing else rewrites a pin). Cheap and idempotent when there's
+		// nothing to fix.
+		a.repairAppShortcutIcons()
 	}()
 }
 
@@ -351,8 +355,8 @@ func (a *App) openAppWindow(id string) {
 // EXISTING shortcut is silently re-written too: its IconLocation must track
 // the rev-versioned icon path, or an icon-style migration would strand it on
 // a stale (possibly deleted) file. NOTE: a taskbar pin is Windows' own COPY of
-// the .lnk — refreshing the Start entry doesn't retro-fix an old pin; the user
-// re-pins once and it sticks from then on.
+// the .lnk, so refreshing the Start entry does nothing for it — that's what
+// repairAppShortcutIcons is for, called just after this.
 func (a *App) autoCreateAppShortcut(id, name string) {
 	d, err := config.Resolve()
 	if err != nil {

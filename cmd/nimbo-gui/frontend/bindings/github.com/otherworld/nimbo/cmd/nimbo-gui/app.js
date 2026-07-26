@@ -151,6 +151,14 @@ export function BeginLogin(server) {
 }
 
 /**
+ * BetaUpdates reports whether the pre-release (beta) update channel is on.
+ * @returns {$CancellablePromise<boolean>}
+ */
+export function BetaUpdates() {
+    return $Call.ByID(2801185815);
+}
+
+/**
  * BlacklistBlocked stops attempting to sync a blocked file.
  * @param {string} abs
  * @returns {$CancellablePromise<void>}
@@ -160,7 +168,8 @@ export function BlacklistBlocked(abs) {
 }
 
 /**
- * BlockedList returns files that can't sync.
+ * BlockedList returns files that can't sync, plus a synthetic row per
+ * currently-escaped extension so the UI can offer to stop escaping it.
  * @returns {$CancellablePromise<$models.BlockedItem[]>}
  */
 export function BlockedList() {
@@ -388,7 +397,8 @@ export function DismissNotification(id) {
 }
 
 /**
- * DoNotificationAction runs a notification's action by label.
+ * DoNotificationAction runs a notification's action by label on the shown
+ * account (the Status-window UI binding).
  * @param {number} id
  * @param {string} label
  * @returns {$CancellablePromise<void>}
@@ -733,7 +743,10 @@ export function OpenSyncFolder() {
 }
 
 /**
- * OpenURL opens a link in the default browser.
+ * OpenURL opens a link in the default browser — unless it carries one of the
+ * nimbo-app URI prefixes the flyout uses, which route to the app-window
+ * features instead. The prefixes ride the existing binding (adding a bound
+ * method would need a bindings regen, which has broken a release before).
  * @param {string} href
  * @returns {$CancellablePromise<void>}
  */
@@ -894,7 +907,8 @@ export function RemoveSyncFolder(remotePath, deleteLocal) {
 }
 
 /**
- * RenameBlocked renames a blocked file so it can sync.
+ * RenameBlocked renames a blocked file so it can sync — or, when newName is an
+ * escape-control sentinel, opts the file's extension into (or out of) escaping.
  * @param {string} abs
  * @param {string} newName
  * @returns {$CancellablePromise<void>}
@@ -965,9 +979,9 @@ export function Search(term) {
 }
 
 /**
- * SetAllowedFilenames persists the allow-list (trimmed, de-duped). It takes
- * effect on the next launch, since the forbidden-name matcher is built when the
- * engine connects to the server.
+ * SetAllowedFilenames persists the allow-list (trimmed, de-duped) and applies it
+ * live: the running engine rebuilds its forbidden-name matcher and re-syncs, so a
+ * change takes effect immediately instead of on next launch.
  * @param {string[]} names
  * @returns {$CancellablePromise<void>}
  */
@@ -999,6 +1013,18 @@ export function SetAutostart(on) {
  */
 export function SetBaseDir(dir) {
     return $Call.ByID(1736883101, dir);
+}
+
+/**
+ * SetBetaUpdates opts this installation in or out of pre-release builds. The
+ * next update check — manual or the daily one — uses the new channel. Opting
+ * out never moves an already-installed beta backwards: MSIX won't install an
+ * older version, so the build stands until a release overtakes it.
+ * @param {boolean} on
+ * @returns {$CancellablePromise<void>}
+ */
+export function SetBetaUpdates(on) {
+    return $Call.ByID(2072542649, on);
 }
 
 /**

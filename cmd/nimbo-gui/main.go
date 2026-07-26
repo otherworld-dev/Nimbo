@@ -161,6 +161,11 @@ func main() {
 
 	svc.refreshLicence() // load any installed business licence
 
+	// Re-point any app shortcut whose icon path died with a previous app
+	// identity (a re-signing, or a move to the Store build) — taskbar pins in
+	// particular, which nothing else ever rewrites. See appshortcuts.go.
+	go svc.repairAppShortcutIcons()
+
 	if hasAccount() {
 		go svc.start(ctx)
 	} else {
