@@ -13,11 +13,8 @@ It talks to Nextcloud entirely over documented HTTP APIs:
 - **Real-time** — the `notify_push` websocket for instant sync triggers and app
   notifications, with OCS polling as a fallback.
 
-## Support & documentation
+## Support
 
-- [FAQ](docs/FAQ.md) — install, updates, accounts, virtual files, exclusions
-- [Troubleshooting](docs/TROUBLESHOOTING.md) — diagnosis steps and common fixes
-- [Known limitations](docs/LIMITATIONS.md) — honest scope of the current release
 - [Report an issue](https://github.com/otherworld-dev/Nimbo/issues)
 
 ## Architecture
