@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/otherworld/nimbo/internal/engine"
@@ -40,5 +41,32 @@ func TestClassifyConflict_DeleteVsEdit(t *testing.T) {
 	}
 	if info.Kind != "deleted-locally" || info.LocalExists || !info.RemoteExists {
 		t.Errorf("b.txt: got %+v", info)
+	}
+}
+
+// TestConflictNameDoesNotStackMarkers pins the fix for the field failure where
+// a repeatedly-conflicting file grew a fresh " (conflicted copy …)" marker each
+// round — six deep on the test VM — until the path crossed MAX_PATH and nothing
+// could open it. A conflict of an already-conflicted copy must REPLACE the old
+// marker, not append another.
+func TestConflictNameDoesNotStackMarkers(t *testing.T) {
+	got := ConflictName("New Text Document (conflicted copy 2026-08-16 000722).txt")
+	if strings.Count(got, "(conflicted copy") != 1 {
+		t.Fatalf("marker stacked: %q", got)
+	}
+	if !strings.HasPrefix(got, "New Text Document (conflicted copy ") || !strings.HasSuffix(got, ").txt") {
+		t.Fatalf("unexpected shape: %q", got)
+	}
+
+	// Six stacked markers (the real VM filename) collapse back to one.
+	stacked := "New Text Document" + strings.Repeat(" (conflicted copy 2026-08-16 000722)", 6) + ".txt"
+	if got := ConflictName(stacked); strings.Count(got, "(conflicted copy") != 1 {
+		t.Fatalf("stacked markers survived: %q", got)
+	}
+
+	// Directory components and ordinary parentheses are untouched.
+	got = ConflictName("a/b (notes) (conflicted copy 2025-01-02 030405).md")
+	if !strings.HasPrefix(got, "a/b (notes) (conflicted copy ") || strings.Count(got, "(conflicted copy") != 1 {
+		t.Fatalf("got %q", got)
 	}
 }

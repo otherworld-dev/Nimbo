@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/transport"
 )
@@ -386,5 +388,117 @@ func TestChildrenOnly(t *testing.T) {
 	// Self row absent (transport doc: included "when present") — unchanged.
 	if got2 := childrenOnly(got, "a"); len(got2) != 2 {
 		t.Fatalf("childrenOnly without self row = %v", got2)
+	}
+}
+
+// RemoteScan must carry the server's mtime through to RemoteState: the adopt
+// classifier compares local files against it, and a zero mtime makes
+// LocalMatchesRemote reject every file (regression: everything classified as a
+// conflict because this field was silently dropped).
+func TestRemoteScanCarriesLastModified(t *testing.T) {
+	f := newFakeTree()
+	mt := time.Unix(1700000000, 0)
+	for dir, entries := range f.dirs {
+		for i := range entries {
+			entries[i].LastModified = mt
+		}
+		f.dirs[dir] = entries
+	}
+	out, err := RemoteScan(context.Background(), f, "", ScanOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p, r := range out {
+		if !r.LastModified.Equal(mt) {
+			t.Errorf("out[%q].LastModified = %v, want %v", p, r.LastModified, mt)
+		}
+	}
+}
+
+// TestRemoteScanCarriesLock covers files_lock state surviving the trip from a
+// listing into RemoteState. Nil matters as much as non-nil: a file nobody has
+// locked, and a file the server said nothing about, must both stay nil so the UI
+// can never report a phantom lock.
+func TestRemoteScanCarriesLock(t *testing.T) {
+	f := newFakeTree()
+	held := &transport.LockInfo{
+		Owner: "bob", OwnerDisplay: "Bob Smith", OwnerType: transport.LockOwnerApp,
+		Token: "files_lock/abc", Since: time.Unix(1786228737, 0),
+	}
+	entries := f.dirs[""]
+	for i := range entries {
+		if entries[i].Path == "f1" {
+			entries[i].Lock = held
+		}
+	}
+	f.dirs[""] = entries
+
+	out, err := RemoteScan(context.Background(), f, "", ScanOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := out["f1"].Lock
+	if got == nil {
+		t.Fatal(`out["f1"].Lock = nil, want bob's lock`)
+	}
+	if got.Owner != "bob" || got.OwnerDisplay != "Bob Smith" || got.OwnerType != transport.LockOwnerApp {
+		t.Errorf("lock = %+v, want bob / Bob Smith / app-owned", got)
+	}
+	if l := out["a/f2"].Lock; l != nil {
+		t.Errorf(`out["a/f2"].Lock = %+v, want nil`, l)
+	}
+}
+
+// A pruned subtree is replayed from the baseline and has no Entry behind it, so
+// it cannot know lock state. It must report nil ("unknown") rather than an empty
+// record, or the UI would tell the user nobody has a file open when it simply
+// never looked.
+func TestRemoteScanPrunedSubtreeHasUnknownLock(t *testing.T) {
+	f := newFakeTree()
+	base := map[string]BaselineState{
+		"a":      {Path: "a", IsDir: true, RemoteETag: "ea"},
+		"a/b":    {Path: "a/b", IsDir: true, RemoteETag: "eb"},
+		"a/f2":   {Path: "a/f2", RemoteETag: "e2"},
+		"a/b/f3": {Path: "a/b/f3", RemoteETag: "e3"},
+	}
+	out, err := RemoteScan(context.Background(), f, "", ScanOpts{Base: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := out["a/f2"]; !ok {
+		t.Fatal(`out["a/f2"] missing — the prune should have replayed it`)
+	} else if got.Lock != nil {
+		t.Errorf(`pruned out["a/f2"].Lock = %+v, want nil (unknown)`, got.Lock)
+	}
+	if n := f.callsFor("a"); n != 0 {
+		t.Fatalf("directory a was listed %d times; the prune did not fire, so this test proves nothing", n)
+	}
+}
+
+// The adopt scan can crawl a huge account for minutes; the UI needs a live
+// signal that work is happening. Progress must be called once per directory
+// listed, with a strictly increasing count.
+func TestRemoteScanReportsProgress(t *testing.T) {
+	f := newFakeTree()
+	var mu sync.Mutex
+	var counts []int
+	_, err := RemoteScan(context.Background(), f, "", ScanOpts{
+		Progress: func(dirsListed int) {
+			mu.Lock()
+			counts = append(counts, dirsListed)
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(counts) != 3 { // root, a, a/b
+		t.Fatalf("Progress called %d times, want 3 (per listed dir): %v", len(counts), counts)
+	}
+	sort.Ints(counts)
+	for i, c := range counts {
+		if c != i+1 {
+			t.Fatalf("counts not 1..N: %v", counts)
+		}
 	}
 }

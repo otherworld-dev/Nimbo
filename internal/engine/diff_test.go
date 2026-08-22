@@ -211,3 +211,82 @@ func TestDeadBaselinePaths(t *testing.T) {
 		t.Fatalf("empty base should yield none, got %v", got)
 	}
 }
+
+// A metadata-only ETag bump - which is what taking or releasing a files_lock
+// lock produces - must not read as a content change.
+//
+// Two failures without this: every peer re-downloads the file twice per lock
+// cycle, and a peer that ALSO edited locally gets a conflicted copy out of a
+// file nobody changed on the server.
+func TestDiffIgnoresMetadataOnlyEtagBump(t *testing.T) {
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	base := map[string]BaselineState{
+		"a.xlsx": {Path: "a.xlsx", RemoteETag: "old", ContentSHA1: sha, LocalSize: 5, LocalMTimeNanos: 1000},
+	}
+	remote := map[string]RemoteState{
+		"a.xlsx": {Path: "a.xlsx", ETag: "new-after-lock", SHA1: sha, Size: 5},
+	}
+
+	// Local untouched: nothing to do at all.
+	local := map[string]LocalState{
+		"a.xlsx": {Path: "a.xlsx", Size: 5, MTime: time.Unix(0, 1000)},
+	}
+	for _, a := range Diff(base, remote, local) {
+		if a.Kind != ActNoop {
+			t.Errorf("unchanged file produced %v (%s); want nothing", a.Kind, a.Reason)
+		}
+	}
+
+	// Local edited: that is a plain upload, NOT a conflict.
+	local["a.xlsx"] = LocalState{Path: "a.xlsx", Size: 9, MTime: time.Unix(0, 2000)}
+	var kinds []ActionKind
+	for _, a := range Diff(base, remote, local) {
+		if a.Kind != ActNoop {
+			kinds = append(kinds, a.Kind)
+		}
+	}
+	if len(kinds) != 1 || kinds[0] != ActUpload {
+		t.Errorf("got %v, want a single upload — the server's bytes never changed", kinds)
+	}
+}
+
+// The override is conservative: with no checksum to compare, the ETag is still
+// trusted, so a real remote edit is never mistaken for metadata.
+func TestDiffTrustsEtagWithoutChecksums(t *testing.T) {
+	base := map[string]BaselineState{
+		"a.xlsx": {Path: "a.xlsx", RemoteETag: "old", LocalSize: 5, LocalMTimeNanos: 1000},
+	}
+	remote := map[string]RemoteState{"a.xlsx": {Path: "a.xlsx", ETag: "new", Size: 6}}
+	local := map[string]LocalState{"a.xlsx": {Path: "a.xlsx", Size: 5, MTime: time.Unix(0, 1000)}}
+
+	var kinds []ActionKind
+	for _, a := range Diff(base, remote, local) {
+		if a.Kind != ActNoop {
+			kinds = append(kinds, a.Kind)
+		}
+	}
+	if len(kinds) != 1 || kinds[0] != ActDownload {
+		t.Errorf("got %v, want a download", kinds)
+	}
+}
+
+// A genuine remote edit still conflicts with a genuine local edit.
+func TestDiffStillConflictsOnRealChange(t *testing.T) {
+	base := map[string]BaselineState{
+		"a.xlsx": {Path: "a.xlsx", RemoteETag: "old", ContentSHA1: "1111111111111111111111111111111111111111", LocalSize: 5, LocalMTimeNanos: 1000},
+	}
+	remote := map[string]RemoteState{
+		"a.xlsx": {Path: "a.xlsx", ETag: "new", SHA1: "2222222222222222222222222222222222222222", Size: 7},
+	}
+	local := map[string]LocalState{"a.xlsx": {Path: "a.xlsx", Size: 9, MTime: time.Unix(0, 2000)}}
+
+	var kinds []ActionKind
+	for _, a := range Diff(base, remote, local) {
+		if a.Kind != ActNoop {
+			kinds = append(kinds, a.Kind)
+		}
+	}
+	if len(kinds) != 1 || kinds[0] != ActConflict {
+		t.Errorf("got %v, want a conflict", kinds)
+	}
+}

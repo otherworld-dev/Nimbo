@@ -1,6 +1,9 @@
 package engine
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // Diff performs a three-way reconciliation of the baseline (last synced),
 // remote, and local states, returning the actions needed to converge them. It
@@ -47,6 +50,26 @@ func classify(p string, b BaselineState, hasB bool, r RemoteState, hasR bool, l 
 	}
 }
 
+// sameContentAsBaseline reports whether the server's copy has the SAME bytes as
+// the last synced state despite a different ETag.
+//
+// Nextcloud bumps a file's ETag for metadata-only changes — taking or releasing
+// a files_lock lock does it, as do tags, comments and favourites. Without this
+// check the diff reads that as "remote changed", which is wrong twice over: on
+// its own it forces a pointless re-download of every peer's copy, and combined
+// with a genuine local edit it manufactures a conflict and a conflicted copy out
+// of a file nobody touched on the server.
+//
+// Conservative: it only overrides when BOTH checksums are known. An absent one
+// (the server did not send oc:checksums, or the baseline predates it) falls back
+// to trusting the ETag.
+func sameContentAsBaseline(r RemoteState, b BaselineState) bool {
+	if r.IsDir || r.SHA1 == "" || b.ContentSHA1 == "" {
+		return false
+	}
+	return strings.EqualFold(r.SHA1, b.ContentSHA1)
+}
+
 // classifyBoth handles a path present on both remote and local.
 func classifyBoth(p string, b BaselineState, hasB bool, r RemoteState, l LocalState) Action {
 	if r.IsDir && l.IsDir {
@@ -56,7 +79,7 @@ func classifyBoth(p string, b BaselineState, hasB bool, r RemoteState, l LocalSt
 		return act(ActConflict, p, "type mismatch: directory on one side, file on the other")
 	}
 
-	remoteChanged := !hasB || r.ETag != b.RemoteETag
+	remoteChanged := !hasB || (r.ETag != b.RemoteETag && !sameContentAsBaseline(r, b))
 	localChanged := !hasB || localFileChanged(l, b)
 
 	switch {

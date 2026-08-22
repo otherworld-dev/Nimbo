@@ -63,6 +63,21 @@ background thread.
   constructor) is inert: `URL()` returns `""`, `Poll()` errors, `Cancel()`
   no-ops. Only `StartLogin` produces a usable flow.
 
+## Sync control
+
+- `SyncNow` runs a **full reconcile** of every pair: both trees are walked, so
+  local-only files upload and remote-only files download. It is deliberately not
+  the cheap remote-delta poll the desktop tray fires — Android's inotify does not
+  reliably report writes made by *other* apps to shared storage, so this is the
+  user's manual recovery path when the watcher missed a change. Expect it to take
+  as long as a startup sync on a large pair, and call it off the main thread like
+  everything else.
+- A pair's **first** pass reconciles both sides. It begins with a bulk download
+  clone, then — when the local folder already had content — continues into the
+  normal diff in the same pass, so pre-existing local files are uploaded rather
+  than ignored. (Before this, pairing a populated folder with an empty remote
+  uploaded nothing and still reported "Up to date".)
+
 ## Sync folders
 
 - **Call `SetBaseDir` before the first `AddSyncFolder`** (once storage
@@ -73,6 +88,32 @@ background thread.
   session counts; you don't need to re-set it every launch.
 - `AddSyncPair(localDir, remoteRoot)` takes an explicit local directory and
   is not guarded (you chose the path).
+
+## File management
+
+The file-browser surface. All of these need the engine running.
+
+- `StatJSON(path)` returns one `Entry` object (not an array) and **errors when the
+  path does not exist** — absence is not an empty result here.
+- `PreviewJPEG(fileID, px)` returns server-rendered thumbnail bytes for images,
+  PDFs and office documents, at most `px` per side (`0` = 256). An error means
+  "not previewable" far more often than it means a fault — show a type icon and
+  do not report it to the user.
+- `DownloadToFile(remotePath, localPath)` and `UploadFile(localPath, remotePath)`
+  stream, create parent directories/collections, and **carry no overall
+  deadline** — any fixed ceiling would break a large file on a slow link. The
+  transport still bounds the connection phases, so a dead server cannot hang them
+  forever, but there is no way to cancel one except to abandon the thread. Run
+  them where that is acceptable (a foreground service, not the UI scope).
+  A failed download leaves no partial file behind.
+- `MkdirRemote(path)`, `DeleteRemote(path)`, `MoveRemote(src, dst)` are ordinary
+  30-second operations. `MoveRemote` covers both rename and move.
+- `DeleteRemote` is only recoverable if the server has its trashbin enabled.
+  Present it as permanent unless you have checked.
+
+None of these touch the sync baseline: deleting or moving a path inside a synced
+pair changes the server, and the next sync pass then propagates that to the local
+copy like any other remote change.
 
 ## JSON payloads
 

@@ -154,12 +154,22 @@ func retryAfter(resp *http.Response) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// DoOnce executes a request exactly once with no retry. Use for non-idempotent
-// or streaming requests (PUT uploads, MOVE). Upload bodies are throttled when an
-// upload limit is configured.
+// DoOnce executes a request exactly once with no application-level retry. Use
+// for non-idempotent or streaming requests (PUT uploads, MOVE). Upload bodies
+// are throttled when an upload limit is configured — including bodies the
+// transport rebuilds via GetBody for its own connection-level replays.
 func (c *Client) DoOnce(req *http.Request) (*http.Response, error) {
 	if req.Body != nil && c.upLimiter != nil {
 		req.Body = limitReadCloser(req.Context(), req.Body, c.upLimiter)
+		if gb := req.GetBody; gb != nil {
+			req.GetBody = func() (io.ReadCloser, error) {
+				b, err := gb()
+				if err != nil {
+					return nil, err
+				}
+				return limitReadCloser(req.Context(), b, c.upLimiter), nil
+			}
+		}
 	}
 	return c.hc.Do(req)
 }

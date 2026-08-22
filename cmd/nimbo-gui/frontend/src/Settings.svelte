@@ -19,7 +19,14 @@
   (async () => { policy = await App.PolicyInfo(); })();
 
   type Entry = { name: string; path: string; isDir: boolean };
-  type Pair = { localDir: string; remoteRoot: string; excludes: string[] };
+  // The guard fields are optional because they ride on PairDTO without a
+  // bindings regen, so the generated model doesn't declare them (it copies them
+  // through at runtime). See PairDTO in service.go.
+  type Pair = {
+    localDir: string; remoteRoot: string; excludes: string[];
+    frozen?: boolean;
+    freezeReason?: string; freezeSample?: string[];
+  };
 
   let tab = $state<"folders" | "sync" | "exclusions" | "appearance" | "general">("folders");
 
@@ -184,6 +191,22 @@
     await App.RemoveSyncFolder(trim(p.remoteRoot), false); // keep local files
     await loadFolders();
   }
+
+  // --- Damage-guard freeze: resume after review ---
+  //
+  // Rides SetSyncMode's sentinel dispatch (see its comment in service.go) so no
+  // new Wails binding is needed; returns "" or a message. The folder is
+  // identified by its local directory, after the colon. resumeBusy is cleared
+  // only AFTER the row has been rebuilt from the engine, so a stale banner's
+  // button cannot be clicked against a folder whose state has already changed.
+  let resumeBusy = $state("");
+  async function resumeFrozen(p: Pair) {
+    resumeBusy = p.localDir;
+    const err = await App.SetSyncMode("guard-resume:" + p.localDir);
+    if (err) alert(err);
+    await loadFolders();
+    resumeBusy = "";
+  }
   let moveBusy = $state(false);
   // Disable "Move…" while a sync is active. The engine also refuses a mid-sync
   // move, but disabling the button prevents the click and explains why. Driven by
@@ -228,6 +251,43 @@
   let up_ = $state(0), down_ = $state(0);
   (async () => { const l = await App.GetLimits(); up_ = l.up; down_ = l.down; })();
   const saveLimits = () => { App.SetLimits(Number(up_) || 0, Number(down_) || 0); flashSaved("limits"); };
+
+  // Disguised file types: server-forbidden names synced via escaped server-side
+  // copies. Reuses the blocked-files bindings (no regen): add derives the ext
+  // from a synthetic filename; remove runs the (now checkpoint-warm) sweep that
+  // deletes the disguised server copies. List rides the diag poll.
+  let newEscape = $state("");
+  // The remove sweep runs in a Go goroutine (the bound call returns at once);
+  // the row's ext vanishes from the diag-fed list when the sweep completes, so
+  // busy-state is "this ext is still listed after I asked to remove it".
+  let removingExt = $state("");
+  // …which never happens if the sweep FAILS: the ext stays listed, so without a
+  // deadline the row reads "Removing…" for good and every Remove button stays
+  // disabled until the window is reopened. Time it out generously instead — long
+  // enough not to interrupt a real sweep, and re-enabling a button is a far
+  // cheaper failure than a permanently wedged panel.
+  let removeTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    const list: string[] = (diag as any)?.escapeExtensions ?? [];
+    if (removingExt && !list.includes(removingExt)) {
+      clearTimeout(removeTimer);
+      removingExt = "";
+    }
+  });
+  async function addEscape() {
+    let ext = newEscape.trim();
+    if (!ext) return;
+    if (!ext.startsWith(".")) ext = "." + ext;
+    newEscape = "";
+    await App.RenameBlocked("x" + ext, "//escape");
+  }
+  async function rmEscape(ext: string) {
+    if (!confirm(`Stop syncing ${ext} files?\n\nTheir disguised copies are removed from the server and the files stay on this device only. Nothing is deleted locally.`)) return;
+    removingExt = ext;
+    clearTimeout(removeTimer);
+    removeTimer = setTimeout(() => { if (removingExt === ext) removingExt = ""; }, 300000);
+    await App.RenameBlocked("", "//unescape:" + ext);
+  }
 
   // Exclusions: global ignore patterns (globs excluded from every sync pair, on
   // top of built-in defaults) and allowed filenames (normally-blocked names like
@@ -371,11 +431,197 @@
   }
   $effect(() => { if (tab === "folders" && syncMode === "ondemand") loadOffline(); });
   (async () => { onDemandSupported = await App.OnDemandSupported(); syncMode = await App.GetSyncMode(); })();
+  // Switching to virtual files over a folder that already holds files needs the
+  // adopt pass, so the files already on disk stay put instead of being left
+  // outside the placeholder system. Scan first, show the cost, then confirm.
+  //
+  // The scan crawls the whole account and can run for MINUTES on a big one, so
+  // it gets a blocking overlay the moment it starts — with a moving folder
+  // count (via the diag poll) so a long crawl doesn't read as a hang — and a
+  // Cancel that aborts the crawl server-side. Nothing changes until confirm.
+  let adopt: any = $state(null);
+  let scanning = $state(false);
+  let scanCancelled = false;
+  // Leaving VFS gets the mirror treatment: instant local scan -> forecast
+  // dialog (files converted back in place, online-only re-download cost) ->
+  // background revert with overlay. revert holds the forecast; null = closed.
+  let revert: any = $state(null);
   async function saveSyncMode() {
+    if (syncMode === "live") {
+      // The overlay opens the INSTANT the mode is picked — even a fast scan
+      // must not leave a dead gap between the click and the next UI.
+      scanning = true; scanCancelled = false;
+      const raw = await App.SetSyncMode("live-scan");
+      scanning = false;
+      let sum: any = null;
+      try { sum = JSON.parse(raw); } catch { sum = null; }
+      if (sum?.error) { alert("File availability: " + sum.error); syncMode = await App.GetSyncMode(); return; }
+      if (sum && (sum.hydrated || sum.dehydrated)) { revert = sum; return; }
+      // Nothing mounted/nothing to revert — plain switch below.
+    }
+    if (syncMode === "ondemand") {
+      scanning = true; scanCancelled = false;
+      const raw = await App.SetSyncMode("ondemand-scan");
+      scanning = false;
+      if (scanCancelled) { scanCancelled = false; return; } // user aborted; control already reset
+      let sum: any = null;
+      try { sum = JSON.parse(raw); } catch { sum = null; }
+      if (sum?.error) {
+        alert("File availability: " + sum.error);
+        syncMode = await App.GetSyncMode(); // the mode didn't change; put the control back
+        return;
+      }
+      // Nothing already on disk to reason about — switch straight over.
+      if (sum && (sum.keep || sum.conflict || sum.upload || sum.replace)) { adopt = sum; return; }
+    }
     syncModeBusy = true;
     const err = await App.SetSyncMode(syncMode);
     syncModeBusy = false;
     if (err) alert("File availability: " + err);
+    await refreshModeAndFolders(); // the plain switch restores/clears pairs synchronously
+  }
+  async function cancelScan() {
+    scanCancelled = true;
+    scanning = false;
+    await App.SetSyncMode("ondemand-cancel"); // aborts the crawl in Go
+    syncMode = await App.GetSyncMode(); // nothing changed; put the control back
+  }
+  // Every completed mode switch changes BOTH the mode and the folder list
+  // (leaving virtual files restores the remembered pairs at the very END of
+  // the switch; entering it clears them). Refresh the two together, or the
+  // Folders section shows the pre-switch list until some other action calls
+  // loadFolders — "sync folders restored" with an empty list (bit Adam,
+  // 2026-08-20).
+  async function refreshModeAndFolders() {
+    syncMode = await App.GetSyncMode();
+    await loadFolders();
+  }
+  // The revert finishes at an unknown later time — sub-second on a small
+  // account (too fast for the 3s diag poll to ever observe, so a
+  // counter-transition watcher can never fire) up to an hour on a big one.
+  // Poll the REAL mode until it settles on live; that works at every speed.
+  let revertPoll: ReturnType<typeof setInterval> | null = null;
+  function stopRevertPoll() { if (revertPoll) { clearInterval(revertPoll); revertPoll = null; } }
+  async function confirmRevert() {
+    revert = null;
+    syncModeBusy = true;
+    const err = await App.SetSyncMode("live-revert"); // returns immediately; overlay takes over
+    syncModeBusy = false;
+    if (err) { alert("File availability: " + err); }
+    stopRevertPoll();
+    // The mode is persisted at the START of the switch but the remembered
+    // pairs are restored at its END (after the engine restart), so the first
+    // "live" answer can predate the restored folder list. Refresh on three
+    // consecutive live ticks rather than one, so the list settles too.
+    let liveTicks = 0;
+    revertPoll = setInterval(async () => {
+      const m = await App.GetSyncMode();
+      if (m !== "live") { liveTicks = 0; return; }
+      syncMode = m;
+      await loadFolders();
+      if (++liveTicks >= 3) stopRevertPoll();
+    }, 1000);
+  }
+  async function cancelRevertDialog() {
+    revert = null;
+    syncMode = await App.GetSyncMode(); // nothing changed; put the control back
+  }
+  // The revert runs for many minutes after the "live-revert" call returns; the
+  // mode only flips at the END. Refresh the selector when the overlay closes,
+  // or it shows "Virtual" after a completed switch (bit Adam on the first run).
+  let revertWasRunning = false;
+  $effect(() => {
+    const t = (diag as any)?.revertTotal || 0;
+    if (t > 0) { revertWasRunning = true; }
+    else if (revertWasRunning) {
+      revertWasRunning = false;
+      refreshModeAndFolders();
+    }
+  });
+  async function cancelRevertRun() {
+    stopRevertPoll();
+    await App.SetSyncMode("revert-cancel"); // remounts VFS; already-reverted files stay plain
+    await refreshModeAndFolders();
+  }
+  // Cancelling the background conversion = switching back to live: the unmount
+  // cancels the conversion cleanly (converted files are correct placeholders,
+  // the rest are untouched plain files).
+  async function cancelConvert() {
+    syncModeBusy = true;
+    const err = await App.SetSyncMode("live");
+    syncModeBusy = false;
+    if (err) alert("File availability: " + err);
+    await refreshModeAndFolders();
+  }
+  async function confirmAdopt() {
+    adopt = null;
+    syncModeBusy = true;
+    const err = await App.SetSyncMode("ondemand-adopt");
+    syncModeBusy = false;
+    if (err) alert("File availability: " + err);
+    await refreshModeAndFolders();
+  }
+  // "Start fresh": switch WITHOUT keeping the local files. A second, explicit
+  // confirmation with exact counts — this deletes data, and in the on-demand
+  // direction local-only files are gone for good.
+  let fresh = $state<null | { target: "ondemand" | "live"; dir: string; total: number; localOnly: number; changed: number }>(null);
+  let freshBusy = $state(false);
+  function askFreshFromAdopt() {
+    if (!adopt) return;
+    fresh = {
+      target: "ondemand", dir: adopt.dir,
+      total: (adopt.keep || 0) + (adopt.replace || 0) + (adopt.upload || 0) + (adopt.conflict || 0),
+      localOnly: adopt.upload || 0, changed: adopt.conflict || 0,
+    };
+    adopt = null;
+  }
+  function askFreshFromRevert() {
+    if (!revert) return;
+    fresh = {
+      target: "live", dir: revert.dir,
+      total: (revert.hydrated || 0) + (revert.dehydrated || 0),
+      localOnly: 0, changed: 0,
+    };
+    revert = null;
+  }
+  async function cancelFresh() {
+    const t = fresh?.target;
+    fresh = null;
+    if (t === "ondemand") await App.SetSyncMode("ondemand-cancel"); // drop the held adopt plan
+    syncMode = await App.GetSyncMode(); // nothing changed; put the control back
+  }
+  // One-UAC badge registration for installs that never ran the elevated
+  // Setup step (Store, in-app updates). Shown in live mode while the current
+  // badge generation is missing.
+  let badgesBusy = $state(false);
+  let badgesMsg = $state("");
+  async function enableBadges() {
+    badgesBusy = true; badgesMsg = "";
+    const err = await App.SetSyncMode("badges-enable");
+    badgesBusy = false;
+    badgesMsg = err || "Badges enabled — restart Explorer if they don't show yet.";
+    diag = await App.Diagnostics();
+  }
+  async function confirmFresh() {
+    if (!fresh) return;
+    const cmd = fresh.target === "ondemand" ? "ondemand-fresh" : "live-fresh";
+    fresh = null;
+    freshBusy = true;
+    const err = await App.SetSyncMode(cmd);
+    freshBusy = false;
+    if (err) alert("File availability: " + err);
+    await refreshModeAndFolders();
+  }
+  async function cancelAdopt() {
+    adopt = null;
+    await App.SetSyncMode("ondemand-cancel"); // drop the held plan; nothing was changed
+    syncMode = await App.GetSyncMode(); // put the control back to the real mode
+  }
+  function mb(bytes: number): string {
+    if (!bytes) return "0 MB";
+    if (bytes < 1024 * 1024) return Math.max(1, Math.round(bytes / 1024)) + " KB";
+    if (bytes < 1024 * 1024 * 1024) return Math.round(bytes / (1024 * 1024)) + " MB";
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + " GB";
   }
 
   let logVerbose = $state(false);
@@ -390,6 +636,27 @@
     const id = setInterval(load, 3000);
     return () => clearInterval(id);
   });
+
+  // Releasing rides SetSyncMode's sentinel dispatch (see its comment in
+  // service.go) so no new Wails binding is needed; it returns "" or a message.
+  let releasingLocks = $state(false);
+  async function toggleFileLockout(on: boolean) {
+    const err = await App.SetSyncMode(on ? "lockout-enable" : "lockout-disable");
+    if (err) alert(err);
+    diag = await App.Diagnostics();
+  }
+  async function toggleFileLocking(on: boolean) {
+    const err = await App.SetSyncMode(on ? "lock-enable" : "lock-disable");
+    if (err) alert(err);
+    diag = await App.Diagnostics();
+  }
+  async function releaseLocks() {
+    releasingLocks = true;
+    const err = await App.SetSyncMode("lock-release-all");
+    releasingLocks = false;
+    if (err) alert(err);
+    diag = await App.Diagnostics();
+  }
 
   let lowMem = $state(true);
   (async () => { lowMem = await App.LowMemoryMode(); })();
@@ -463,12 +730,26 @@
   // below is gated on canApply — which is false on the Store build (the Store
   // updates the app itself) and on loose dev builds.
   let beta = $state(false);
+  let betaConfirm = $state(false);
   (async () => { beta = await App.BetaUpdates(); })();
-  async function toggleBeta() {
-    beta = !beta;
-    await App.SetBetaUpdates(beta);
+  async function toggleBeta(e: Event) {
+    if (!beta) {
+      // Turning betas ON needs eyes-open consent — put the checkbox back and
+      // show the warning; nothing changes unless it's confirmed.
+      (e.currentTarget as HTMLInputElement).checked = false;
+      betaConfirm = true;
+      return;
+    }
+    beta = false;
+    await App.SetBetaUpdates(false);
     // Whatever the last check wrote described the channel we just left —
     // clear it rather than leave a stale verdict on screen.
+    updateMsg = ""; updateURL = ""; updateNotes = ""; updateAvail = false;
+  }
+  async function confirmBeta() {
+    betaConfirm = false;
+    beta = true;
+    await App.SetBetaUpdates(true);
     updateMsg = ""; updateURL = ""; updateNotes = ""; updateAvail = false;
   }
   async function checkUpdate() {
@@ -519,6 +800,121 @@
           {#if policy.lockSyncMode}<p class="managed">🔒 Set by your organisation.</p>{/if}
         </div>
       {/if}
+      {#if revert}
+        <div class="modalback">
+          <div class="addpanel modalbox">
+            <div class="addhead">Switch back to normal files?</div>
+            <p class="hint">Your files in <b>{revert.dir}</b> go back to being ordinary files, in place.</p>
+            <ul class="hint">
+              {#if revert.hydrated}<li><b>{revert.hydrated.toLocaleString()}</b> are on this PC — converted back instantly, nothing transferred.</li>{/if}
+              {#if revert.dehydrated}<li><b>{revert.dehydrated.toLocaleString()}</b> are online-only — they'll download through normal syncing after the switch ({mb(revert.downloadBytes)}).</li>{/if}
+            </ul>
+            <p class="hint">Your sync folders are restored automatically.</p>
+            <div class="addbtns">
+              <button class="primary" onclick={confirmRevert}>Switch to normal files</button>
+              <button onclick={askFreshFromRevert}>Start fresh…</button>
+              <button onclick={cancelRevertDialog}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      {/if}
+      {#if (diag as any)?.revertTotal > 0}
+        <div class="modalback">
+          <div class="addpanel modalbox">
+            <div class="addhead">Converting your files back…</div>
+            <p class="hint">Leave Nimbo running until this finishes. Your files stay usable throughout.</p>
+            <p class="hint"><b>{(diag as any).revertDone.toLocaleString()}</b> of <b>{(diag as any).revertTotal.toLocaleString()}</b> files</p>
+            <div class="addbtns">
+              <button onclick={cancelRevertRun}>Cancel and stay on virtual files</button>
+            </div>
+          </div>
+        </div>
+      {/if}
+      {#if (diag as any)?.adoptConvertTotal > 0}
+        <!-- Background conversion in progress (driven purely by the diag poll,
+             so it shows regardless of which call started the switch). -->
+        <div class="modalback">
+          <div class="addpanel modalbox">
+            <div class="addhead">Converting your files…</div>
+            <p class="hint">Nimbo is adopting the files already in your folder as virtual files. You can keep using your computer — just leave Nimbo running until this finishes.</p>
+            <p class="hint"><b>{(diag as any).adoptConvertDone.toLocaleString()}</b> of <b>{(diag as any).adoptConvertTotal.toLocaleString()}</b> files</p>
+            <div class="addbtns">
+              <button onclick={cancelConvert} disabled={syncModeBusy}>Cancel and switch back</button>
+            </div>
+          </div>
+        </div>
+      {/if}
+      {#if scanning}
+        <!-- Blocks the window for the whole crawl: without this, a multi-minute
+             scan behind a small hint line reads as "the switch did nothing". -->
+        <div class="modalback">
+          <div class="addpanel modalbox">
+            <div class="addhead">Checking your files…</div>
+            <p class="hint">Nimbo is comparing everything in your folder with your server before switching. On a large account this can take several minutes. Nothing is changed until you confirm.</p>
+            <p class="hint"><b>{(diag as any)?.adoptScanDirs || 0}</b> folders checked so far</p>
+            <div class="addbtns">
+              <button onclick={cancelScan}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      {/if}
+      {#if adopt}
+        <!-- Confirm before touching a folder that already holds files: the scan
+             changed nothing, so cancelling here is free. -->
+        <div class="modalback">
+          <div class="addpanel modalbox">
+            <div class="addhead">Keep the files already in this folder?</div>
+            <p class="hint">There are already files in <b>{adopt.dir}</b>. Nimbo can keep them where they are instead of downloading everything again.</p>
+            <ul class="hint">
+              {#if adopt.keep}<li><b>{adopt.keep}</b> already match your server — kept on this PC, nothing re-downloaded.</li>{/if}
+              {#if adopt.replace}<li><b>{adopt.replace}</b> are online-only leftovers from another client — replaced with Nimbo placeholders.</li>{/if}
+              {#if adopt.upload}<li><b>{adopt.upload}</b> aren’t on your server yet — uploaded.</li>{/if}
+              {#if adopt.conflict}<li><b>{adopt.conflict}</b> differ from your server — both versions kept (your copy is uploaded as a “conflicted copy”).</li>{/if}
+            </ul>
+            {#if adopt.uploadBytes}<p class="hint">Upload size: {mb(adopt.uploadBytes)}</p>{/if}
+            <div class="addbtns">
+              <button class="primary" onclick={confirmAdopt}>Keep my files</button>
+              <button onclick={askFreshFromAdopt}>Start fresh…</button>
+              <button onclick={cancelAdopt}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      {/if}
+      {#if fresh}
+        <div class="modalback">
+          <div class="addpanel modalbox">
+            <div class="addhead">{fresh.target === "ondemand" ? "Delete the local copies?" : "Clear the folder and re-download?"}</div>
+            {#if fresh.target === "ondemand"}
+              <p class="hint">Everything in <b>{fresh.dir}</b> ({fresh.total.toLocaleString()} files) is removed from this PC and becomes online-only. Your synced-folder setup is cleared too. Your files on the server are untouched and download when you open them.</p>
+              {#if fresh.localOnly}<p class="hint danger"><b>{fresh.localOnly.toLocaleString()}</b> files aren’t on your server yet — deleting them here loses them <b>forever</b>.</p>{/if}
+              {#if fresh.changed}<p class="hint danger"><b>{fresh.changed.toLocaleString()}</b> files have local changes that differ from the server — those changes are discarded.</p>{/if}
+            {:else}
+              <p class="hint">Everything in <b>{fresh.dir}</b> is removed from this PC and your synced-folder setup is cleared — you pick what to sync again afterwards. Your files on the server are untouched.</p>
+              <p class="hint danger">Anything in this folder that never reached the server is lost <b>forever</b>.</p>
+            {/if}
+            <div class="addbtns">
+              <button class="danger" onclick={confirmFresh}>Delete and start fresh</button>
+              <button class="primary" onclick={cancelFresh}>Go back</button>
+            </div>
+          </div>
+        </div>
+      {/if}
+      {#if freshBusy}
+        <div class="modalback">
+          <div class="addpanel modalbox">
+            <div class="addhead">Starting fresh…</div>
+            <p class="hint">Clearing the folder and switching over. This can take a while for large folders — leave Nimbo running.</p>
+          </div>
+        </div>
+      {/if}
+      {#if syncMode === "live" && diag && !(diag as any).badgesRegistered}
+        <p class="fhint">
+          Folder badges (the little status icons on your files) aren’t set up on this install.
+          <button class="link" onclick={enableBadges} disabled={badgesBusy}>{badgesBusy ? "Waiting for Windows…" : "Enable badges…"}</button>
+          Windows asks for permission once.
+          {#if badgesMsg}<br />{badgesMsg}{/if}
+        </p>
+      {/if}
       {#if syncMode === "ondemand"}
         <!-- On-demand mode: the whole account is virtual; per-folder sync is off. -->
         <div class="row"><h3>Virtual file system</h3></div>
@@ -542,6 +938,27 @@
           <p class="empty">No folders synced yet. Click “Add folder” to choose one.</p>
         {:else}
           {#each pairs as p}
+            {#if p.frozen}
+              <!-- The damage guard stopped this folder: a pass looked like the
+                   server losing files rather than the user changing them.
+                   Nothing was downloaded or removed — it waits for a human. -->
+              <div class="freeze">
+                <div class="freezehead">⚠ Sync paused — needs review</div>
+                <p class="freezewhy">{p.freezeReason}</p>
+                <p class="freezewhat">
+                  <b>{localName(p.localDir)}</b> was not changed: nothing was downloaded or removed.
+                  This usually means the folder on the server was moved, emptied, or restored from
+                  an older backup. If that was expected, resume; if not, check the server first.
+                </p>
+                {#if p.freezeSample?.length}
+                  <ul class="freezelist">
+                    {#each p.freezeSample as s}<li>{s}</li>{/each}
+                  </ul>
+                {/if}
+                <button class="primary small" disabled={resumeBusy === p.localDir}
+                        onclick={() => resumeFrozen(p)}>Resume syncing</button>
+              </div>
+            {/if}
             <div class="conn">
               <div class="connmain">
                 <span class="remote">/{trim(p.remoteRoot)}</span>
@@ -588,7 +1005,8 @@
               <p class="hint">Your copy on the server is kept. What about the files already downloaded to this computer?</p>
               <div class="addbtns">
                 <button class="primary" onclick={() => confirmDeselect(false)}>Keep files here</button>
-                <button class="danger" onclick={() => confirmDeselect(true)}>Delete to free space</button>
+                <button class="danger" onclick={() => confirmDeselect(true)}>
+                  Delete to free space</button>
               </div>
               <button class="link" onclick={() => (pending = null)}>Cancel</button>
             </div>
@@ -712,6 +1130,40 @@
         </select>
       </div>
 
+      <h3>Files in use</h3>
+      {#if !(diag as any)?.lockingAvailable}
+        <p class="fhint">Your server doesn't have the <b>Files Lock</b> app, so {brandName} can't tell when
+          someone else has a file open. Ask your administrator to enable it.</p>
+      {:else}
+        <p class="fhint">{brandName} warns you when someone else has a file open, so you don't both
+          edit it at once. The list lives in the status window, under <b>In use</b>.</p>
+        <label class="check"><input type="checkbox" checked={(diag as any)?.fileLocking ?? false}
+          onchange={(ev) => toggleFileLocking((ev.currentTarget as HTMLInputElement).checked)} />
+          Lock files I have open, so other users are told</label>
+        <p class="fhint">When you open a document, {brandName} marks it in use on the server so other
+          people see it before they start editing. Off by default. Your server does not expire locks
+          on its own, so {brandName} releases them itself — on close, on quit, and at the next start
+          if something crashed.</p>
+        <label class="check"><input type="checkbox" checked={(diag as any)?.fileLockout ?? false}
+          onchange={(ev) => toggleFileLockout((ev.currentTarget as HTMLInputElement).checked)} />
+          Stop me editing files someone else has open</label>
+        <p class="fhint">Holds the file open so Word, Excel and the rest refuse to edit it and show
+          their own “locked by …” message, instead of letting you make a second copy by accident.
+          Off by default — it is the stricter option, and it applies to every program, not just Office.</p>
+        {#if ((diag as any)?.heldLocks ?? []).length}
+          <p class="fhint"><b>{brandName} is holding {((diag as any).heldLocks).length}
+            lock{((diag as any).heldLocks).length === 1 ? "" : "s"}</b>, so other people are being told
+            these files are in use. They're released automatically when you close the file and when
+            {brandName} quits — this button is here for when something goes wrong, because your server
+            never expires a lock on its own.</p>
+          {#each ((diag as any)?.heldLocks ?? []) as l}
+            <div class="irow"><span>{l.path}</span></div>
+          {/each}
+          <div class="addrow"><button onclick={releaseLocks} disabled={releasingLocks}>
+            {releasingLocks ? "Releasing…" : "Release my locks"}</button></div>
+        {/if}
+      {/if}
+
       <h3>Performance</h3>
       <label class="check"><input type="checkbox" checked={lowMem} onchange={toggleLowMem} /> Low memory mode</label>
       <p class="fhint">Keeps {brandName}'s footprint small by reading sync state from disk instead of holding it all in memory. Recommended. Turn off only if you want the fastest possible background re-syncs on a very large account (uses noticeably more RAM); local edits are unaffected either way.</p>
@@ -736,6 +1188,14 @@
       <div class="addrow"><input placeholder=".htaccess" bind:value={newAllowed} onkeydown={(e) => e.key === "Enter" && addAllowed()} /><button onclick={addAllowed}>Add</button></div>
       {#each allowed as p}<div class="irow"><span>{p}</span><button class="link" onclick={() => rmAllowed(p)}>Remove</button></div>{/each}
       {#if allowed.length === 0}<p class="empty">None — the standard blocks apply.</p>{/if}
+
+      <h3>Disguised file types</h3>
+      <p class="fhint">File types your server refuses to store under their real names (like <b>.htaccess</b>) can sync anyway: {brandName} stores them on the server under a disguised name and shows them here with their real one. Only kicks in for names the server actually rejects — listing an ordinary type does nothing.</p>
+      <div class="addrow"><input placeholder=".htaccess" bind:value={newEscape} onkeydown={(e) => e.key === "Enter" && addEscape()} /><button onclick={addEscape}>Add</button></div>
+      {#each ((diag as any)?.escapeExtensions ?? []) as ext}
+        <div class="irow"><span>{ext}</span><button class="link" disabled={removingExt !== ""} onclick={() => rmEscape(ext)}>{removingExt === ext ? "Removing…" : "Remove"}</button></div>
+      {/each}
+      {#if !((diag as any)?.escapeExtensions?.length)}<p class="empty">None — server-rejected names stay on this device only.</p>{/if}
 
     {:else if tab === "appearance"}
       <h3>Panel</h3>
@@ -896,19 +1356,34 @@
       <h3>About</h3>
       <div class="updaterow">
         <span class="about">{brandName} {version}</span>
-        <button class="link" onclick={checkUpdate} disabled={updateBusy}>Check for updates</button>
-        {#if updateMsg}<span class="upmsg">{updateMsg}</span>{/if}
-        {#if updateAvail}
-          {#if canApply}
+        <!-- The whole updater is self-update machinery, so it only exists where
+             self-update can actually happen: gated on canApply, which is false
+             on the Store build (the Store delivers updates itself and must not
+             be second-guessed by a check it can't fulfil) and on loose dev runs. -->
+        {#if canApply}
+          <button class="link" onclick={checkUpdate} disabled={updateBusy}>Check for updates</button>
+          {#if updateMsg}<span class="upmsg">{updateMsg}</span>{/if}
+          {#if updateAvail}
             <button class="link" onclick={applyUpdate} disabled={updateBusy}>Update now</button>
-          {:else if updateURL}
-            <button class="link" onclick={() => App.OpenURL(updateURL)}>Get update</button>
           {/if}
         {/if}
       </div>
       {#if canApply}
         <label class="check"><input type="checkbox" checked={beta} onchange={toggleBeta} /> Get beta releases early</label>
         <p class="fhint">Beta builds reach you before everyone else and are less tested. Turning this off stops future betas — it won't move you back, so you'll stay on your current build until a normal release overtakes it.</p>
+      {/if}
+      {#if betaConfirm}
+        <div class="modalback">
+          <div class="addpanel modalbox">
+            <div class="addhead">Get beta releases?</div>
+            <p class="hint">Beta builds come straight from active development: they change often, are less tested, and may contain bugs — including ones that could affect the files being synced.</p>
+            <p class="hint">They are provided as-is, without warranty of any kind, and the developer accepts no liability for any loss or damage arising from their use. Keep a backup of anything you can't afford to lose.</p>
+            <div class="addbtns">
+              <button class="primary" onclick={confirmBeta}>I understand — enable betas</button>
+              <button onclick={() => (betaConfirm = false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
       {/if}
       {#if updateNotes}
         <div class="relnotes">{updateNotes}</div>
@@ -1024,6 +1499,17 @@
   .connmain .local { color: var(--fg2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .danger { color: #c0392b; }
   .connacts { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+  /* Backup mode sits under its connection row: the tickbox, the consequence of
+     having it on, and — when the guard has stopped the folder — the review
+     banner above the row, where it can't be missed. */
+  .hint code { font-size: 11px; background: var(--bg2, rgba(127,127,127,.12)); padding: 0 3px; border-radius: 3px; }
+  .freeze { border: 1px solid #e6b3ad; background: #fdf3f2; color: #7a2f26; border-radius: 8px;
+            padding: 10px 12px; margin-bottom: 6px; font-size: 12.5px; }
+  .freezehead { font-weight: 600; margin-bottom: 4px; }
+  .freeze p { margin: 0 0 6px; }
+  .freezewhy { font-weight: 600; }
+  .freezelist { margin: 0 0 8px; padding-left: 18px; max-height: 96px; overflow-y: auto; }
+  .freezelist li { font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
   .modalback { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex;
                align-items: center; justify-content: center; z-index: 50; }
   .modalbox { max-width: 360px; width: 90%; margin: 0; box-shadow: 0 10px 40px rgba(0,0,0,.4); }

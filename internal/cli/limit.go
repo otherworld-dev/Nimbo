@@ -31,7 +31,7 @@ func cmdLimit(_ context.Context, args []string) error {
 	}
 	if args[0] == "none" {
 		s.UploadKBps, s.DownloadKBps = 0, 0
-		return saveLimits(d, s)
+		return saveLimits(d, s.UploadKBps, s.DownloadKBps)
 	}
 
 	// Parse "up <kbps>" / "down <kbps>" pairs.
@@ -49,15 +49,20 @@ func cmdLimit(_ context.Context, args []string) error {
 			return fmt.Errorf("unknown limit %q (use up|down|none)", args[i])
 		}
 	}
-	return saveLimits(d, s)
+	return saveLimits(d, s.UploadKBps, s.DownloadKBps)
 }
 
-func saveLimits(d config.Dirs, s config.Settings) error {
-	if err := d.SaveSettings(s); err != nil {
+// saveLimits writes just the two limit fields, so a CLI invocation made while
+// the GUI is running can't hand back the rest of the settings as they were when
+// this command started.
+func saveLimits(d config.Dirs, up, down int) error {
+	if err := d.UpdateSettings(func(s *config.Settings) {
+		s.UploadKBps, s.DownloadKBps = up, down
+	}); err != nil {
 		return err
 	}
 	fmt.Printf("Limits set — upload: %s, download: %s (applies to new syncs)\n",
-		limitStr(s.UploadKBps), limitStr(s.DownloadKBps))
+		limitStr(up), limitStr(down))
 	return nil
 }
 

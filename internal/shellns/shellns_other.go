@@ -10,6 +10,10 @@ func Supported() bool { return false }
 // Enabled reports whether the sidebar node is registered.
 func Enabled() bool { return false }
 
+// Packaged reports whether registry changes have to be applied out of an MSIX
+// container. Always false off Windows.
+func Packaged() bool { return false }
+
 // Register is a no-op on non-Windows platforms.
 func Register(string, string, string) error { return nil }
 

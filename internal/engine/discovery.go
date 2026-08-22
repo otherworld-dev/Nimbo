@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/otherworld/nimbo/internal/transport"
 )
@@ -55,6 +56,11 @@ type ScanOpts struct {
 	// back on a later attempt when the ETag still matches — so a failed crawl
 	// resumes instead of restarting cold. Nil disables checkpointing.
 	Checkpoint ScanCheckpoint
+	// Progress, when non-nil, is called once per directory listed (cached or
+	// fetched) with the running total — a heartbeat for UIs sitting on a
+	// multi-minute crawl. Called from worker goroutines; must be fast and
+	// safe for concurrent use.
+	Progress func(dirsListed int)
 }
 
 // ScanCheckpoint caches raw directory listings across scan attempts (Deck
@@ -123,6 +129,7 @@ func RemoteScan(ctx context.Context, c PropFinder, root string, opts ScanOpts) (
 	)
 
 	cp := opts.Checkpoint
+	var listed atomic.Int64 // directories listed so far, for the Progress heartbeat
 
 	// process lists one directory (from cache when the checkpoint validates,
 	// else the network), records its children, and queues changed
@@ -142,6 +149,9 @@ func RemoteScan(ctx context.Context, c PropFinder, root string, opts ScanOpts) (
 			if err == nil && cp != nil && !it.noCache && it.etag != "" {
 				cp.Save(it.dir, it.etag, childrenOnly(entries, it.dir))
 			}
+		}
+		if err == nil && opts.Progress != nil {
+			opts.Progress(int(listed.Add(1)))
 		}
 
 		mu.Lock()
@@ -176,13 +186,16 @@ func RemoteScan(ctx context.Context, c PropFinder, root string, opts ScanOpts) (
 				continue // E2EE folder — leave untouched on both sides
 			}
 			out[rel] = RemoteState{
-				Path:     rel,
-				IsDir:    e.IsDir,
-				ETag:     e.ETag,
-				FileID:   e.FileID,
-				Size:     e.Size,
-				SHA1:     parseChecksumSHA1(e.Checksums),
-				ReadOnly: e.ServerReadOnly(),
+				Path:         rel,
+				IsDir:        e.IsDir,
+				ETag:         e.ETag,
+				FileID:       e.FileID,
+				Size:         e.Size,
+				LastModified: e.LastModified,
+				SHA1:         parseChecksumSHA1(e.Checksums),
+				ReadOnly:     e.ServerReadOnly(),
+				Lock:         e.Lock,
+				LockKnown:    true, // straight off a listing, so Lock is authoritative
 			}
 			if !e.IsDir {
 				continue

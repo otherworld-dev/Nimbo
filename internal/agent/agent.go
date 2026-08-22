@@ -23,6 +23,8 @@ import (
 
 	"github.com/otherworld/nimbo/internal/account"
 	"github.com/otherworld/nimbo/internal/activity"
+	"github.com/otherworld/nimbo/internal/syncguard"
+	"github.com/otherworld/nimbo/internal/cfapi"
 	"github.com/otherworld/nimbo/internal/config"
 	"github.com/otherworld/nimbo/internal/engine"
 	"github.com/otherworld/nimbo/internal/notify"
@@ -56,6 +58,11 @@ type Engine struct {
 	// change can swap them live between syncs, instead of only on next launch.
 	forbidden atomic.Pointer[engine.Forbidden]
 	escaper   atomic.Pointer[engine.Escaper]
+	// guard is the account's damage-guard state (which folders are frozen),
+	// reloaded at the top of every sync pass (see ensurePair). A nil pointer
+	// means the state could not be READ — distinct from an empty set, which
+	// means "nothing is frozen". See guardStateUnavailable.
+	guard atomic.Pointer[config.GuardStates]
 
 	mu            sync.Mutex
 	paused        bool          // indefinite manual pause
@@ -95,6 +102,26 @@ type Engine struct {
 	blocked     map[string][]engine.Blocked // key = pair LocalDir
 	blockedSubs []chan struct{}
 
+	lockedMu   sync.Mutex
+	locked     map[string][]LockedFile // key = pair LocalDir — files OTHER users hold locked
+	lockedSubs []chan struct{}
+	lockToast  map[string]time.Time // path+owner -> last toast, to survive a flapping lock
+
+	// statusIcons registers live sync folders as cloud sync roots so Explorer
+	// draws native sync-state icons on them — the only route that works for a
+	// packaged build (see statusroot_windows.go).
+	statusIcons *statusRoots
+
+	// lockWarn makes OTHER people's locks visible locally: the deny-write handle
+	// plus the synthesised name carrier. Separate from lockMgr, which owns the
+	// locks we take ourselves.
+	lockWarn *lockWarner
+
+	// lockMgr owns the locks WE take (as opposed to `locked`, which is what other
+	// people hold). Separate because their lifetimes are entirely different: ours
+	// must be released or they last forever.
+	lockMgr *lockMgr
+
 	// failLog dedupes per-action sync failures so a permanently-rejected item
 	// (e.g. something dropped into the app-managed .Collectives folder) is logged
 	// once with a human-readable reason instead of spamming every sync pass.
@@ -109,6 +136,21 @@ type Engine struct {
 	inflightMu       sync.Mutex
 	inflight         map[string]bool // absolute paths currently being transferred
 	onOverlayRefresh func(string)    // notified when a path's sync state changes
+
+	overlayRootsMu sync.RWMutex
+	overlayRoots   []string // extra synced dirs with no live pair (on-demand mounts)
+
+	sharedMu       sync.RWMutex
+	sharedRemote   map[string]bool // files-root-relative paths carrying a share
+	receivedShares map[string]bool // the received-from-others subset, for arrival toasts
+	sharesPrimed   bool            // first refresh done — only later arrivals toast
+
+	// scanLastEmit throttles the scan heartbeat (see scanstatus.go): the scan
+	// callbacks fire per directory/entry from worker goroutines, far faster than
+	// the UI needs or can render.
+	scanMu       sync.Mutex
+	scanStart    time.Time // when the current scan pass began (quiet-period gate)
+	scanLastEmit time.Time
 
 	progMu      sync.Mutex
 	prog        SyncProgress
@@ -243,9 +285,20 @@ func NewEngineFor(ctx context.Context, accountID string) (*Engine, error) {
 		recorder:  activity.New(),
 		blocked:   make(map[string][]engine.Blocked),
 		conflicts: make(map[string][]ConflictItem),
+		locked:    make(map[string][]LockedFile),
+		lockToast: make(map[string]time.Time),
 	}
+	eng.lockMgr = newLockMgr(client, d, acc.LoginName)
+	eng.lockWarn = newLockWarner(d, func() string { return acc.LoginName })
+	eng.statusIcons = newStatusRoots()
 	eng.forbidden.Store(forbidden)
 	eng.escaper.Store(escaper)
+	// Load the backup set before the engine is handed out: the zero value reads
+	// as "unreadable", which suspends every pair. An unreadable file here leaves
+	// it that way deliberately — the engine still builds, and every sync refuses
+	// with a message saying why, rather than silently reverting one-way folders
+	// to two-way and uploading the local mirror.
+	_ = eng.reloadGuardState()
 	return eng, nil
 }
 
@@ -291,6 +344,14 @@ func (e *Engine) DoNotificationAction(ctx context.Context, a transport.Notificat
 // PushAvailable reports whether the server offers notify_push.
 func (e *Engine) PushAvailable() bool { return e.caps.NotifyPush != nil }
 
+// LockingAvailable reports whether the server has the files_lock app, which the
+// whole file-locking feature is gated on. Capabilities are fetched once at
+// sign-in, so an admin installing the app while Nimbo runs is not noticed until
+// restart — the same caveat that already applies to notify_push.
+func (e *Engine) LockingAvailable() bool {
+	return e.caps != nil && e.caps.Files.Locking != ""
+}
+
 // ThemeColor returns the user's Nextcloud primary theme colour (hex), or "" if
 // the server doesn't advertise one.
 func (e *Engine) ThemeColor() string {
@@ -318,6 +379,12 @@ func (e *Engine) Apps(ctx context.Context) ([]transport.App, error) {
 // Quota returns the user's storage usage.
 func (e *Engine) Quota(ctx context.Context) (transport.QuotaInfo, error) {
 	return e.client.UserQuota(ctx)
+}
+
+// Preview returns a server-rendered thumbnail for a file id, at most px pixels
+// per side. Images, PDFs and office documents all answer; anything else errors.
+func (e *Engine) Preview(ctx context.Context, fileID string, px int) ([]byte, error) {
+	return e.client.Preview(ctx, fileID, px)
 }
 
 // --- Trashbin & file versions (server features surfaced in the GUI) ---
@@ -380,18 +447,77 @@ func (e *Engine) DownloadRange(ctx context.Context, remotePath string, offset, l
 	return buf[:n], nil
 }
 
+// DownloadTo streams a remote file to localPath, creating its parent
+// directories. Unlike DownloadRange it never holds the file in memory, so it is
+// safe for the arbitrarily large files a file-manager UI will ask for.
+//
+// It writes to a temp file in the destination directory and renames on success,
+// so a failed or cancelled download leaves nothing behind: callers cache by file
+// id, and a truncated leftover would otherwise be served forever as the real file.
+func (e *Engine) DownloadTo(ctx context.Context, remotePath, localPath string) error {
+	dir := filepath.Dir(localPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	body, _, err := e.client.Get(ctx, remotePath)
+	if err != nil {
+		return err
+	}
+	defer body.Close()
+
+	tmp, err := os.CreateTemp(dir, ".download-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		tmp.Close()        // second close is harmless
+		os.Remove(tmpName) // no-op once the rename below has succeeded
+	}()
+
+	if _, err := io.Copy(tmp, body); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, localPath)
+}
+
 // Upload pushes localPath's content to the files-root-relative remotePath,
 // creating parent collections as needed (chunked for large files). Used by the
 // on-demand write-back watcher; it does NOT touch the diff-engine baseline.
-func (e *Engine) Upload(ctx context.Context, localPath, remotePath string) error {
+//
+// It joins the standard progress burst, so the flyout shows the file name,
+// bytes, speed and ETA exactly like a classic sync — before this, a multi-hour
+// on-demand upload ran with the UI claiming "Up to date" throughout (issue #1:
+// "does not show any sign in the app that it is doing so").
+// The returned ETag is the uploaded revision's own (authoritative — a
+// baseline recorded from a later Stat could adopt a concurrent writer's
+// revision as "already synced"); it may be empty on servers that omit it.
+func (e *Engine) Upload(ctx context.Context, localPath, remotePath string) (string, error) {
 	remotePath = strings.Trim(remotePath, "/")
 	if i := strings.LastIndex(remotePath, "/"); i > 0 {
 		if err := e.client.EnsureCollection(ctx, remotePath[:i]); err != nil {
-			return err
+			return "", err
 		}
 	}
-	_, err := transfer.Upload(ctx, e.client, localPath, remotePath)
-	return err
+	var size int64
+	if fi, err := os.Stat(localPath); err == nil {
+		size = fi.Size()
+	}
+	e.progStart(1, size)
+	defer e.progEnd()
+	e.progCurrent(filepath.Base(localPath))
+	res, err := transfer.UploadProgress(ctx, e.client, localPath, remotePath,
+		func(n int64) { e.progBytes.Add(n) })
+	if err == nil {
+		e.progComplete()
+	}
+	return res.ETag, err
 }
 
 // MkdirRemote creates remotePath (and any missing parents) on the server.
@@ -428,27 +554,27 @@ func (e *Engine) PinnedApps() []string {
 
 // PinApp pins an app by ID (no-op if already pinned).
 func (e *Engine) PinApp(id string) error {
-	s, _ := e.dirs.LoadSettings()
-	for _, p := range s.PinnedApps {
-		if p == id {
-			return nil
+	return e.dirs.UpdateSettings(func(s *config.Settings) {
+		for _, p := range s.PinnedApps {
+			if p == id {
+				return
+			}
 		}
-	}
-	s.PinnedApps = append(s.PinnedApps, id)
-	return e.dirs.SaveSettings(s)
+		s.PinnedApps = append(s.PinnedApps, id)
+	})
 }
 
 // UnpinApp removes an app from the pinned list.
 func (e *Engine) UnpinApp(id string) error {
-	s, _ := e.dirs.LoadSettings()
-	out := s.PinnedApps[:0]
-	for _, p := range s.PinnedApps {
-		if p != id {
-			out = append(out, p)
+	return e.dirs.UpdateSettings(func(s *config.Settings) {
+		out := s.PinnedApps[:0]
+		for _, p := range s.PinnedApps {
+			if p != id {
+				out = append(out, p)
+			}
 		}
-	}
-	s.PinnedApps = out
-	return e.dirs.SaveSettings(s)
+		s.PinnedApps = out
+	})
 }
 
 // Favorites returns the user's favourited files and folders.
@@ -507,6 +633,294 @@ func (e *Engine) BlockedFiles() []BlockedFile {
 		}
 	}
 	return out
+}
+
+// LockedFile is a file another user currently holds a files_lock lock on.
+type LockedFile struct {
+	LocalDir     string // the sync pair's local root
+	Path         string // pair-relative path
+	Abs          string // absolute local path
+	Owner        string // login name of the lock holder
+	OwnerDisplay string // display name, when the server gave one
+	AppName      string // for an app lock, the editor holding it (e.g. "Text"); empty otherwise
+	OwnerType    transport.LockOwnerType
+	Since        time.Time
+}
+
+// Who names the lock holder as a human would. An APP lock has no person behind
+// it — nc:lock-owner is absent and nc:lock-owner-displayname carries the app's
+// name — so callers must check AppName first; Who deliberately never returns an
+// app name as if it were a colleague.
+func (f LockedFile) Who() string {
+	if f.AppName != "" {
+		return "Someone else"
+	}
+	if f.OwnerDisplay != "" {
+		return f.OwnerDisplay
+	}
+	if f.Owner != "" {
+		return f.Owner
+	}
+	return "Someone else"
+}
+
+// Summary is the one-line description shown in a toast and in the status list.
+func (f LockedFile) Summary() string {
+	name := filepath.Base(f.Path)
+	if f.AppName != "" {
+		// e.g. "New notes.md is open in Nextcloud Text" — the server tells us the
+		// app but not the person, so do not invent one.
+		return name + " is open in Nextcloud " + f.AppName
+	}
+	return f.Who() + " has " + name + " open"
+}
+
+// LockedFiles returns every file other users have locked, across pairs.
+func (e *Engine) LockedFiles() []LockedFile {
+	e.lockedMu.Lock()
+	defer e.lockedMu.Unlock()
+	var out []LockedFile
+	for dir, list := range e.locked {
+		for _, f := range list {
+			f.LocalDir = dir
+			f.Abs = filepath.Join(dir, filepath.FromSlash(f.Path))
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// SubscribeLocked returns a channel signalled when the locked set changes.
+func (e *Engine) SubscribeLocked() <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	e.lockedMu.Lock()
+	e.lockedSubs = append(e.lockedSubs, ch)
+	e.lockedMu.Unlock()
+	return ch
+}
+
+// EnableStatusIcons registers a live sync folder as a status-only cloud sync
+// root, which gives it Explorer's Status column; the per-item icons come from
+// NCOverlays.dll's CustomStateHandler asking FileStatus over the status pipe.
+// Applied to every live pair automatically — there is no user toggle.
+func (e *Engine) EnableStatusIcons(dir, displayName, iconPath string) error {
+	return e.statusIcons.enable(dir, displayName, iconPath)
+}
+
+// DisableStatusIcons unregisters the root — for a removed pair, or a folder
+// about to be claimed by an on-demand mount (nested sync roots are refused).
+func (e *Engine) DisableStatusIcons(dir string) { e.statusIcons.disable(dir) }
+
+// TakeLock locks a remote path on the server so other people are told the file
+// is in use. Nimbo owns the lock's whole lifetime from here — see lockMgr.
+func (e *Engine) TakeLock(ctx context.Context, remotePath string) error {
+	if !e.LockingAvailable() {
+		return fmt.Errorf("this server doesn't have the Files Lock app")
+	}
+	return e.lockMgr.take(ctx, remotePath)
+}
+
+// ReleaseLock drops a lock we took. A path we do not hold is a no-op, never an
+// UNLOCK — releasing somebody else's lock returns 423 and is not ours to do.
+func (e *Engine) ReleaseLock(ctx context.Context, remotePath string) error {
+	return e.lockMgr.release(ctx, remotePath)
+}
+
+// ReleaseAllLocks drops every lock this account holds and reports how many went.
+// This is the user's escape hatch as well as the shutdown path: the server never
+// expires a lock, so without it a stuck one would need admin intervention.
+func (e *Engine) ReleaseAllLocks(ctx context.Context) (int, error) {
+	return e.lockMgr.releaseAll(ctx)
+}
+
+// HeldLocks lists the locks Nimbo currently holds for this account.
+func (e *Engine) HeldLocks() []config.HeldLock { return e.lockMgr.list() }
+
+// lockHeartbeat is how often we re-assert the locks we hold. Re-locking is the
+// only refresh mechanism files_lock offers, and it matters on any server whose
+// admin has configured lock_timeout — without it their locks would expire under
+// a user who still has the file open.
+const lockHeartbeat = 5 * time.Minute
+
+// runLockLifetime sweeps locks a previous run stranded, then keeps ours alive
+// until the context ends, releasing everything on the way out.
+//
+// It deliberately does NOT consult e.Paused() and never takes moveExcl: pausing
+// syncing must not stop us releasing a lock, and PauseSchedule auto-pauses
+// nightly — driving this from a sync path would strand every lock until morning.
+func (e *Engine) runLockLifetime(ctx context.Context) {
+	if !e.LockingAvailable() {
+		return
+	}
+	if n, err := e.lockMgr.sweep(ctx); n > 0 || err != nil {
+		slog.Info("swept locks left by a previous run", "released", n, "err", err)
+	}
+	if e.lockWarn != nil {
+		if n := e.lockWarn.sweep(); n > 0 {
+			slog.Info("removed lock warnings left by a previous run", "files", n)
+		}
+	}
+	t := time.NewTicker(lockHeartbeat)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			// Best effort on the way out, on a fresh context: ctx is already dead,
+			// and a lock we fail to release here lasts forever.
+			if e.lockWarn != nil {
+				e.lockWarn.closeAll() // never leave a user unable to edit their own file
+			}
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+			if n, err := e.lockMgr.releaseAll(rctx); n > 0 || err != nil {
+				slog.Info("released locks on shutdown", "released", n, "err", err)
+			}
+			cancel()
+			return
+		case <-t.C:
+			e.lockMgr.heartbeat(ctx)
+		}
+	}
+}
+
+// heldStatus is the flyout line for a pass that finished with nothing to do.
+// Held uploads are the exception to "Up to date".
+func heldStatus(held []string) string {
+	switch len(held) {
+	case 0:
+		return "Up to date"
+	case 1:
+		return "Waiting — " + filepath.Base(held[0]) + " is in use by someone else"
+	default:
+		return fmt.Sprintf("Waiting — %d files are in use by someone else", len(held))
+	}
+}
+
+// lockScan reads a pass's remote map and returns the paths whose lock state it
+// can vouch for, plus the ones another user holds. Split out of applyPlan so the
+// examined/locked distinction is unit-testable.
+func lockScan(remote map[string]engine.RemoteState, login, localDir string) (map[string]bool, []LockedFile) {
+	examined := make(map[string]bool, len(remote))
+	var locked []LockedFile
+	for rel, r := range remote {
+		if r.IsDir || !r.LockKnown {
+			continue // a pruned subtree was replayed from the baseline: it did not look
+		}
+		examined[rel] = true
+		if !r.Lock.HeldByOther(login) {
+			continue
+		}
+		locked = append(locked, LockedFile{
+			Path: rel, LocalDir: localDir,
+			Owner: r.Lock.Owner, OwnerDisplay: r.Lock.OwnerDisplay,
+			AppName:   r.Lock.AppName(),
+			OwnerType: r.Lock.OwnerType, Since: r.Lock.Since,
+		})
+	}
+	return examined, locked
+}
+
+// lockToastWindow is how long a given lock stays "already announced". A lock can
+// legitimately vanish and reappear between passes — its subtree gets pruned by
+// its ETag and replayed from the baseline, which carries no lock state — and
+// without this window that flapping would toast the user repeatedly.
+const lockToastWindow = time.Hour
+
+// reconcileLocked updates a pair's locked set from one sync pass.
+//
+// examined is the set of paths this pass had authoritative lock knowledge for;
+// l is the subset another user holds. Entries for examined paths are replaced
+// wholesale (so a RELEASED lock disappears), and entries for paths this pass
+// never looked at are left exactly as they were.
+//
+// It deliberately does NOT copy the blocked-files merge-only rule. Merge-only is
+// right for a blocked file — a forbidden name stays forbidden until the user
+// renames it — but a lock is transient, and merge-only meant a released lock was
+// only ever cleared by the hourly full reconcile. Found on the 2026-08-09 beta:
+// every routine pass is a delta, so a lock could sit in the UI for an hour after
+// the other user closed the file.
+func (e *Engine) reconcileLocked(localDir string, examined map[string]bool, l []LockedFile) {
+	e.lockedMu.Lock()
+	if e.locked == nil {
+		e.locked = make(map[string][]LockedFile) // engines built outside NewEngineFor (tests)
+	}
+	old := e.locked[localDir]
+	next := make([]LockedFile, 0, len(old)+len(l))
+	for _, x := range old {
+		if !examined[x.Path] {
+			next = append(next, x) // not looked at this pass — leave it alone
+		}
+	}
+	next = append(next, l...)
+	if len(next) == 0 {
+		delete(e.locked, localDir)
+	} else {
+		e.locked[localDir] = next
+	}
+	subs := append([]chan struct{}(nil), e.lockedSubs...)
+
+	// Work out the transitions while we still hold the mutex, so the toast
+	// bookkeeping cannot race another pass.
+	was := make(map[string]bool, len(old))
+	for _, x := range old {
+		was[x.Path+"\x00"+x.Owner] = true
+	}
+	held := make(map[string]bool, len(l))
+	for _, nl := range l {
+		held[nl.Path] = true
+	}
+
+	// Every transition is logged, whether or not it toasts. Diagnosing a lock
+	// complaint otherwise means probing the server by hand — the log said nothing
+	// either way, which cost real time on the 2026-08-09 beta.
+	var added, removed []LockedFile
+	for _, nl := range l {
+		if !was[nl.Path+"\x00"+nl.Owner] {
+			added = append(added, nl)
+		}
+	}
+	for _, x := range old {
+		if examined[x.Path] && !held[x.Path] {
+			removed = append(removed, x)
+		}
+	}
+
+	// Toasting is narrower than logging: it also honours the re-notify window, so
+	// a lock that flaps across passes does not nag.
+	var fresh []LockedFile
+	if e.onToast != nil {
+		now := time.Now()
+		for _, nl := range added {
+			key := nl.Path + "\x00" + nl.Owner
+			if last, ok := e.lockToast[key]; ok && now.Sub(last) < lockToastWindow {
+				continue
+			}
+			if e.lockToast == nil {
+				e.lockToast = make(map[string]time.Time)
+			}
+			e.lockToast[key] = now
+			fresh = append(fresh, nl)
+		}
+	}
+	e.lockedMu.Unlock()
+	notifyAll(subs)
+
+	for _, f := range added {
+		slog.Info("file locked by someone else", "path", f.Path,
+			"by", f.Who(), "app", f.AppName, "type", int(f.OwnerType))
+	}
+	for _, f := range removed {
+		slog.Info("lock released", "path", f.Path, "by", f.Who(), "app", f.AppName)
+	}
+	if len(removed) > 0 {
+		// Something we may have been holding an upload for is free again. Nudge a
+		// pass rather than leaving it until the hourly full walk.
+		e.TriggerSync()
+	}
+	for _, f := range fresh {
+		// The activation args land in dispatchToastActivation: a click opens
+		// the sync status window on its "In use" tab.
+		e.toast("File in use", f.Summary(), "action=inuse")
+	}
 }
 
 // SubscribeBlocked returns a channel signalled when the blocked set changes.
@@ -722,9 +1136,9 @@ func (e *Engine) ResolveConflict(ctx context.Context, item ConflictItem, choice 
 	}
 
 	ex := &transfer.Executor{
-		Client:     e.client,
-		State:      st,
-		PairKey:    PairKey(item.LocalDir, item.RemoteRoot),
+		Client:  e.client,
+		State:   st,
+		PairKey: PairKey(item.LocalDir, item.RemoteRoot),
 		LocalRoot:  item.LocalDir,
 		RemoteRoot: item.RemoteRoot,
 		Escaper:    e.escaper.Load(),
@@ -797,6 +1211,59 @@ func (e *Engine) Browse(ctx context.Context, remotePath string) ([]transport.Ent
 	return e.client.PropFind(ctx, remotePath, 1)
 }
 
+// Escaper returns the current name-escaping translator (nil-safe to use: a
+// nil or inactive escaper encodes/decodes to identity). The adopt scan needs
+// it to classify local names against their escaped server counterparts.
+func (e *Engine) Escaper() *engine.Escaper { return e.escaper.Load() }
+
+// GlobalIgnoreMatcher returns the account's global ignore predicate — the same
+// rules live-mode pairs apply, minus per-pair excludes (on-demand mode has no
+// pairs). The adopt scan uses it so ignored trees (node_modules, .git, …) never
+// enter the plan: without it they classify as "upload" and the confirm dialog
+// offers to push gigabytes of dev-tree junk to the server.
+func (e *Engine) GlobalIgnoreMatcher() func(rel string) bool {
+	gi, _ := e.dirs.LoadIgnore()
+	return engine.NewIgnore(gi).Match
+}
+
+// RemoteTree walks the whole remote subtree under root and returns its current
+// state keyed by root-relative path. Used by the on-demand adopt scan, which
+// must classify every pre-existing local file against the server before it can
+// show the user a summary.
+//
+// Names are reported RAW — no escaper decoding — because the on-demand world
+// (placeholder identities, reconcile, write-back) works in raw server names,
+// and adopt must classify in that same namespace: decoding here would mark a
+// local file in-sync under an identity reconcile can never find, which reads
+// as a server-side delete. An escaped-name file simply fails its upload (the
+// server forbids the raw name) and stays a plain local file — safe.
+//
+// The crawl is checkpoint-backed: each directory listing is cached in the
+// state DB as it is fetched, so a cancelled or failed scan retried later only
+// re-fetches what changed — on a big account that turns a minutes-long recrawl
+// into seconds. Rows are keyed apart from the sync pairs' checkpoints and are
+// deliberately NOT cleared on success: a crash mid-adopt is recovered by
+// re-scanning, which should stay warm. The 14-day age-out is the backstop.
+//
+// skip (optional) is an ignore predicate (root-relative paths): matches are
+// omitted from the result AND not descended into server-side, so ignored trees
+// cost no PROPFINDs. progress (optional) receives the running count of
+// directories listed — the heartbeat a UI needs to distinguish a long crawl
+// from a hang.
+func (e *Engine) RemoteTree(ctx context.Context, root string, skip func(string) bool, progress func(int)) (map[string]engine.RemoteState, error) {
+	opts := engine.ScanOpts{Skip: skip, Progress: progress}
+	var cp *scanCheckpoint
+	if st, err := e.getStore(); err == nil {
+		cp = newScanCheckpoint(st, "vfs-adopt:"+strings.Trim(root, "/"))
+		opts.Checkpoint = cp
+	}
+	remote, err := engine.RemoteScan(ctx, e.client, root, opts)
+	if cp != nil {
+		cp.logSummary()
+	}
+	return remote, err
+}
+
 // ListShares / CreatePublicLink / CreateUserShare / DeleteShare proxy the client.
 func (e *Engine) ListShares(ctx context.Context, path string) ([]transport.Share, error) {
 	return e.client.ListShares(ctx, path)
@@ -819,9 +1286,9 @@ func (e *Engine) Limits() (up, down int) {
 
 // SetLimits persists and applies bandwidth limits (KiB/s; 0 = unlimited).
 func (e *Engine) SetLimits(up, down int) error {
-	s, _ := e.dirs.LoadSettings()
-	s.UploadKBps, s.DownloadKBps = up, down
-	if err := e.dirs.SaveSettings(s); err != nil {
+	if err := e.dirs.UpdateSettings(func(s *config.Settings) {
+		s.UploadKBps, s.DownloadKBps = up, down
+	}); err != nil {
 		return err
 	}
 	e.client.SetLimits(up, down)
@@ -841,9 +1308,7 @@ func (e *Engine) BaseDir() string {
 
 // SetBaseDir persists the local base directory.
 func (e *Engine) SetBaseDir(dir string) error {
-	s, _ := e.dirs.LoadSettings()
-	s.BaseDir = dir
-	return e.dirs.SaveSettings(s)
+	return e.dirs.UpdateSettings(func(s *config.Settings) { s.BaseDir = dir })
 }
 
 // SyncedRemotes returns the set of remote folder paths currently configured as
@@ -894,6 +1359,13 @@ func (e *Engine) AddSyncPair(localDir, remoteRoot string) error {
 		return err
 	}
 	for _, p := range pairs {
+		// The EXACT pair already existing is success, not an error: signing
+		// back into an account whose config survived (only the keychain secret
+		// was lost) replays the setup flow, and "that remote folder is already
+		// synced" dead-ended it (2026-08-21).
+		if strings.Trim(p.RemoteRoot, "/") == remoteRoot && filepath.Clean(p.LocalDir) == localDir {
+			return nil
+		}
 		if strings.Trim(p.RemoteRoot, "/") == remoteRoot {
 			return fmt.Errorf("that remote folder is already synced")
 		}
@@ -1073,6 +1545,27 @@ func (e *Engine) RemoveSyncFolder(remoteRoot string, deleteLocal bool) error {
 	return nil
 }
 
+// ResetPairState wipes a pair's baseline and scan-checkpoint rows so its next
+// sync treats the pair as brand new: server files download, nothing is inferred
+// deleted. This is the "start from scratch" safety step and MUST run BEFORE the
+// pair's local files are deleted — an empty folder against a surviving baseline
+// reads as the user having deleted everything, and those deletes would
+// propagate to the server.
+func (e *Engine) ResetPairState(localDir, remoteRoot string) error {
+	st, err := e.getStore()
+	if err != nil {
+		return err
+	}
+	key := PairKey(localDir, remoteRoot)
+	if err := st.DeleteBaselineAll(key); err != nil {
+		return err
+	}
+	if err := st.ClearScanCheckpoint(key); err != nil {
+		slog.Warn("scan checkpoint clear on reset failed", "err", err)
+	}
+	return nil
+}
+
 // RemotePathFor maps an absolute local path to its files-root-relative remote
 // path by finding the sync pair that contains it. Returns false if the path
 // isn't inside any synced folder.
@@ -1128,21 +1621,57 @@ func (e *Engine) markInflight(abs string, on bool) {
 // or "none" (outside any synced folder).
 func (e *Engine) FileStatus(abs string) string {
 	abs = filepath.Clean(abs)
-	pairs, _ := e.dirs.LoadPairs()
-	inPair := false
-	for _, p := range pairs {
-		rel, err := filepath.Rel(filepath.Clean(p.LocalDir), abs)
+	under := func(dir string) bool {
+		rel, err := filepath.Rel(filepath.Clean(dir), abs)
 		if err != nil {
-			continue
+			return false
 		}
 		rel = filepath.ToSlash(rel)
-		if rel == ".." || strings.HasPrefix(rel, "../") {
-			continue
-		}
-		inPair = true
-		break
+		return rel != ".." && !strings.HasPrefix(rel, "../")
 	}
+
+	inPair := false
+	pairDir := ""
+	pairRemote := ""
+	pairs, _ := e.dirs.LoadPairs()
+	for _, p := range pairs {
+		if under(p.LocalDir) {
+			inPair = true
+			pairDir = p.LocalDir
+			pairRemote = strings.Trim(p.RemoteRoot, "/")
+			break
+		}
+	}
+	// Engine-ignored files never sync, so no badge may claim otherwise (#575):
+	// a tick on the official client's journals would be a lie, and "sync" or
+	// "warn" can never truthfully apply either.
+	if inPair {
+		if rel, err := filepath.Rel(filepath.Clean(pairDir), abs); err == nil {
+			if e.GlobalIgnoreMatcher()(filepath.ToSlash(rel)) {
+				return "none"
+			}
+		}
+	}
+	// On-demand mounts are ours too (they have no pairs — entering the mode
+	// clears them all), but ONLY for states the Cloud Files platform cannot
+	// know: transfers and errors. Per-item AVAILABILITY there — online-only
+	// cloud, downloaded tick, pinned solid — is the platform's own glyph set,
+	// and a blanket "ok" badge would stamp a synced tick over online-only
+	// files, erasing exactly the distinction virtual files exist to show.
+	inMount := false
+	mountDir := ""
 	if !inPair {
+		e.overlayRootsMu.RLock()
+		for _, dir := range e.overlayRoots {
+			if under(dir) {
+				inMount = true
+				mountDir = dir
+				break
+			}
+		}
+		e.overlayRootsMu.RUnlock()
+	}
+	if !inPair && !inMount {
 		return "none"
 	}
 	e.inflightMu.Lock()
@@ -1161,7 +1690,226 @@ func (e *Engine) FileStatus(abs string) string {
 			return "warn"
 		}
 	}
+	// A share on this exact remote path marks the item as shared — the share
+	// ROOT only, not everything inside it (OneDrive's model). It outranks the
+	// idle answers ("ok"/mount "none") but never a transfer or a problem, and
+	// it applies inside mounts too: availability glyphs are native there,
+	// sharing is not.
+	root, base := pairDir, pairRemote
+	if inMount {
+		root, base = mountDir, "" // account mounts sit at the files root
+	}
+	if rel, err := filepath.Rel(filepath.Clean(root), abs); err == nil {
+		remote := filepath.ToSlash(rel)
+		if remote == "." {
+			remote = ""
+		}
+		if base != "" {
+			remote = strings.Trim(base+"/"+remote, "/")
+		}
+		if e.isSharedRemote(remote) {
+			return "shared"
+		}
+	}
+	if inMount {
+		return "none" // idle in a mount: the native cloud glyph owns the row
+	}
 	return "ok"
+}
+
+// SetSharedRemotePaths replaces the set of files-root-relative paths that
+// carry a share (created by this user or received from another). FileStatus
+// answers "shared" for exactly these nodes.
+func (e *Engine) SetSharedRemotePaths(paths []string) {
+	m := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		p = strings.Trim(strings.ReplaceAll(p, "\\", "/"), "/")
+		if p != "" {
+			m[p] = true
+		}
+	}
+	e.sharedMu.Lock()
+	e.sharedRemote = m
+	e.sharedMu.Unlock()
+}
+
+func (e *Engine) isSharedRemote(remote string) bool {
+	if remote == "" {
+		return false
+	}
+	e.sharedMu.RLock()
+	defer e.sharedMu.RUnlock()
+	return e.sharedRemote[remote]
+}
+
+// RefreshShares fetches the account's share list — both created and received —
+// and updates the set FileStatus answers "shared" from. Nodes whose shared
+// state flipped get an overlay refresh so Explorer repaints them, and a share
+// that ARRIVES from another user (after the first refresh has primed the set)
+// raises a toast so the recipient hears about it.
+func (e *Engine) RefreshShares(ctx context.Context) error {
+	if e.client == nil {
+		return nil
+	}
+	own, received, err := e.client.ListAllShares(ctx)
+	if err != nil {
+		return err
+	}
+	norm := func(p string) string { return strings.Trim(strings.ReplaceAll(p, "\\", "/"), "/") }
+	set := make(map[string]bool, len(own)+len(received))
+	recv := make(map[string]bool, len(received))
+	for _, s := range own {
+		if p := norm(s.Path); p != "" {
+			set[p] = true
+		}
+	}
+	type arrival struct{ path, by string }
+	var arrived []arrival
+	e.sharedMu.Lock()
+	old := e.sharedRemote
+	oldRecv := e.receivedShares
+	primed := e.sharesPrimed
+	for _, s := range received {
+		p := norm(s.Path)
+		if p == "" {
+			continue
+		}
+		set[p] = true
+		recv[p] = true
+		if primed && !oldRecv[p] {
+			arrived = append(arrived, arrival{path: p, by: s.SharedBy()})
+		}
+	}
+	e.sharedRemote = set
+	e.receivedShares = recv
+	e.sharesPrimed = true
+	e.sharedMu.Unlock()
+
+	for _, a := range arrived {
+		name := a.path
+		if i := strings.LastIndexByte(name, '/'); i >= 0 {
+			name = name[i+1:]
+		}
+		e.toast("Folder shared with you", a.by+" shared \""+name+"\" with you — it appears in your sync folder", "")
+	}
+	if e.onOverlayRefresh == nil {
+		return nil
+	}
+	poke := func(remote string) {
+		for _, abs := range e.localPathsForRemote(remote) {
+			e.onOverlayRefresh(abs)
+		}
+	}
+	for p := range set {
+		if !old[p] {
+			poke(p)
+		}
+	}
+	for p := range old {
+		if !set[p] {
+			poke(p)
+		}
+	}
+	return nil
+}
+
+// localPathsForRemote maps a files-root-relative path to every local absolute
+// path that shows it, through the live pairs and the on-demand mounts.
+func (e *Engine) localPathsForRemote(remote string) []string {
+	var out []string
+	remote = strings.Trim(remote, "/")
+	if pairs, err := e.dirs.LoadPairs(); err == nil {
+		for _, p := range pairs {
+			base := strings.Trim(p.RemoteRoot, "/")
+			rest := ""
+			switch {
+			case base == "":
+				rest = remote
+			case remote == base:
+				rest = ""
+			case strings.HasPrefix(remote, base+"/"):
+				rest = remote[len(base)+1:]
+			default:
+				continue
+			}
+			out = append(out, filepath.Join(p.LocalDir, filepath.FromSlash(rest)))
+		}
+	}
+	e.overlayRootsMu.RLock()
+	for _, dir := range e.overlayRoots {
+		out = append(out, filepath.Join(dir, filepath.FromSlash(remote)))
+	}
+	e.overlayRootsMu.RUnlock()
+	return out
+}
+
+// presenceLoop keeps the user's Nextcloud presence dot "online" while the
+// engine runs. Without heartbeats the server decays a user to offline within
+// minutes of their last web/app activity — which made accounts that only run
+// Nimbo look offline to everyone despite syncing happily. The official client
+// heartbeats the same way. Best-effort: servers without the user_status app
+// just error quietly.
+func (e *Engine) presenceLoop(ctx context.Context) {
+	beat := func() {
+		bctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		if err := e.client.UserStatusHeartbeat(bctx); err != nil {
+			slog.Debug("user-status heartbeat failed", "err", err)
+		}
+	}
+	beat()
+	t := time.NewTicker(4 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			beat()
+		}
+	}
+}
+
+// sharesRefreshLoop refreshes the shared-paths set once at engine start and
+// then periodically — shares change server-side with no local activity to
+// piggyback on, so a poll is the only honest source.
+func (e *Engine) sharesRefreshLoop(ctx context.Context) {
+	refresh := func() {
+		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if err := e.RefreshShares(rctx); err != nil {
+			slog.Debug("share list refresh failed", "err", err)
+		}
+	}
+	refresh()
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			refresh()
+		}
+	}
+}
+
+// SetOverlayRoots records folders that FileStatus should treat as synced
+// territory even though no live sync pair covers them.
+//
+// This exists for on-demand (virtual files) mode, which deliberately has no
+// pairs at all: switching into it clears them so the watcher cannot fight the
+// Cloud Files provider. FileStatus keys off pairs, so without this the Explorer
+// shell extension is told "none" for every file in the mount and draws no
+// status icon anywhere.
+func (e *Engine) SetOverlayRoots(dirs []string) {
+	if e == nil {
+		return
+	}
+	cp := append([]string(nil), dirs...)
+	e.overlayRootsMu.Lock()
+	e.overlayRoots = cp
+	e.overlayRootsMu.Unlock()
 }
 
 // SetProgressFunc registers a callback notified (throttled) with live sync
@@ -1248,6 +1996,10 @@ func (e *Engine) Progress() SyncProgress {
 	p := e.prog
 	if p.Active {
 		p.DoneBytes = e.progBytes.Load()
+		// Retried/resumed transfers can re-report bytes; never show >100%.
+		if p.TotalBytes > 0 && p.DoneBytes > p.TotalBytes {
+			p.DoneBytes = p.TotalBytes
+		}
 		// ETA rides on the cumulative average rate (bytes since the burst began),
 		// which is far steadier than the instantaneous speed — it doesn't whipsaw
 		// between a big file and a burst of tiny ones, and converges as it runs.
@@ -1695,6 +2447,22 @@ func PairKey(localDir, remoteRoot string) string {
 
 // ensurePair makes sure the local directory and remote root exist.
 func (e *Engine) ensurePair(ctx context.Context, p Pair) error {
+	// Refresh the guard state here rather than only at start-up. This is the
+	// one call every sync entry point makes before computing a plan, so a
+	// folder frozen by another pass moments ago cannot slip through on a stale
+	// set. It costs the same small file read applyPlan already does for the
+	// blacklist. Failing here stops the pass before the scan rather than after
+	// it; applyPlan re-checks anyway, for callers that reach it another way.
+	if err := e.reloadGuardState(); err != nil {
+		return err
+	}
+	// A frozen folder does nothing at all until the user has looked at it. This
+	// is upstream of the clone, which never reaches applyPlan's own check — and
+	// a state-database reset is exactly what routes a frozen pair back into the
+	// clone, where a re-download would overwrite what the freeze was protecting.
+	if err := e.frozenPairErr(p); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(p.LocalDir, 0o755); err != nil {
 		return err
 	}
@@ -1709,6 +2477,12 @@ func (e *Engine) ensurePair(ctx context.Context, p Pair) error {
 // computePlan scans both sides, diffs against the baseline, and coalesces renames.
 func (e *Engine) computePlan(ctx context.Context, st *state.Store, p Pair) ([]engine.Action, map[string]engine.RemoteState, map[string]engine.BaselineState, error) {
 	pk := PairKey(p.LocalDir, p.RemoteRoot)
+	// Narrate the stages. On a big change batch the scan alone runs for minutes,
+	// and one flat "Scanning…" for all of it is indistinguishable from a hang.
+	// Nothing is emitted until the pass outlives scanQuietPeriod, so the warm
+	// 15-second poll stays silent (see scanstatus.go).
+	e.scanBegin()
+	e.scanPhase("Reading your file list…")
 	base, err := st.LoadBaseline(pk)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1720,9 +2494,13 @@ func (e *Engine) computePlan(ctx context.Context, st *state.Store, p Pair) ([]en
 	globalIgnore, _ := e.dirs.LoadIgnore()
 	ig := engine.NewIgnore(append(append([]string{}, globalIgnore...), p.Excludes...))
 	cp := newScanCheckpoint(st, pk)
+	e.scanPhase("Checking server…")
 	remote, err := engine.RemoteScan(ctx, e.client, p.RemoteRoot, engine.ScanOpts{
 		Base: base, Skip: ig.Match, OnEncrypted: e.noteEncrypted, Esc: e.escaper.Load(),
 		Checkpoint: cp,
+		Progress: func(dirs int) {
+			e.scanTick("Checking server… " + commas(dirs) + " folders")
+		},
 	})
 	cp.logSummary()
 	if _, _, saves := cp.stats(); saves > 0 {
@@ -1731,16 +2509,29 @@ func (e *Engine) computePlan(ctx context.Context, st *state.Store, p Pair) ([]en
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("remote scan: %w", err)
 	}
-	local, err := engine.LocalScan(p.LocalDir)
+	e.scanPhase("Checking your files…")
+	local, err := engine.LocalScanProgress(p.LocalDir, "", func(files int) {
+		e.scanTick("Checking your files… " + commas(files))
+	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("local scan: %w", err)
 	}
 	ig.FilterLocal(local)
 	ig.FilterRemote(remote)
 
+	e.scanPhase("Comparing changes…")
 	actions := engine.Diff(base, remote, local)
 	pruneDeadBaselines(st, pk, base, remote, local)
+
+	// Rename coalescing SHA1-hashes local files to match them against the
+	// baseline — the slowest stage of all on a big batch of new files, and until
+	// now completely invisible. CoalesceRenames drives hashLocal from its own
+	// sequential loop, so a plain counter is safe here.
+	e.scanPhase("Matching moved files…")
+	hashed := 0
 	hashLocal := func(rel string) (string, error) {
+		hashed++
+		e.scanTick("Matching moved files… " + commas(hashed))
 		return transfer.SHA1File(filepath.Join(p.LocalDir, filepath.FromSlash(rel)))
 	}
 	return engine.CoalesceRenames(actions, base, remote, local, hashLocal), remote, base, nil
@@ -1950,6 +2741,14 @@ func (e *Engine) SyncOnce(ctx context.Context, p Pair) (transfer.Stats, error) {
 	// or move); the diff path takes over once it's fully done. A pre-existing
 	// synced pair (baseline but no clone state) is marked done so it isn't recloned.
 	pk := PairKey(p.LocalDir, p.RemoteRoot)
+	// A clone walks the REMOTE tree only, so it is blind to local-only content:
+	// pairing an already-populated folder with an empty remote used to produce
+	// zero actions, mark the clone done and report "Up to date" having uploaded
+	// nothing. Sampled BEFORE the clone runs, since the clone itself populates
+	// the folder. When there is local content the pass continues into the diff
+	// below, which classifies local-only paths as uploads.
+	localHadContent := !localRootVanished(p.LocalDir)
+	var cloneStats transfer.Stats
 	switch status, _ := st.CloneStatus(pk); {
 	case status == "done":
 		// Proceed to the diff path below. Backfill the config-side sync-history
@@ -1958,12 +2757,21 @@ func (e *Engine) SyncOnce(ctx context.Context, p Pair) (transfer.Stats, error) {
 		e.markPairSyncedOnce(pk)
 	case status == "started":
 		e.status("Syncing…")
-		return e.cloneRemote(ctx, st, p)
+		s, err := e.cloneRemote(ctx, st, p)
+		if err != nil || !localHadContent {
+			return s, err
+		}
+		cloneStats = s
 	default:
 		if empty, _ := st.BaselineEmpty(pk); empty {
 			e.warnIfStateReset(pk, p) // synced before but no state? say so before the takeover
 			e.status("Syncing…")
-			return e.cloneRemote(ctx, st, p)
+			s, err := e.cloneRemote(ctx, st, p)
+			if err != nil || !localHadContent {
+				return s, err
+			}
+			cloneStats = s
+			break // clone done; fall through to reconcile the local-only side
 		}
 		_ = st.SetCloneStatus(pk, "done")
 		e.markPairSynced(pk) // baseline present = synced before; seed the config-side marker
@@ -1990,7 +2798,10 @@ func (e *Engine) SyncOnce(ctx context.Context, p Pair) (transfer.Stats, error) {
 		}
 		return transfer.Stats{}, err
 	}
-	return e.applyPlan(ctx, st, p, actions, remote, base, true) // full reconcile
+	planStats, err := e.applyPlan(ctx, st, p, actions, remote, base, true) // full reconcile
+	// cloneStats is non-zero only when this pass also ran a clone first, so the
+	// caller sees one set of totals for the whole pass.
+	return cloneStats.Plus(planStats), err
 }
 
 // cloneEnumConcurrency bounds concurrent recursive PROPFINDs while the tree is
@@ -2107,7 +2918,7 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 			if info, serr := os.Stat(filepath.Join(p.LocalDir, filepath.FromSlash(rel))); serr == nil {
 				fi = info
 			}
-			switch decideCloneFile(takeover, fi, isDehydratedPlaceholder(fi), r) {
+			switch decideCloneFile(takeover, fi, cfapi.IsDehydrated(fi), r) {
 			case cloneAdopt:
 				_ = st.UpsertBaseline(pk, baselineForLocal(p.LocalDir, rel, r))
 			case cloneDownload:
@@ -2280,6 +3091,8 @@ func humanActionErr(a engine.Action, err error) string {
 	switch {
 	case strings.HasPrefix(a.Path, ".Collectives") || strings.Contains(s, ".Collectives"):
 		return "can't sync inside “.Collectives” — it's managed by the Collectives app and won't accept items created here; move this out of .Collectives to sync it"
+	case transport.IsLocked(err):
+		return "someone else has this file open — it's locked on the server"
 	case strings.Contains(low, "insufficientstorage") || strings.Contains(s, "507"):
 		return "the server wouldn't accept it (out of space, or the folder is read-only)"
 	case strings.Contains(low, "parent node does not exist") || strings.Contains(s, "409"):
@@ -2338,7 +3151,7 @@ const (
 // is skipped so the first normal sync keeps both versions.
 //
 // dehydrated marks a local file whose bytes are not actually on disk (a cloud
-// placeholder — see isDehydratedPlaceholder), which is always fetched instead.
+// placeholder — see cfapi.IsDehydrated), which is always fetched instead.
 func decideCloneFile(takeover bool, localFI os.FileInfo, dehydrated bool, r engine.RemoteState) cloneDecision {
 	if localFI == nil || localFI.IsDir() {
 		return cloneDownload
@@ -2358,8 +3171,7 @@ func decideCloneFile(takeover bool, localFI os.FileInfo, dehydrated bool, r engi
 		}
 		return cloneDownload
 	}
-	dt := localFI.ModTime().Unix() - r.LastModified.Unix()
-	if localFI.Size() == r.Size && !r.LastModified.IsZero() && dt >= -2 && dt <= 2 {
+	if engine.LocalMatchesRemote(localFI, r) {
 		return cloneAdopt
 	}
 	return cloneSkip
@@ -2471,6 +3283,12 @@ func maintainDirBaselines(st *state.Store, pk string, base map[string]engine.Bas
 // directory-etag maintenance (nil = remote wasn't a subtree-listing scan, only
 // failure-dirtying applies).
 func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions []engine.Action, remote map[string]engine.RemoteState, base map[string]engine.BaselineState, fullScan bool) (transfer.Stats, error) {
+	// The guard state could not be read. It records which folders are frozen,
+	// so proceeding would resume a paused folder and apply the very changes the
+	// guard stopped. Refuse every pair on this account until it is readable.
+	if e.guardStateUnavailable() {
+		return transfer.Stats{}, errGuardStateUnavailable()
+	}
 	// Filter out files the server forbids (flagged for the UI) and files the user
 	// blacklisted (dropped silently).
 	blset, _ := e.dirs.LoadBlacklist()
@@ -2488,6 +3306,113 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	}
 	if len(blocked) > 0 {
 		slog.Debug("files blocked (server-forbidden names)", "count", len(blocked))
+	}
+
+	pk := PairKey(p.LocalDir, p.RemoteRoot)
+
+	// The damage guard: refuse a pass that looks like the SERVER lost data — a
+	// restore from an old snapshot, a shared folder someone emptied, ransomware
+	// encrypting in place — rather than the user changing things.
+	//
+	// It sits at applyPlan rather than at each entry point because SyncOnce,
+	// SyncScope, SyncPaths and syncRemoteDelta all funnel through here — judging
+	// per entry point would let the push/delta and watcher fast paths bypass it.
+	// It complements the two guards below, which protect the SERVER from a
+	// vanished local folder; this one protects the LOCAL copy, and counts files
+	// being REPLACED as well as deleted, because ransomware's plan is all
+	// downloads and a deletions-only check would wave every encrypted file
+	// through. A trip refuses the WHOLE pass, downloads included, for the same
+	// reason.
+	{
+		// Backstop for ensurePair's check: this is the last point before actions
+		// are executed, and a freeze can be written by another pair's pass while
+		// this one is scanning.
+		if err := e.frozenPairErr(p); err != nil {
+			return transfer.Stats{}, err
+		}
+
+		// A pass with nothing to do is judged — and spends — nothing. Otherwise
+		// the first quiet 15-second poll after the user resumes a frozen folder
+		// would burn the single-pass exemption they were granted, and the real
+		// pass behind it would be refused all over again.
+		if len(actions) > 0 {
+			cloned, _ := st.CloneStatus(pk)
+			exempt := e.consumeGuardExemption(p)
+			if syncguard.GuardApplies(cloned, exempt) {
+				known, err := st.BaselineCount(pk)
+				if err != nil {
+					return transfer.Stats{}, fmt.Errorf("damage guard: cannot count known files: %w", err)
+				}
+				// The guard needs to tell a tracked path from a new one, and
+				// SyncPaths deliberately hands applyPlan a nil base (its remote
+				// map is stat-built, so it must not stamp dir etags). Read the
+				// rows for just this plan's paths rather than guessing: with no
+				// baseline a total rewrite scores as pure additions.
+				gbase, err := e.baselineForGuard(st, pk, base, actions)
+				if err != nil {
+					return transfer.Stats{}, err
+				}
+				// The listing check first: it runs on what the scan returned
+				// rather than on the plan, so it catches a server folder that was
+				// emptied or restored from an old snapshot before any action is
+				// derived. Only a full scan's remote map is a complete listing —
+				// a scoped, stat-built or delta map is a handful of paths and
+				// would read as a catastrophic shrink every time.
+				if fullScan {
+					if reason, trips := syncguard.ScanTrips(len(remote), known, syncguard.DefaultPct); trips {
+						return transfer.Stats{}, e.tripGuard(p, reason, syncguard.Counts{}, known)
+					}
+				}
+				counts := syncguard.Count(actions, gbase)
+				if reason, trips := syncguard.Trips(counts, known, syncguard.DefaultFloor, syncguard.DefaultPct); trips {
+					return transfer.Stats{}, e.tripGuard(p, reason, counts, known)
+				}
+			}
+		}
+	}
+
+	// Files another user has open. This is derived from the same listing the plan
+	// came from, so it costs nothing extra. Only paths we actually listed count: a
+	// subtree pruned by its ETag is replayed from the baseline with Lock == nil,
+	// which means "we did not look", not "free".
+	//
+	// Skipped for a backup pair: it is a server write we have no use for, since a
+	// one-way folder never uploads and so never needs to know who else has a file
+	// open.
+	// A folder that has just left virtual-files mode may legitimately be missing
+	// files locally — placeholders that never populated leave an empty directory.
+	// The reconciler cannot tell that from a user deletion, so for one pass we
+	// restore rather than delete. See Deck #571: this cost a real shared file.
+	if e.dirs.IsPostRevert(p.LocalDir) {
+		var restored []string
+		actions, restored = engine.RestoreInsteadOfDelete(actions, remote)
+		if len(restored) > 0 {
+			slog.Warn("first pass after leaving virtual files: restoring missing files instead of deleting them on the server",
+				"dir", p.LocalDir, "count", len(restored))
+		}
+	}
+
+	var heldUploads []string
+	if e.LockingAvailable() {
+		examined, lockedNow := lockScan(remote, e.Account.LoginName, p.LocalDir)
+		e.reconcileLocked(p.LocalDir, examined, lockedNow)
+
+		// Warn the local editor, but ONLY from here — the live sync path. The
+		// warner writes a name carrier next to the document, and a real file
+		// inside an on-demand root makes the cloud filter treat the directory as
+		// already populated, so the actual placeholders never appear. Seen in the
+		// field 2026-08-16: a shared folder went empty on the VM.
+		if e.lockWarn != nil && e.lockoutEnabled() {
+			e.lockWarn.apply(e.LockedFiles())
+		}
+
+		// Hold back uploads to files somebody else is editing. Uploading now would
+		// hand THEM the conflict when they save, despite them having done nothing
+		// wrong; waiting puts it on whoever ignored the warning instead.
+		actions, heldUploads = engine.FilterLocked(actions, remote, e.Account.LoginName)
+		for _, rel := range heldUploads {
+			slog.Info("holding an upload: someone else has the file open", "path", rel)
+		}
 	}
 
 	// Data-loss guard. If this plan would delete files on the SERVER while the
@@ -2527,18 +3452,21 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		}
 	}
 
-	pk := PairKey(p.LocalDir, p.RemoteRoot)
 	if len(actions) == 0 {
 		// Nothing to do — but re-listed dirs still need their etags stamped, or
 		// they are re-listed on every future scan (this quiet case is the common
 		// steady state: our own transfers stale the ancestor dir etags).
-		maintainDirBaselines(st, pk, base, remote, nil)
+		maintainDirBaselines(st, pk, base, remote, heldUploads)
 		if base != nil {
 			e.clearCheckpoint(st, pk) // clean pass — the crawl's rescue rows served their purpose
 		}
 		// A quiet pass must still clear "Scanning…" — nothing else will until the
 		// next delta runs, which used to leave the flyout stuck for minutes.
-		e.status("Up to date")
+		//
+		// But a pass whose ONLY work was held is not "Up to date": the user's
+		// change is deliberately unsynced and saying otherwise would have them
+		// close the laptop believing it had gone.
+		e.status(heldStatus(heldUploads))
 		return transfer.Stats{}, nil
 	}
 
@@ -2572,7 +3500,13 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		Workers:    4,
 		Policy:     e.policy,
 		OnBegin: func(a engine.Action) {
-			e.markInflight(filepath.Join(p.LocalDir, filepath.FromSlash(a.Path)), true)
+			abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
+			e.markInflight(abs, true)
+			// Our own deny-write handle would refuse our own download. Let go for
+			// the duration of the transfer and re-take it afterwards.
+			if e.lockWarn != nil {
+				e.lockWarn.release(abs)
+			}
 			if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
 				e.progCurrent(filepath.Base(a.Path))
 			}
@@ -2581,7 +3515,18 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			e.progBytes.Add(delta)
 		},
 		OnEvent: func(a engine.Action, aerr error) {
-			e.markInflight(filepath.Join(p.LocalDir, filepath.FromSlash(a.Path)), false)
+			abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
+			e.markInflight(abs, false)
+			if e.lockWarn != nil {
+				e.lockWarn.retake(abs) // no-op unless it is still locked by someone else
+			}
+			if aerr == nil && (a.Kind == engine.ActDownload || a.Kind == engine.ActUpload || a.Kind == engine.ActConflict) {
+				// ActConflict included: keep-both leaves the server's fresh copy
+				// at a.Path (downloaded) and uploads the conflicted twin - both
+				// synced, but neither is a plain Download/Upload action, so the
+				// icon stayed on the pending spinner until the next restart.
+				e.statusIcons.notifySynced(p.LocalDir, a.Path)
+			}
 			if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
 				e.progComplete()
 			}
@@ -2606,8 +3551,22 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	// Unresolved conflicts must keep their subtrees re-scanned (a pruned dir would
 	// reconstruct the conflicted file's remote state from the stale baseline and
 	// the conflict would stop being re-detected).
+	// A held upload is unfinished business for the same reason: if its parent
+	// directory is stamped clean, the ETag prune skips the subtree and the
+	// pending local change stops being re-detected until something else there
+	// changes.
+	problems = append(problems, heldUploads...)
 	for _, c := range ex.Pending {
 		problems = append(problems, c.Path)
+	}
+	if err == nil && len(problems) == 0 && base != nil {
+		// A clean full pass means the local tree now matches the server, so the
+		// post-revert safety net has done its job and normal delete semantics
+		// can resume.
+		if e.dirs.IsPostRevert(p.LocalDir) {
+			_ = e.dirs.ClearPostRevert(p.LocalDir)
+			slog.Info("post-revert restore window closed", "dir", p.LocalDir)
+		}
 	}
 	if err == nil {
 		maintainDirBaselines(st, pk, base, remote, problems)
@@ -2698,8 +3657,10 @@ func relsFor(localRoot string, changed []string) (rels []string, ok bool) {
 // of a couple of round-trips no matter how large its folder is — the fix for a
 // file changing directly inside a huge top-level folder costing a full-tree walk.
 // Because all three maps are restricted to the same path set, the diff can only
-// emit actions for those paths (no spurious deletes of unscanned siblings). Renames
-// spanning the set aren't coalesced here; the periodic full poll handles those.
+// emit actions for those paths (no spurious deletes of unscanned siblings).
+// Renames WITHIN the set are coalesced into server-side moves (see planPaths); a
+// rename split across debounce batches still degrades to delete+upload and is
+// left to the periodic full poll.
 func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (transfer.Stats, error) {
 	if e.Paused() {
 		return transfer.Stats{}, nil
@@ -2740,7 +3701,7 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 		// remotely", deleting the local file out from under a live server copy.
 		rp := strings.Trim(p.RemoteRoot+"/"+esc.Encode(rel), "/")
 		if ent, found, rerr := e.client.Stat(ctx, rp); rerr == nil && found {
-			remote[rel] = engine.RemoteState{Path: rel, IsDir: ent.IsDir, ETag: ent.ETag, FileID: ent.FileID, Size: ent.Size}
+			remote[rel] = remoteStateFrom(rel, ent)
 		}
 	}
 
@@ -2749,11 +3710,55 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 	ig.FilterLocal(local)
 	ig.FilterRemote(remote)
 
-	actions := engine.Diff(base, remote, local)
+	actions := planPaths(base, remote, local, func(rel string) (string, error) {
+		return transfer.SHA1File(filepath.Join(p.LocalDir, filepath.FromSlash(rel)))
+	})
 	pruneDeadBaselines(st, pk, base, remote, local)
 	// nil base: this remote map is stat-built (not a subtree listing), so it must
 	// never stamp dir etags — only failure-dirtying applies inside applyPlan.
 	return e.applyPlan(ctx, st, p, actions, remote, nil, false) // scoped/delta — merge blocks, don't clear
+}
+
+// remoteStateFrom converts a single Stat result into a RemoteState. It exists so
+// the hand-built map in SyncPaths cannot drift from what a real listing produces
+// — lock state was nearly missed exactly that way, which would have left the
+// feature working on cold scans and dead on the path an Office save takes.
+//
+// Note this is a Stat, not a listing: fields a depth-0 PROPFIND does not carry
+// meaningfully here (SHA1, ReadOnly, LastModified) are deliberately left unset,
+// as they were before.
+func remoteStateFrom(rel string, ent transport.Entry) engine.RemoteState {
+	return engine.RemoteState{
+		Path:      rel,
+		IsDir:     ent.IsDir,
+		ETag:      ent.ETag,
+		FileID:    ent.FileID,
+		Size:      ent.Size,
+		Lock:      ent.Lock,
+		LockKnown: true, // a Stat DID look, so its answer is authoritative
+	}
+}
+
+// planPaths diffs an explicit path set and then coalesces renames within it.
+//
+// A move arrives at the watcher as two paths — old gone, new appeared — and
+// diffed independently that is a server-side delete plus a full re-upload of
+// content the server already has. It also read as "Deleted on server" in the
+// activity feed, which is accurate but alarming. Both halves are in the same
+// batch, so the pair can be matched (new file's SHA1+size against the vanishing
+// baseline row) and rewritten into a single server-side MOVE.
+//
+// Only moves whose old and new paths land in the SAME batch are caught. A move
+// split across debounce windows still degrades to delete+upload, because the
+// delete has already been applied by the time the new path shows up — the
+// periodic full pass is what covers that case.
+func planPaths(
+	base map[string]engine.BaselineState,
+	remote map[string]engine.RemoteState,
+	local map[string]engine.LocalState,
+	hashLocal func(rel string) (string, error),
+) []engine.Action {
+	return engine.CoalesceRenames(engine.Diff(base, remote, local), base, remote, local, hashLocal)
 }
 
 // syncRemoteDelta is the fast path for a notify_push. The push only says "the
@@ -3015,16 +4020,27 @@ func (e *Engine) seedDevIgnores() {
 		}
 		slog.Info("seeded dev-tree ignore patterns", "patterns", devIgnores)
 	}
-	s.DevIgnoresSeeded = true
-	if err := e.dirs.SaveSettings(s); err != nil {
+	// Re-read rather than saving back the settings loaded above: this runs at
+	// engine start, concurrently with whatever the caller is doing, and the file
+	// I/O in between is a wide window in which another change can land. Writing
+	// back the stale copy is how a SetBaseDir issued right after Start could be
+	// silently reverted.
+	if err := e.dirs.UpdateSettings(func(s *config.Settings) { s.DevIgnoresSeeded = true }); err != nil {
 		slog.Warn("could not persist dev-ignore migration flag", "err", err)
 	}
 }
 
 func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transfer.Stats)) error {
 	e.onSync = onSync
+	_ = e.reloadGuardState()  // before any watcher fires its first scan
 	e.seedDevIgnores()        // before any watcher fires its first scan
+	go e.sharesRefreshLoop(ctx) // keeps the shared-folder markers current
+	go e.presenceLoop(ctx)      // keeps the user's Nextcloud presence "online"
 	defer e.closeStoreFinal() // resident baseline cache lives only while running
+	// Drop backup entries whose folder is gone. Here, and only here: the config
+	// is quiescent, no watcher exists yet, and a stale entry is otherwise both
+	// permanent and invisible (BackupViews iterates over pairs).
+	e.sweepGuardState()
 	e.watchMu.Lock()
 	// runCtx is published under watchMu — startWatcher derives watcher
 	// contexts from it under the same lock, so it can never observe a torn
@@ -3043,12 +4059,24 @@ func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transf
 		e.pollInterval = 5 * time.Minute // push handles the common case; poll is a safety net
 		go e.runPush(ctx)
 	}
+	// State this once at startup: "nothing ever shows up under In use" has two
+	// very different causes, and without this line they look identical in a log.
+	if e.LockingAvailable() {
+		slog.Info("file locking available (files_lock)")
+	} else {
+		slog.Info("file locking unavailable — the server has no files_lock app; who-has-a-file-open will stay empty")
+	}
 	e.status("Up to date")
 
 	for _, p := range pairs {
 		e.startWatcher(p)
 	}
-	go e.watchPause(ctx) // resume/pause at timed expiry and schedule boundaries
+	go e.watchPause(ctx)      // resume/pause at timed expiry and schedule boundaries
+	go e.runLockLifetime(ctx) // sweep, heartbeat and release the locks WE hold
+	// Attic retention runs on its own clock, deliberately NOT off the sync loop:
+	// every sync entry point early-returns while paused and quiet hours
+	// auto-pauses daily, so a purge driven from there would strand indefinitely
+	// and the attic would grow without bound.
 	<-ctx.Done()
 	// Wait for in-flight sync passes before the deferred closeStoreFinal
 	// closes the state DB under them; a Stop-then-Start cycle also can't
@@ -3137,6 +4165,11 @@ func (e *Engine) startWatcher(p Pair) {
 		defer close(done) // let stopWatcherSync wait for an in-flight sync to drain
 		_ = e.ensurePair(cctx, p)
 		syncFn := func(ctx context.Context, changed []string) error {
+			// An editor's lock file appearing or vanishing is how we learn a document
+			// was opened or closed. This is the last point those paths exist: relsFor
+			// and then the ignore filter drop them a few frames from here.
+			e.handleEditorLockFiles(ctx, p, changed)
+
 			// Local edits identify their exact paths, so reconcile just those files
 			// (no subtree walk — instant even inside a huge folder). A full pass
 			// (nil changed — startup, poll, push) reconciles the whole pair.

@@ -48,3 +48,14 @@ func (c *Client) SetUserStatusMessage(ctx context.Context, message, icon string)
 func (c *Client) ClearUserStatusMessage(ctx context.Context) error {
 	return c.doOCS(ctx, http.MethodDelete, c.ocsURL(userStatusBase+"/message"), nil, "", nil)
 }
+
+// UserStatusHeartbeat tells the server the user is actively here, which is
+// what keeps their presence dot "online". Nextcloud decays a user to offline
+// after a few minutes without one — the web UI and the official client both
+// send these — so a desktop sync client that never does leaves its user
+// looking offline to everyone despite syncing happily.
+func (c *Client) UserStatusHeartbeat(ctx context.Context) error {
+	form := url.Values{"status": {"online"}}
+	return c.doOCS(ctx, http.MethodPut, c.ocsURL("apps/user_status/api/v1/heartbeat"),
+		strings.NewReader(form.Encode()), "application/x-www-form-urlencoded", nil)
+}

@@ -23,6 +23,10 @@ var (
 	// of the Nextcloud-ish blue.
 	indigo = color.RGBA{0x58, 0x56, 0xE0, 0xff}
 	amber  = color.RGBA{0xf0, 0xa0, 0x20, 0xff}
+	// Shared: azure — a clearly different hue family from the green tick, the
+	// violet-indigo spinner, and the amber warning (the first teal version
+	// read as "another tick" at 16px).
+	azure = color.RGBA{0x10, 0x69, 0xd8, 0xff}
 	white  = color.RGBA{0xff, 0xff, 0xff, 0xff}
 )
 
@@ -32,6 +36,7 @@ func main() {
 	write(filepath.Join(out, "ok.ico"), func(s int) image.Image { return badge(s, green, glyphCheck) })
 	write(filepath.Join(out, "sync.ico"), func(s int) image.Image { return badge(s, indigo, glyphSync) })
 	write(filepath.Join(out, "warn.ico"), func(s int) image.Image { return badge(s, amber, glyphBang) })
+	write(filepath.Join(out, "shared.ico"), func(s int) image.Image { return badge(s, azure, glyphPerson) })
 }
 
 type glyphFn func(img *image.RGBA, cx, cy, r float64, col color.RGBA)
@@ -121,6 +126,14 @@ func glyphCheck(img *image.RGBA, cx, cy, r float64, col color.RGBA) {
 func glyphBang(img *image.RGBA, cx, cy, r float64, col color.RGBA) {
 	thickLine(img, cx, cy-0.48*r, cx, cy+0.15*r, r*0.26, col)
 	disc(img, cx, cy+0.46*r, r*0.16, col)
+}
+
+// glyphPerson draws ONE large person silhouette (head + shoulders) — the
+// shared marker. A single big figure stays readable at 16px where two tiny
+// ones blurred into a tick-like blob.
+func glyphPerson(img *image.RGBA, cx, cy, r float64, col color.RGBA) {
+	disc(img, cx, cy-0.22*r, r*0.26, col)
+	thickLine(img, cx-0.26*r, cy+0.38*r, cx+0.26*r, cy+0.38*r, r*0.52, col)
 }
 
 // glyphSync draws a white circular arrow within the badge disc.

@@ -8,9 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/otherworld/nimbo/internal/brand"
-	"github.com/otherworld/nimbo/internal/shellns"
 )
 
 // MoveSyncFolder re-points the sync folder at oldLocal to newLocal WITHOUT
@@ -55,11 +52,7 @@ func (a *App) MoveSyncFolder(oldLocal, newLocal string) string {
 	// The whole-account pair defines the account root: refresh the stored baseDir
 	// and the Explorer sidebar so "Open folder" and the sidebar follow the move.
 	a.healBaseDir()
-	if shellns.Enabled() {
-		if icon, err := navIconPath(); err == nil {
-			_ = shellns.Register(brand.Current.Name, a.GetBaseDir(), icon)
-		}
-	}
+	a.syncSidebar()
 	a.rebuildTrayMenu()
 	a.eng.TriggerSync() // a confirming pass; should be a no-op (everything already in sync)
 	return ""

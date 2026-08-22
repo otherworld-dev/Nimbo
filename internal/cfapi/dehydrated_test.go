@@ -1,4 +1,4 @@
-package agent
+package cfapi
 
 import "testing"
 
@@ -35,8 +35,8 @@ func TestPlaceholderAttrs(t *testing.T) {
 		{"no attributes", 0, false},
 	}
 	for _, c := range cases {
-		if got := placeholderAttrs(c.attrs); got != c.want {
-			t.Errorf("%s: placeholderAttrs(%#x) = %v, want %v", c.name, c.attrs, got, c.want)
+		if got := PlaceholderAttrs(c.attrs); got != c.want {
+			t.Errorf("%s: PlaceholderAttrs(%#x) = %v, want %v", c.name, c.attrs, got, c.want)
 		}
 	}
 }

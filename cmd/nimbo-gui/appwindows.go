@@ -376,14 +376,14 @@ func (a *App) autoCreateAppShortcut(id, name string) {
 	if existed && oldName != curName {
 		_ = removeShortcutFile(oldName) // app was renamed server-side — retire the old entry
 	}
-	if s, err = d.LoadSettings(); err != nil { // reload: minimize clobbering concurrent writers
-		return
-	}
-	if s.AppShortcuts == nil {
-		s.AppShortcuts = map[string]string{}
-	}
-	s.AppShortcuts[id] = curName
-	_ = d.SaveSettings(s)
+	// Re-reads under the settings lock rather than saving back the copy loaded
+	// above, so the shortcut-creation window can't clobber a concurrent writer.
+	_ = d.UpdateSettings(func(s *config.Settings) {
+		if s.AppShortcuts == nil {
+			s.AppShortcuts = map[string]string{}
+		}
+		s.AppShortcuts[id] = curName
+	})
 	if !existed {
 		notify.Toast(name+" added to the Start menu", "Pin it to the taskbar if you like — remove it via the dock's Pin-apps editor.", "")
 		a.emit("apps")
@@ -411,18 +411,17 @@ func (a *App) saveAppWindowSize(id string, w, h int) {
 	if err != nil {
 		return
 	}
-	s, err := d.LoadSettings()
-	if err != nil {
-		return
+	if s, err := d.LoadSettings(); err == nil {
+		if cur, ok := s.AppWindowSizes[id]; ok && cur.W == w && cur.H == h {
+			return // unchanged — resizes are chatty, don't rewrite settings for nothing
+		}
 	}
-	if s.AppWindowSizes == nil {
-		s.AppWindowSizes = map[string]config.AppWindowSize{}
-	}
-	if cur, ok := s.AppWindowSizes[id]; ok && cur.W == w && cur.H == h {
-		return
-	}
-	s.AppWindowSizes[id] = config.AppWindowSize{W: w, H: h}
-	if err := d.SaveSettings(s); err != nil {
+	if err := d.UpdateSettings(func(s *config.Settings) {
+		if s.AppWindowSizes == nil {
+			s.AppWindowSizes = map[string]config.AppWindowSize{}
+		}
+		s.AppWindowSizes[id] = config.AppWindowSize{W: w, H: h}
+	}); err != nil {
 		slog.Debug("could not save app window size", "app", id, "err", err)
 	}
 }
@@ -479,12 +478,13 @@ func (a *App) toggleAppShortcut(id string) {
 			notify.Toast(brand.Current.Name, "Couldn't remove the Start menu shortcut: "+err.Error(), "")
 			return
 		}
-		delete(s.AppShortcuts, id)
-		if s.AppShortcutsOptOut == nil {
-			s.AppShortcutsOptOut = map[string]bool{}
-		}
-		s.AppShortcutsOptOut[id] = true // don't auto-recreate on the next window open
-		_ = d.SaveSettings(s)
+		_ = d.UpdateSettings(func(s *config.Settings) {
+			delete(s.AppShortcuts, id)
+			if s.AppShortcutsOptOut == nil {
+				s.AppShortcutsOptOut = map[string]bool{}
+			}
+			s.AppShortcutsOptOut[id] = true // don't auto-recreate on the next window open
+		})
 		notify.Toast(brand.Current.Name, name+" removed from the Start menu.", "")
 		a.emit("apps")
 		return
@@ -494,12 +494,13 @@ func (a *App) toggleAppShortcut(id string) {
 		notify.Toast(brand.Current.Name, "Couldn't add to the Start menu: "+err.Error(), "")
 		return
 	}
-	if s.AppShortcuts == nil {
-		s.AppShortcuts = map[string]string{}
-	}
-	s.AppShortcuts[id] = sanitizeFileName(name) + ".lnk"
-	delete(s.AppShortcutsOptOut, id) // an explicit add re-enables auto-care
-	_ = d.SaveSettings(s)
+	_ = d.UpdateSettings(func(s *config.Settings) {
+		if s.AppShortcuts == nil {
+			s.AppShortcuts = map[string]string{}
+		}
+		s.AppShortcuts[id] = sanitizeFileName(name) + ".lnk"
+		delete(s.AppShortcutsOptOut, id) // an explicit add re-enables auto-care
+	})
 	notify.Toast(name+" added to the Start menu", "Launch or pin it like any app — it opens in its own window.", "")
 	a.emit("apps")
 }

@@ -8,7 +8,7 @@
 #          from make-cert.ps1 in Cert:\CurrentUser\My (CN=Nimbo Dev) to sign.
 param(
     [string]$Version = "0.1.0",
-    [int]$Revision = 0,                    # explicit 4th component; 0 = auto-bump from .build-rev
+    [int]$Revision = 0,                    # explicit 4th component; 0 = auto-bump above max(.build-rev, newest GitHub release) - see rev-common.ps1
     [string]$SignSubject = "CN=Nimbo Dev", # signing cert subject; change when moving to a real CA cert (must match the manifest Publisher)
 
     # --- Azure Trusted Signing (-AzureSign) ---
@@ -31,7 +31,19 @@ param(
     # Store listing title = the package's Properties>DisplayName, which must match a
     # reserved app name in Partner Center. The keyworded name ranks in Store search
     # ("nextcloud"/"sync"); VisualElements (Start menu) stays plain "Nimbo".
-    [string]$StoreDisplayName = "Nimbo - Nextcloud Sync Client",
+    # Store DisplayName. MUST NOT contain "Nextcloud": Nextcloud's trademark
+    # guidelines (nextcloud.com/trademarks) say of desktop clients, verbatim,
+    # "you can NOT use the term 'Nextcloud' in the name of your client. You MUST
+    # make clear that your client is NOT the official Nextcloud client." The
+    # DEFAULT IS DELIBERATELY COMPLIANT so a build can never silently ship a
+    # violation. Adam's decision (2026-08-07) is to submit as "Nimbo - Sync
+    # Client for Nextcloud" for discoverability, accepting that this breaches the
+    # naming rule as written; that title must therefore be passed EXPLICITLY on
+    # the command line, so it is a choice every time rather than a default.
+    # Either way the description MUST state plainly that Nimbo is not the
+    # official Nextcloud client and is not affiliated with Nextcloud GmbH — that
+    # half of the policy is a hard MUST and costs nothing.
+    [string]$StoreDisplayName = "Nimbo",
 
     # --- Testing the Store build's behaviour (-StoreChannel) ---
     # Builds an ordinary, dev-signed, normally-installable package whose binary
@@ -45,8 +57,11 @@ param(
     # hide for the wrong reason.
     #
     #   .\package.ps1 -StoreChannel      -> install it, then check Settings > About:
-    #                                       "Update now" and "Get beta releases
-    #                                       early" must BOTH be absent.
+    #                                       the ENTIRE updater must be absent -
+    #                                       "Check for updates", "Update now" AND
+    #                                       "Get beta releases early" (the Store
+    #                                       delivers updates itself; Adam's call
+    #                                       2026-07-26). Only the version shows.
     #
     # Never ship one of these: it's dev-signed under the normal identity but
     # self-update is disabled, so it can't update itself or be updated. Uninstall
@@ -92,12 +107,24 @@ if ($Store) {
     Write-Host "Store package version: $pkgVersion (revision pinned to 0 for the Store)"
 } else {
     if ($Revision -gt 0) {
-        # Caller supplied the revision (release.ps1 derives it from the latest GitHub
-        # release so versions stay monotonic regardless of which machine builds).
+        # Caller supplied the revision explicitly - trust it verbatim.
         $rev = $Revision
     } else {
+        # Unified sequence (see rev-common.ps1): go one above the HIGHER of the
+        # local counter and the newest GitHub release, so local test builds and
+        # releases can never reuse each other's numbers. Offline / no gh / no
+        # github remote quietly falls back to the local counter alone.
         $rev = 0
         if (Test-Path $revFile) { $rev = [int]((Get-Content $revFile -Raw).Trim()) }
+        . (Join-Path $here "rev-common.ps1")
+        $gr = Resolve-GitHubOwnerRepo -RepoRoot $here
+        if ($gr) {
+            $ghMax = Get-HighestReleaseRevision -Owner $gr.Owner -Repo $gr.Repo
+            if ($ghMax -gt $rev) {
+                Write-Host "GitHub's newest release revision is $ghMax (local counter $rev) - building above it"
+                $rev = $ghMax
+            }
+        }
         $rev++
     }
     if ($rev -gt 65535) { $rev = 1 }  # MSIX revision field maxes at 65535
@@ -150,6 +177,47 @@ Pop-Location
 Write-Host "Building context-menu DLL..."
 & (Join-Path $repo "shell\windows\ctxmenu\build.ps1")
 Copy-Item -Force (Join-Path $repo "shell\windows\ctxmenu\out\NimboCtxMenu.dll") (Join-Path $stage "NimboCtxMenu.dll")
+
+# --- build the status-overlay DLL ---
+# The icons ship beside the DLL in an "icons" folder: GetOverlayInfo builds the
+# path from the module's own location, so the layout inside the package has to
+# match the layout the DLL is built into.
+# Built into a scratch dir, not shell\windows\overlays\out: where the overlays
+# are registered on the build machine, explorer.exe holds the DLL open and
+# writing over it fails.
+Write-Host "Building status-overlay DLL..."
+$ovlOut = Join-Path ([System.IO.Path]::GetTempPath()) ("nimbo-overlays-" + [guid]::NewGuid().ToString("N"))
+& (Join-Path $repo "shell\windows\overlays\build.ps1") -OutDir $ovlOut | Out-Null
+$ovl = Join-Path $ovlOut "NCOverlays.dll"
+if (-not (Test-Path $ovl)) { throw "NCOverlays.dll was not produced" }
+Copy-Item -Force $ovl (Join-Path $stage "NCOverlays.dll")
+New-Item -ItemType Directory -Force -Path (Join-Path $stage "icons") | Out-Null
+Copy-Item -Force (Join-Path $ovlOut "icons\*.ico") (Join-Path $stage "icons")
+Remove-Item -Recurse -Force $ovlOut -ErrorAction SilentlyContinue
+Write-Host "Staged: NCOverlays.dll + $((Get-ChildItem (Join-Path $stage 'icons')).Count) overlay icons"
+
+# Sign the staged DLL NOW, before makeappx: the copy packed INTO the MSIX is
+# what the in-app badge registration stages out and verifies (SHA-256 +
+# Authenticode) before regsvr32ing it elevated. Signing only after packing
+# left the in-package copy UNSIGNED, and the in-app enable correctly refused
+# it (2026-08-22). The loose stage copy doubles as Setup.exe's payload, so
+# this one signature serves both. Store builds need it too — the Store signs
+# the CONTAINER, not the files inside it.
+$ovlStaged = Join-Path $stage "NCOverlays.dll"
+if ($AzureSign -or $Store) {
+    try {
+        & (Join-Path $here "azure-sign.ps1") -Path @($ovlStaged) -CertProfile $AzureCertProfile
+    } catch {
+        if ($Store) { Write-Warning "NCOverlays.dll left unsigned (no Azure signing available) - the in-app badge enable will refuse it: $_" }
+        else { throw }
+    }
+} else {
+    $devCert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction SilentlyContinue |
+        Where-Object { $_.Subject -eq $SignSubject } | Select-Object -First 1
+    if ($devCert -and $signtool) {
+        & $signtool sign /fd SHA256 /sha1 $devCert.Thumbprint $ovlStaged | Out-Null
+    }
+}
 
 # --- stage manifest (bumped revision + Publisher matching the signer) + assets ---
 # The source manifest stays at 0.1.0.0 / CN=Nimbo Dev; only the staged copy
@@ -215,7 +283,9 @@ if ($Store) {
     Write-Host "  $msix"
     Write-Host "Next: run the Windows App Cert Kit on it, then upload to Partner Center."
 } elseif ($AzureSign) {
-    & (Join-Path $here "azure-sign.ps1") -Path $msix -CertProfile $AzureCertProfile
+    # The staged NCOverlays.dll was already signed before packing (above), so
+    # only the container needs signing here.
+    & (Join-Path $here "azure-sign.ps1") -Path @($msix) -CertProfile $AzureCertProfile
 } else {
     $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction SilentlyContinue |
         Where-Object { $_.Subject -eq $SignSubject } | Select-Object -First 1

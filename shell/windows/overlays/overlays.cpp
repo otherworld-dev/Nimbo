@@ -30,6 +30,8 @@ static const CLSID CLSID_OK   = {0x4f8b2c10,0x1a3d,0x4e55,{0x9b,0x21,0x0c,0x7e,0
 static const CLSID CLSID_SYNC = {0x4f8b2c10,0x1a3d,0x4e55,{0x9b,0x21,0x0c,0x7e,0x5a,0x9d,0x00,0x02}};
 // {4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0003} Warning
 static const CLSID CLSID_WARN = {0x4f8b2c10,0x1a3d,0x4e55,{0x9b,0x21,0x0c,0x7e,0x5a,0x9d,0x00,0x03}};
+// {4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0004} Shared (with/by another user)
+static const CLSID CLSID_SHARE = {0x4f8b2c10,0x1a3d,0x4e55,{0x9b,0x21,0x0c,0x7e,0x5a,0x9d,0x00,0x04}};
 
 struct HandlerDef {
     const CLSID*  clsid;
@@ -44,13 +46,17 @@ static const HandlerDef kHandlers[] = {
     {&CLSID_OK,   L"{4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0001}", L"Nimbo1Synced",  L"Nimbo Synced",  L"OK",   L"ok.ico"},
     {&CLSID_SYNC, L"{4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0002}", L"Nimbo2Syncing", L"Nimbo Syncing", L"SYNC", L"sync.ico"},
     {&CLSID_WARN, L"{4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0003}", L"Nimbo3Warning", L"Nimbo Warning", L"WARN", L"warn.ico"},
+    {&CLSID_SHARE, L"{4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0004}", L"Nimbo4Shared", L"Nimbo Shared", L"SHARED", L"shared.ico"},
 };
-static const int kHandlerCount = 3;
+static const int kHandlerCount = 4;
 
-// Windows honors only ~15 overlay handlers, claimed in name sort order. OneDrive
-// uses 17 leading spaces and the official Nextcloud client 16; 18 puts ours
-// first so they're guaranteed a slot.
-static const int kPrioritySpaces = 18;
+// Windows honors only ~15 overlay handlers, claimed in name sort order — and
+// fewer than the registry list suggests once built-ins take their share.
+// OneDrive escalated to 19 leading spaces (it used 17 when this was 18), and
+// at 18 the budget cut off EXACTLY after our third handler: the shared badge
+// registered, activated under a direct COM probe, and never painted
+// (2026-08-21, the full night of it). 20 sorts all four of ours first.
+static const int kPrioritySpaces = 20;
 
 // --- Named-pipe status query (with a short cache) -----------------------------
 
@@ -171,6 +177,83 @@ private:
     const HandlerDef* m_def;
 };
 
+#include "propsource.inc.cpp"
+
+// --- Null cloud-files handlers ------------------------------------------------
+//
+// The package manifest's windows.cloudFiles extension must declare a
+// CustomStateHandler / ThumbnailProviderHandler / ExtendedPropertyHandler /
+// BannersHandler (the schema requires all four elements), and the Clsid must
+// resolve to a REAL activatable class: with made-up CLSIDs Explorer's per-item
+// state pipeline in the sync root failed mid-query and drew wrong or stuck
+// Status glyphs, and with the Clsid attributes omitted Windows invalidated the
+// whole sync-root registration (GetCurrentSyncRoots stopped listing it - no
+// Status column, no cloud glyphs at all; measured on the test VM, v0.1.0.230/1).
+//
+// Nimbo has no custom states, thumbnails, properties, or banners - the native
+// cloud glyphs are the UI - so these classes activate successfully and then
+// decline every interface beyond IUnknown, which Explorer handles as "handler
+// present, nothing to add" and falls back to native rendering cleanly.
+
+static const CLSID CLSID_NullCustomState = {0x4f8b2c10,0x1a3d,0x4e55,{0x9b,0x21,0x0c,0x7e,0x5a,0x9d,0x01,0x01}};
+static const CLSID CLSID_NullThumbnail   = {0x4f8b2c10,0x1a3d,0x4e55,{0x9b,0x21,0x0c,0x7e,0x5a,0x9d,0x01,0x02}};
+static const CLSID CLSID_NullExtProps    = {0x4f8b2c10,0x1a3d,0x4e55,{0x9b,0x21,0x0c,0x7e,0x5a,0x9d,0x01,0x03}};
+static const CLSID CLSID_NullBanners     = {0x4f8b2c10,0x1a3d,0x4e55,{0x9b,0x21,0x0c,0x7e,0x5a,0x9d,0x01,0x04}};
+
+class NullCloudHandler : public IUnknown {
+public:
+    NullCloudHandler() : m_ref(1) { InterlockedIncrement(&g_objs); }
+    virtual ~NullCloudHandler() { InterlockedDecrement(&g_objs); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown) {
+            *ppv = static_cast<IUnknown*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&m_ref); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = InterlockedDecrement(&m_ref);
+        if (r == 0) delete this;
+        return r;
+    }
+private:
+    LONG m_ref;
+};
+
+class NullFactory : public IClassFactory {
+public:
+    NullFactory() : m_ref(1) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IClassFactory) {
+            *ppv = static_cast<IClassFactory*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&m_ref); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = InterlockedDecrement(&m_ref);
+        if (r == 0) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE CreateInstance(IUnknown* outer, REFIID riid, void** ppv) override {
+        if (outer) return CLASS_E_NOAGGREGATION;
+        NullCloudHandler* o = new (std::nothrow) NullCloudHandler();
+        if (!o) return E_OUTOFMEMORY;
+        HRESULT hr = o->QueryInterface(riid, ppv);
+        o->Release();
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE LockServer(BOOL) override { return S_OK; }
+private:
+    LONG m_ref;
+};
+
 // --- Class factory ------------------------------------------------------------
 
 class Factory : public IClassFactory {
@@ -230,6 +313,23 @@ extern "C" HRESULT STDMETHODCALLTYPE DllGetClassObject(REFCLSID rclsid, REFIID r
             f->Release();
             return hr;
         }
+    }
+    if (rclsid == CLSID_NullCustomState) {
+        // The real CustomStateHandler: per-item Status-column state on every
+        // install channel (see propsource.inc.cpp).
+        PropertySourceFactory* f = new (std::nothrow) PropertySourceFactory();
+        if (!f) return E_OUTOFMEMORY;
+        HRESULT hr = f->QueryInterface(riid, ppv);
+        f->Release();
+        return hr;
+    }
+    if (rclsid == CLSID_NullThumbnail ||
+        rclsid == CLSID_NullExtProps || rclsid == CLSID_NullBanners) {
+        NullFactory* f = new (std::nothrow) NullFactory();
+        if (!f) return E_OUTOFMEMORY;
+        HRESULT hr = f->QueryInterface(riid, ppv);
+        f->Release();
+        return hr;
     }
     return CLASS_E_CLASSNOTAVAILABLE;
 }

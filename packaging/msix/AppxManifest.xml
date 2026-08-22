@@ -9,7 +9,8 @@
     xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
     xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
     xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
-    IgnorableNamespaces="uap uap3 rescap com com3 desktop desktop4 desktop5">
+    xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3"
+    IgnorableNamespaces="uap uap3 rescap com com3 desktop desktop3 desktop4 desktop5">
 
   <!-- Name + Publisher must match the signing certificate's subject (CN=Nimbo Dev). -->
   <Identity Name="Nimbo" Publisher="CN=Nimbo Dev" Version="0.1.0.0" ProcessorArchitecture="x64" />
@@ -68,6 +69,19 @@
             <com:SurrogateServer DisplayName="Nimbo context menu">
               <com:Class Id="7E9C1A20-3B4D-4F8A-A1C2-9D5E0F7B6A11" Path="NimboCtxMenu.dll" ThreadingModel="STA" />
             </com:SurrogateServer>
+            <!-- The three sync-state icon overlay handlers in NCOverlays.dll.
+                 ThreadingModel matches what the DLL registers for itself when
+                 installed by hand (Apartment == STA here). -->
+            <com:SurrogateServer DisplayName="Nimbo status overlays">
+              <com:Class Id="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0001" Path="NCOverlays.dll" ThreadingModel="STA" />
+              <com:Class Id="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0002" Path="NCOverlays.dll" ThreadingModel="STA" />
+              <com:Class Id="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0003" Path="NCOverlays.dll" ThreadingModel="STA" />
+              <!-- Null cloudFiles handlers (see the windows.cloudFiles extension). -->
+              <com:Class Id="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0101" Path="NCOverlays.dll" ThreadingModel="STA" />
+              <com:Class Id="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0102" Path="NCOverlays.dll" ThreadingModel="STA" />
+              <com:Class Id="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0103" Path="NCOverlays.dll" ThreadingModel="STA" />
+              <com:Class Id="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0104" Path="NCOverlays.dll" ThreadingModel="STA" />
+            </com:SurrogateServer>
             <com3:ExeServer Executable="nimbo-gui.exe" Arguments="-ToastActivated" DisplayName="Nimbo toast activator">
               <com:Class Id="00EEDCE7-5C4E-4573-85C2-98790F8F98AE" />
             </com3:ExeServer>
@@ -91,6 +105,53 @@
             </desktop5:ItemType>
           </desktop4:FileExplorerContextMenus>
         </desktop4:Extension>
+
+        <!-- Sync-state icon overlays. Windows draws NO badges of its own for
+             cloud files: every provider supplies handlers, which is why OneDrive
+             registers seven under HKLM\...\ShellIconOverlayIdentifiers. A
+             packaged app cannot write that key, so this extension is the route -
+             the system registers the handlers on our behalf, exactly as the
+             brokered API does for the sync root itself.
+             Overlays only render inside a registered sync root (see
+             internal/cfapi), so these stay invisible until a folder is one. -->
+        <!-- MUST be the desktop3/desktop4 namespaces, NOT the cloudfiles one.
+             The SDK also ships CloudFilesManifestSchema.xsd, which defines the
+             identical shape under .../appx/manifest/cloudfiles/windows10, and
+             makeappx validates that form perfectly happily - but the runtime
+             ignores it, so v0.1.0.216-219 shipped an extension that passed the
+             build and did nothing. Explorer never loaded NCOverlays.dll. This is
+             the exact shape OneDrive uses (read back with
+             `Get-AppxPackage *OneDriveSync* | Get-AppxPackageManifest`), which is
+             demonstrably honoured on the same machines.
+
+             Every required handler carries a real CLSID for the same reason:
+             OneDrive supplies a dummy GUID even for ExtendedPropertyHandler,
+             which it does not implement, commented "required field". The four we
+             do not implement point at unregistered placeholder GUIDs in our own
+             range; only the overlay handlers below are backed by real classes. -->
+        <desktop3:Extension Category="windows.cloudFiles">
+          <desktop3:CloudFiles>
+            <!-- All four handler elements are schema-mandatory AND their Clsids
+                 must resolve to real activatable classes: made-up CLSIDs
+                 (v0.1.0.216-228) broke Explorer's per-item state mid-query
+                 (wrong/stuck Status glyphs on healthy directories), and
+                 omitting the Clsids (v0.1.0.230/1) invalidated the whole
+                 sync-root registration (no Status column, no cloud glyphs).
+                 These CLSIDs are null handlers in NCOverlays.dll: they
+                 activate, then decline every interface - "present, nothing to
+                 add" - so Explorer renders pure native cloud states. -->
+            <desktop3:CustomStateHandler Clsid="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0101" />
+            <desktop3:ThumbnailProviderHandler Clsid="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0102" />
+            <desktop3:ExtendedPropertyHandler Clsid="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0103" />
+            <desktop3:BannersHandler Clsid="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0104" />
+            <desktop3:CloudFilesContextMenus />
+            <desktop4:DesktopIconOverlayHandlers>
+              <desktop4:DesktopIconOverlayHandler Clsid="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0001" />
+              <desktop4:DesktopIconOverlayHandler Clsid="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0002" />
+              <desktop4:DesktopIconOverlayHandler Clsid="4F8B2C10-1A3D-4E55-9B21-0C7E5A9D0003" />
+            </desktop4:DesktopIconOverlayHandlers>
+          </desktop3:CloudFiles>
+        </desktop3:Extension>
       </Extensions>
     </Application>
   </Applications>

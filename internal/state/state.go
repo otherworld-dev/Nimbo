@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS scan_checkpoint (
   saved_at   INTEGER NOT NULL,  -- unix seconds, for the age-out backstop
   children   BLOB    NOT NULL,  -- gzip(JSON []cpEntry), fmt=1 (agent owns the codec)
   PRIMARY KEY (account_id, pair_key, dir_path)
-);`
+);
+`
 
 // Open opens (creating if needed) the state database at path for the given
 // account and ensures the schema exists. cacheBaseline holds each pair's baseline
@@ -576,5 +577,24 @@ func (s *Store) DeleteBaselineUnder(pairKey, prefix string) error {
 			}
 		}
 	}
+	return nil
+}
+
+// DeleteBaselineAll removes EVERY baseline row for one pair. This is the
+// "start from scratch" safety primitive: it must run BEFORE the pair's local
+// files are deleted, so a later sync reads the empty folder as
+// "absent-from-baseline, download everything" — never as "the user deleted
+// everything, propagate the deletes to the server".
+func (s *Store) DeleteBaselineAll(pairKey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`DELETE FROM baseline WHERE account_id = ? AND pair_key = ?`,
+		s.accountID, pairKey,
+	)
+	if err != nil {
+		return fmt.Errorf("delete baseline for pair: %w", err)
+	}
+	delete(s.cache, pairKey)
 	return nil
 }

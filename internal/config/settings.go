@@ -73,9 +73,30 @@ type Settings struct {
 	// remote path each mirrors, so they can be reconnected on the next launch
 	// (and any sync root left registered after a hard exit can be healed).
 	OnDemandMounts []OnDemandMount `json:"onDemandMounts"`
+	// RememberedPairs are the live sync pairs cleared when entering on-demand
+	// mode, restored automatically when the user switches back to live — a mode
+	// round-trip must not cost the user their folder setup.
+	RememberedPairs []SyncPair `json:"rememberedPairs,omitempty"`
 	// DevIgnoresSeeded records that dependency/VCS dir patterns (node_modules,
 	// .git, …) were seeded into the user-editable global ignore list, so the
 	// one-time migration never re-adds a pattern the user deliberately removed.
+	// FileLocking: take a files_lock lock while a document is open, so colleagues
+	// are told it is in use. OFF by default (zero value): a lock is visible to
+	// other people and, on a server with no lock_timeout configured, a bug here
+	// would strand a file that only an administrator could free.
+	FileLocking bool `json:"fileLocking"`
+
+	// FileLockout: also HOLD a file open locally while somebody else has it
+	// locked, so the local editor refuses to edit it and shows its own "locked
+	// by" dialog. OFF by default and gated separately from FileLocking: this is
+	// the intrusive half, and a bug in the release path stops a user editing
+	// their own document until Nimbo restarts.
+	FileLockout bool `json:"fileLockout"`
+
+	// BadgesOffered: the one-time "enable folder badges?" toast has been shown
+	// (live mode, badges unregistered). The Settings button remains regardless.
+	BadgesOffered bool `json:"badgesOffered"`
+
 	DevIgnoresSeeded bool `json:"devIgnoresSeeded"`
 	// AppWindowSizes remembers the last window size per Nextcloud-app window
 	// (apps opened as desktop windows from the flyout dock), keyed by app id.
@@ -87,6 +108,17 @@ type Settings struct {
 	// AppShortcutsOptOut marks apps whose Start-menu shortcut the user removed;
 	// opening the app's window won't auto-create it again.
 	AppShortcutsOptOut map[string]bool `json:"appShortcutsOptOut,omitempty"`
+	// SidebarEnabled is whether the user wants the Explorer navigation-pane
+	// entry. A pointer because "never chosen" must be distinguishable from
+	// "off": on the first run of a build that applies the entry out of the MSIX
+	// container we fall back to reading the registry, which is the only chance
+	// to notice an entry an older (unpackaged) build left behind.
+	SidebarEnabled *bool `json:"sidebarEnabled,omitempty"`
+	// SidebarTarget is the folder the entry was last pointed at. A packaged
+	// build cannot read this back — its own HKCU reads are answered from the
+	// package's private hive, not the keys Explorer reads — so it has to
+	// remember what it asked for to know when a rewrite is due.
+	SidebarTarget string `json:"sidebarTarget,omitempty"`
 }
 
 // AppWindowSize is a remembered app-window size in logical pixels.
@@ -139,15 +171,42 @@ func (d Dirs) LoadSettings() (Settings, error) {
 	return s, nil
 }
 
-// SaveSettings persists settings.
+// UpdateSettings applies mutate to the current settings and persists the result,
+// holding the settings file's lock across the whole read-modify-write.
+//
+// PREFER THIS OVER LoadSettings + SaveSettings for changing one setting. Settings
+// are written from the GUI's handler goroutines and from the engine's, and a bare
+// load-mutate-save loses an update whenever two overlap: both read the same file,
+// so the second one writes back the stale value it read for every field but its
+// own. That is why an unlucky SetBaseDir could appear to do nothing.
+//
+// mutate runs under the lock, so it must not call back into UpdateSettings.
+func (d Dirs) UpdateSettings(mutate func(*Settings)) error {
+	mu := fileMutex(d.SettingsFile())
+	mu.Lock()
+	defer mu.Unlock()
+
+	s, err := d.LoadSettings()
+	if err != nil {
+		return err
+	}
+	mutate(&s)
+	return d.saveSettingsLocked(s)
+}
+
+// SaveSettings persists settings wholesale. Changing a single field is a job for
+// UpdateSettings — this overwrites every other field with whatever s carries.
 func (d Dirs) SaveSettings(s Settings) error {
+	mu := fileMutex(d.SettingsFile())
+	mu.Lock()
+	defer mu.Unlock()
+	return d.saveSettingsLocked(s)
+}
+
+func (d Dirs) saveSettingsLocked(s Settings) error {
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := d.SettingsFile() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, d.SettingsFile())
+	return writeFileLocked(d.SettingsFile(), data, 0o600)
 }

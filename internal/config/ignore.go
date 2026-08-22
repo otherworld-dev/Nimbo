@@ -41,9 +41,5 @@ func (d Dirs) LoadIgnore() ([]string, error) {
 
 // SaveIgnore writes the global ignore patterns (one per line).
 func (d Dirs) SaveIgnore(patterns []string) error {
-	tmp := d.IgnoreFile() + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strings.Join(patterns, "\n")+"\n"), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, d.IgnoreFile())
+	return writeFileAtomic(d.IgnoreFile(), []byte(strings.Join(patterns, "\n")+"\n"), 0o600)
 }

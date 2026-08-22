@@ -2,6 +2,8 @@ package transport
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -22,10 +24,81 @@ type Entry struct {
 	FileID       string // oc:fileid — stable across renames/moves
 	LastModified time.Time
 	ContentType  string
-	Checksums    string // raw oc:checksums value, e.g. "SHA1:abc MD5:def"
-	IsEncrypted  bool   // nc:is-encrypted — an end-to-end encrypted folder (contents are opaque to clients without E2EE keys)
-	Permissions  string // oc:permissions, e.g. "RGDNVW" (file) / "RMGCK" (dir); empty = unknown
+	Checksums    string    // raw oc:checksums value, e.g. "SHA1:abc MD5:def"
+	IsEncrypted  bool      // nc:is-encrypted — an end-to-end encrypted folder (contents are opaque to clients without E2EE keys)
+	Permissions  string    // oc:permissions, e.g. "RGDNVW" (file) / "RMGCK" (dir); empty = unknown
+	Lock         *LockInfo // files_lock state; nil = unlocked OR the server didn't say (see LockInfo)
 }
+
+// LockOwnerType identifies who took a lock, from nc:lock-owner-type.
+type LockOwnerType int
+
+const (
+	LockOwnerUser  LockOwnerType = 0 // a person locked it by hand, e.g. in the web UI
+	LockOwnerApp   LockOwnerType = 1 // a collaborative editor — Nextcloud Office or Text
+	LockOwnerToken LockOwnerType = 2 // a WebDAV client holding a lock token
+)
+
+// LockInfo is the files_lock state of an entry.
+//
+// A nil *LockInfo means "not locked, or the server did not tell us" — the two are
+// deliberately indistinguishable here so that a server without the files_lock app
+// can never be read as "locked". Ask Capabilities whether locking is supported at
+// all before telling a user that nobody has a file open.
+type LockInfo struct {
+	Owner        string        // nc:lock-owner — the login name; EMPTY for an app lock
+	OwnerDisplay string        // nc:lock-owner-displayname — a person for type 0, the APP's name for type 1
+	OwnerEditor  string        // nc:lock-owner-editor — the app id holding a type-1 lock, e.g. "text"
+	OwnerType    LockOwnerType // nc:lock-owner-type
+	Token        string        // nc:lock-token
+	Since        time.Time     // nc:lock-time (epoch seconds)
+	Timeout      time.Duration // nc:lock-timeout; zero means the server set no expiry
+}
+
+// AppName is the editor holding an app lock, as a human would say it. Empty for
+// a lock that belongs to a person rather than an app.
+//
+// Type-1 locks carry no nc:lock-owner at all — verified against a live Text
+// session — so OwnerDisplay is the APP's name ("Text"), not somebody's. Treating
+// it as a person produces "Text is editing this", which reads like a colleague
+// called Text.
+func (l *LockInfo) AppName() string {
+	if l == nil || l.OwnerType != LockOwnerApp {
+		return ""
+	}
+	if l.OwnerDisplay != "" {
+		return l.OwnerDisplay
+	}
+	if l.OwnerEditor != "" {
+		return l.OwnerEditor
+	}
+	return "another app"
+}
+
+// ContentSHA1 is the server's SHA1 for this entry, parsed out of the raw
+// oc:checksums value, or "" when the server did not provide one.
+func (e Entry) ContentSHA1() string {
+	for _, tok := range strings.Fields(e.Checksums) {
+		if strings.HasPrefix(strings.ToUpper(tok), "SHA1:") {
+			return strings.ToLower(tok[len("SHA1:"):])
+		}
+	}
+	return ""
+}
+
+// HeldByOther reports whether this lock belongs to somebody other than the
+// signed-in user. An unattributable lock counts as someone else's: the file is
+// locked and we cannot prove it is ours, so the safe answer is to say so. A nil
+// receiver is simply not locked, which saves every caller a nil check.
+func (l *LockInfo) HeldByOther(login string) bool {
+	if l == nil {
+		return false
+	}
+	return login == "" || !strings.EqualFold(l.Owner, login)
+}
+
+// LockedByOther is HeldByOther for an entry straight off a listing.
+func (e Entry) LockedByOther(login string) bool { return e.Lock.HeldByOther(login) }
 
 // ServerReadOnly reports whether the server marks this entry as not writable: a
 // file with no W(rite) permission, or a directory you cannot create in (no
@@ -79,6 +152,14 @@ const propfindBody = `<?xml version="1.0" encoding="UTF-8"?>
     <oc:checksums/>
     <oc:permissions/>
     <nc:is-encrypted/>
+    <nc:lock/>
+    <nc:lock-owner/>
+    <nc:lock-owner-displayname/>
+    <nc:lock-owner-editor/>
+    <nc:lock-owner-type/>
+    <nc:lock-time/>
+    <nc:lock-timeout/>
+    <nc:lock-token/>
   </d:prop>
 </d:propfind>`
 
@@ -113,6 +194,16 @@ type davProp struct {
 	// oc:checksums wraps one or more <oc:checksum> children; the digest text is
 	// in the child, not the wrapper.
 	Checksums string `xml:"checksums>checksum"`
+	// files_lock properties (nc namespace). Absent unless the app is installed —
+	// the server then returns them in a 404 propstat, which parseResponse skips.
+	Lock             string `xml:"lock"`
+	LockOwner        string `xml:"lock-owner"`
+	LockOwnerDisplay string `xml:"lock-owner-displayname"`
+	LockOwnerEditor  string `xml:"lock-owner-editor"`
+	LockOwnerType    string `xml:"lock-owner-type"`
+	LockTime         string `xml:"lock-time"`
+	LockTimeout      string `xml:"lock-timeout"`
+	LockToken        string `xml:"lock-token"`
 	// Trashbin properties (nc namespace; only populated for trashbin PROPFINDs).
 	TrashFilename string `xml:"trashbin-filename"`
 	TrashOrigLoc  string `xml:"trashbin-original-location"`
@@ -273,6 +364,32 @@ func (c *Client) parseResponse(prefix string, r davResponse) (Entry, bool) {
 	if t, err := http.ParseTime(prop.GetLastModified); err == nil {
 		e.LastModified = t
 	}
+	// files_lock. Only a positive nc:lock yields a record: an unlocked file
+	// reports it as an EMPTY string, and a server without the app omits it
+	// entirely (it arrives in a 404 propstat we never read). Both mean "not
+	// locked" — we never claim a file is locked on thin evidence.
+	if prop.Lock == "1" || strings.EqualFold(prop.Lock, "true") {
+		li := &LockInfo{
+			Owner:        strings.TrimSpace(prop.LockOwner),
+			OwnerDisplay: strings.TrimSpace(prop.LockOwnerDisplay),
+			OwnerEditor:  strings.TrimSpace(prop.LockOwnerEditor),
+			Token:        strings.TrimSpace(prop.LockToken),
+		}
+		if n, err := strconv.Atoi(strings.TrimSpace(prop.LockOwnerType)); err == nil {
+			li.OwnerType = LockOwnerType(n)
+		}
+		if secs, err := strconv.ParseInt(strings.TrimSpace(prop.LockTime), 10, 64); err == nil && secs > 0 {
+			li.Since = time.Unix(secs, 0)
+		}
+		// nc:lock-timeout is NOT reliably "seconds remaining" — a live NC 34.0.2
+		// returned -60 for a one-second-old lock. Non-positive is read as "the
+		// server set no expiry", which is the truth on a default install:
+		// files_lock does not expire locks unless an admin configures it.
+		if secs, err := strconv.Atoi(strings.TrimSpace(prop.LockTimeout)); err == nil && secs > 0 {
+			li.Timeout = time.Duration(secs) * time.Second
+		}
+		e.Lock = li
+	}
 	return e, true
 }
 
@@ -352,11 +469,30 @@ func (c *Client) Put(ctx context.Context, remotePath string, body io.Reader, siz
 // passing an OC-Checksum (e.g. "SHA1:abc…") for the server to verify, and
 // returns the stored revision's ETag and file ID. Intended for small files;
 // large files use the chunked uploader.
-func (c *Client) PutWithChecksum(ctx context.Context, remotePath string, body io.Reader, size int64, ocChecksum string) (etag, fileID string, err error) {
+//
+// newBody must return a fresh reader of the whole content each call — it backs
+// the request's GetBody so the transport can replay the PUT after a
+// connection-level failure (HTTP/2 GOAWAY, stale reused connection).
+func (c *Client) PutWithChecksum(ctx context.Context, remotePath string, newBody func() (io.Reader, error), size int64, ocChecksum string) (etag, fileID string, err error) {
+	body, err := newBody()
+	if err != nil {
+		return "", "", err
+	}
 	req, err := c.NewRequest(ctx, http.MethodPut, c.davURL(remotePath), body)
 	if err != nil {
 		return "", "", err
 	}
+	req.GetBody = func() (io.ReadCloser, error) {
+		r, err := newBody()
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(r), nil
+	}
+	// Hashed, not the raw path: header values must stay printable ASCII, and
+	// a path can contain anything.
+	pathHash := sha1.Sum([]byte(remotePath))
+	req.Header.Set("Idempotency-Key", "nimbo-put-"+hex.EncodeToString(pathHash[:8]))
 	if size >= 0 {
 		req.ContentLength = size
 	}
@@ -463,13 +599,115 @@ func (c *Client) Move(ctx context.Context, src, dst string) error {
 	return nil
 }
 
+// LockResult is what the server returns from a LOCK: the token identifying the
+// lock, the file's NEW ETag (locking bumps it), and the lock's own state. One
+// LOCK therefore tells the client everything — no follow-up PROPFIND.
+type LockResult struct {
+	Token string
+	ETag  string
+	Info  LockInfo
+}
+
+// lockProp is a LOCK/UNLOCK reply body: a bare <d:prop>, NOT a multistatus. It
+// reuses davProp so the lock fields are parsed by exactly one set of tags.
+type lockProp struct {
+	XMLName xml.Name `xml:"prop"`
+	davProp
+}
+
+func parseLockResult(body []byte) (LockResult, error) {
+	var p lockProp
+	if err := xml.Unmarshal(body, &p); err != nil {
+		return LockResult{}, fmt.Errorf("decode LOCK response: %w", err)
+	}
+	res := LockResult{
+		Token: strings.TrimSpace(p.LockToken),
+		ETag:  strings.Trim(strings.TrimSpace(p.GetETag), `"`),
+		Info: LockInfo{
+			Owner:        strings.TrimSpace(p.LockOwner),
+			OwnerDisplay: strings.TrimSpace(p.LockOwnerDisplay),
+			OwnerEditor:  strings.TrimSpace(p.LockOwnerEditor),
+			Token:        strings.TrimSpace(p.LockToken),
+		},
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(p.LockOwnerType)); err == nil {
+		res.Info.OwnerType = LockOwnerType(n)
+	}
+	return res, nil
+}
+
+// Lock takes a files_lock lock on remotePath, via the app's user-lock flow
+// (X-User-Lock) rather than the native WebDAV token flow.
+//
+// Re-locking a lock we already hold returns 200 with the SAME token — that is
+// how the heartbeat works; there is no separate refresh verb. A lock held by
+// somebody else returns 423, which IsLocked recognises.
+func (c *Client) Lock(ctx context.Context, remotePath string) (LockResult, error) {
+	req, err := c.NewRequest(ctx, "LOCK", c.davURL(remotePath), nil)
+	if err != nil {
+		return LockResult{}, err
+	}
+	req.Header.Set("X-User-Lock", "1")
+	resp, err := c.DoOnce(req)
+	if err != nil {
+		return LockResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return LockResult{}, statusError("LOCK", remotePath, resp)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return LockResult{}, err
+	}
+	return parseLockResult(body)
+}
+
+// Unlock releases a lock WE hold.
+//
+// Only ever call this for a lock in our own registry: releasing somebody else's
+// returns 423 and is not ours to clear. A second UNLOCK of the same path returns
+// 412 Precondition Failed — NOT 404 — which simply means the lock is already
+// gone, so it counts as success. The startup sweep hits that routinely, and
+// treating it as an error would log a failure on every boot.
+func (c *Client) Unlock(ctx context.Context, remotePath string) error {
+	req, err := c.NewRequest(ctx, "UNLOCK", c.davURL(remotePath), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-User-Lock", "1")
+	resp, err := c.DoOnce(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusNoContent, http.StatusPreconditionFailed:
+		return nil
+	}
+	return statusError("UNLOCK", remotePath, resp)
+}
+
 // statusError builds a descriptive error from an unexpected response, including
 // a short snippet of the body.
+// IsLocked reports whether err is a 423 Locked from the server — files_lock
+// refusing a write because somebody else holds the file.
+//
+// This package returns untyped errors with the status formatted into the
+// message, so a substring match is the only option; it keys on the exact phrase
+// statusError builds rather than a bare "423", which would also match a path or
+// a byte count. One definition, because both the agent (for the user-facing
+// message) and the transfer executor (which must not retry a lock) need it.
+func IsLocked(err error) bool {
+	return StatusCode(err) == http.StatusLocked ||
+		(err != nil && strings.Contains(err.Error(), "server returned 423"))
+}
+
 func statusError(op, path string, resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<12))
 	snippet := strings.TrimSpace(string(body))
 	if len(snippet) > 300 {
 		snippet = snippet[:300] + "…"
 	}
-	return fmt.Errorf("%s %q: server returned %s: %s", op, path, resp.Status, snippet)
+	return &StatusError{Op: op, Path: path, Code: resp.StatusCode, Status: resp.Status, Snippet: snippet}
 }

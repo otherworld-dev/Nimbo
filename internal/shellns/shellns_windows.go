@@ -4,9 +4,43 @@
 // navigation pane. It uses the documented "delegate folder" namespace pattern —
 // a CLSID under HKCU that shell32 hosts and points at a target folder — so it
 // needs no COM code and no administrator rights.
+//
+// PACKAGED (MSIX) BUILDS MUST NOT WRITE THESE KEYS DIRECTLY. Inside the package
+// container every HKCU write is virtualized into the package's own private hive
+// (…\Packages\<pfn>\SystemAppData\Helium\User.dat): the write reports success
+// and the app reads its own value back, but Explorer runs outside the container
+// and never sees any of it. That silently broke this feature for every MSIX
+// install — the Settings toggle looked like it worked because it was reading
+// back its own virtual write, while the navigation pane kept whatever an old
+// unpackaged build had left in the real HKCU. It is the same trap the tray-icon
+// migration documents in applyUpdate (cmd/nimbo-gui/restart_windows.go).
+//
+// Packaged builds therefore apply the change from a one-shot SCHEDULED TASK: the
+// Task Scheduler service runs it outside our container, so its writes land in
+// the real HKCU. Two consequences worth knowing:
+//
+//   - Reads are unreliable once a build has written virtually. A container read
+//     is answered from the package hive first, and deleting a key that exists in
+//     the real hive leaves a deletion marker rather than removing it. Callers
+//     must remember what they asked for instead of reading it back (see
+//     config.Settings.SidebarEnabled / SidebarTarget).
+//   - The icon has to live outside the package data root. Everything the app
+//     writes under AppData is redirected into …\Packages\<pfn>\LocalCache, whose
+//     path changes with the package family name — the same PFN change that
+//     blanked the pinned taskbar icons. The task writes the icon to
+//     %LOCALAPPDATA%\<brand>\ instead, which survives.
 package shellns
 
 import (
+	"encoding/base64"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"unsafe"
+
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
@@ -27,6 +61,11 @@ const (
 func Supported() bool { return true }
 
 // Enabled reports whether the Nimbo sidebar node is registered.
+//
+// Only trustworthy on unpackaged builds. Inside the MSIX container this answers
+// from the package's private hive as soon as any build has written there, so a
+// packaged caller should prefer its own recorded state and use this only as the
+// first-run fallback.
 func Enabled() bool {
 	k, err := registry.OpenKey(registry.CURRENT_USER, clsidBase, registry.QUERY_VALUE)
 	if err != nil {
@@ -36,53 +75,74 @@ func Enabled() bool {
 	return true
 }
 
+// Packaged reports whether this process runs inside an MSIX package, i.e.
+// whether registry changes have to be applied out of the container.
+func Packaged() bool { return packageFamilyName() != "" }
+
+// --- the values that make up the entry ---
+
+type valKind int
+
+const (
+	kindSz valKind = iota
+	kindExpandSz
+	kindDword
+)
+
+// regVal is one HKCU value to write. Name "" means the key's default value.
+type regVal struct {
+	key  string
+	name string
+	kind valKind
+	s    string
+	d    uint32
+}
+
+// desired returns every value that defines the sidebar entry, in write order.
+// Pure, so both write paths (direct and out-of-container) render the same thing.
+func desired(name, targetFolder, iconPath string) []regVal {
+	return []regVal{
+		{clsidBase, "", kindSz, name, 0},
+		{clsidBase, "System.IsPinnedToNameSpaceTree", kindDword, "", 1},
+		{clsidBase, "SortOrderIndex", kindDword, "", 0x42},
+		{clsidBase + `\DefaultIcon`, "", kindSz, iconPath + ",0", 0},
+		{clsidBase + `\InProcServer32`, "", kindExpandSz, `%SystemRoot%\system32\shell32.dll`, 0},
+		{clsidBase + `\InProcServer32`, "ThreadingModel", kindSz, "Both", 0},
+		{clsidBase + `\Instance`, "CLSID", kindSz, delegateCLSID, 0},
+		{clsidBase + `\Instance\InitPropertyBag`, "Attributes", kindDword, "", 0x11},
+		{clsidBase + `\Instance\InitPropertyBag`, "TargetFolderPath", kindExpandSz, targetFolder, 0},
+		{clsidBase + `\ShellFolder`, "Attributes", kindDword, "", 0xF080004D},
+		{clsidBase + `\ShellFolder`, "FolderValueFlags", kindDword, "", 0x28},
+		// Pin into the navigation-pane tree and hide the matching Desktop icon.
+		{nameSpace, "", kindSz, name, 0},
+		{hideDeskKy, NavGUID, kindDword, "", 1},
+	}
+}
+
 // Register pins a navigation-pane root named name, pointing at targetFolder and
 // shown with iconPath. Idempotent; updates target/icon on each call.
+//
+// On a packaged build the write is handed to a scheduled task and this returns
+// as soon as the task is queued — a failure to *queue* it surfaces as an error,
+// but the entry appears a moment later, not by the time this returns.
 func Register(name, targetFolder, iconPath string) error {
-	if err := setStr(clsidBase, "", name); err != nil {
-		return err
+	if Packaged() {
+		return registerOutOfContainer(name, targetFolder, iconPath)
 	}
-	if err := setDword(clsidBase, "System.IsPinnedToNameSpaceTree", 1); err != nil {
-		return err
+	for _, v := range desired(name, targetFolder, iconPath) {
+		if err := write(v); err != nil {
+			return err
+		}
 	}
-	if err := setDword(clsidBase, "SortOrderIndex", 0x42); err != nil {
-		return err
-	}
-	if err := setStr(clsidBase+`\DefaultIcon`, "", iconPath+",0"); err != nil {
-		return err
-	}
-	if err := setExpand(clsidBase+`\InProcServer32`, "", `%SystemRoot%\system32\shell32.dll`); err != nil {
-		return err
-	}
-	if err := setStr(clsidBase+`\InProcServer32`, "ThreadingModel", "Both"); err != nil {
-		return err
-	}
-	if err := setStr(clsidBase+`\Instance`, "CLSID", delegateCLSID); err != nil {
-		return err
-	}
-	if err := setDword(clsidBase+`\Instance\InitPropertyBag`, "Attributes", 0x11); err != nil {
-		return err
-	}
-	if err := setExpand(clsidBase+`\Instance\InitPropertyBag`, "TargetFolderPath", targetFolder); err != nil {
-		return err
-	}
-	if err := setDword(clsidBase+`\ShellFolder`, "Attributes", 0xF080004D); err != nil {
-		return err
-	}
-	if err := setDword(clsidBase+`\ShellFolder`, "FolderValueFlags", 0x28); err != nil {
-		return err
-	}
-	// Pin into the navigation-pane tree and hide the matching Desktop icon.
-	if err := setStr(nameSpace, "", name); err != nil {
-		return err
-	}
-	_ = setDword(hideDeskKy, NavGUID, 1)
 	refresh()
 	return nil
 }
 
 // Unregister removes the sidebar node.
 func Unregister() error {
+	if Packaged() {
+		return runOutOfContainer("unregister", unregisterScript())
+	}
 	deleteTree(clsidBase)
 	deleteTree(nameSpace)
 	delValue(hideDeskKy, NavGUID)
@@ -90,7 +150,245 @@ func Unregister() error {
 	return nil
 }
 
-// --- registry helpers ---
+// --- out-of-container application (packaged builds) ---
+
+// stableIconPath is where a packaged build's sidebar icon lives: under
+// %LOCALAPPDATA%\<brand>\, NOT in the package data root, so that a package
+// family name change does not blank the navigation-pane icon. Only the
+// scheduled task can create it — the app's own writes there are redirected —
+// but the path itself resolves correctly from inside the container.
+func stableIconPath(brandDir string) string {
+	local := os.Getenv("LOCALAPPDATA")
+	if local == "" || brandDir == "" {
+		return ""
+	}
+	return filepath.Join(local, brandDir, "nimbo.ico")
+}
+
+// registerOutOfContainer renders the registration as a PowerShell script and
+// runs it from a scheduled task. The icon travels as base64 inside the script:
+// the app can read its own copy but the task cannot (the app's path is
+// redirected into the package's LocalCache), and hard-coding that redirected
+// path would tie the icon to the current package family name.
+func registerOutOfContainer(name, targetFolder, iconPath string) error {
+	icon := stableIconPath(name)
+	if icon == "" {
+		icon = iconPath
+	}
+	ico, err := os.ReadFile(iconPath)
+	if err != nil {
+		return fmt.Errorf("read sidebar icon: %w", err)
+	}
+	return runOutOfContainer("register", registerScript(desired(name, targetFolder, icon), icon, ico))
+}
+
+// registerScript renders the values as PowerShell. The icon bytes are written
+// first so the DefaultIcon value never points at a file that is not there yet.
+func registerScript(vals []regVal, iconPath string, ico []byte) string {
+	var b strings.Builder
+	b.WriteString("$ErrorActionPreference = 'Continue'\r\n")
+	b.WriteString(fmt.Sprintf("$icon = %s\r\n", psQuote(iconPath)))
+	// .NET rather than New-Item: New-Item has no -LiteralPath, and a brand whose
+	// name contains [ ] would be read as a wildcard.
+	b.WriteString("[IO.Directory]::CreateDirectory((Split-Path -Parent $icon)) | Out-Null\r\n")
+	b.WriteString(fmt.Sprintf("[IO.File]::WriteAllBytes($icon, [Convert]::FromBase64String('%s'))\r\n",
+		base64.StdEncoding.EncodeToString(ico)))
+	for _, v := range vals {
+		key := `HKCU:\` + v.key
+		b.WriteString(fmt.Sprintf("if (-not (Test-Path -LiteralPath %s)) { New-Item -Path %s -Force | Out-Null }\r\n",
+			psQuote(key), psQuote(key)))
+		nm := v.name
+		if nm == "" {
+			nm = "(default)"
+		}
+		switch v.kind {
+		case kindDword:
+			b.WriteString(fmt.Sprintf("New-ItemProperty -LiteralPath %s -Name %s -Value %d -PropertyType DWord -Force | Out-Null\r\n",
+				psQuote(key), psQuote(nm), v.d))
+		case kindExpandSz:
+			b.WriteString(fmt.Sprintf("New-ItemProperty -LiteralPath %s -Name %s -Value %s -PropertyType ExpandString -Force | Out-Null\r\n",
+				psQuote(key), psQuote(nm), psQuote(v.s)))
+		default:
+			b.WriteString(fmt.Sprintf("New-ItemProperty -LiteralPath %s -Name %s -Value %s -PropertyType String -Force | Out-Null\r\n",
+				psQuote(key), psQuote(nm), psQuote(v.s)))
+		}
+	}
+	b.WriteString(notifyShellPS)
+	return b.String()
+}
+
+// unregisterScript removes the entry from the real HKCU.
+func unregisterScript() string {
+	var b strings.Builder
+	b.WriteString("$ErrorActionPreference = 'Continue'\r\n")
+	for _, k := range []string{clsidBase, nameSpace} {
+		b.WriteString(fmt.Sprintf("Remove-Item -LiteralPath %s -Recurse -Force -ErrorAction SilentlyContinue\r\n",
+			psQuote(`HKCU:\`+k)))
+	}
+	b.WriteString(fmt.Sprintf("Remove-ItemProperty -LiteralPath %s -Name %s -Force -ErrorAction SilentlyContinue\r\n",
+		psQuote(`HKCU:\`+hideDeskKy), psQuote(NavGUID)))
+	b.WriteString(notifyShellPS)
+	return b.String()
+}
+
+// notifyShellPS makes Explorer reload its namespace. SHChangeNotify has to be
+// called from out here too: a broadcast raised inside the container refers to a
+// change Explorer cannot see.
+const notifyShellPS = "Add-Type -MemberDefinition '[DllImport(\"shell32.dll\")] public static extern void SHChangeNotify(int e, uint f, IntPtr a, IntPtr b);' -Name ShNs -Namespace NimboSidebar -ErrorAction SilentlyContinue\r\n" +
+	"try { [NimboSidebar.ShNs]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero) } catch {}\r\n"
+
+// runOutOfContainer writes body to a .ps1 and runs it via a one-shot scheduled
+// task, which executes outside our MSIX job so its HKCU writes are real.
+//
+// The script and its task definition go in the REAL user home, not %TEMP%: our
+// temp directory is the package-private AppContainer one and the task, running
+// unpackaged, cannot read it. The task is defined by XML rather than bare
+// schtasks flags because schtasks defaults to "only on AC power", which leaves
+// the task Queued forever on a laptop on battery. Both are the same constraints
+// applyUpdate documents.
+func runOutOfContainer(action, body string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	pkg := packageName()
+	if pkg == "" {
+		pkg = "Nimbo"
+	}
+	taskName := pkg + "SidebarUpdate"
+	ps1 := filepath.Join(home, "nimbo-sidebar.ps1")
+	vbs := filepath.Join(home, "nimbo-sidebar.vbs")
+	taskXML := filepath.Join(home, "nimbo-sidebar-task.xml")
+	logf := filepath.Join(home, "nimbo-sidebar.log")
+
+	script := fmt.Sprintf("\"$(Get-Date -Format s) sidebar %s\" | Out-File -FilePath %s -Append\r\n", action, psQuote(logf)) +
+		body +
+		fmt.Sprintf("\"$(Get-Date -Format s) sidebar %s done\" | Out-File -FilePath %s -Append\r\n", action, psQuote(logf)) +
+		fmt.Sprintf("schtasks /delete /tn %s /f | Out-Null\r\n", taskName) +
+		fmt.Sprintf("Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue\r\n", psQuote(taskXML)) +
+		fmt.Sprintf("Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue\r\n", psQuote(vbs)) +
+		"Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\r\n"
+	if err := os.WriteFile(ps1, []byte(script), 0o644); err != nil {
+		return err
+	}
+	// The task cannot run powershell.exe directly: a console process gets its
+	// conhost window created BEFORE -WindowStyle Hidden is processed, so every
+	// sync-mode switch flashed a black box. wscript.exe is a windowless host,
+	// and Run's window style 0 creates the console hidden from the start.
+	launcher := "CreateObject(\"WScript.Shell\").Run \"powershell -NoProfile -ExecutionPolicy Bypass -File \"\"" +
+		ps1 + "\"\"\", 0, False\r\n"
+	if err := os.WriteFile(vbs, []byte(launcher), 0o644); err != nil {
+		return err
+	}
+	xml := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>wscript.exe</Command>
+      <Arguments>//B //Nologo "%s"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+`, xmlEscape(vbs))
+	if err := os.WriteFile(taskXML, utf16LEBOM(xml), 0o644); err != nil {
+		return err
+	}
+	mk := exec.Command("schtasks", "/create", "/tn", taskName, "/xml", taskXML, "/f")
+	mk.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if out, err := mk.CombinedOutput(); err != nil {
+		return fmt.Errorf("schtasks create failed: %v: %s", err, out)
+	}
+	run := exec.Command("schtasks", "/run", "/tn", taskName)
+	run.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if out, err := run.CombinedOutput(); err != nil {
+		return fmt.Errorf("schtasks run failed: %v: %s", err, out)
+	}
+	return nil
+}
+
+// psQuote renders s as a PowerShell single-quoted literal (no expansion, so a
+// path holding a $ or a backtick stays literal; an embedded quote is doubled).
+func psQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// xmlEscape escapes the XML special characters in s for the task definition.
+func xmlEscape(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;").Replace(s)
+}
+
+// utf16LEBOM renders s as UTF-16LE bytes with a BOM — the encoding schtasks
+// expects for /xml task definitions.
+func utf16LEBOM(s string) []byte {
+	u := windows.StringToUTF16(s)
+	b := []byte{0xFF, 0xFE}
+	for _, c := range u[:len(u)-1] { // drop the NUL terminator
+		b = append(b, byte(c), byte(c>>8))
+	}
+	return b
+}
+
+// --- package identity ---
+
+var (
+	kernel32                        = windows.NewLazySystemDLL("kernel32.dll")
+	procGetCurrentPackageFamilyName = kernel32.NewProc("GetCurrentPackageFamilyName")
+)
+
+// packageFamilyName returns this process's MSIX package family name, or "" when
+// the build is not packaged.
+func packageFamilyName() string {
+	var length uint32
+	procGetCurrentPackageFamilyName.Call(uintptr(unsafe.Pointer(&length)), 0)
+	if length == 0 {
+		return "" // APPMODEL_ERROR_NO_PACKAGE — not packaged
+	}
+	buf := make([]uint16, length)
+	r, _, _ := procGetCurrentPackageFamilyName.Call(uintptr(unsafe.Pointer(&length)), uintptr(unsafe.Pointer(&buf[0])))
+	if r != 0 {
+		return ""
+	}
+	return windows.UTF16ToString(buf)
+}
+
+// packageName is the MSIX package Name — the family name up to the first
+// underscore. Used to name the task after the running brand's own package so a
+// white-label build does not collide with Nimbo's.
+func packageName() string {
+	pfn := packageFamilyName()
+	if i := strings.IndexByte(pfn, '_'); i > 0 {
+		return pfn[:i]
+	}
+	return pfn
+}
+
+// --- registry helpers (direct path, unpackaged builds) ---
+
+func write(v regVal) error {
+	switch v.kind {
+	case kindDword:
+		return setDword(v.key, v.name, v.d)
+	case kindExpandSz:
+		return setExpand(v.key, v.name, v.s)
+	default:
+		return setStr(v.key, v.name, v.s)
+	}
+}
 
 func setStr(path, name, val string) error {
 	k, _, err := registry.CreateKey(registry.CURRENT_USER, path, registry.SET_VALUE)

@@ -12,7 +12,7 @@ import (
 // paths to their current state. The root itself is not included. OS/editor junk
 // and in-progress temp files are skipped so they never drive sync decisions.
 func LocalScan(root string) (map[string]LocalState, error) {
-	return LocalScanScoped(root, "")
+	return LocalScanProgress(root, "", nil)
 }
 
 // LocalScanScoped is LocalScan limited to one subtree: it walks only root/scope
@@ -22,6 +22,16 @@ func LocalScan(root string) (map[string]LocalState, error) {
 // locally (its subtree was deleted), it returns an empty map so the diff
 // propagates the deletions instead of erroring.
 func LocalScanScoped(root, scope string) (map[string]LocalState, error) {
+	return LocalScanProgress(root, scope, nil)
+}
+
+// LocalScanProgress is LocalScanScoped with an optional heartbeat: progress, when
+// non-nil, is called once per entry added to the result with the running total.
+// A big tree takes minutes to walk, and the caller needs a number that visibly
+// moves to tell a slow scan from a hang. progress is called from the walk
+// goroutine, in order, so implementations need no locking of their own — but
+// they must be fast, since they run once per file.
+func LocalScanProgress(root, scope string, progress func(files int)) (map[string]LocalState, error) {
 	info, err := os.Stat(root)
 	if err != nil {
 		return nil, fmt.Errorf("local root %q: %w", root, err)
@@ -69,6 +79,9 @@ func LocalScanScoped(root, scope string) (map[string]LocalState, error) {
 			st.Size = fi.Size()
 		}
 		out[rel] = st
+		if progress != nil {
+			progress(len(out))
+		}
 		return nil
 	})
 	if err != nil {

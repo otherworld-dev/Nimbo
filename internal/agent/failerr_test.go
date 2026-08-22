@@ -18,6 +18,7 @@ func TestHumanActionErr(t *testing.T) {
 		{"docs/x.txt", "server returned 403 Forbidden", "permission denied"},
 		{"a/b", `mkdir E:\Nextcloud\a: Access is denied.`, "Windows denied access"},
 		{"deep/file.md", "MKCOL: 409 Conflict: Parent node does not exist", "parent folder"},
+		{"Team/Budget.xlsx", `PUT "Team/Budget.xlsx": server returned 423 Locked`, "someone else"},
 		{"q/r", "some unrecognised transport error", "some unrecognised transport error"}, // falls back to raw
 	}
 	for _, c := range cases {

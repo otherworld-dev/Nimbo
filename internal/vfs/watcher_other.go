@@ -11,18 +11,23 @@ import (
 
 // Ops are the server-side actions the watcher performs (unused off Windows).
 type Ops struct {
-	Upload func(ctx context.Context, localPath, remotePath string) error
-	Mkdir  func(ctx context.Context, remotePath string) error
-	Delete func(ctx context.Context, remotePath string) error
-	Move   func(ctx context.Context, srcRemote, dstRemote string) error
-	List   func(rel string) ([]cfapi.PlaceholderInfo, error)
+	Upload         func(ctx context.Context, localPath, remotePath string) error
+	Mkdir          func(ctx context.Context, remotePath string) error
+	Delete         func(ctx context.Context, remotePath string) error
+	Move           func(ctx context.Context, srcRemote, dstRemote string) error
+	List           func(rel string) ([]cfapi.PlaceholderInfo, error)
 	Report         func(kind, remotePath string, err error)
 	RecordBaseline func(remotePath, etag string)
 	Baseline       func(remotePath string) (string, bool)
 	RecordFileID   func(remotePath, fileid string)
 	FileID         func(remotePath string) (string, bool)
 	DropFileID     func(remotePath string)
-	Log            func(format string, args ...any)
+	// Encode/Decode map between local and escaped-on-server names for disguised
+	// file types; see the Windows build for the full contract. Mirrored here so
+	// the non-Windows build keeps compiling.
+	Encode func(rel string) string
+	Decode func(rel string) string
+	Log    func(format string, args ...any)
 }
 
 // Watcher is a no-op outside Windows (on-demand files are Windows-only).

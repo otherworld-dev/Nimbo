@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -361,11 +362,26 @@ func (e *Executor) rebaselineFile(ctx context.Context, rel string) error {
 	})
 }
 
+// ConflictName is conflictName for callers outside this package (the on-demand
+// adopt keeps both versions the same way), exported so the naming convention has
+// exactly one definition.
+func ConflictName(rel string) string { return conflictName(rel) }
+
+// conflictMarker matches the " (conflicted copy <timestamp>)" markers this
+// client writes, so a repeat conflict can replace the old marker rather than
+// stack a fresh one each round — six stacked markers pushed one field path past
+// MAX_PATH and nothing could open the file any more.
+var conflictMarker = regexp.MustCompile(` \(conflicted copy \d{4}-\d{2}-\d{2} \d{6}\)`)
+
+// StripConflictMarkers removes every conflict marker from a name or path.
+func StripConflictMarkers(s string) string { return conflictMarker.ReplaceAllString(s, "") }
+
 // conflictName inserts a " (conflicted copy <timestamp>)" marker before the file
 // extension, mirroring the convention users recognise from other sync clients.
+// Any marker already in the name is replaced, never stacked.
 func conflictName(rel string) string {
 	ext := path.Ext(rel)
-	stem := strings.TrimSuffix(rel, ext)
+	stem := StripConflictMarkers(strings.TrimSuffix(rel, ext))
 	ts := time.Now().Format("2006-01-02 150405")
 	return stem + " (conflicted copy " + ts + ")" + ext
 }

@@ -40,24 +40,31 @@ func (d Dirs) LoadBlacklist() (map[string]bool, error) {
 
 // AddBlacklist adds an absolute local path to the blacklist.
 func (d Dirs) AddBlacklist(absPath string) error {
-	set, err := d.LoadBlacklist()
-	if err != nil {
-		return err
-	}
-	set[normalizePath(absPath)] = true
-	return d.saveBlacklist(set)
+	return d.updateBlacklist(func(set map[string]bool) { set[normalizePath(absPath)] = true })
 }
 
 // RemoveBlacklist removes a path from the blacklist (so it can sync again).
 func (d Dirs) RemoveBlacklist(absPath string) error {
+	return d.updateBlacklist(func(set map[string]bool) { delete(set, normalizePath(absPath)) })
+}
+
+// updateBlacklist reads, mutates and rewrites the list under the file's lock. A
+// sync pass can walk into several forbidden names at once, and without the lock
+// each addition would be overwritten by the stale set the next one had read.
+func (d Dirs) updateBlacklist(mutate func(map[string]bool)) error {
+	mu := fileMutex(d.BlacklistFile())
+	mu.Lock()
+	defer mu.Unlock()
+
 	set, err := d.LoadBlacklist()
 	if err != nil {
 		return err
 	}
-	delete(set, normalizePath(absPath))
+	mutate(set)
 	return d.saveBlacklist(set)
 }
 
+// saveBlacklist rewrites the file; callers hold the blacklist file's lock.
 func (d Dirs) saveBlacklist(set map[string]bool) error {
 	list := make([]string, 0, len(set))
 	for p := range set {
@@ -67,11 +74,7 @@ func (d Dirs) saveBlacklist(set map[string]bool) error {
 	if err != nil {
 		return err
 	}
-	tmp := d.BlacklistFile() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, d.BlacklistFile())
+	return writeFileLocked(d.BlacklistFile(), data, 0o600)
 }
 
 // normalizePath canonicalises a path for set comparison (clean + lowercase).

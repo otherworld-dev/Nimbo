@@ -21,6 +21,11 @@ var defaultIgnore = []string{
 	// official Nextcloud/ownCloud desktop client state (e.g. after a takeover):
 	".sync_*.db", ".sync_*.db-shm", ".sync_*.db-wal", "._sync_*.db",
 	".owncloudsync.log*", ".nextcloudsync.log*", "*.~syncpart",
+	// Left behind by the retired one-way backup mode (beta v0.1.0.205 only):
+	// its attic held everything the backup removed or replaced. The entry
+	// stays so an install that still has one never uploads it — that would
+	// resurrect on the server the very files the server deleted.
+	".nimbo-attic",
 }
 
 // Ignore matches paths against gitignore-lite glob patterns so they are excluded

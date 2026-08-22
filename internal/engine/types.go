@@ -4,11 +4,19 @@
 // actions. It deliberately has no dependency on transport or storage details so
 // the reconciliation logic stays easy to test in isolation.
 //
+// The pure three-way diff depends on nothing but the three state structs below,
+// which is what keeps it easy to test. Discovery does touch transport, mostly to
+// flatten its Entry into these primitives.
+//
 // Note: this lives in package "engine" rather than "sync" to avoid shadowing
 // the standard library's sync package.
 package engine
 
-import "time"
+import (
+	"time"
+
+	"github.com/otherworld/nimbo/internal/transport"
+)
 
 // RemoteState is what a PROPFIND told us about a path right now.
 type RemoteState struct {
@@ -20,6 +28,16 @@ type RemoteState struct {
 	SHA1         string    // content SHA1 from oc:checksums, when the server provides it
 	LastModified time.Time // server mtime; populated where needed (e.g. takeover adoption)
 	ReadOnly     bool      // server marks this not-writable (oc:permissions) -> mirror as a local read-only attribute
+	// Lock is files_lock state, when the server has the app. nil is ambiguous on
+	// its own — see LockKnown.
+	Lock *transport.LockInfo
+	// LockKnown says whether Lock is authoritative: true when this entry came
+	// from a real listing or Stat, false when it was replayed from the baseline
+	// for a subtree the ETag prune skipped (addBaselineSubtree), which has no
+	// Entry behind it and therefore cannot know. Without this, "unlocked" and
+	// "we did not look" are indistinguishable, and a pass would silently clear
+	// locks in folders it never examined.
+	LockKnown bool
 }
 
 // LocalState is what the filesystem walk told us about a path right now.

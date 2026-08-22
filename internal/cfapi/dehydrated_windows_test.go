@@ -1,4 +1,4 @@
-package agent
+package cfapi
 
 import (
 	"os"
@@ -22,7 +22,7 @@ func TestIsDehydratedPlaceholderRealFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if isDehydratedPlaceholder(fi) {
+	if IsDehydrated(fi) {
 		t.Error("a normal file must not read as dehydrated")
 	}
 
@@ -51,13 +51,13 @@ func TestIsDehydratedPlaceholderRealFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !isDehydratedPlaceholder(fi) {
+	if !IsDehydrated(fi) {
 		t.Error("a file marked offline must read as dehydrated")
 	}
 }
 
 func TestIsDehydratedPlaceholderNil(t *testing.T) {
-	if isDehydratedPlaceholder(nil) {
+	if IsDehydrated(nil) {
 		t.Error("nil FileInfo must not read as dehydrated")
 	}
 }

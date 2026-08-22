@@ -13,7 +13,7 @@
   };
 
   type Activity = { time: string; kind: string; path: string; remotePath: string; err: string };
-  type Attention = { conflicts: number; blocked: number };
+  type Attention = { conflicts: number; blocked: number; locked: number };
   type Progress = { active: boolean; current: string; done: number; total: number; speed: number; avgSpeed: number; doneBytes: number; totalBytes: number; enumerating: boolean };
 
   function etaText(p: Progress): string {
@@ -41,7 +41,7 @@
   let showSearch = $state(true);
   let notifCount = $state(0);
   let header = $state<Header>({ user: "", server: "", statusType: "", statusMsg: "", statusIcon: "", quotaUsed: 0, quotaTotal: 0, quotaPct: 0, unlimited: false });
-  let attention = $state<Attention>({ conflicts: 0, blocked: 0 });
+  let attention = $state<Attention>({ conflicts: 0, blocked: 0, locked: 0 });
   let pauseInfo = $state<{ paused: boolean; reason: string; until: string }>({ paused: false, reason: "", until: "" });
   let pauseMenu = $state(false);
   let editStatus = $state(false);
@@ -55,11 +55,18 @@
   let acctBusy = $state(false);
   const hostOf = (s: string) => { try { return new URL(s).host; } catch { return s; } };
   async function loadAccounts() { accounts = (await App.ListAccounts()) ?? []; }
+  // Errors render inline — a raw alert() in the flyout draws the browser's
+  // "wails.localhost says" dialog over the panel, which looks broken.
+  let acctError = $state("");
   async function switchAccount(id: string) {
     acctBusy = true;
     const err = await App.SwitchAccount(id);
     acctBusy = false;
-    if (err) { alert(err); return; }
+    if (err) {
+      acctError = err;
+      setTimeout(() => { acctError = ""; }, 8000);
+      return;
+    }
     await refresh();
   }
 
@@ -85,7 +92,7 @@
     if (a.length || !apps.length) apps = a; // don't blank a populated rail on a transient empty fetch
     const h = await App.Header();
     if (h.user || !header.user) header = h; // don't flap the identity to "logged out"
-    attention = await App.Attention();
+    attention = await fetchAttention();
     notifCount = await App.NotificationCount();
     showDock = await App.ShowAppDock();
     dockSide = await App.AppDockSide();
@@ -110,6 +117,11 @@
     while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
     return { n: n < 10 && i > 0 ? n.toFixed(1) : String(Math.round(n)), u: u[i] };
   }
+
+  // cast: the Go AttentionInfo carries `locked` (added without a bindings
+  // regen), so the generated type is a subset of our Attention at runtime.
+  const fetchAttention = async (): Promise<Attention> =>
+    (await App.Attention()) as unknown as Attention;
 
   let attentionTotal = $derived(attention.conflicts + attention.blocked);
   let attentionText = $derived(
@@ -152,8 +164,9 @@
   Events.On("searchbar", (e: any) => { showSearch = e.data; if (!showSearch) clearSearch(); });
   Events.On("appearance", async () => { appearance = await App.FlyoutAppearance(); });
   Events.On("notifications", async () => { notifCount = await App.NotificationCount(); });
-  Events.On("conflicts", async () => { attention = await App.Attention(); });
-  Events.On("blocked", async () => { attention = await App.Attention(); });
+  Events.On("conflicts", async () => { attention = await fetchAttention(); });
+  Events.On("blocked", async () => { attention = await fetchAttention(); });
+  Events.On("locks", async () => { attention = await fetchAttention(); });
 
   const presenceLabel = (s: string) =>
     s === "online" ? "Online" : s === "away" ? "Away" : s === "dnd" ? "Do not disturb"
@@ -213,9 +226,15 @@
   }
 
   let pinned = $derived(apps.filter(a => a.pinned));
+  // Status-text fragments meaning "the engine is working". KEEP IN STEP with
+  // busyStatusWords in service.go — the scan reports itself in stages
+  // ("Checking server…", "Comparing changes…"), none of which contain "sync" or
+  // "scan", so a new stage word must be added in BOTH places or the dot goes
+  // grey mid-scan.
+  const busy = /sync|scan|reading|checking|comparing|matching|moving/;
   let dotClass = $derived(
     paused ? "dot paused"
-    : /sync|scan/.test(status.toLowerCase()) ? "dot syncing"
+    : busy.test(status.toLowerCase()) ? "dot syncing"
     : "dot ok"
   );
 </script>
@@ -283,6 +302,10 @@
       </div>
     {/if}
 
+    {#if acctError}
+      <div class="accterror">{acctError}</div>
+    {/if}
+
     {#if header.user && editStatus}
       <div class="statusedit">
         <div class="types">
@@ -306,6 +329,16 @@
       <span class="warn">⚠</span>
       <span class="atext">{attentionText} need{attentionTotal === 1 ? "s" : ""} attention</span>
       <span class="go">Review →</span>
+    </button>
+  {/if}
+
+  <!-- Files someone else has open. Informational, NOT a fault, so it is a quiet
+       line of its own rather than part of the amber "needs attention" bar. -->
+  {#if attention.locked > 0}
+    <button class="inuse" onclick={() => App.OpenStatusTab("inuse")}>
+      <span class="iicon">🔒</span>
+      <span class="atext">{attention.locked} file{attention.locked === 1 ? "" : "s"} in use by someone else</span>
+      <span class="go">View →</span>
     </button>
   {/if}
 
@@ -350,7 +383,9 @@
   <div class="acthead">
     <div class="acttop">
       <h2>Recent activity</h2>
-      <div class="syncstat" title={progress.active && !paused ? progress.current : ""}>
+      <!-- The status text truncates hard in this narrow row, and the scan's live
+           count sits at the END of it — so expose the full string on hover. -->
+      <div class="syncstat" title={progress.active && !paused ? progress.current : status}>
         {#if progress.active && !paused}
           <span class="dot syncing"></span>
           {#if progress.enumerating}
@@ -543,6 +578,14 @@
   .alert .warn { font-size: 14px; }
   .alert .atext { flex: 1; font-weight: 500; }
   .alert .go { color: #8a6d1a; font-weight: 600; white-space: nowrap; }
+  /* Deliberately not amber: a locked file is information, not a problem. */
+  .inuse { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 16px; border: none;
+           border-bottom: 1px solid var(--border); background: var(--tint); color: var(--muted);
+           font-size: 12.5px; text-align: left; cursor: pointer; }
+  .inuse:hover { background: var(--border); }
+  .inuse .iicon { font-size: 13px; }
+  .inuse .atext { flex: 1; }
+  .inuse .go { font-weight: 600; white-space: nowrap; }
   .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
   .dot.ok { background: #2e7d32; } .dot.syncing { background: var(--accent); } .dot.paused { background: var(--muted); }
   .pausemenu { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
@@ -558,6 +601,8 @@
   .moremenu .acctmain { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .moremenu .accthost { color: var(--muted, #888); font-weight: 400; }
   .moremenu .acctstat { color: var(--muted, #888); font-size: 11px; white-space: nowrap; max-width: 40%; overflow: hidden; text-overflow: ellipsis; }
+  .accterror { margin-top: 8px; padding: 6px 10px; border: 1px solid #e6b8b2; border-radius: 6px;
+               color: #c0392b; font-size: 12px; }
   .search { padding: 8px 16px 4px; position: relative; }
   .searchbar { display: flex; align-items: center; gap: 7px; padding: 6px 9px; background: var(--panel-2);
                border: 1px solid var(--border-2); border-radius: 8px; }

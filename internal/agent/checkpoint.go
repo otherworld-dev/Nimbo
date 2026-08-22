@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/state"
 	"github.com/otherworld/nimbo/internal/transport"
@@ -16,7 +17,11 @@ import (
 // format read as misses and are overwritten by the next save — the state DB
 // has no column-migration mechanism, so this byte is how the blob can ever
 // evolve.
-const cpFormat = 1
+// Format history: v1 had no mtime — the adopt scan classifies against
+// LastModified, and v1 replay zeroed it, mislabelling every on-server file as
+// a conflict (a warm re-scan once offered 556k conflicted copies / 478 GB of
+// uploads; the confirm dialog caught it). v1 rows read as misses and refetch.
+const cpFormat = 2
 
 // cpEntry is the persisted mirror of the transport.Entry fields the remote
 // scan consumes. Deliberately NOT transport.Entry itself: explicit short JSON
@@ -32,9 +37,12 @@ type cpEntry struct {
 	Checksums   string `json:"c,omitempty"`
 	IsEncrypted bool   `json:"x,omitempty"`
 	Permissions string `json:"p,omitempty"`
+	// MTimeUnix is the server's Last-Modified (unix seconds; DAV serves
+	// second precision). Added in fmt v2 — see cpFormat.
+	MTimeUnix int64 `json:"m,omitempty"`
 }
 
-// encodeCPBlob serialises a directory's children as gzipped JSON (fmt=1).
+// encodeCPBlob serialises a directory's children as gzipped JSON (cpFormat).
 func encodeCPBlob(children []transport.Entry) ([]byte, error) {
 	rows := make([]cpEntry, 0, len(children))
 	for _, e := range children {
@@ -43,10 +51,15 @@ func encodeCPBlob(children []transport.Entry) ([]byte, error) {
 		if i := strings.LastIndex(p, "/"); i >= 0 {
 			name = p[i+1:]
 		}
+		var mt int64
+		if !e.LastModified.IsZero() {
+			mt = e.LastModified.Unix()
+		}
 		rows = append(rows, cpEntry{
 			Name: name, IsDir: e.IsDir, Size: e.Size, ETag: e.ETag,
 			FileID: e.FileID, Checksums: e.Checksums,
 			IsEncrypted: e.IsEncrypted, Permissions: e.Permissions,
+			MTimeUnix: mt,
 		})
 	}
 	var buf bytes.Buffer
@@ -61,7 +74,8 @@ func encodeCPBlob(children []transport.Entry) ([]byte, error) {
 }
 
 // decodeCPBlob reverses encodeCPBlob, re-prefixing each child's path with its
-// directory. LastModified/ContentType are zero — the scan never consumes them.
+// directory. ContentType is zero (nothing consumes it); LastModified is
+// restored at second precision (the adopt classifier depends on it).
 func decodeCPBlob(dir string, blob []byte) ([]transport.Entry, error) {
 	zr, err := gzip.NewReader(bytes.NewReader(blob))
 	if err != nil {
@@ -78,10 +92,15 @@ func decodeCPBlob(dir string, blob []byte) ([]transport.Entry, error) {
 		if dir != "" {
 			p = dir + "/" + r.Name
 		}
+		var mt time.Time
+		if r.MTimeUnix != 0 {
+			mt = time.Unix(r.MTimeUnix, 0).UTC()
+		}
 		out = append(out, transport.Entry{
 			Path: p, IsDir: r.IsDir, Size: r.Size, ETag: r.ETag,
 			FileID: r.FileID, Checksums: r.Checksums,
 			IsEncrypted: r.IsEncrypted, Permissions: r.Permissions,
+			LastModified: mt,
 		})
 	}
 	return out, nil

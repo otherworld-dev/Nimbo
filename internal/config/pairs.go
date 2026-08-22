@@ -89,12 +89,8 @@ func (d Dirs) SavePairs(pairs []SyncPair) error {
 	if err != nil {
 		return err
 	}
-	tmp := d.PairsFile() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("write pairs: %w", err)
-	}
-	if err := os.Rename(tmp, d.PairsFile()); err != nil {
-		return fmt.Errorf("commit pairs: %w", err)
+	if err := writeFileAtomic(d.PairsFile(), data, 0o600); err != nil {
+		return fmt.Errorf("save pairs: %w", err)
 	}
 	return nil
 }

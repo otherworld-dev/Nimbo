@@ -42,10 +42,13 @@ internal/cli        CLI command implementations
 ## Status
 
 **Feature-complete desktop client.** Auth, transport, the sync engine,
-bidirectional `sync`, live `watch` with conflict/rename handling, **real-time
-push + desktop notifications**, sharing, selective sync, bandwidth limits, and a
-**native tray GUI** with first-run sign-in, a tray menu, an activity/conflicts
-status window, and a Sync-settings window for choosing folders. Working today:
+bidirectional `sync` with a **damage guard** (a run that would delete or
+replace most of a folder pauses for review instead of applying — the
+ransomware/bad-restore failsafe), live `watch` with conflict/rename
+handling, **real-time push + desktop notifications**, sharing, selective sync,
+bandwidth limits, and a **native tray GUI** with first-run sign-in, a tray
+menu, an activity/conflicts status window, and a Sync-settings window for
+choosing folders. Working today:
 
 ```sh
 go build ./...

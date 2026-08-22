@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -273,10 +274,68 @@ func (e *Executor) runTransfers(ctx context.Context, transfers []engine.Action, 
 	wg.Wait()
 }
 
+// redundantDownload reports whether a planned download would fetch bytes the
+// local file already has, and returns the local content hash so the caller can
+// rebaseline without hashing twice.
+//
+// A server-side metadata change bumps the ETag without touching content — taking
+// or releasing a files_lock lock does exactly that, as do tags, comments and
+// favourites — and the diff sees only the ETag. Without this guard every peer
+// re-downloads the whole file twice per lock cycle.
+//
+// Deliberately conservative: no server checksum, a size mismatch, or any error
+// means "download it".
+func (e *Executor) redundantDownload(rel string) (string, bool) {
+	r, ok := e.Remote[rel]
+	if !ok || r.IsDir || r.SHA1 == "" {
+		return "", false
+	}
+	fi, err := os.Stat(e.localPath(rel))
+	if err != nil || fi.IsDir() || fi.Size() != r.Size {
+		return "", false
+	}
+	localSHA, err := sha1File(e.localPath(rel))
+	if err != nil || localSHA == "" {
+		return "", false
+	}
+	// A save landing during the hash would be absorbed into the baseline as
+	// "unchanged" and never uploaded — refuse the shortcut if the file moved.
+	if cur, serr := os.Stat(e.localPath(rel)); serr != nil ||
+		cur.Size() != fi.Size() || !cur.ModTime().Equal(fi.ModTime()) {
+		return "", false
+	}
+	return localSHA, strings.EqualFold(localSHA, r.SHA1)
+}
+
+// rebaselineUnchanged records the server's new ETag against unchanged local
+// content, so a metadata-only change stops looking like a pending download. It
+// makes no network call: the ETag and file id come from the listing that
+// produced this plan, and the hash was computed by redundantDownload.
+func (e *Executor) rebaselineUnchanged(rel, localSHA string) error {
+	fi, err := os.Stat(e.localPath(rel))
+	if err != nil {
+		return err
+	}
+	r := e.Remote[rel]
+	return e.saveFileBaseline(rel, FileResult{
+		ETag: r.ETag, FileID: r.FileID,
+		Size: fi.Size(), MTimeNanos: fi.ModTime().UnixNano(),
+		ContentSHA1: localSHA,
+	})
+}
+
 // applyTransfer performs a single download or upload and records the baseline.
 func (e *Executor) applyTransfer(ctx context.Context, a engine.Action) error {
 	remote := e.remotePath(a.Path)
 	local := e.localPath(a.Path)
+
+	// A download whose bytes we already hold is pure waste — see redundantDownload.
+	if a.Kind == engine.ActDownload {
+		if localSHA, redundant := e.redundantDownload(a.Path); redundant {
+			slog.Info("download skipped (metadata-only change, content identical)", "path", a.Path)
+			return e.rebaselineUnchanged(a.Path, localSHA)
+		}
+	}
 
 	// Retry transient failures with backoff. Resume (range download / chunk
 	// upload) makes retries cheap; context cancellation stops immediately.
@@ -299,7 +358,11 @@ func (e *Executor) applyTransfer(ctx context.Context, a engine.Action) error {
 		} else {
 			res, err = UploadProgress(ctx, e.Client, local, remote, prog)
 		}
-		if err == nil || ctx.Err() != nil {
+		// A lock is not a transient failure — somebody else has the file and will
+		// have it for as long as they have it. Retrying just delays the message.
+		// The same goes for every other deliberate refusal (quota, forbidden,
+		// auth): re-hashing a huge file two more times won't change the answer.
+		if err == nil || ctx.Err() != nil || transport.IsLocked(err) || !transport.Retryable(err) {
 			break
 		}
 	}
@@ -322,16 +385,26 @@ func (e *Executor) applyTransfer(ctx context.Context, a engine.Action) error {
 	if a.Kind == engine.ActDownload {
 		_ = setReadOnly(local, e.Remote[a.Path].ReadOnly) // mirror server read-only
 	}
-	return e.saveFileBaseline(a.Path, res)
+	if err := e.saveFileBaseline(a.Path, res); err != nil {
+		return err
+	}
+	return nil
 }
 
 // applyDelete removes a path on the side that no longer should have it and drops
 // its baseline row.
 func (e *Executor) applyDelete(ctx context.Context, a engine.Action) error {
 	if a.Kind == engine.ActDeleteLocal {
-		clearReadOnlyTree(e.localPath(a.Path)) // mirrored read-only files block RemoveAll on Windows
-		if err := os.RemoveAll(e.localPath(a.Path)); err != nil {
-			return err
+		clearReadOnlyTree(e.localPath(a.Path)) // mirrored read-only files block deletion on Windows
+		// Recycle Bin first: a deletion mirrored FROM the server is the one
+		// this PC never chose, so it keeps an undo. Below the damage guard's
+		// thresholds this is the only safety net a server-side deletion has.
+		// Falls back to a plain delete where no bin exists (non-Windows, or a
+		// path the shell refuses).
+		if err := recycle(e.localPath(a.Path)); err != nil {
+			if err := os.RemoveAll(e.localPath(a.Path)); err != nil {
+				return err
+			}
 		}
 	} else {
 		if err := e.Client.Delete(ctx, e.remotePath(a.Path)); err != nil {
@@ -420,8 +493,12 @@ func (e *Executor) deleteBaseline(rel string) error {
 	return e.State.DeleteBaseline(e.PairKey, rel)
 }
 
-func sortByPathAsc(a []engine.Action)  { sort.Slice(a, func(i, j int) bool { return a[i].Path < a[j].Path }) }
-func sortByPathDesc(a []engine.Action) { sort.Slice(a, func(i, j int) bool { return a[i].Path > a[j].Path }) }
+func sortByPathAsc(a []engine.Action) {
+	sort.Slice(a, func(i, j int) bool { return a[i].Path < a[j].Path })
+}
+func sortByPathDesc(a []engine.Action) {
+	sort.Slice(a, func(i, j int) bool { return a[i].Path > a[j].Path })
+}
 
 // sleepBackoff waits an exponential delay for the given (1-based) retry attempt,
 // or returns early if the context is cancelled.

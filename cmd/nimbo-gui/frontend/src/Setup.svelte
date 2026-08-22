@@ -39,12 +39,62 @@
     }
   }
 
+  // Adopt confirmation: choosing virtual files over a folder that already
+  // holds files returns a scan summary (JSON) instead of switching straight
+  // away — the user confirms before anything in the folder is touched. The
+  // scan crawls the whole account (minutes on a big one), so it gets a
+  // blocking overlay with a live folder count and a Cancel.
+  let adopt = $state<any>(null);
+  let scanning = $state(false);
+  let scanDirs = $state(0);
+  let scanCancelled = false;
+  let scanPoll: ReturnType<typeof setInterval> | null = null;
+
   async function connect() {
     busy = true; err = "";
+    if (mode === "ondemand") {
+      scanning = true; scanCancelled = false; scanDirs = 0;
+      scanPoll = setInterval(async () => {
+        const d: any = await App.Diagnostics();
+        scanDirs = d?.adoptScanDirs || 0;
+      }, 1500);
+    }
     const msg = await App.CompleteSetup(localDir, mode);
-    if (msg) { err = msg; busy = false; return; }
+    if (scanPoll) { clearInterval(scanPoll); scanPoll = null; }
+    scanning = false;
+    busy = false;
+    if (scanCancelled) { scanCancelled = false; return; }
+    if (msg) {
+      if (mode === "ondemand" && msg.startsWith("{")) {
+        try {
+          const sum = JSON.parse(msg);
+          if (sum.error) { err = sum.error; return; }
+          adopt = sum; return;
+        } catch {}
+      }
+      err = msg; return;
+    }
     if (mode === "choose") await App.OpenSettings();
     done();
+  }
+
+  async function cancelScan() {
+    scanCancelled = true;
+    scanning = false;
+    await App.SetSyncMode("ondemand-cancel"); // aborts the crawl in Go
+  }
+
+  async function confirmAdopt() {
+    adopt = null; busy = true;
+    const msg = await App.SetSyncMode("ondemand-adopt");
+    busy = false;
+    if (msg) { err = msg; return; }
+    done();
+  }
+
+  async function cancelAdopt() {
+    adopt = null;
+    await App.SetSyncMode("ondemand-cancel"); // drop the held plan; nothing was changed
   }
 
   function skip() { done(); }
@@ -83,13 +133,11 @@
 
       <label class="opt" class:sel={mode === "ondemand"} class:off={!info.onDemandSupport}>
         <input type="radio" bind:group={mode} value="ondemand" disabled={busy || !info.onDemandSupport} />
-        <span>Use virtual files instead of downloading content immediately
-          <em class="exp">experimental</em>
-        </span>
+        <span>Use virtual files instead of downloading content immediately</span>
       </label>
       {#if mode === "ondemand"}
         <p class="note">Files appear instantly but download only when you open them.
-          Changes you make aren't uploaded back yet.</p>
+          Anything you add or change syncs back to your server as usual.</p>
       {/if}
     </div>
 
@@ -101,6 +149,39 @@
         {busy ? "Setting up…" : "Connect"}
       </button>
     </div>
+
+    {#if scanning}
+      <div class="modalback">
+        <div class="modalbox">
+          <div class="mhead">Checking your files…</div>
+          <p class="sub left">Nimbo is comparing everything in this folder with your server before setting up. On a large account this can take several minutes. Nothing is changed until you confirm.</p>
+          <p class="sub left"><b>{scanDirs}</b> folders checked so far</p>
+          <div class="actions">
+            <button class="ghost" onclick={cancelScan}>Cancel</button>
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    {#if adopt}
+      <div class="modalback">
+        <div class="modalbox">
+          <div class="mhead">Keep the files already in this folder?</div>
+          <p class="sub left">There are already files in <b>{localDir}</b>. Nimbo can keep them where they are instead of downloading everything again.</p>
+          <ul class="sub mlist">
+            {#if adopt.keep}<li><b>{adopt.keep}</b> already match your server — kept on this PC.</li>{/if}
+            {#if adopt.replace}<li><b>{adopt.replace}</b> are online-only leftovers from another app — replaced with Nimbo placeholders.</li>{/if}
+            {#if adopt.upload}<li><b>{adopt.upload}</b> aren’t on your server yet — uploaded.</li>{/if}
+            {#if adopt.conflict}<li><b>{adopt.conflict}</b> differ from your server — both versions kept.</li>{/if}
+          </ul>
+          {#if adopt.uploadBytes}<p class="sub left">Upload size: {fmt(adopt.uploadBytes)}</p>{/if}
+          <div class="actions">
+            <button class="ghost" onclick={cancelAdopt}>Cancel</button>
+            <button class="primary" onclick={confirmAdopt}>Keep my files</button>
+          </div>
+        </div>
+      </div>
+    {/if}
   {:else}
     <p class="loading">Loading account…</p>
   {/if}
@@ -137,4 +218,12 @@
   button.ghost { border: 1px solid var(--border-2); background: transparent; color: var(--fg); }
   button.ghost:hover { background: var(--hover); }
   button:disabled { opacity: 0.6; cursor: default; }
+  .modalback { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45);
+               display: flex; align-items: center; justify-content: center; z-index: 10; }
+  .modalbox { background: var(--bg); border: 1px solid var(--border-2); border-radius: 10px;
+              padding: 18px; max-width: 420px; display: flex; flex-direction: column; gap: 10px; }
+  .mhead { font-weight: 600; font-size: 14px; }
+  .mlist { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+  .left { text-align: left; }
+  .modalbox .actions { margin-top: 4px; }
 </style>

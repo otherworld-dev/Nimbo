@@ -75,3 +75,27 @@ func (s *etagStore) setMany(pairs map[string]string) {
 	s.mu.Unlock()
 	_ = os.WriteFile(s.path, b, 0o644)
 }
+
+// knownDir reports whether remote is a directory the server is known to have:
+// either it has a recorded baseline itself, or some recorded baseline lives
+// beneath it. Used by the state heal to decide a plain local directory inside a
+// mount is server content that is safe to convert back into a cloud
+// placeholder, without a network round trip.
+func (s *etagStore) knownDir(remote string) bool {
+	key := etagKey(remote)
+	if key == "" {
+		return false
+	}
+	prefix := key + "/"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.m[key]; ok {
+		return true
+	}
+	for k := range s.m {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}

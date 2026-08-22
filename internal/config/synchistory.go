@@ -42,7 +42,15 @@ func (d Dirs) LoadSyncHistory() (map[string]bool, error) {
 
 // MarkPairSynced records that a pair completed its initial clone. Idempotent;
 // atomically rewrites the file (tmp + rename, like SavePairs).
+//
+// The engine calls this once per pair, so several can land at once: the whole
+// read-modify-write is serialised, or a marker written concurrently with another
+// would be overwritten by the stale set the other one had read.
 func (d Dirs) MarkPairSynced(pairKey string) error {
+	mu := fileMutex(d.SyncHistoryFile())
+	mu.Lock()
+	defer mu.Unlock()
+
 	hist, err := d.LoadSyncHistory()
 	if err != nil {
 		// Unreadable/corrupt history: rebuild rather than wedge the tripwire
@@ -62,12 +70,8 @@ func (d Dirs) MarkPairSynced(pairKey string) error {
 	if err != nil {
 		return err
 	}
-	tmp := d.SyncHistoryFile() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("write sync history: %w", err)
-	}
-	if err := os.Rename(tmp, d.SyncHistoryFile()); err != nil {
-		return fmt.Errorf("commit sync history: %w", err)
+	if err := writeFileLocked(d.SyncHistoryFile(), data, 0o600); err != nil {
+		return fmt.Errorf("save sync history: %w", err)
 	}
 	return nil
 }

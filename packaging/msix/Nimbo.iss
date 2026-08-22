@@ -43,6 +43,13 @@ Source: "NimboDev.cer";     DestDir: "{tmp}"; Flags: deleteafterinstall
 #endif
 Source: "setup-steps.ps1";  DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "launch-nimbo.ps1"; DestDir: "{tmp}"; Flags: deleteafterinstall
+; Explorer overlay badges: the icon-overlay DLL cannot be loaded from inside the
+; MSIX (Windows refuses to map WindowsApps DLLs into identity-less processes and
+; the overlay list is HKLM-only), so Setup - the one elevated moment every
+; direct-download install already has - places a copy in Program Files and
+; registers it classically, exactly as OneDrive's installer does.
+Source: "stage\NCOverlays.dll"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "stage\icons\*.ico";    DestDir: "{tmp}\icons"; Flags: deleteafterinstall
 
 [Run]
 ; Offer to launch Nimbo after install.
@@ -63,7 +70,9 @@ begin
         #ifndef NoDevCert
         ' -Cer "'  + ExpandConstant('{tmp}\NimboDev.cer') + '"' +
         #endif
-        ' -Msix "' + ExpandConstant('{tmp}\Nimbo.msix') + '"',
+        ' -Msix "' + ExpandConstant('{tmp}\Nimbo.msix') + '"' +
+        ' -OverlayDll "' + ExpandConstant('{tmp}\NCOverlays.dll') + '"' +
+        ' -OverlayIcons "' + ExpandConstant('{tmp}\icons') + '"',
         '', SW_HIDE, ewWaitUntilTerminated, rc) then
       rc := -1;
     if rc <> 0 then

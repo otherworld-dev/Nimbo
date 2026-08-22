@@ -6,8 +6,14 @@ package cfapi
 
 import (
 	"errors"
+	"os"
 	"time"
 )
+
+// IsDehydrated always reports false outside Windows: the placeholder attributes
+// it looks for are a Windows filesystem concept, and no supported non-Windows
+// provider leaves hollow files behind for a sync to trip over.
+func IsDehydrated(os.FileInfo) bool { return false }
 
 // PlaceholderInfo mirrors the Windows type so cross-platform code referencing it
 // (e.g. the vfs stub) compiles.
@@ -57,5 +63,29 @@ func PinStateOf(string) string { return "" }
 // Dehydrate is unavailable off Windows.
 func Dehydrate(string) error { return errors.New("on-demand files are Windows-only") }
 
+// RevertPlaceholder is unavailable off Windows.
+func RevertPlaceholder(string) error { return errors.New("on-demand files are Windows-only") }
+
 // UnregisterLegacyShellSyncRoot is a no-op on non-Windows platforms.
 func UnregisterLegacyShellSyncRoot() {}
+
+// RegisterStatusRoot is unavailable off Windows (Supported() gates all callers).
+func RegisterStatusRoot(string) error { return errors.New("cloud sync roots are Windows-only") }
+
+// ShellSyncRootRegistered is always false off Windows: there is no Explorer.
+func ShellSyncRootRegistered(string) bool { return false }
+
+// IsPlaceholder is always false off Windows.
+func IsPlaceholder(string) (bool, error) { return false, nil }
+
+// Disconnect is a no-op off Windows.
+func Disconnect(string, int64) {}
+
+// ShellNotifyUpdated is Windows-only (Explorer glyph refresh); no-op elsewhere.
+func ShellNotifyUpdated(string) {}
+
+// ExcludeFromSync is Windows-only (cloud-filter pin state); no-op elsewhere.
+func ExcludeFromSync(string) error { return nil }
+
+// ExposePlaceholders is Windows-only; no-op elsewhere.
+func ExposePlaceholders() {}

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -28,14 +29,14 @@ import (
 	"github.com/otherworld/nimbo/internal/activity"
 	"github.com/otherworld/nimbo/internal/agent"
 	"github.com/otherworld/nimbo/internal/applog"
-	"github.com/otherworld/nimbo/internal/cfapi"
 	"github.com/otherworld/nimbo/internal/autostart"
 	"github.com/otherworld/nimbo/internal/brand"
+	"github.com/otherworld/nimbo/internal/cfapi"
 	"github.com/otherworld/nimbo/internal/config"
 	"github.com/otherworld/nimbo/internal/license"
 	"github.com/otherworld/nimbo/internal/notify"
-	"github.com/otherworld/nimbo/internal/policy"
 	"github.com/otherworld/nimbo/internal/overlay"
+	"github.com/otherworld/nimbo/internal/policy"
 	"github.com/otherworld/nimbo/internal/shellmenu"
 	"github.com/otherworld/nimbo/internal/shellns"
 	"github.com/otherworld/nimbo/internal/transfer"
@@ -47,16 +48,16 @@ import (
 // App is the Wails-bound service: its exported methods are callable from the
 // frontend, and it forwards engine changes to the UI as events.
 type App struct {
-	app         *application.App
-	ctx         context.Context
-	eng         *agent.Engine
-	status      string
-	statusWin   *application.WebviewWindow
-	statusTab   string // tab the status window should open on ("" = default)
-	settingsWin *application.WebviewWindow
-	loginWin    *application.WebviewWindow
-	loginMu     sync.Mutex         // guards loginCancel
-	loginCancel context.CancelFunc // cancels the in-flight login-flow poll (nil when none)
+	app             *application.App
+	ctx             context.Context
+	eng             *agent.Engine
+	status          string
+	statusWin       *application.WebviewWindow
+	statusTab       string // tab the status window should open on ("" = default)
+	settingsWin     *application.WebviewWindow
+	loginWin        *application.WebviewWindow
+	loginMu         sync.Mutex         // guards loginCancel
+	loginCancel     context.CancelFunc // cancels the in-flight login-flow poll (nil when none)
 	shareWin        *application.WebviewWindow
 	sharePath       string
 	pendingShare    string // local path to share once the engine is ready
@@ -65,22 +66,46 @@ type App struct {
 	pendingVersions string // local path to show versions for once the engine is ready
 	tray            *application.SystemTray
 	flyout          *application.WebviewWindow // the tray flyout panel (for live resize)
-	engCancel    context.CancelFunc // stops the running engine (sign-out)
-	logsWin      *application.WebviewWindow
-	appWinsMu    sync.Mutex                             // guards appWins + appOpening (accessed from binding, event and main goroutines)
-	appWins      map[string]*application.WebviewWindow // Nextcloud-app windows by app id
-	appOpening   map[string]bool                        // opens in flight (coalesces double-clicks during the slow app-list fetch)
-	pendingApp   string                                 // app id to open once the engine is ready (--app launch)
-	appsCacheMu  sync.Mutex
-	appsCache    []transport.App // last-fetched navigation apps (flyout refreshes keep it warm)
-	appsCacheAt  time.Time
-	onDemandMounts map[string]*odMount // local dir -> active mount
-	pendingKeep  string // on-demand path to pin once mounts are ready
-	pendingFree  string // on-demand path to free up once mounts are ready
-	vfsToastMu   sync.Mutex
-	lastVfsToast time.Time // rate-limits on-demand error toasts
-	etags        *etagStore // last-synced server ETag per remote path (conflict baseline)
-	fileids      *etagStore // remote path -> oc:fileid, for down-sync rename detection
+	engCancel       context.CancelFunc         // stops the running engine (sign-out)
+	logsWin         *application.WebviewWindow
+	appWinsMu       sync.Mutex                            // guards appWins + appOpening (accessed from binding, event and main goroutines)
+	appWins         map[string]*application.WebviewWindow // Nextcloud-app windows by app id
+	appOpening      map[string]bool                       // opens in flight (coalesces double-clicks during the slow app-list fetch)
+	pendingApp      string                                // app id to open once the engine is ready (--app launch)
+	startRetrying   atomic.Bool                           // one engine-start retry loop at a time
+	overlayServe    sync.Once                             // the status pipe is process-global; serve it once
+	appsCacheMu     sync.Mutex
+	appsCache       []transport.App // last-fetched navigation apps (flyout refreshes keep it warm)
+	appsCacheAt     time.Time
+	onDemandMounts  map[string]*odMount // local dir -> active mount
+	pendingKeep     string              // on-demand path to pin once mounts are ready
+	pendingFree     string              // on-demand path to free up once mounts are ready
+	// pendingAdopt holds the plan from the last "ondemand-scan" so the confirmed
+	// "ondemand-adopt" acts on exactly what the user was shown. preMountAdopt is
+	// the confirmed plan staged for mountOnDemandWith, which runs its Apply
+	// between registering the sync root and starting the write-back watcher —
+	// the watcher must never see adopt's local mutations as user actions.
+	pendingAdopt  *adoptPending
+	preMountAdopt *adoptPending
+	// adoptScanDirs is the live directory count of an in-flight adopt scan
+	// (0 = none), surfaced via Diagnostics so the scanning overlay has a moving
+	// number. adoptScanCancel aborts that scan; guarded by adoptScanMu because
+	// the cancel arrives on a different Wails call than the scan holding it.
+	adoptScanDirs   atomic.Int64
+	adoptScanMu     sync.Mutex
+	adoptScanCancel context.CancelFunc
+	// adoptConvertDone/Total drive the conversion progress overlay (files
+	// marked so far / plan size; total 0 = no conversion running).
+	adoptConvertDone  atomic.Int64
+	adoptConvertTotal atomic.Int64
+	// revertDone/Total drive the leave-VFS overlay the same way.
+	revertDone    atomic.Int64
+	revertTotal   atomic.Int64
+	pendingRevert *revertPending
+	vfsToastMu    sync.Mutex
+	lastVfsToast  time.Time  // rate-limits on-demand error toasts
+	etags         *etagStore // last-synced server ETag per remote path (conflict baseline)
+	fileids       *etagStore // remote path -> oc:fileid, for down-sync rename detection
 
 	// Side-by-side accounts: a.eng is the PRIMARY (default) account the UI
 	// shows; every other configured account runs a secondary engine that syncs
@@ -91,8 +116,8 @@ type App struct {
 	acctStatus  map[string]string // account ID -> latest engine status line
 
 	licMu sync.Mutex
-	lic   license.Info   // current business-licence state (gates business-tier features)
-	pol   policy.Policy  // admin policy — applied ONLY when business-licensed
+	lic   license.Info  // current business-licence state (gates business-tier features)
+	pol   policy.Policy // admin policy — applied ONLY when business-licensed
 }
 
 // secondaryEngine is a background sync engine for a non-primary account.
@@ -107,6 +132,12 @@ type odMount struct {
 	remoteRoot string
 	watcher    *vfs.Watcher
 	accountID  string // owning account (mounts are torn down with their engine)
+	// convertCancel aborts an in-flight background adopt conversion (set only
+	// while one runs). Unmounting cancels it so a mode switch mid-convert stops
+	// the marking cleanly — converted files stay converted, the rest stay plain.
+	convertCancel context.CancelFunc
+	// healCancel stops the periodic state heal (vfsheal.go) when the mount goes.
+	healCancel context.CancelFunc
 }
 
 // start brings up the sync engine (if an account is configured) and wires its
@@ -116,6 +147,25 @@ func (a *App) start(ctx context.Context) {
 	eng, err := agent.NewEngine(ctx)
 	if err != nil {
 		slog.Warn("engine not started", "err", err)
+		// A configured account whose engine could not start is almost always a
+		// server that is briefly unreachable (boot races, outages) — that must
+		// NOT read as "Not signed in" and silently strand the app engine-less
+		// until a manual relaunch (bit the VM on 2026-08-21, twice). Say what is
+		// actually happening and keep retrying.
+		//
+		// EXCEPT a missing app password: the account exists but its secret is
+		// gone from the keychain (store wiped, profile trouble). No amount of
+		// retrying brings a credential back — that spun "trying to connect"
+		// forever on the VM. It is the auth-lost case: ask for a sign-in.
+		if a.hasConfiguredAccount() {
+			if errors.Is(err, account.ErrNoSecret) {
+				a.onAuthLost()
+				return
+			}
+			a.setStatus("Can't reach your server — retrying")
+			a.scheduleStartRetry(ctx)
+			return
+		}
 		a.setStatus("Not signed in")
 		if a.pendingApp != "" { // a Start-menu app shortcut launched us — say why nothing opened
 			notify.Toast(brand.Current.Name, "Sign in first — then "+a.pendingApp+" can open in its own window.", "")
@@ -143,9 +193,22 @@ func (a *App) start(ctx context.Context) {
 
 	// Serve per-file sync status to the Explorer overlay shell extension, and let
 	// the engine poke Explorer to refresh an icon when a file's state changes.
-	if _, err := overlay.Serve(a.ctx, eng.FileStatus); err != nil {
-		slog.Warn("overlay status server not started", "err", err)
-	}
+	//
+	// Serve ONCE per process: the pipe name is process-global, so serving per
+	// engine start meant every restart (mode switches!) failed with "Access is
+	// denied" while the pipe stayed bound to the FIRST engine's closure —
+	// stale pairs, stale answers (2026-08-21). The closure reads the CURRENT
+	// engine at query time instead.
+	a.overlayServe.Do(func() {
+		if _, err := overlay.Serve(a.ctx, func(p string) string {
+			if e := a.eng; e != nil {
+				return e.FileStatus(p)
+			}
+			return "none"
+		}); err != nil {
+			slog.Warn("overlay status server not started", "err", err)
+		}
+	})
 	eng.SetOverlayRefresh(overlay.NotifyChange)
 
 	// Live sync-progress → frontend, and animate the tray icon by state.
@@ -181,19 +244,13 @@ func (a *App) start(ctx context.Context) {
 
 	a.healBaseDir() // repair a stored baseDir that drifted from the account root
 
-	// Keep the Explorer sidebar entry's target/icon current if it's enabled.
-	if shellns.Enabled() {
-		if icon, err := navIconPath(); err == nil {
-			_ = shellns.Register(brand.Current.Name, a.GetBaseDir(), icon)
-		}
-	}
-
 	// Forward engine change-notifications to the frontend; each goroutine exits
 	// when the engine is stopped (sign-out), so they don't leak across sessions.
 	forwardEvents(runCtx, eng.Recorder().Subscribe(), func() { a.emit("activity") })
 	forwardEvents(runCtx, eng.Notifier().Subscribe(), func() { a.emit("notifications") })
 	forwardEvents(runCtx, eng.SubscribeConflicts(), func() { a.emit("conflicts") })
 	forwardEvents(runCtx, eng.SubscribeBlocked(), func() { a.emit("blocked") })
+	forwardEvents(runCtx, eng.SubscribeLocked(), func() { a.emit("locks") })
 
 	go a.updateCheckLoop(runCtx) // periodic background "update available" toast
 
@@ -205,7 +262,15 @@ func (a *App) start(ctx context.Context) {
 		a.mountAccountOnDemand() // mount the account folder (BaseDir) as virtual files
 	} else {
 		pairs, _ = eng.Pairs()
+		a.cleanupStatusRoots() // live pairs carry badges, never a sync root
 	}
+
+	// AFTER the mount and cleanupStatusRoots above, both of which affect the
+	// folder as a cloud sync root. Run earlier and syncSidebar sees no sync root,
+	// adds an entry of its own, and the registration a few lines later puts a
+	// second one beside it — which is exactly the duplicate that survived two
+	// attempts to fix it further down the call.
+	a.syncSidebar()
 	go func() {
 		_ = eng.Run(runCtx, toAgentPairs(pairs), func(agent.Pair, transfer.Stats) {})
 	}()
@@ -359,10 +424,39 @@ func (a *App) unmountAccount(accountID string) {
 		if m.watcher != nil {
 			m.watcher.Close()
 		}
-		cfapi.Unmount(dir, m.connKey)
+		if m.healCancel != nil {
+			m.healCancel()
+		}
+		// Disconnect, never Unmount: this path runs on transient auth loss, and
+		// CfUnregisterSyncRoot's documented sweep strips the cloud state from
+		// the whole tree (the #580 flattener). The registration stays; a
+		// re-auth remounts over it (UPDATE flag).
+		cfapi.Disconnect(dir, m.connKey)
 		delete(a.onDemandMounts, dir)
 		slog.Info("on-demand mount disconnected", "dir", dir, "account", accountID)
 	}
+	a.refreshOverlayRoots()
+}
+
+// refreshOverlayRoots tells the engine which folders the Explorer shell
+// extension should get a real status for. On-demand mode has no sync pairs —
+// entering it clears them so the watcher cannot fight the Cloud Files provider —
+// and FileStatus keys off pairs, so without this every file in a virtual-files
+// folder is reported as "none" and never gets a status icon.
+//
+// Every mount is registered against the PRIMARY engine, which is the one
+// serving the overlay pipe. For a secondary account's mount that means the
+// in-flight/blocked detail comes from the wrong engine, so a file mid-transfer
+// may show as in-sync; the alternative is no icon at all on those folders.
+func (a *App) refreshOverlayRoots() {
+	if a.eng == nil {
+		return
+	}
+	dirs := make([]string, 0, len(a.onDemandMounts))
+	for dir := range a.onDemandMounts {
+		dirs = append(dirs, dir)
+	}
+	a.eng.SetOverlayRoots(dirs)
 }
 
 // stopSecondary stops one background account engine and its on-demand mounts.
@@ -566,10 +660,9 @@ func (a *App) BetaUpdates() bool { return betaUpdates() }
 // older version, so the build stands until a release overtakes it.
 func (a *App) SetBetaUpdates(on bool) {
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.BetaUpdates = on
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 }
 
@@ -690,25 +783,221 @@ func (a *App) GetSyncMode() string {
 // overlapping pair would fight the placeholder watcher) and mounts the account
 // folder. Switching back to live unmounts it. Local files are left in place.
 func (a *App) SetSyncMode(mode string) string {
+	// Backup mode is per FOLDER, so its sub-commands carry the local directory
+	// after the colon. Each needs its own explicit prefix case: an unmatched
+	// string falls through and is persisted as Settings.SyncMode, which unmounts
+	// every on-demand root and restarts the stack under a mode that does not
+	// HasPrefix cases can't sit in the switch below (it switches on the whole
+	// value), so this is a separate, equally explicit switch — an unmatched
+	// string would otherwise fall through and be persisted as the sync mode.
+	//
+	// Matched BEFORE the file-availability policy check because resuming a
+	// paused folder is not a file-availability mode and that policy has no
+	// business gating it: an admin who pins the fleet to "live" must not make a
+	// frozen folder impossible to resume.
+	switch {
+	case strings.HasPrefix(mode, "guard-resume:"):
+		return a.resumeFrozen(strings.TrimPrefix(mode, "guard-resume:"))
+	}
 	if a.policyNow().SyncMode != "" {
 		return "File availability is managed by your organisation."
 	}
-	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
-			s.SyncMode = mode
-			_ = d.SaveSettings(s)
+	// Adopt sub-modes ride on this method's existing string argument rather than
+	// adding App methods, because regenerating the Wails bindings has broken a
+	// release before (0.1.0.97). They are NOT persisted as a sync mode.
+	switch mode {
+	case "ondemand-scan":
+		return a.scanAdopt()
+	case "ondemand-adopt":
+		return a.adoptAndSwitch()
+	case "ondemand-fresh":
+		// Switch to virtual files WITHOUT keeping the local copies: baselines
+		// wiped first, folder cleared, mount starts empty. The UI confirms the
+		// deletion (with local-only counts) before sending this.
+		return a.freshOndemand()
+	case "live-fresh":
+		// Switch to live files WITHOUT converting: folder cleared, everything
+		// re-downloads. UI-confirmed like ondemand-fresh.
+		return a.freshLive()
+	case "live-scan":
+		return a.scanRevert()
+	case "live-revert":
+		return a.revertAndSwitch()
+	case "revert-cancel":
+		for _, m := range a.onDemandMounts {
+			if m.convertCancel != nil {
+				m.convertCancel()
+			}
 		}
+		return ""
+	case "ondemand-cancel":
+		// Drops a held plan AND aborts an in-flight scan (the scanning overlay's
+		// Cancel) — the crawl stops server-side rather than burning PROPFINDs
+		// for a result nobody will read.
+		a.pendingAdopt = nil
+		a.adoptScanMu.Lock()
+		if a.adoptScanCancel != nil {
+			a.adoptScanCancel()
+		}
+		a.adoptScanMu.Unlock()
+		return ""
+	case "badges-enable":
+		// One UAC consent registers the Explorer corner badges — the piece an
+		// MSIX cannot self-register (see badges.go). Offered in live mode when
+		// the current badge generation is missing; the Store channel has no
+		// other way to get badges at all.
+		return a.enableBadges()
+	case "lockout-enable", "lockout-disable":
+		if d, err := config.Resolve(); err == nil {
+			if set, e := d.LoadSettings(); e == nil {
+				set.FileLockout = mode == "lockout-enable"
+				_ = d.SaveSettings(set)
+			}
+		}
+		return ""
+	case "lock-enable", "lock-disable":
+		if d, err := config.Resolve(); err == nil {
+			_ = d.UpdateSettings(func(set *config.Settings) {
+				set.FileLocking = mode == "lock-enable"
+			})
+		}
+		// Turning it OFF must drop what we already hold, or those locks would sit
+		// on the server with nothing left to release them.
+		if mode == "lock-disable" {
+			return a.releaseAllLocks()
+		}
+		return ""
+	case "lock-release-all":
+		// The escape hatch for locks Nimbo holds. It rides here rather than
+		// becoming an App method for the same bindings reason as the adopt
+		// sub-modes, and this method returns a string so a failure can reach the
+		// user instead of vanishing.
+		return a.releaseAllLocks()
+	}
+	var prevMode string
+	if d, err := config.Resolve(); err == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
+			prevMode = s.SyncMode
+			s.SyncMode = mode
+		})
 	}
 	// The mode shapes every account's engine setup (live pairs vs virtual
 	// roots), so restart the stack under the new mode: start() mounts the
 	// primary and startSecondaries() handles the background accounts.
+	//
+	// Every step logs before it runs: this sequence once hung permanently on a
+	// live install with the log silent, leaving nothing to diagnose from. The
+	// last breadcrumb printed names the step that never returned.
+	slog.Info("sync mode switch: unmounting on-demand roots", "to", mode)
 	a.unmountAllOnDemand()
+	slog.Info("sync mode switch: stopping engine")
 	a.stopEngine()
+	slog.Info("sync mode switch: restarting stack")
 	a.start(a.ctx)
+	slog.Info("sync mode switch: stack restarted")
 	if a.eng == nil {
 		return "couldn't restart syncing — check the logs"
 	}
+	// A failed account mount must not read as success: without this check the
+	// switch reports OK while nothing is virtual — and an adopt would run
+	// against an unmounted folder. The most common cause is another sync
+	// provider still owning the folder (Windows allows one per folder).
+	if mode == "ondemand" {
+		if !cfapi.Supported() {
+			return "Virtual files aren't supported on this system."
+		}
+		if _, ok := a.onDemandMounts[a.GetBaseDir()]; !ok {
+			return "Couldn't take over the folder for virtual files. If another sync app (like the official Nextcloud client or OneDrive) is still syncing this folder, sign out of it or uninstall it first, then switch again."
+		}
+	}
+	if mode == "live" {
+		a.maybeOfferBadges()
+		// Restore the pairs the on-demand switch cleared: a mode round-trip
+		// must hand the user back their folder setup. Takeover re-adopts the
+		// (now plain) files against the surviving baseline — no re-download.
+		if d, err := config.Resolve(); err == nil {
+			// Take and clear in one locked step, so the pairs can't be restored
+			// twice or dropped by a settings write landing in between.
+			var remembered []config.SyncPair
+			_ = d.UpdateSettings(func(s *config.Settings) {
+				remembered, s.RememberedPairs = s.RememberedPairs, nil
+			})
+			for _, p := range remembered {
+				if msg := a.AddSyncPair(p.LocalDir, p.RemoteRoot); msg != "" {
+					slog.Warn("could not restore sync pair after leaving virtual files",
+						"local", p.LocalDir, "err", msg)
+				} else {
+					slog.Info("restored sync pair after leaving virtual files", "local", p.LocalDir)
+				}
+			}
+		}
+	}
+	// A registered (or just-unregistered) sync root only reaches Explorer at
+	// process start — verified live 2026-08-22: a fresh window in the old
+	// Explorer process never gains the Status column; a fresh process shows it
+	// fully populated. Offer a restart whenever this switch changed the
+	// registration; gated on the PREVIOUS mode so a first-run "live" setup
+	// (no root ever existed) doesn't toast for nothing.
+	if (mode == "ondemand" && prevMode != "ondemand") || (mode == "live" && prevMode == "ondemand") {
+		a.offerExplorerRestart()
+	}
 	return ""
+}
+
+// offerExplorerRestart raises a clickable toast to restart File Explorer so it
+// picks up a sync-root registration change (Status column / sync icons).
+func (a *App) offerExplorerRestart() {
+	if !a.NotificationsEnabled() {
+		return
+	}
+	notify.Toast(brand.Current.Name,
+		"Restart File Explorer to update the sync icons in your folders — click here to restart it now.",
+		"action=explorer-restart")
+}
+
+// hasConfiguredAccount reports whether at least one account is set up — the
+// discriminator between "genuinely not signed in" and "signed in but the
+// server is unreachable right now".
+func (a *App) hasConfiguredAccount() bool {
+	d, err := config.Resolve()
+	if err != nil {
+		return false
+	}
+	st, err := account.LoadStore(d.AccountsFile())
+	return err == nil && len(st.Accounts) > 0
+}
+
+// scheduleStartRetry keeps trying to bring the engine up after a start failed
+// with an account configured — a server that is down at app launch must not
+// strand the app engine-less until a manual relaunch. One loop at a time; it
+// ends when an engine exists or the app shuts down.
+func (a *App) scheduleStartRetry(ctx context.Context) {
+	if !a.startRetrying.CompareAndSwap(false, true) {
+		return // a retry loop is already running
+	}
+	go func() {
+		defer a.startRetrying.Store(false)
+		delay := 15 * time.Second
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+			if a.eng != nil {
+				return // something else (a sign-in, a mode switch) brought it up
+			}
+			slog.Info("retrying engine start", "after", delay)
+			a.start(ctx)
+			if a.eng != nil {
+				a.emit("activity")
+				return
+			}
+			if delay < time.Minute {
+				delay *= 2
+			}
+		}
+	}()
 }
 
 // clearLivePairs removes every configured live sync pair (config + its watcher)
@@ -718,14 +1007,43 @@ func (a *App) clearLivePairs() {
 		return
 	}
 	pairs, _ := a.eng.Pairs()
+	// Remember what we're clearing so switching back to live restores the
+	// user's folder setup instead of silently forgetting it (bit Adam twice).
+	if len(pairs) > 0 {
+		if d, err := config.Resolve(); err == nil {
+			_ = d.UpdateSettings(func(s *config.Settings) {
+				s.RememberedPairs = pairs
+			})
+		}
+	}
 	for _, p := range pairs {
 		if err := a.eng.RemoveSyncFolder(p.RemoteRoot, false); err != nil {
 			slog.Warn("clear live pair", "remote", p.RemoteRoot, "err", err)
 			continue
 		}
+		// The pair's status root must go before the on-demand mount claims the
+		// tree — Windows refuses nested sync roots, and the registration
+		// survives restarts, so this cannot rely on it having been made by this
+		// process.
+		a.eng.DisableStatusIcons(p.LocalDir)
 		slog.Info("cleared live sync pair for on-demand mode", "remote", p.RemoteRoot, "local", p.LocalDir)
 	}
 	a.rebuildTrayMenu()
+}
+
+// resumeFrozen clears a folder's damage-guard freeze after the user has
+// reviewed it. Returns "" or a message for the user. Rides SetSyncMode's
+// string argument (as "guard-resume:<localDir>") so nothing new is bound and
+// the bindings are untouched.
+func (a *App) resumeFrozen(localDir string) string {
+	if a.eng == nil {
+		return "not signed in"
+	}
+	if err := a.eng.ClearFreeze(localDir); err != nil {
+		return err.Error()
+	}
+	a.eng.TriggerSync() // run the pass the user just approved, rather than waiting for the poll
+	return ""
 }
 
 // --- On-demand (virtual files): one account-level mount ---
@@ -745,6 +1063,7 @@ func (a *App) mountAccountOnDemand() {
 	if _, already := a.onDemandMounts[dir]; already {
 		return
 	}
+	slog.Info("mounting account folder as virtual files", "dir", dir)
 	if err := a.mountOnDemand(dir, ""); err != nil {
 		slog.Warn("on-demand account mount failed", "dir", dir, "err", err)
 	}
@@ -816,7 +1135,11 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 		if err != nil {
 			return nil, err
 		}
-		var items []cfapi.PlaceholderInfo
+		// Non-nil from the start: an empty-but-successful listing must be
+		// distinguishable from a failed one, because cfapi only marks a directory
+		// permanently populated for the former. Returning nil here would make a
+		// genuinely empty folder unretryable if it later gained files.
+		items := []cfapi.PlaceholderInfo{}
 		for _, e := range entries {
 			p := strings.Trim(e.Path, "/")
 			if p == remote || p == "" {
@@ -837,14 +1160,21 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 				Identity: []byte(p), ETag: e.ETag, FileID: e.FileID,
 			})
 		}
+		// On-demand mode has no sync pairs, so applyPlan — where the live path
+		// notices other people's locks — never runs. This listing is the only
+		// place lock state passes through, so feed it in here.
+		eng.NoteRemoteLocks(localDir, root, entries)
 		return items, nil
 	}
-	// Population is best-effort (an error just shows the folder empty until retry).
+	// A failed listing returns NIL, which cfapi reads as "do not mark this
+	// directory populated" so the shell asks again. Returning an empty slice
+	// instead would strand the folder empty forever.
 	// It also records the conflict baseline (server ETag) for each placeholder.
 	list := func(rel string) []cfapi.PlaceholderInfo {
 		items, err := listRemote(rel)
 		if err != nil {
 			slog.Warn("on-demand list failed", "rel", rel, "err", err)
+			return nil
 		}
 		base := make(map[string]string, len(items))
 		fids := make(map[string]string, len(items))
@@ -861,10 +1191,15 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 		return items
 	}
 	exe, _ := os.Executable()
+	// Breadcrumb pair around Mount: it registers the sync root (filter + shell
+	// COM) and connects the provider — the exact window a live-install mode
+	// switch once hung in, silently. Run verbose for per-step cfapi detail.
+	slog.Info("registering cloud sync root", "dir", localDir)
 	connKey, err := cfapi.Mount(localDir, brand.Current.Name, exe, hydrate, list)
 	if err != nil {
 		return err
 	}
+	slog.Info("cloud sync root connected", "dir", localDir)
 	// Write-back + down-sync: watch the mount for user changes (upload/mkdir/
 	// delete/move) and pull changes made elsewhere (List). When notify_push is
 	// available the reconcile is driven by push (Poke), so the poll is a long
@@ -873,27 +1208,76 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 	if eng.PushAvailable() {
 		poll = 5 * time.Minute
 	}
-	w, werr := vfs.New(a.ctx, localDir, root, poll, vfs.Ops{
-		Upload:         a.uploadWithConflictFor(eng, etags),
-		Mkdir:          eng.MkdirRemote,
-		Delete:         eng.DeleteRemote,
-		Move:           eng.MoveRemote,
-		List:           listRemote,
-		Report:         report,
-		RecordBaseline: func(remote, etag string) { etags.set(remote, etag) },
-		Baseline:       func(remote string) (string, bool) { e := etags.get(remote); return e, e != "" },
-		RecordFileID:   func(remote, fid string) { fileids.set(remote, fid) },
-		FileID:         func(remote string) (string, bool) { f := fileids.get(remote); return f, f != "" },
-		DropFileID:     func(remote string) { fileids.del(remote) },
-		Log:            func(f string, args ...any) { slog.Info("vfs", "msg", fmt.Sprintf(f, args...)) },
-	})
-	if werr != nil {
-		slog.Warn("vfs write-back watcher not started", "dir", localDir, "err", werr)
+	up := a.uploadWithConflictFor(eng, etags)
+	startWatcher := func() *vfs.Watcher {
+		w, werr := vfs.New(a.ctx, localDir, root, poll, vfs.Ops{
+			Upload:         up,
+			Mkdir:          eng.MkdirRemote,
+			Delete:         eng.DeleteRemote,
+			Move:           eng.MoveRemote,
+			List:           listRemote,
+			// Lost-MOVE detection: after a rename's MOVE "fails", the watcher
+			// asks whether the destination exists — the server may have applied
+			// the move and only the response was lost.
+			Stat: func(remote string) (bool, error) {
+				sctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+				defer cancel()
+				_, ok, err := eng.StatRemote(sctx, remote)
+				return ok, err
+			},
+			Report:         report,
+			RecordBaseline: func(remote, etag string) { etags.set(remote, etag) },
+			Baseline:       func(remote string) (string, bool) { e := etags.get(remote); return e, e != "" },
+			RecordFileID:   func(remote, fid string) { fileids.set(remote, fid) },
+			FileID:         func(remote string) (string, bool) { f := fileids.get(remote); return f, f != "" },
+			DropFileID:     func(remote string) { fileids.del(remote) },
+			// Disguised file types: the server stores ".htaccess" as
+			// ".htaccess.nimboesc". The escaper is loaded PER CALL, never captured —
+			// it's an atomic pointer the engine swaps whenever the user toggles a
+			// type in Settings, and this mount outlives that.
+			Encode: func(rel string) string { return eng.Escaper().Encode(rel) },
+			Decode: func(rel string) string { d, _ := eng.Escaper().Decode(rel); return d },
+			Log:    func(f string, args ...any) { slog.Info("vfs", "msg", fmt.Sprintf(f, args...)) },
+		})
+		if werr != nil {
+			slog.Warn("vfs write-back watcher not started", "dir", localDir, "err", werr)
+		}
+		return w
 	}
 	if a.onDemandMounts == nil {
 		a.onDemandMounts = map[string]*odMount{}
 	}
-	a.onDemandMounts[localDir] = &odMount{connKey: connKey, remoteRoot: root, watcher: w, accountID: eng.Account.ID}
+	m := &odMount{connKey: connKey, remoteRoot: root, accountID: eng.Account.ID}
+	a.onDemandMounts[localDir] = m
+	a.refreshOverlayRoots()
+
+	// Background state heal: converts plain directories inside the mount back
+	// into in-sync cloud placeholders so Explorer shows real state instead of
+	// the perpetual "sync pending" arrows. See vfsheal.go for the full story.
+	healCtx, healCancel := context.WithCancel(a.ctx)
+	m.healCancel = healCancel
+	go a.healMountState(healCtx, localDir, root, etags)
+
+	// A confirmed adopt plan runs its local mutations after the sync root is
+	// registered (MarkInSync needs it) and strictly before the write-back
+	// watcher exists — the watcher pushes local changes to the server as user
+	// actions, so a stub delete it observed would become a server-side DELETE.
+	// The conversion itself runs on a goroutine: marking hundreds of thousands
+	// of files takes minutes, and doing it inside this call froze the whole
+	// settings UI for the duration (the watcher is simply created afterwards by
+	// the same goroutine, preserving the ordering). The mount is already
+	// registered above, so unmounting works throughout; unmount cancels the
+	// conversion via m.convertCancel.
+	if pending := a.preMountAdopt; pending != nil && pending.dir == localDir {
+		a.preMountAdopt = nil
+		cctx, cancel := context.WithCancel(a.ctx)
+		m.convertCancel = cancel
+		slog.Info("adopt: converting existing files in the background",
+			"files", len(pending.plan.Entries), "dir", localDir)
+		go a.runAdoptConvert(cctx, m, pending.plan, localDir, root, up, startWatcher)
+		return nil
+	}
+	m.watcher = startWatcher()
 	slog.Info("on-demand mount connected", "dir", localDir, "remoteRoot", root)
 	return nil
 }
@@ -934,36 +1318,82 @@ func (a *App) vfsErrorToast(kind, remotePath string, err error) {
 func (a *App) uploadWithConflictFor(eng *agent.Engine, etags *etagStore) func(ctx context.Context, localPath, remotePath string) error {
 	return func(ctx context.Context, localPath, remotePath string) error {
 		remotePath = strings.Trim(remotePath, "/")
-		base := etags.get(remotePath)
-		if base != "" {
-			if cur, ok, err := eng.StatRemote(ctx, remotePath); err == nil && ok && cur.ETag != base {
-				// Server changed too — keep both: park the server's version.
-				conflict := conflictName(remotePath)
-				if mErr := eng.MoveRemote(ctx, remotePath, conflict); mErr != nil {
-					slog.Warn("vfs conflict: could not park server copy", "remote", remotePath, "err", mErr)
-				} else {
-					slog.Info("vfs conflict: kept both", "remote", remotePath, "serverCopy", conflict)
-					eng.Recorder().Add(activity.Event{Path: conflict, Kind: "conflict"})
-					notify.Toast("Sync conflict", filepath.Base(remotePath)+" was edited in both places — kept both copies", "")
-				}
+
+		// Decline while somebody else holds the lock. Uploading now would hand
+		// THEM the conflict when they saved, and in on-demand mode it would also
+		// be resolved the wrong way round — the local copy takes the original
+		// name here, so the lock holder would lose it. The watcher re-arms on
+		// this error rather than treating it as a failure.
+		if eng.LockingAvailable() {
+			if ent, ok, err := eng.StatRemote(ctx, remotePath); err == nil && ok &&
+				ent.Lock.HeldByOther(eng.Account.LoginName) {
+				return fmt.Errorf("%s: %w", remotePath, vfs.ErrHeldByLock)
 			}
 		}
-		if err := eng.Upload(ctx, localPath, remotePath); err != nil {
+
+		base := etags.get(remotePath)
+		cur, curExists, statErr := eng.StatRemote(ctx, remotePath)
+		switch {
+		case base != "" && statErr == nil && curExists && cur.ETag != base && !sameBytesAsServer(localPath, cur):
+			// Server changed too — keep both: park the server's version. A
+			// failed park must ABORT the upload: proceeding would overwrite
+			// the very edit the check just detected. The watcher retries.
+			if mErr := parkServerCopy(eng, ctx, remotePath); mErr != nil {
+				return fmt.Errorf("could not set the server's edited copy aside: %w", mErr)
+			}
+		case base == "" && statErr == nil && curExists && !sameBytesAsServer(localPath, cur):
+			// No baseline (state loss, a rescue upload) but the server HAS a
+			// different copy — overwriting it blind loses somebody's data.
+			// Keep both; the data-safe default when history is unknown.
+			if mErr := parkServerCopy(eng, ctx, remotePath); mErr != nil {
+				return fmt.Errorf("could not set the server's existing copy aside: %w", mErr)
+			}
+		case base != "" && statErr != nil:
+			// The conflict check itself failed — don't fail open into an
+			// overwrite; the upload will be retried.
+			return fmt.Errorf("could not check the server copy before uploading: %w", statErr)
+		}
+		etag, err := eng.Upload(ctx, localPath, remotePath)
+		if err != nil {
 			return err
 		}
-		if cur, ok, err := eng.StatRemote(ctx, remotePath); err == nil && ok {
-			etags.set(remotePath, cur.ETag) // baseline now matches what we uploaded
+		// Baseline from the upload's OWN revision when the server names it — a
+		// fresh Stat could adopt a concurrent writer's newer revision as ours.
+		if etag == "" {
+			if cur, ok, serr := eng.StatRemote(ctx, remotePath); serr == nil && ok {
+				etag = cur.ETag
+			}
+		}
+		if etag != "" {
+			etags.set(remotePath, etag)
 		}
 		return nil
 	}
 }
 
+// parkServerCopy moves the server's version of remotePath aside as a
+// "conflicted copy" sibling, surfacing the conflict to the user.
+func parkServerCopy(eng *agent.Engine, ctx context.Context, remotePath string) error {
+	conflict := conflictName(remotePath)
+	if err := eng.MoveRemote(ctx, remotePath, conflict); err != nil {
+		slog.Warn("vfs conflict: could not park server copy", "remote", remotePath, "err", err)
+		return err
+	}
+	slog.Info("vfs conflict: kept both", "remote", remotePath, "serverCopy", conflict)
+	eng.Recorder().Add(activity.Event{Path: conflict, Kind: "conflict"})
+	notify.Toast("Sync conflict", filepath.Base(remotePath)+" was edited in both places — kept both copies", "")
+	return nil
+}
+
 // conflictName builds a "<name> (conflicted copy <date>)<ext>" sibling path.
+// A marker already in the name is replaced, never stacked (transfer.conflictName
+// has the same rule): stacking grew one field filename past MAX_PATH.
 func conflictName(remote string) string {
 	dir, file := "", strings.Trim(remote, "/")
 	if i := strings.LastIndex(file, "/"); i >= 0 {
 		dir, file = file[:i+1], file[i+1:]
 	}
+	file = transfer.StripConflictMarkers(file)
 	stem, ext := file, ""
 	if j := strings.LastIndex(file, "."); j > 0 {
 		stem, ext = file[:j], file[j:]
@@ -1035,16 +1465,47 @@ func (a *App) pokeOnDemand() {
 	}
 }
 
-// unmountAllOnDemand stops the active mount (graceful shutdown / leaving
-// on-demand mode). Placeholders stay on disk and are reconnected next launch.
-func (a *App) unmountAllOnDemand() {
+// disconnectAllOnDemand pauses every mount WITHOUT touching its registration:
+// placeholders keep their cloud state and the next launch reconnects in place.
+// This is the shutdown/auth-loss/account-switch path. Full unmountAllOnDemand
+// (below) unregisters, and Windows then strips the cloud state from the whole
+// tree - correct only when leaving virtual-files mode or signing out.
+func (a *App) disconnectAllOnDemand() {
 	for dir, m := range a.onDemandMounts {
+		if m.convertCancel != nil {
+			m.convertCancel()
+		}
 		if m.watcher != nil {
 			m.watcher.Close()
+		}
+		if m.healCancel != nil {
+			m.healCancel()
+		}
+		cfapi.Disconnect(dir, m.connKey)
+		delete(a.onDemandMounts, dir)
+		slog.Info("on-demand mount disconnected (registration kept)", "dir", dir)
+	}
+	a.refreshOverlayRoots()
+}
+
+// unmountAllOnDemand permanently unmounts (mode switch away from virtual files,
+// sign-out). The registration is removed and Windows strips placeholder state
+// from the tree - by design here; use disconnectAllOnDemand everywhere else.
+func (a *App) unmountAllOnDemand() {
+	for dir, m := range a.onDemandMounts {
+		if m.convertCancel != nil {
+			m.convertCancel() // stop a background adopt conversion first
+		}
+		if m.watcher != nil {
+			m.watcher.Close()
+		}
+		if m.healCancel != nil {
+			m.healCancel()
 		}
 		cfapi.Unmount(dir, m.connKey)
 		delete(a.onDemandMounts, dir)
 	}
+	a.refreshOverlayRoots()
 }
 
 // cleanupStrayOnDemand removes the sync roots left by the old experimental
@@ -1075,8 +1536,7 @@ func (a *App) cleanupStrayOnDemand() {
 			slog.Info("purged stray on-demand folder", "dir", m.Local)
 		}
 	}
-	s.OnDemandMounts = nil
-	_ = d.SaveSettings(s)
+	_ = d.UpdateSettings(func(s *config.Settings) { s.OnDemandMounts = nil })
 }
 
 // NextcloudAppearance reports the user's Nextcloud appearance: "dark", "light",
@@ -1109,10 +1569,9 @@ func (a *App) GetTheme() string {
 // SetTheme persists the UI theme mode and broadcasts it so every window updates.
 func (a *App) SetTheme(mode string) {
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.Theme = mode
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 	if a.app != nil {
 		a.app.Event.Emit("theme", mode)
@@ -1178,12 +1637,11 @@ func (a *App) FlyoutAppearance() FlyoutAppearanceDTO {
 // broadcasts so an open flyout updates live.
 func (a *App) SetFlyoutAppearance(dto FlyoutAppearanceDTO) {
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.DockIconSize, s.PanelWidth, s.Density = dto.DockIconSize, dto.PanelWidth, dto.Density
 			s.FlyoutSections = dto.Sections
 			s.HideSearch = !sliceHas(dto.Sections, "search") // keep the legacy flag in step
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 	a.applyFlyoutWidth(dto.PanelWidth)
 	a.emit("appearance")
@@ -1211,10 +1669,9 @@ func (a *App) ShowAppDock() bool {
 // flyout updates live.
 func (a *App) SetShowAppDock(on bool) {
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.HideAppDock = !on
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 	if a.app != nil {
 		a.app.Event.Emit("appdock", on)
@@ -1239,10 +1696,9 @@ func (a *App) SetAppDockSide(side string) {
 		side = "right"
 	}
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.AppDockSide = side
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 	if a.app != nil {
 		a.app.Event.Emit("appdock-side", side)
@@ -1264,10 +1720,9 @@ func (a *App) ShowSearch() bool {
 // the flyout updates live.
 func (a *App) SetShowSearch(on bool) {
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.HideSearch = !on
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 	if a.app != nil {
 		a.app.Event.Emit("searchbar", on)
@@ -1289,10 +1744,9 @@ func (a *App) LowMemoryMode() bool {
 // takes effect immediately (freeing the cache when turning low-memory on).
 func (a *App) SetLowMemoryMode(on bool) {
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.KeepBaselineInMemory = !on
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 	if a.eng != nil {
 		a.eng.ReloadStore()
@@ -1313,10 +1767,9 @@ func (a *App) NotificationsEnabled() bool {
 func (a *App) SetNotifications(on bool) {
 	notify.SetEnabled(on)
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.MuteNotifications = !on
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 }
 
@@ -1395,13 +1848,34 @@ func (a *App) animateTray() {
 	}
 }
 
+// busyStatusWords are the status-text fragments that mean "the engine is
+// working", used to spin the tray icon and colour the flyout's status dot.
+//
+// KEEP IN STEP with the same list in Flyout.svelte (the `busy` regex) — the two
+// are unavoidably duplicated across the Go/Svelte boundary. The scan reports
+// itself in stages (see agent.computePlan), and none of those messages contain
+// "sync" or "scan", so a new stage word must be added in BOTH places or the tray
+// silently stops spinning mid-scan.
+var busyStatusWords = []string{"sync", "scan", "reading", "checking", "comparing", "matching", "moving"}
+
+// isBusyStatus reports whether a status string describes work in progress.
+func isBusyStatus(status string) bool {
+	s := strings.ToLower(status)
+	for _, w := range busyStatusWords {
+		if strings.Contains(s, w) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) trayState() string {
 	if a.eng != nil && a.eng.Paused() {
 		return "paused"
 	}
 	s := strings.ToLower(a.status)
 	switch {
-	case strings.Contains(s, "sync"):
+	case isBusyStatus(s):
 		return "sync"
 	case strings.Contains(s, "error"):
 		return "error"
@@ -1459,6 +1933,9 @@ func (a *App) Header() HeaderInfo {
 type AttentionInfo struct {
 	Conflicts int `json:"conflicts"`
 	Blocked   int `json:"blocked"`
+	// Locked: files someone else has open. Informational, not a fault — the UI
+	// wording should reflect that.
+	Locked int `json:"locked"`
 }
 
 // Attention reports how many conflicts and can't-sync files are outstanding.
@@ -1469,6 +1946,7 @@ func (a *App) Attention() AttentionInfo {
 	info := AttentionInfo{
 		Conflicts: len(a.eng.PendingConflicts()),
 		Blocked:   len(a.eng.BlockedFiles()),
+		Locked:    len(a.eng.LockedFiles()),
 	}
 	// Background accounts' conflicts/blocked count toward the badge so they
 	// can't go unnoticed; their lists live behind a "Show" switch (the resolve
@@ -1476,6 +1954,7 @@ func (a *App) Attention() AttentionInfo {
 	for _, se := range a.secondaries {
 		info.Conflicts += len(se.eng.PendingConflicts())
 		info.Blocked += len(se.eng.BlockedFiles())
+		info.Locked += len(se.eng.LockedFiles())
 	}
 	return info
 }
@@ -1615,12 +2094,11 @@ func (a *App) GetPauseSchedule() ScheduleDTO {
 // SetPauseSchedule saves and applies the quiet-hours window.
 func (a *App) SetPauseSchedule(enabled bool, fromMin, toMin int) {
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.PauseScheduleEnabled = enabled
 			s.PauseFromMin = fromMin
 			s.PauseToMin = toMin
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 	if a.eng != nil {
 		a.eng.SetPauseSchedule(agent.PauseSchedule{Enabled: enabled, FromMin: fromMin, ToMin: toMin})
@@ -1929,7 +2407,7 @@ type ConflictItem struct {
 	LocalExists  bool   `json:"localExists"`
 	RemoteExists bool   `json:"remoteExists"`
 	LocalSize    int64  `json:"localSize"`
-	LocalMTime   string `json:"localMTime"`  // "YYYY-MM-DD HH:MM" or ""
+	LocalMTime   string `json:"localMTime"` // "YYYY-MM-DD HH:MM" or ""
 	RemoteSize   int64  `json:"remoteSize"`
 	RemoteMTime  string `json:"remoteMTime"`
 }
@@ -2098,10 +2576,9 @@ func (a *App) GetConflictPolicy() string {
 // SetConflictPolicy saves and applies the default conflict policy.
 func (a *App) SetConflictPolicy(policy string) {
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.ConflictPolicy = policy
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 	if a.eng != nil {
 		a.eng.SetConflictPolicy(conflictPolicy(policy))
@@ -2136,10 +2613,9 @@ func (a *App) SetAllowedFilenames(names []string) {
 		out = append(out, n)
 	}
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.AllowedFilenames = out
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 	if a.eng != nil {
 		a.eng.SetAllowedFilenames(out)
@@ -2188,6 +2664,81 @@ type DiagnosticsDTO struct {
 	PushUptime    string `json:"pushUptime"`
 	LastStatus    string `json:"lastStatus"`
 	LastSync      string `json:"lastSync"`
+	// AdoptScanDirs is the adopt scan's live heartbeat: directories listed so
+	// far, 0 when no scan is running. Rides this already-polled DTO so the
+	// scanning overlay gets a moving number without a new binding.
+	AdoptScanDirs int `json:"adoptScanDirs"`
+	// AdoptConvertDone/Total is the background conversion's heartbeat (files
+	// marked so far / plan size); Total 0 = no conversion running.
+	AdoptConvertDone  int `json:"adoptConvertDone"`
+	AdoptConvertTotal int `json:"adoptConvertTotal"`
+	// RevertDone/Total: the leave-VFS pass, same shape.
+	RevertDone  int `json:"revertDone"`
+	RevertTotal int `json:"revertTotal"`
+	// EscapeExtensions: file types currently synced under disguised names
+	// (server-forbidden names only). Rides here so the Exclusions UI can list
+	// them without a new binding.
+	EscapeExtensions []string `json:"escapeExtensions"`
+	// LockingAvailable: the server has the files_lock app. When false the UI must
+	// say it CANNOT KNOW who has a file open — "nobody has this open" would be a
+	// different and untrue claim. Rides here rather than adding a binding.
+	LockingAvailable bool `json:"lockingAvailable"`
+	// ObservedLocks: files other users currently have open, across every account.
+	ObservedLocks []LockDTO `json:"observedLocks"`
+	// FileLocking: whether Nimbo takes locks of its own (off by default).
+	FileLocking bool `json:"fileLocking"`
+	// FileLockout: whether Nimbo also holds other people's locked files open
+	// locally, so the editor here refuses them (off by default).
+	FileLockout bool `json:"fileLockout"`
+	// BadgesRegistered: the current generation of Explorer corner badges is
+	// registered on this machine (badges.go). When false in live mode, the UI
+	// offers the one-UAC enable step.
+	BadgesRegistered bool `json:"badgesRegistered"`
+	// HeldLocks: locks NIMBO holds, across every account. Surfaced so the user can
+	// see and clear them — the server will never expire one on its own.
+	HeldLocks []LockDTO `json:"heldLocks"`
+}
+
+// releaseAllLocks drops every lock Nimbo holds, across the shown account and
+// every background one. Returns "" on success or a message for the UI.
+//
+// Worth having a button for: the server never expires a lock, and no other user
+// can clear one, so a stuck lock would otherwise need an administrator.
+func (a *App) releaseAllLocks() string {
+	if a.eng == nil {
+		return "Not signed in."
+	}
+	ctx := a.ctx
+	total := 0
+	var firstErr error
+	rel := func(eng *agent.Engine) {
+		if eng == nil {
+			return
+		}
+		n, err := eng.ReleaseAllLocks(ctx)
+		total += n
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	rel(a.eng)
+	for _, se := range a.secondaries {
+		rel(se.eng)
+	}
+	if firstErr != nil {
+		return fmt.Sprintf("Released %d, but some could not be released: %v", total, firstErr)
+	}
+	return ""
+}
+
+// LockDTO is one file another user holds open, for the Settings list.
+type LockDTO struct {
+	Path      string `json:"path"`
+	Owner     string `json:"owner"`     // display name where the server gave one, else the login
+	Summary   string `json:"summary"`   // ready-made one-liner; an app lock names no person
+	OwnerType int    `json:"ownerType"` // 0 manual, 1 an app (Text/Office), 2 token
+	Since     string `json:"since"`     // RFC3339; empty when the server gave no time
+	Account   string `json:"account"`   // login name of the account it belongs to
 }
 
 // Diagnostics returns Nimbo's current health (no network calls) for the UI.
@@ -2197,14 +2748,73 @@ func (a *App) Diagnostics() DiagnosticsDTO {
 	}
 	d := a.eng.Diagnostics()
 	dto := DiagnosticsDTO{
-		ServerURL:     d.ServerURL,
-		ServerVersion: d.ServerVersion,
-		Account:       d.Account,
-		PushAvailable: d.PushAvailable,
-		PushConnected: d.PushConnected,
-		LastStatus:    d.LastStatus,
-		LastSync:      "—",
+		ServerURL:         d.ServerURL,
+		ServerVersion:     d.ServerVersion,
+		Account:           d.Account,
+		PushAvailable:     d.PushAvailable,
+		PushConnected:     d.PushConnected,
+		LastStatus:        d.LastStatus,
+		LastSync:          "—",
+		AdoptScanDirs:     int(a.adoptScanDirs.Load()),
+		AdoptConvertDone:  int(a.adoptConvertDone.Load()),
+		AdoptConvertTotal: int(a.adoptConvertTotal.Load()),
+		RevertDone:        int(a.revertDone.Load()),
+		RevertTotal:       int(a.revertTotal.Load()),
 	}
+	if s, err := config.Resolve(); err == nil {
+		if set, e := s.LoadSettings(); e == nil {
+			dto.EscapeExtensions = set.EscapeExtensions
+			dto.FileLocking = set.FileLocking
+			dto.FileLockout = set.FileLockout
+		}
+	}
+	dto.BadgesRegistered = badgesRegistered()
+	dto.LockingAvailable = a.eng.LockingAvailable()
+	dto.ObservedLocks = []LockDTO{}
+	collectLocks := func(eng *agent.Engine) {
+		if eng == nil {
+			return
+		}
+		for _, f := range eng.LockedFiles() {
+			var since string
+			if !f.Since.IsZero() {
+				since = f.Since.Format(time.RFC3339)
+			}
+			dto.ObservedLocks = append(dto.ObservedLocks, LockDTO{
+				Path: f.Path, Owner: f.Who(), Summary: f.Summary(), OwnerType: int(f.OwnerType),
+				Since: since, Account: eng.Account.LoginName,
+			})
+		}
+	}
+	collectLocks(a.eng)
+	// Background accounts too, or a lock held under one is invisible.
+	for _, se := range a.secondaries {
+		collectLocks(se.eng)
+	}
+	sort.Slice(dto.ObservedLocks, func(i, j int) bool {
+		return dto.ObservedLocks[i].Path < dto.ObservedLocks[j].Path
+	})
+	dto.HeldLocks = []LockDTO{}
+	collectHeld := func(eng *agent.Engine) {
+		if eng == nil {
+			return
+		}
+		for _, h := range eng.HeldLocks() {
+			var since string
+			if !h.Taken.IsZero() {
+				since = h.Taken.Format(time.RFC3339)
+			}
+			dto.HeldLocks = append(dto.HeldLocks, LockDTO{
+				Path: h.RemotePath, Owner: h.Account, Summary: h.RemotePath,
+				Since: since, Account: h.Account,
+			})
+		}
+	}
+	collectHeld(a.eng)
+	for _, se := range a.secondaries {
+		collectHeld(se.eng)
+	}
+	sort.Slice(dto.HeldLocks, func(i, j int) bool { return dto.HeldLocks[i].Path < dto.HeldLocks[j].Path })
 	if d.PushConnected && !d.PushSince.IsZero() {
 		dto.PushUptime = humanDuration(time.Since(d.PushSince))
 	}
@@ -2512,7 +3122,7 @@ func (a *App) OpenShare(remotePath string) {
 		return
 	}
 	a.shareWin = a.app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name: "share", Title: brand.Current.Name+" — Share", Width: 480, Height: 560, URL: "/#share",
+		Name: "share", Title: brand.Current.Name + " — Share", Width: 480, Height: 560, URL: "/#share",
 	})
 	a.shareWin.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) { a.shareWin = nil })
 	bringToFront(a.shareWin)
@@ -2561,6 +3171,7 @@ func (a *App) CreatePublicLink(password, expiration string, allowEdit bool) stri
 		return err.Error()
 	}
 	notify.Toast("Public link created", filepath.Base(a.sharePath)+" now has a shareable link", "")
+	go a.eng.RefreshShares(a.ctx) // the shared marker appears without waiting for the poll
 	return ""
 }
 
@@ -2576,6 +3187,7 @@ func (a *App) CreateUserShare(user string, allowEdit bool) string {
 		return err.Error()
 	}
 	notify.Toast("Shared", filepath.Base(a.sharePath)+" shared with "+strings.TrimSpace(user), "")
+	go a.eng.RefreshShares(a.ctx)
 	return ""
 }
 
@@ -2587,6 +3199,7 @@ func (a *App) DeleteShare(id string) string {
 	if err := a.eng.DeleteShare(a.ctx, id); err != nil {
 		return err.Error()
 	}
+	go a.eng.RefreshShares(a.ctx) // an unshared folder drops its marker promptly
 	return ""
 }
 
@@ -2614,7 +3227,7 @@ func (a *App) OpenVersions(remotePath string) {
 		return
 	}
 	a.versionsWin = a.app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name: "versions", Title: brand.Current.Name+" — Version history", Width: 460, Height: 480, URL: "/#versions",
+		Name: "versions", Title: brand.Current.Name + " — Version history", Width: 460, Height: 480, URL: "/#versions",
 	})
 	a.versionsWin.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) { a.versionsWin = nil })
 	bringToFront(a.versionsWin)
@@ -2748,6 +3361,22 @@ func (a *App) dispatchToastActivation(args string) {
 		return
 	}
 	switch v.Get("action") {
+	case "badges":
+		// The "enable folder badges?" toast: run the one-UAC registration and
+		// report how it went. Not InvokeAsync — the UAC wait must not sit on
+		// the UI thread.
+		go func() {
+			if msg := a.enableBadges(); msg != "" {
+				notify.Toast("Folder badges", msg, "")
+			}
+		}()
+	case "inuse":
+		// A "File in use" toast: show WHO has WHAT open, in context.
+		application.InvokeAsync(func() { a.openStatus("inuse") })
+	case "explorer-restart":
+		// The sync-icons toast after a mode switch: the user consented to the
+		// restart by clicking. Off the UI thread — it waits on processes.
+		go restartExplorer()
 	case "login":
 		application.InvokeAsync(func() { a.showLogin() })
 	case "update":
@@ -2988,23 +3617,139 @@ func errString(err error) string {
 func (a *App) SidebarSupported() bool { return shellns.Supported() }
 
 // SidebarEnabled reports whether the Nimbo sidebar root is registered.
-func (a *App) SidebarEnabled() bool { return shellns.Enabled() }
+//
+// Answered from our own recorded choice, not the registry: a packaged build
+// reads HKCU through the MSIX container, which returns the package's private
+// copy rather than the keys Explorer actually uses. The registry is consulted
+// only when nothing has been recorded yet — a fresh install (nothing there) or
+// an entry left by an older unpackaged build (which is real, and ours).
+func (a *App) SidebarEnabled() bool { return sidebarWanted() }
+
+// sidebarWanted resolves the stored sidebar preference, falling back to the
+// registry the first time.
+func sidebarWanted() bool {
+	if d, err := config.Resolve(); err == nil {
+		if s, e := d.LoadSettings(); e == nil && s.SidebarEnabled != nil {
+			return *s.SidebarEnabled
+		}
+	}
+	return shellns.Enabled()
+}
+
+// sidebarSyncRoot is recorded as the sidebar's target when we deliberately have
+// no entry of our own because a cloud sync root supplies one. It can never
+// collide with a real folder, so the ordinary "already applied for this folder"
+// test still re-registers if the folder later stops being a sync root.
+const sidebarSyncRoot = "\x00cloud-sync-root"
+
+// rememberSidebar records the choice (and the folder it was applied for) so the
+// next launch knows whether the entry needs rewriting.
+func rememberSidebar(on bool, target string) {
+	d, err := config.Resolve()
+	if err != nil {
+		return
+	}
+	_ = d.UpdateSettings(func(s *config.Settings) {
+		s.SidebarEnabled, s.SidebarTarget = &on, target
+	})
+}
 
 // SetSidebar adds or removes the Nimbo root in the Explorer navigation
 // pane, pointing at the default sync location.
 func (a *App) SetSidebar(on bool) string {
 	if !on {
-		return errString(shellns.Unregister())
+		if err := shellns.Unregister(); err != nil {
+			return err.Error()
+		}
+		rememberSidebar(false, "")
+		return ""
 	}
 	target := a.GetBaseDir()
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		return err.Error()
 	}
+	if cfapi.ShellSyncRootRegistered(target) {
+		// Explorer already lists this folder under its cloud provider name. A
+		// delegate-folder entry on top of that is a second, identical-looking
+		// Nimbo in the navigation pane.
+		_ = shellns.Unregister()
+		// Preference on, target recorded as the sentinel: if the folder later
+		// stops being a sync root, syncSidebar sees an unapplied target and puts
+		// our own entry back.
+		rememberSidebar(true, sidebarSyncRoot)
+		return ""
+	}
 	icon, err := navIconPath()
 	if err != nil {
 		return err.Error()
 	}
-	return errString(shellns.Register(brand.Current.Name, target, icon))
+	if err := shellns.Register(brand.Current.Name, target, icon); err != nil {
+		return err.Error()
+	}
+	rememberSidebar(true, target)
+	return ""
+}
+
+// syncSidebar re-points the Explorer entry at the current base dir when the user
+// has it on and it isn't already there. Called on startup and after a move.
+//
+// The "isn't already there" test is against our own record, not the registry:
+// see SidebarEnabled. That record is also what repairs a stale entry — a build
+// that pre-dates it has no SidebarTarget, so the first launch rewrites the keys
+// once and fixes whatever an old unpackaged install left pointing at a folder
+// that no longer exists.
+func (a *App) syncSidebar() {
+	if !shellns.Supported() || !sidebarWanted() {
+		return
+	}
+	target := a.GetBaseDir()
+	if target == "" {
+		return
+	}
+	// A cloud sync root already supplies the navigation-pane entry, so drop ours
+	// rather than sit beside it. This also cleans up after an upgrade: installs
+	// that had the sidebar on before the folder became a sync root are carrying
+	// a duplicate right now.
+	//
+	// Unregister is called unconditionally, NOT behind shellns.Enabled(): that
+	// function reads the package's private hive inside the MSIX container and so
+	// cannot see the real entry. Unregister is idempotent, so calling it when
+	// there is nothing to remove costs nothing.
+	//
+	// On-demand mode counts as a sync root whether or not the registration has
+	// happened yet: in that mode the account folder is always mounted as one, so
+	// asking the registry instead would make this depend on call ordering.
+	if a.GetSyncMode() == "ondemand" || cfapi.ShellSyncRootRegistered(target) {
+		// Deliberately NOT skipped when a previous launch already recorded the
+		// stand-down. There is no reliable way from inside the container to ask
+		// whether the entry is really gone -- shellns.Enabled() reads the merged
+		// package hive and skews positive -- so trusting our own record risks
+		// never retrying a removal that silently failed. The cost of getting it
+		// wrong that way is a permanent duplicate; the cost of retrying is one
+		// queued task per launch.
+		if err := shellns.Unregister(); err != nil {
+			slog.Warn("could not drop the duplicate navigation-pane entry", "err", err)
+			return // leave the record alone so the next launch retries
+		}
+		slog.Info("removed the duplicate navigation-pane entry; the cloud sync root provides it", "dir", target)
+		rememberSidebar(true, sidebarSyncRoot)
+		return
+	}
+	if d, err := config.Resolve(); err == nil {
+		if s, e := d.LoadSettings(); e == nil && s.SidebarEnabled != nil && s.SidebarTarget == target {
+			return // already applied for this folder
+		}
+	}
+	icon, err := navIconPath()
+	if err != nil {
+		slog.Warn("sidebar icon unavailable", "err", err)
+		return
+	}
+	if err := shellns.Register(brand.Current.Name, target, icon); err != nil {
+		slog.Warn("sidebar registration failed", "err", err)
+		return
+	}
+	rememberSidebar(true, target)
 }
 
 // navIconPath writes the embedded app icon to the config dir and returns its
@@ -3062,10 +3807,43 @@ func (a *App) TailLog() string {
 }
 
 // OpenLogFolder reveals the log directory in the file manager.
+//
+// The path needs de-virtualising first: MSIX filesystem redirection means the
+// app WRITES its logs under the package's LocalCache while SEEING the classic
+// AppData path — and Explorer, unpackaged, sees only the real (empty or
+// absent) classic directory, so the button appeared to do nothing.
 func (a *App) OpenLogFolder() {
 	if p := a.LogPath(); p != "" {
-		openPath(filepath.Dir(p))
+		openPath(deVirtualizedDir(filepath.Dir(p)))
 	}
+}
+
+// deVirtualizedDir maps an AppData path to the package-redirected location an
+// UNPACKAGED viewer actually finds the files at, when running packaged and the
+// redirected directory exists. Everywhere else the path comes back unchanged.
+func deVirtualizedDir(dir string) string {
+	pfn := packageFamilyName()
+	if pfn == "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return dir
+	}
+	for classic, redirected := range map[string]string{
+		filepath.Join(home, "AppData", "Local"):   filepath.Join(home, "AppData", "Local", "Packages", pfn, "LocalCache", "Local"),
+		filepath.Join(home, "AppData", "Roaming"): filepath.Join(home, "AppData", "Local", "Packages", pfn, "LocalCache", "Roaming"),
+	} {
+		rel, rerr := filepath.Rel(classic, dir)
+		if rerr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		mapped := filepath.Join(redirected, rel)
+		if fi, serr := os.Stat(mapped); serr == nil && fi.IsDir() {
+			return mapped
+		}
+	}
+	return dir
 }
 
 // OpenLogs opens (or focuses) the in-app log viewer window.
@@ -3138,7 +3916,7 @@ func (a *App) OpenLogs() {
 		return
 	}
 	a.logsWin = a.app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name: "logs", Title: brand.Current.Name+" — Logs", Width: 780, Height: 540, URL: "/#logs",
+		Name: "logs", Title: brand.Current.Name + " — Logs", Width: 780, Height: 540, URL: "/#logs",
 	})
 	a.logsWin.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) { a.logsWin = nil })
 }
@@ -3158,10 +3936,9 @@ func (a *App) SetVerbose(on bool) {
 	applog.SetVerbose(on)
 	slog.Info("log verbosity changed", "verbose", on)
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil {
+		_ = d.UpdateSettings(func(s *config.Settings) {
 			s.VerboseLog = on
-			_ = d.SaveSettings(s)
-		}
+		})
 	}
 }
 
@@ -3234,8 +4011,19 @@ func (a *App) SwitchAccount(id string) string {
 	if err := st.SetDefault(id); err != nil {
 		return err.Error()
 	}
-	a.unmountAllOnDemand()
+	a.disconnectAllOnDemand()
 	a.stopEngine()
+	// Switching to an account whose app password is gone from the keychain
+	// means the user WANTS that account — ask for its sign-in directly instead
+	// of bouncing through a failing engine start plus an error message on top
+	// of the login window it would open anyway.
+	if _, err := account.LoadSecret(id); err != nil {
+		a.setStatus("Sign in again")
+		a.emit("account")
+		a.rebuildTrayMenu()
+		application.InvokeAsync(a.showLogin)
+		return ""
+	}
 	a.start(a.ctx)
 	if a.eng == nil {
 		return "couldn't start syncing for that account — check its sign-in"
@@ -3343,10 +4131,18 @@ func (a *App) clearSyncData(d config.Dirs, accountID string) {
 	// Legacy unscoped files need no handling here — engine start migrates them
 	// to the active account's scoped names before any UI action can reach this,
 	// and deleting them blind could destroy ANOTHER account's unmigrated setup.
+	// The backup config goes with the pair list it is keyed to. Left behind, a
+	// later sign-in inherits PairKeys that match nothing — and a folder recreated
+	// with the same local and remote paths would silently come back one-way, so
+	// the user's edits would stop reaching the server with nothing to explain it.
+	// It deliberately does NOT touch any .nimbo-attic folder: those sit inside the
+	// user's own directories and hold their files, exactly like the synced files
+	// this function also leaves in place.
 	paths := []string{
 		d.PairsFile(),
 		d.VFSETagsFile(),
 		d.VFSFileIDsFile(),
+		d.GuardStateFile(),
 	}
 	if accountID != "" {
 		db := d.StateDB(accountID)
@@ -3365,7 +4161,7 @@ func (a *App) clearSyncData(d config.Dirs, accountID string) {
 // the user just signs in again to the same server).
 func (a *App) onAuthLost() {
 	application.InvokeAsync(func() {
-		a.unmountAllOnDemand()
+		a.disconnectAllOnDemand()
 		a.stopEngine()
 		a.setStatus("Sign in again")
 		a.rebuildTrayMenu()
@@ -3397,7 +4193,7 @@ func (a *App) showLogin() {
 		return
 	}
 	a.loginWin = a.app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name: "login", Title: brand.Current.Name+" — Sign in", Width: 440, Height: 300, URL: "/#login",
+		Name: "login", Title: brand.Current.Name + " — Sign in", Width: 440, Height: 300, URL: "/#login",
 	})
 	// Closing the window abandons any in-flight browser login — stop polling so
 	// the goroutine doesn't leak (an unapproved flow polls 404 forever).
@@ -3478,7 +4274,7 @@ func (a *App) BeginLogin(server string) string {
 		// down first — the fresh login is now the default account (Complete
 		// sets it) and start() binds to the default.
 		if a.eng != nil {
-			a.unmountAllOnDemand()
+			a.disconnectAllOnDemand()
 			a.stopEngine()
 		}
 		a.start(a.ctx)
@@ -3568,6 +4364,22 @@ func (a *App) CompleteSetup(localDir, mode string) string {
 		if err := a.eng.SetBaseDir(localDir); err != nil {
 			return err.Error()
 		}
+		// A folder that already holds files (e.g. the official client's old
+		// sync folder) gets the adopt flow here too, not just in Settings: the
+		// summary JSON goes back to the setup UI, which shows the same confirm
+		// dialog and then calls SetSyncMode("ondemand-adopt"). JSON is
+		// distinguishable from this method's plain error strings by its shape.
+		raw := a.scanAdopt()
+		var sum adoptSummary
+		if json.Unmarshal([]byte(raw), &sum) == nil {
+			if sum.Error != "" && !folderEmpty(localDir) {
+				return sum.Error
+			}
+			if sum.Keep+sum.Conflict+sum.Upload+sum.Replace > 0 {
+				return raw
+			}
+		}
+		a.pendingAdopt = nil
 		return a.SetSyncMode("ondemand")
 	default:
 		return "unknown setup mode"
@@ -3595,7 +4407,7 @@ func (a *App) OpenSettings() {
 		return
 	}
 	a.settingsWin = a.app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name: "settings", Title: brand.Current.Name+" — Settings", Width: 720, Height: 600, URL: "/#settings",
+		Name: "settings", Title: brand.Current.Name + " — Settings", Width: 720, Height: 600, URL: "/#settings",
 	})
 	a.settingsWin.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) { a.settingsWin = nil })
 }
@@ -3683,10 +4495,20 @@ func (a *App) BrowseRemote(path string) []BrowseEntry {
 }
 
 // PairDTO describes a configured sync pair.
+//
+// The backup fields ride here rather than on a new bound method: DTO fields
+// carry no hashed method ids, so adding them needs no bindings regen (the
+// generated model copies unknown fields straight through).
 type PairDTO struct {
 	LocalDir   string   `json:"localDir"`
 	RemoteRoot string   `json:"remoteRoot"`
 	Excludes   []string `json:"excludes"`
+	// Frozen is true when the damage guard paused this folder pending review.
+	Frozen bool `json:"frozen"`
+	// FreezeReason is the human-readable explanation shown in the banner.
+	FreezeReason string `json:"freezeReason,omitempty"`
+	// FreezeSample is a few affected paths, so the user can judge the trip.
+	FreezeSample []string `json:"freezeSample,omitempty"`
 }
 
 // GetPairs returns configured sync pairs.
@@ -3695,9 +4517,16 @@ func (a *App) GetPairs() []PairDTO {
 		return nil
 	}
 	pairs, _ := a.eng.Pairs()
+	views := a.eng.FrozenViews()
 	out := make([]PairDTO, 0, len(pairs))
 	for _, p := range pairs {
-		out = append(out, PairDTO{LocalDir: p.LocalDir, RemoteRoot: p.RemoteRoot, Excludes: p.Excludes})
+		d := PairDTO{LocalDir: p.LocalDir, RemoteRoot: p.RemoteRoot, Excludes: p.Excludes}
+		if v, ok := views[p.LocalDir]; ok {
+			d.Frozen = v.Frozen
+			d.FreezeReason = v.FreezeReason
+			d.FreezeSample = v.FreezeSample
+		}
+		out = append(out, d)
 	}
 	return out
 }
@@ -3806,10 +4635,35 @@ func pickFolderFallback(start string) string {
 	return strings.TrimSpace(string(out))
 }
 func (a *App) RemoveSyncFolder(remotePath string, deleteLocal bool) {
-	if a.eng != nil {
-		_ = a.eng.RemoveSyncFolder(remotePath, deleteLocal)
-		a.rebuildTrayMenu()
+	if a.eng == nil {
+		return
 	}
+	// A connection the user removes takes its backup setting with it — otherwise
+	// the entry outlives the pair, and re-adding the same folder (which the UI
+	// offers as an ordinary two-way sync) would silently bring back a one-way
+	// folder whose local edits never reach the server. ForgetSyncFolder does both
+	// halves in the one order that is safe; see it for why the gate matters.
+	//
+	// This method is bound to the frontend and returns nothing, so a failure can
+	// only be logged. Changing that means a new signature, hence a bindings
+	// regen — deliberately not done here.
+	// Look the pair up BEFORE it goes: its local dir's status root should not
+	// outlive the pair.
+	var localDir string
+	if pairs, err := a.eng.Pairs(); err == nil {
+		for _, p := range pairs {
+			if p.RemoteRoot == remotePath {
+				localDir = p.LocalDir
+				break
+			}
+		}
+	}
+	if err := a.eng.ForgetSyncFolder(remotePath, deleteLocal); err != nil {
+		slog.Warn("could not remove the sync folder", "remote", remotePath, "err", err)
+	} else if localDir != "" {
+		a.eng.DisableStatusIcons(localDir)
+	}
+	a.rebuildTrayMenu()
 }
 
 // AddExclude / RemoveExclude toggle selective-sync excludes within a pair.

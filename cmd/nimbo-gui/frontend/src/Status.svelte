@@ -11,13 +11,16 @@
   };
   type Notif = { id: number; app: string; subject: string; message: string; link: string; actions: { label: string }[] };
   type Blocked = { abs: string; path: string; reason: string; ext: string; escapable: boolean; escaping: boolean };
+  type Lock = { path: string; owner: string; summary: string; ownerType: number; since: string; account: string };
   type Trash = { href: string; name: string; originalLocation: string; deletedAt: string; size: number; isDir: boolean };
 
-  let tab = $state<"activity" | "conflicts" | "notifications" | "blocked" | "trash">("activity");
+  let tab = $state<"activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "trash">("activity");
   let activity = $state<Activity[]>([]);
   let conflicts = $state<Conflict[]>([]);
   let notifs = $state<Notif[]>([]);
   let blocked = $state<Blocked[]>([]);
+  let locks = $state<Lock[]>([]);
+  let lockingAvailable = $state(true);
   let trash = $state<Trash[]>([]);
   let trashBusy = $state(false);
   let otherAttn = $state<OtherAttention[]>([]);
@@ -36,8 +39,15 @@
   // cast: the Go BlockedItem carries ext/escapable/escaping (added without a
   // bindings regen), so the generated type is a subset of our Blocked at runtime.
   async function loadBlocked() { blocked = ((await App.BlockedList()) ?? []) as unknown as Blocked[]; }
+  // Locks ride DiagnosticsDTO rather than a method of their own, so this costs
+  // no bindings regen. Cast for the same reason loadBlocked does.
+  async function loadLocks() {
+    const d = (await App.Diagnostics()) as any;
+    locks = (d?.observedLocks ?? []) as Lock[];
+    lockingAvailable = !!d?.lockingAvailable;
+  }
   async function loadTrash() { trashBusy = true; trash = (await App.TrashList()) ?? []; trashBusy = false; }
-  function loadAll() { loadActivity(); loadConflicts(); loadNotifs(); loadBlocked(); }
+  function loadAll() { loadActivity(); loadConflicts(); loadNotifs(); loadBlocked(); loadLocks(); }
   loadAll();
 
   const restoreTrash = async (t: Trash) => { await App.RestoreTrash(t.href); await loadTrash(); };
@@ -48,7 +58,7 @@
   // bare "<tab>" or "<tab>" + newline + "<highlight-key>": the flyout newline-
   // joins the target row's key into OpenStatusTab's one string arg (so no extra
   // Go binding is needed), and we flash + scroll to the matching row.
-  type Tab = "activity" | "conflicts" | "notifications" | "blocked" | "trash";
+  type Tab = "activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "trash";
   const NL = String.fromCharCode(10); // newline — never occurs in a tab name or file path
   let highlight = $state("");
   let hlTimer: ReturnType<typeof setTimeout>;
@@ -70,7 +80,7 @@
   Events.On("status-tab", (e: any) => applyDeepLink(e.data as string));
   // Once the active tab's list has rendered, scroll the flashed row into view.
   $effect(() => {
-    void (activity.length + conflicts.length + notifs.length + blocked.length + trash.length);
+    void (activity.length + conflicts.length + notifs.length + blocked.length + locks.length + trash.length);
     if (!highlight) return;
     requestAnimationFrame(() =>
       document.querySelector(".body .hl")?.scrollIntoView({ block: "center", behavior: "smooth" }));
@@ -80,6 +90,7 @@
   Events.On("conflicts", loadConflicts);
   Events.On("notifications", loadNotifs);
   Events.On("blocked", loadBlocked);
+  Events.On("locks", loadLocks);
 
   const conflictDesc = (k: string) =>
     k === "deleted-locally" ? "You deleted this; it changed on the server."
@@ -155,6 +166,7 @@
     <button class:active={tab==="conflicts"} onclick={() => tab="conflicts"}>Conflicts{conflicts.length ? ` (${conflicts.length})` : ""}</button>
     <button class:active={tab==="notifications"} onclick={() => tab="notifications"}>Notifications{notifs.length ? ` (${notifs.length})` : ""}</button>
     <button class:active={tab==="blocked"} onclick={() => tab="blocked"}>Can't sync{realBlocked.length ? ` (${realBlocked.length})` : ""}</button>
+    <button class:active={tab==="inuse"} onclick={() => tab="inuse"}>In use{locks.length ? ` (${locks.length})` : ""}</button>
     <button class:active={tab==="trash"} onclick={() => { tab="trash"; loadTrash(); }}>Trash</button>
   </nav>
 
@@ -281,6 +293,24 @@
           </div>
         {/if}
       {/each}
+
+    {:else if tab === "inuse"}
+      {#if !lockingAvailable}
+        <p class="empty">Your server doesn't have the Files Lock app, so Nimbo can't tell
+          when someone else has a file open.</p>
+      {:else if locks.length === 0}
+        <p class="empty">Nobody else has any of your files open.</p>
+      {:else}
+        {#each locks as l}
+          <div class="card" class:hl={l.path === highlight}>
+            <div class="title">{l.path}</div>
+            <div class="desc">
+              {l.summary}. Saving your own changes will keep both versions rather
+              than overwriting theirs.
+            </div>
+          </div>
+        {/each}
+      {/if}
 
     {:else}
       {#if trashBusy && trash.length === 0}<p class="empty">Loading…</p>

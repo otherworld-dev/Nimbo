@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/state"
 	"github.com/otherworld/nimbo/internal/transport"
@@ -20,11 +21,16 @@ func openCPTestStore(t *testing.T) *state.Store {
 }
 
 func TestCPBlobRoundtrip(t *testing.T) {
+	// LastModified MUST survive the roundtrip: the adopt scan classifies local
+	// files against it, and a replayed listing with zero mtimes mislabels every
+	// on-server file as a conflict (live incident: a warm re-scan offered to
+	// conflicted-copy 556k files / upload 478 GB; the confirm dialog caught it).
+	mt := time.Unix(1700000000, 0).UTC()
 	children := []transport.Entry{
-		{Path: "Work/dir_a/sub", IsDir: true, ETag: "e1", FileID: "10", Permissions: "RGDNVCK"},
+		{Path: "Work/dir_a/sub", IsDir: true, ETag: "e1", FileID: "10", Permissions: "RGDNVCK", LastModified: mt},
 		{Path: "Work/dir_a/100%_report.txt", ETag: "e2", FileID: "11", Size: 42,
-			Checksums: "SHA1:aa MD5:bb", Permissions: "RGDNVW"},
-		{Path: "Work/dir_a/vault", IsDir: true, ETag: "e3", IsEncrypted: true, Permissions: "RGDNVCK"},
+			Checksums: "SHA1:aa MD5:bb", Permissions: "RGDNVW", LastModified: mt.Add(time.Hour)},
+		{Path: "Work/dir_a/vault", IsDir: true, ETag: "e3", IsEncrypted: true, Permissions: "RGDNVCK", LastModified: mt},
 	}
 	blob, err := encodeCPBlob(children)
 	if err != nil {

@@ -1,0 +1,7 @@
+// Icon resources referenced by the CustomStateHandler's IconResource strings
+// ("<dllpath>,-101" etc.) so the Status column can render them on every
+// install channel without loose files.
+101 ICON "icons/ok.ico"
+102 ICON "icons/sync.ico"
+103 ICON "icons/warn.ico"
+104 ICON "icons/shared.ico"

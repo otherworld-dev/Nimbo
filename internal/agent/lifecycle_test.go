@@ -23,6 +23,58 @@ func TestStartWatcherBeforeRunIsInertNoPanic(t *testing.T) {
 	}
 }
 
+// The two trigger kinds must stay distinct: TriggerSync fires the cheap
+// remote-delta pass, TriggerFullSync the local-walking reconcile.
+// mobile.Client.SyncNow routes through TriggerFullSync because Android's inotify
+// does not see writes made by other apps to shared storage — a manual "Sync now"
+// wired to the delta trigger could never upload a file the watcher missed.
+//
+// Characterisation coverage: this plumbing had no tests, and the two maps are
+// easy to transpose in a refactor.
+func TestTriggerFullSyncSignalsOnlyTheFullTrigger(t *testing.T) {
+	full := make(chan struct{}, 1)
+	delta := make(chan struct{}, 1)
+	e := &Engine{
+		triggers:     map[string]chan struct{}{"pair": delta},
+		triggersFull: map[string]chan struct{}{"pair": full},
+	}
+
+	e.TriggerFullSync()
+
+	select {
+	case <-full:
+	default:
+		t.Fatal("TriggerFullSync did not signal the full-pass trigger")
+	}
+	select {
+	case <-delta:
+		t.Fatal("TriggerFullSync also signalled the remote-delta trigger")
+	default:
+	}
+}
+
+func TestTriggerSyncSignalsOnlyTheDeltaTrigger(t *testing.T) {
+	full := make(chan struct{}, 1)
+	delta := make(chan struct{}, 1)
+	e := &Engine{
+		triggers:     map[string]chan struct{}{"pair": delta},
+		triggersFull: map[string]chan struct{}{"pair": full},
+	}
+
+	e.TriggerSync()
+
+	select {
+	case <-delta:
+	default:
+		t.Fatal("TriggerSync did not signal the remote-delta trigger")
+	}
+	select {
+	case <-full:
+		t.Fatal("TriggerSync also signalled the full-pass trigger")
+	default:
+	}
+}
+
 func TestDrainWatchersWaitsForDoneChannels(t *testing.T) {
 	quick := make(chan struct{})
 	slow := make(chan struct{})

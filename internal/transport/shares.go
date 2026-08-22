@@ -28,14 +28,27 @@ const (
 
 // Share describes a file/folder share returned by the OCS Sharing API.
 type Share struct {
-	ID          flexString `json:"id"`
-	ShareType   int        `json:"share_type"`
-	Path        string     `json:"path"`
-	Permissions int        `json:"permissions"`
-	ShareWith   string     `json:"share_with"`
-	URL         string     `json:"url"`        // public-link URL
-	Token       string     `json:"token"`      // public-link token
-	Expiration  string     `json:"expiration"` // YYYY-MM-DD or empty
+	ID           flexString `json:"id"`
+	ShareType    int        `json:"share_type"`
+	Path         string     `json:"path"`
+	Permissions  int        `json:"permissions"`
+	ShareWith    string     `json:"share_with"`
+	URL          string     `json:"url"`               // public-link URL
+	Token        string     `json:"token"`             // public-link token
+	Expiration   string     `json:"expiration"`        // YYYY-MM-DD or empty
+	Owner        string     `json:"uid_owner"`         // who shared it
+	OwnerDisplay string     `json:"displayname_owner"` // their display name
+}
+
+// SharedBy names the sharer as a human would.
+func (s Share) SharedBy() string {
+	if s.OwnerDisplay != "" {
+		return s.OwnerDisplay
+	}
+	if s.Owner != "" {
+		return s.Owner
+	}
+	return "Someone"
 }
 
 // flexString decodes a JSON value that may be a string or a number into a string
@@ -50,6 +63,20 @@ func (f *flexString) UnmarshalJSON(b []byte) error {
 func (f flexString) String() string { return string(f) }
 
 const sharesPath = "apps/files_sharing/api/v1/shares"
+
+// ListAllShares returns every share this account takes part in, in two
+// halves: the shares the user created (any type), and the files/folders other
+// people shared WITH them. Paths are files-root-relative, as the user sees
+// them.
+func (c *Client) ListAllShares(ctx context.Context) (own, received []Share, err error) {
+	if err := c.doOCS(ctx, http.MethodGet, c.ocsURL(sharesPath), nil, "", &own); err != nil {
+		return nil, nil, err
+	}
+	if err := c.doOCS(ctx, http.MethodGet, c.ocsURL(sharesPath)+"&shared_with_me=true", nil, "", &received); err != nil {
+		return nil, nil, err
+	}
+	return own, received, nil
+}
 
 // ListShares returns the shares on a path (files-root-relative), including
 // reshares.

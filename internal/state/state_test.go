@@ -63,3 +63,35 @@ func TestBaselineRoundTrip(t *testing.T) {
 		t.Errorf("expected empty after delete, got %d", len(got))
 	}
 }
+
+// TestDeleteBaselineAll pins the "start from scratch" safety contract: wiping a
+// pair's ENTIRE baseline before its local files are deleted is what makes the
+// engine later read the empty folder as "download everything" instead of
+// "the user deleted everything - propagate the deletes to the server".
+func TestDeleteBaselineAll(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := Open(dbPath, "acct1", true) // cached path, so the cache purge is exercised too
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	for _, p := range []string{"a.txt", "sub/b.txt", "sub/deep/c.txt"} {
+		if err := st.UpsertBaseline("Pair", engine.BaselineState{Path: p, RemoteETag: "e"}); err != nil {
+			t.Fatalf("UpsertBaseline(%s): %v", p, err)
+		}
+	}
+	if err := st.UpsertBaseline("OtherPair", engine.BaselineState{Path: "keep.txt", RemoteETag: "e"}); err != nil {
+		t.Fatalf("UpsertBaseline(other): %v", err)
+	}
+
+	if err := st.DeleteBaselineAll("Pair"); err != nil {
+		t.Fatalf("DeleteBaselineAll: %v", err)
+	}
+	if got, _ := st.LoadBaseline("Pair"); len(got) != 0 {
+		t.Errorf("baseline not fully wiped: %v", got)
+	}
+	if got, _ := st.LoadBaseline("OtherPair"); len(got) != 1 {
+		t.Errorf("another pair's baseline was touched: %v", got)
+	}
+}

@@ -76,40 +76,15 @@ if (-not $Owner) { throw "no -Owner given and no 'github' remote configured" }
 Write-Host "Publishing to $Owner/$Repo"
 
 # --- 1. build + sign ---
-# Derive the next revision from recent releases so versions are monotonic no
-# matter which machine builds (the local .build-rev can reset or diverge across
-# checkouts; a lower revision would silently stop auto-updates). Uses `release
-# list` (not `release view`, which resolves GitHub's "latest" and excludes
-# pre-releases) so pre-releases count too - but --exclude-drafts stays on,
-# since a hand-created draft would otherwise feed a bogus/missing tag into the
-# derivation.
-#
-# `release list` sorts by createdAt, which is the TAGGED COMMIT's date, not the
-# release's publish time. In this repo tags land on the github snapshot
-# branch HEAD, so many releases routinely share one createdAt (ties are the
-# norm here, not the exception) - position 0 under a tie is not guaranteed to
-# be the highest revision. Take the max revision across a window of recent
-# releases instead of trusting sort order, so a tie can never derive a
-# revision that collides with an existing release.
+# The revision comes from package.ps1's unified auto-bump (see rev-common.ps1):
+# one above the higher of the local .build-rev and the newest GitHub release,
+# so versions stay monotonic no matter which machine builds AND local test
+# builds can never share a number with a release. If the GitHub query fails,
+# package.ps1 falls back to the local counter alone - a stale counter would
+# then collide with an existing tag and `gh release create` fails loudly
+# rather than shipping a duplicate.
 if (-not $SkipBuild) {
-    $nextRev = 0
-    # Same guard as the existence check below: under $ErrorActionPreference=Stop,
-    # redirecting a native exe's stderr in Windows PowerShell turns it into a
-    # terminating NativeCommandError - which would abort the release outright
-    # instead of reaching the .build-rev fallback this block documents.
-    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    $tags = @(& $gh release list --repo "$Owner/$Repo" --limit 20 --exclude-drafts --json tagName --jq '.[].tagName' 2>$null)
-    $tagsOk = ($LASTEXITCODE -eq 0)
-    $ErrorActionPreference = $eap
-    $maxRev = ($tags | ForEach-Object { if ($_ -match '\.(\d+)\s*$') { [int]$Matches[1] } } |
-               Measure-Object -Maximum).Maximum
-    if ($tagsOk -and $null -ne $maxRev) {
-        $nextRev = $maxRev + 1
-        Write-Host "Highest revision among the last $($tags.Count) release(s) is $maxRev -> building revision $nextRev"
-    } else {
-        Write-Host "No prior release found; falling back to local .build-rev auto-bump"
-    }
-    & (Join-Path $here "package.ps1") -Version $Version -Revision $nextRev -SignSubject $SignSubject -AzureSign:$AzureSign -AzureCertProfile $AzureCertProfile
+    & (Join-Path $here "package.ps1") -Version $Version -SignSubject $SignSubject -AzureSign:$AzureSign -AzureCertProfile $AzureCertProfile
 }
 $msix = Join-Path $here "Nimbo.msix"
 if (-not (Test-Path $msix)) { throw "Nimbo.msix not found - build first (omit -SkipBuild)" }

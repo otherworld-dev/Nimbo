@@ -58,14 +58,16 @@ func (c *Client) ListChunks(ctx context.Context, uploadID string) (map[string]in
 
 // PutChunk uploads a single numbered chunk. destPath is the final files-root-
 // relative destination, required by v2 in the Destination header.
-func (c *Client) PutChunk(ctx context.Context, uploadID, chunkName string, body io.Reader, size int64, destPath string) error {
-	req, err := c.NewRequest(ctx, http.MethodPut, c.uploadsURL("/"+uploadID+"/"+chunkName), body)
+//
+// newBody must return a fresh reader of the whole chunk each call: it doubles
+// as the request's GetBody, which is what lets the HTTP/2 transport replay the
+// PUT when the server recycles the connection (GOAWAY) after the body was
+// written — without it a routine proxy reload mid-chunk kills the upload.
+func (c *Client) PutChunk(ctx context.Context, uploadID, chunkName string, newBody func() (io.Reader, error), size int64, destPath string) error {
+	req, err := c.newChunkRequest(ctx, uploadID, chunkName, newBody, size, destPath)
 	if err != nil {
 		return err
 	}
-	req.ContentLength = size
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Destination", c.davURL(destPath))
 	resp, err := c.DoOnce(req)
 	if err != nil {
 		return err
@@ -75,6 +77,34 @@ func (c *Client) PutChunk(ctx context.Context, uploadID, chunkName string, body 
 		return statusError("PUT chunk "+chunkName, uploadID, resp)
 	}
 	return nil
+}
+
+// newChunkRequest builds a replayable chunk PUT: GetBody rebuilds the body via
+// newBody (HTTP/2 GOAWAY replay), and Idempotency-Key marks the PUT safe to
+// replay on a stale reused connection (net/http only replays non-idempotent
+// methods when that header is present). Re-sending the same bytes to the same
+// chunk name is idempotent by construction.
+func (c *Client) newChunkRequest(ctx context.Context, uploadID, chunkName string, newBody func() (io.Reader, error), size int64, destPath string) (*http.Request, error) {
+	body, err := newBody()
+	if err != nil {
+		return nil, err
+	}
+	req, err := c.NewRequest(ctx, http.MethodPut, c.uploadsURL("/"+uploadID+"/"+chunkName), body)
+	if err != nil {
+		return nil, err
+	}
+	req.GetBody = func() (io.ReadCloser, error) {
+		r, err := newBody()
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(r), nil
+	}
+	req.ContentLength = size
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Destination", c.davURL(destPath))
+	req.Header.Set("Idempotency-Key", uploadID+"-"+chunkName)
+	return req, nil
 }
 
 // AssembleUpload finalises a chunked upload by MOVEing the assembly member to
@@ -101,6 +131,25 @@ func (c *Client) AssembleUpload(ctx context.Context, uploadID, destPath string, 
 	}
 	etag, fileID = revisionHeaders(resp.Header)
 	return etag, fileID, nil
+}
+
+// DeleteChunk removes a single chunk from an upload session — used to prune
+// stale members (e.g. from an older chunk layout) before assembly, which
+// concatenates every member of the collection.
+func (c *Client) DeleteChunk(ctx context.Context, uploadID, chunkName string) error {
+	req, err := c.NewRequest(ctx, http.MethodDelete, c.uploadsURL("/"+uploadID+"/"+chunkName), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.DoOnce(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return statusError("DELETE chunk "+chunkName, uploadID, resp)
+	}
+	return nil
 }
 
 // DeleteUpload removes a temporary upload collection (best-effort cleanup).

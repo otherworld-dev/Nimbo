@@ -102,6 +102,7 @@ func applyUpdate(msixURL string) error {
 	}
 	taskName := brand.Current.AppID + "SelfUpdate"
 	ps1 := filepath.Join(home, "nimbo-update.ps1")
+	vbs := filepath.Join(home, "nimbo-update.vbs")
 	taskXML := filepath.Join(home, "nimbo-update-task.xml")
 	logf := filepath.Join(home, "nimbo-update.log")
 	// Brand-derived identifiers so a white-label build's updater targets ITS
@@ -153,28 +154,54 @@ func applyUpdate(msixURL string) error {
 			"  Start-Sleep -Milliseconds 500\r\n"+
 			"  \"$(Get-Date -Format s) app closed in $([int]((Get-Date) - $t0).TotalMilliseconds) ms\" | Out-File -FilePath '%[3]s' -Append\r\n"+
 			"}\r\n"+
-			// Diagnostic: log every process still holding the package right before we
-			// install — one running from the package path (a stray app process) or one
-			// that has loaded a package DLL (Explorer / a dllhost COM surrogate holding
-			// the shell extension). Add-AppxPackage waits ~30s per such process in its
-			// TerminateApplications phase, which is the remaining slow-update cost after
-			// the app itself closes fast. This names the culprits in the log so the next
-			// slow update is self-diagnosing rather than guesswork.
+			// Every process still holding the package right before we install — one
+			// running from the package path (a stray app process) or one that has
+			// loaded a package DLL (Explorer / a dllhost COM surrogate holding the
+			// shell extension). Add-AppxPackage waits ~30s per such process in its
+			// TerminateApplications phase, and that wait WAS the whole remaining
+			// slow-update cost: measured across .181-.189, an install with a dllhost
+			// holder took 107s and one with no holders took 12s.
+			//
+			// So close the ones that are ours to close instead of paying the wait.
+			// A dllhost is a COM surrogate — a host Windows respawns on demand, and
+			// killing it only aborts an in-flight shell-extension query — and a stray
+			// copy of our own exe is ours by definition. ANYTHING ELSE IS LEFT ALONE,
+			// Explorer above all: it can load the context-menu DLL directly, and
+			// killing it would take the user's desktop and every open window with it.
+			// A 30s wait is much cheaper than that, so unknown holders stay listed in
+			// the log and the deployment engine deals with them.
 			"\"$(Get-Date -Format s) package holders before install:\" | Out-File -FilePath '%[3]s' -Append\r\n"+
+			"$killed = 0\r\n"+
 			"Get-Process -ErrorAction SilentlyContinue | ForEach-Object {\r\n"+
 			"  $pp = $_\r\n"+
 			"  try {\r\n"+
 			"    $hit = $false\r\n"+
 			"    if ($pp.Path -like '*WindowsApps\\%[6]s_*') { $hit = $true }\r\n"+
 			"    elseif ($pp.Modules | Where-Object { $_.FileName -like '*WindowsApps\\%[6]s_*' }) { $hit = $true }\r\n"+
-			"    if ($hit) { \"  $($pp.ProcessName) pid=$($pp.Id)\" | Out-File -FilePath '%[3]s' -Append }\r\n"+
+			"    if ($hit) {\r\n"+
+			"      if ($pp.ProcessName -eq 'dllhost' -or $pp.ProcessName -eq '%[9]s') {\r\n"+
+			"        try {\r\n"+
+			"          Stop-Process -Id $pp.Id -Force -ErrorAction Stop\r\n"+
+			"          $killed++\r\n"+
+			"          \"  $($pp.ProcessName) pid=$($pp.Id) - terminated\" | Out-File -FilePath '%[3]s' -Append\r\n"+
+			"        } catch {\r\n"+
+			"          \"  $($pp.ProcessName) pid=$($pp.Id) - could not terminate: $_\" | Out-File -FilePath '%[3]s' -Append\r\n"+
+			"        }\r\n"+
+			"      } else {\r\n"+
+			"        \"  $($pp.ProcessName) pid=$($pp.Id) - left alone (deployment will wait ~30s)\" | Out-File -FilePath '%[3]s' -Append\r\n"+
+			"      }\r\n"+
+			"    }\r\n"+
 			"  } catch {}\r\n"+
 			"}\r\n"+
+			// Let the handles actually drop before the deployment engine looks, or it
+			// finds the package still held and waits for it anyway.
+			"if ($killed -gt 0) { Start-Sleep -Milliseconds 750 }\r\n"+
+			"$ti = Get-Date\r\n"+
 			"try {\r\n"+
 			"  Add-AppxPackage -Path '%[1]s' -ForceTargetApplicationShutdown\r\n"+
-			"  \"$(Get-Date -Format s) installed ok, now on $((Get-AppxPackage -Name %[6]s).Version)\" | Out-File -FilePath '%[3]s' -Append\r\n"+
+			"  \"$(Get-Date -Format s) installed ok in $([int]((Get-Date) - $ti).TotalSeconds)s ($killed holder(s) pre-closed), now on $((Get-AppxPackage -Name %[6]s).Version)\" | Out-File -FilePath '%[3]s' -Append\r\n"+
 			"} catch {\r\n"+
-			"  \"$(Get-Date -Format s) FAILED: $_\" | Out-File -FilePath '%[3]s' -Append\r\n"+
+			"  \"$(Get-Date -Format s) FAILED after $([int]((Get-Date) - $ti).TotalSeconds)s: $_\" | Out-File -FilePath '%[3]s' -Append\r\n"+
 			"}\r\n"+
 			// Relaunch via explorer (the same proven route relaunchSelf uses) after a
 			// beat for the package registration to settle — Start-Process with a
@@ -210,9 +237,19 @@ func applyUpdate(msixURL string) error {
 			"  Start-Sleep -Seconds 2\r\n"+
 			"}\r\n"+
 			"schtasks /delete /tn %[4]s /f | Out-Null\r\n"+
-			"Remove-Item -LiteralPath '%[5]s' -Force -ErrorAction SilentlyContinue\r\n",
-		msixURL, pfn, logf, taskName, taskXML, pkgName, brand.Current.AppID, exeRegex, procName)
+			"Remove-Item -LiteralPath '%[5]s' -Force -ErrorAction SilentlyContinue\r\n"+
+			"Remove-Item -LiteralPath '%[10]s' -Force -ErrorAction SilentlyContinue\r\n",
+		msixURL, pfn, logf, taskName, taskXML, pkgName, brand.Current.AppID, exeRegex, procName, vbs)
 	if err := os.WriteFile(ps1, []byte(script), 0o644); err != nil {
+		return err
+	}
+	// The task cannot run powershell.exe directly: a console process gets its
+	// conhost window created BEFORE -WindowStyle Hidden is processed, flashing
+	// a black box at the user mid-update. wscript.exe is a windowless host, and
+	// Run's window style 0 creates the console hidden from the start.
+	launcher := "CreateObject(\"WScript.Shell\").Run \"powershell -NoProfile -ExecutionPolicy Bypass -File \"\"" +
+		ps1 + "\"\"\", 0, False\r\n"
+	if err := os.WriteFile(vbs, []byte(launcher), 0o644); err != nil {
 		return err
 	}
 	// The task definition. schtasks' bare /create defaults to "start only on AC
@@ -237,12 +274,12 @@ func applyUpdate(msixURL string) error {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>powershell</Command>
-      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%s"</Arguments>
+      <Command>wscript.exe</Command>
+      <Arguments>//B //Nologo "%s"</Arguments>
     </Exec>
   </Actions>
 </Task>
-`, xmlEscape(ps1))
+`, xmlEscape(vbs))
 	if err := os.WriteFile(taskXML, utf16LEBOM(xml), 0o644); err != nil {
 		return err
 	}

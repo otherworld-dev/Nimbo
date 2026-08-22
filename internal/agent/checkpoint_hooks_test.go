@@ -18,6 +18,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -46,15 +47,19 @@ type davNode struct {
 }
 
 // fakeDAV serves just enough WebDAV for real sync passes: PROPFIND depth 1
-// and infinity, GET, MKCOL. Concurrency-safe — the remote scan probes it
-// from 4 workers at once. Failures are injected per path so a test can kill
-// one directory's listing (mid-crawl scan failure) or one file's download.
+// and infinity, GET, PUT, MKCOL, DELETE. Concurrency-safe — the remote scan
+// probes it from 4 workers at once. Failures are injected per path so a test
+// can kill one directory's listing (mid-crawl scan failure) or one file's
+// download.
 type fakeDAV struct {
 	mu      sync.Mutex
 	nodes   map[string]davNode
-	failPF  map[string]int // dir -> status served instead of its listing
-	failGET map[string]int // file -> status served instead of its body
-	pfCalls map[string]int // PROPFINDs seen per dir, failures included
+	failPF  map[string]int    // dir -> status served instead of its listing
+	failGET map[string]int    // file -> status served instead of its body
+	pfCalls map[string]int    // PROPFINDs seen per dir, failures included
+	puts    map[string]string // file -> body of the last PUT accepted
+	mkcols  map[string]int    // dir -> MKCOLs seen
+	deletes []string          // paths DELETEd, in order
 }
 
 func newFakeDAV(nodes map[string]davNode) *fakeDAV {
@@ -63,20 +68,59 @@ func newFakeDAV(nodes map[string]davNode) *fakeDAV {
 		failPF:  map[string]int{},
 		failGET: map[string]int{},
 		pfCalls: map[string]int{},
+		puts:    map[string]string{},
+		mkcols:  map[string]int{},
 	}
 }
 
-func (f *fakeDAV) setNode(p string, n davNode)      { f.mu.Lock(); f.nodes[p] = n; f.mu.Unlock() }
-func (f *fakeDAV) setFailPF(dir string, code int)   { f.mu.Lock(); f.failPF[dir] = code; f.mu.Unlock() }
-func (f *fakeDAV) clearFailPF(dir string)           { f.mu.Lock(); delete(f.failPF, dir); f.mu.Unlock() }
-func (f *fakeDAV) setFailGET(file string, code int) { f.mu.Lock(); f.failGET[file] = code; f.mu.Unlock() }
-func (f *fakeDAV) clearFailGET(file string)         { f.mu.Lock(); delete(f.failGET, file); f.mu.Unlock() }
+// putPaths returns every file path uploaded so far, sorted.
+func (f *fakeDAV) putPaths() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.puts))
+	for p := range f.puts {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// putBody returns the bytes uploaded to a path (empty when never uploaded).
+func (f *fakeDAV) putBody(p string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.puts[p]
+}
+
+func (f *fakeDAV) setNode(p string, n davNode)    { f.mu.Lock(); f.nodes[p] = n; f.mu.Unlock() }
+func (f *fakeDAV) delNode(p string)               { f.mu.Lock(); delete(f.nodes, p); f.mu.Unlock() }
+func (f *fakeDAV) setFailPF(dir string, code int) { f.mu.Lock(); f.failPF[dir] = code; f.mu.Unlock() }
+func (f *fakeDAV) clearFailPF(dir string)         { f.mu.Lock(); delete(f.failPF, dir); f.mu.Unlock() }
+func (f *fakeDAV) setFailGET(file string, code int) {
+	f.mu.Lock()
+	f.failGET[file] = code
+	f.mu.Unlock()
+}
+func (f *fakeDAV) clearFailGET(file string) { f.mu.Lock(); delete(f.failGET, file); f.mu.Unlock() }
 
 func (f *fakeDAV) pfCount(dir string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.pfCalls[dir]
 }
+
+// deletePaths returns every path DELETEd so far, sorted.
+func (f *fakeDAV) deletePaths() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := append([]string(nil), f.deletes...)
+	sort.Strings(out)
+	return out
+}
+
+// forgetDeletes clears the DELETE log, so a test can assert about one phase of
+// a fixture without the previous phase's deletions counting against it.
+func (f *fakeDAV) forgetDeletes() { f.mu.Lock(); f.deletes = nil; f.mu.Unlock() }
 
 func (f *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rel := strings.Trim(strings.TrimPrefix(r.URL.Path, davPrefix), "/")
@@ -89,8 +133,10 @@ func (f *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(code)
 			return
 		}
-		n, ok := f.nodes[rel]
-		if !ok || !n.isDir {
+		// A FILE answers too, with a single self row — that is what a depth-0
+		// PROPFIND is, and transport.Client.Stat is built on it, so the whole
+		// SyncPaths route depends on it behaving like a real server.
+		if _, ok := f.nodes[rel]; !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -107,8 +153,31 @@ func (f *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_, _ = w.Write([]byte(n.body))
-	case "MKCOL":
+	case "PUT":
+		// Accept the upload and publish it, so a later listing sees it exactly
+		// as a real server would. The ETag header is what transport.Put reads
+		// back to record the baseline.
+		body, _ := io.ReadAll(r.Body)
+		f.puts[rel] = string(body)
+		etag := "e-put-" + rel
+		f.nodes[rel] = davNode{etag: etag, body: string(body)}
+		w.Header().Set("ETag", `"`+etag+`"`)
+		w.Header().Set("OC-FileId", "id-"+rel)
 		w.WriteHeader(http.StatusCreated)
+	case "MKCOL":
+		f.mkcols[rel]++
+		if _, exists := f.nodes[rel]; !exists {
+			f.nodes[rel] = davNode{isDir: true, etag: "e-mkcol-" + rel}
+		}
+		w.WriteHeader(http.StatusCreated)
+	case "DELETE":
+		f.deletes = append(f.deletes, rel)
+		if _, exists := f.nodes[rel]; !exists {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		delete(f.nodes, rel)
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -148,7 +217,9 @@ func (f *fakeDAV) row(p string, n davNode) string {
 		}
 		return fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:resourcetype><d:collection/></d:resourcetype><d:getetag>&quot;%s&quot;</d:getetag><oc:permissions>RGDNVCK</oc:permissions></d:prop></d:propstat></d:response>`, href, n.etag)
 	}
-	return fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:resourcetype/><d:getetag>&quot;%s&quot;</d:getetag><d:getcontentlength>%d</d:getcontentlength><oc:permissions>RGDNVW</oc:permissions></d:prop></d:propstat></d:response>`, href, n.etag, len(n.body))
+	// Files carry a fixed Last-Modified (unix 1700000000): the adopt scan
+	// classifies against it, so tests must see it survive cold AND warm scans.
+	return fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:resourcetype/><d:getetag>&quot;%s&quot;</d:getetag><d:getcontentlength>%d</d:getcontentlength><d:getlastmodified>Tue, 14 Nov 2023 22:13:20 GMT</d:getlastmodified><oc:permissions>RGDNVW</oc:permissions></d:prop></d:propstat></d:response>`, href, n.etag, len(n.body))
 }
 
 func davUnder(p, dir string) bool {
@@ -177,6 +248,12 @@ func newHookEngine(t *testing.T, server string) (*Engine, *state.Store) {
 		recorder:  activity.New(),
 		blocked:   make(map[string][]engine.Blocked),
 		conflicts: make(map[string][]ConflictItem),
+	}
+	// As NewEngineFor does. The zero value of the guard state reads as
+	// "unreadable", which suspends every pair — tests that call applyPlan
+	// directly never pass through ensurePair, where a real run loads it.
+	if err := e.reloadGuardState(); err != nil {
+		t.Fatal(err)
 	}
 	st, err := e.getStore()
 	if err != nil {

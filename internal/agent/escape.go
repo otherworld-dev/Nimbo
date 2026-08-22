@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/otherworld/nimbo/internal/config"
 	"github.com/otherworld/nimbo/internal/engine"
 	"github.com/otherworld/nimbo/internal/policy"
 	"github.com/otherworld/nimbo/internal/transfer"
@@ -62,20 +63,24 @@ func (e *Engine) EnableEscaping(ext string) error {
 	if policy.Load().DisableNameEscaping {
 		return fmt.Errorf("name escaping is disabled by administrator policy")
 	}
-	s, err := e.dirs.LoadSettings()
-	if err != nil {
-		return err
-	}
-	for _, x := range s.EscapeExtensions {
-		if strings.EqualFold(x, ext) {
-			return nil // already on
+	var already bool
+	var exts []string
+	if err := e.dirs.UpdateSettings(func(s *config.Settings) {
+		for _, x := range s.EscapeExtensions {
+			if strings.EqualFold(x, ext) {
+				already = true
+				return
+			}
 		}
-	}
-	s.EscapeExtensions = append(s.EscapeExtensions, ext)
-	if err := e.dirs.SaveSettings(s); err != nil {
+		s.EscapeExtensions = append(s.EscapeExtensions, ext)
+		exts = s.EscapeExtensions
+	}); err != nil {
 		return err
 	}
-	e.escaper.Store(engine.NewEscaper(e.forbidden.Load(), s.EscapeExtensions, ""))
+	if already {
+		return nil
+	}
+	e.escaper.Store(engine.NewEscaper(e.forbidden.Load(), exts, ""))
 	e.TriggerFullSync()
 	slog.Info("name escaping enabled", "ext", ext)
 	return nil
@@ -100,7 +105,22 @@ func (e *Engine) DisableEscaping(ctx context.Context, ext string) (int, error) {
 	removed := 0
 	for _, p := range pairs {
 		// Raw scan (no escaper) so we see the X<suffix> names exactly as stored.
-		remote, err := engine.RemoteScan(ctx, e.client, p.RemoteRoot, engine.ScanOpts{})
+		// Checkpoint-backed under the same key as the adopt scan (both are raw
+		// whole-tree listings), so a sweep after a recent adopt/scan is warm —
+		// cold, this crawl ran silently for over an hour on a real account.
+		// NOTE: the pair BASELINE must NOT be used here: it is keyed by DECODED
+		// names, and a baseline-pruned subtree would hide the escaped copies
+		// this sweep exists to find.
+		opts := engine.ScanOpts{}
+		var cp *scanCheckpoint
+		if st, serr := e.getStore(); serr == nil {
+			cp = newScanCheckpoint(st, "vfs-adopt:"+strings.Trim(p.RemoteRoot, "/"))
+			opts.Checkpoint = cp
+		}
+		remote, err := engine.RemoteScan(ctx, e.client, p.RemoteRoot, opts)
+		if cp != nil {
+			cp.logSummary()
+		}
 		if err != nil {
 			return removed, fmt.Errorf("scan %s: %w", p.RemoteRoot, err)
 		}
@@ -144,21 +164,19 @@ func (e *Engine) DisableEscaping(ctx context.Context, ext string) (int, error) {
 		}
 	}
 	// Persist the removal + swap in a fresh escaper.
-	s, err := e.dirs.LoadSettings()
-	if err != nil {
-		return removed, err
-	}
-	kept := s.EscapeExtensions[:0]
-	for _, x := range s.EscapeExtensions {
-		if !strings.EqualFold(x, ext) {
-			kept = append(kept, x)
+	var kept []string
+	if err := e.dirs.UpdateSettings(func(s *config.Settings) {
+		kept = s.EscapeExtensions[:0]
+		for _, x := range s.EscapeExtensions {
+			if !strings.EqualFold(x, ext) {
+				kept = append(kept, x)
+			}
 		}
-	}
-	s.EscapeExtensions = kept
-	if err := e.dirs.SaveSettings(s); err != nil {
+		s.EscapeExtensions = kept
+	}); err != nil {
 		return removed, err
 	}
-	e.escaper.Store(engine.NewEscaper(e.forbidden.Load(), s.EscapeExtensions, ""))
+	e.escaper.Store(engine.NewEscaper(e.forbidden.Load(), kept, ""))
 	e.TriggerFullSync() // re-surface the reverted files as blocked
 	slog.Info("name escaping disabled", "ext", ext, "serverCopiesRemoved", removed)
 	return removed, nil

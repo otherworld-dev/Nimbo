@@ -13,6 +13,7 @@ import (
 
 	"github.com/otherworld/nimbo/internal/account"
 	"github.com/otherworld/nimbo/internal/applog"
+	"github.com/otherworld/nimbo/internal/cfapi"
 	"github.com/otherworld/nimbo/internal/brand"
 	"github.com/otherworld/nimbo/internal/config"
 	"github.com/otherworld/nimbo/internal/shellmenu"
@@ -36,7 +37,11 @@ var channel = "direct"
 // isStoreBuild reports whether this is the Microsoft Store distribution build.
 func isStoreBuild() bool { return channel == "store" }
 
-// hasAccount reports whether an account is already configured.
+// hasAccount reports whether an account is configured AND its app password is
+// still in the keychain. An account whose secret has vanished (wiped store,
+// profile trouble) must take the sign-in path here: starting the engine can
+// only fail, and the failure handler's InvokeAsync panics this early — the
+// Wails main loop is not running yet (crashed the VM on 2026-08-21).
 func hasAccount() bool {
 	d, err := config.Resolve()
 	if err != nil {
@@ -46,8 +51,15 @@ func hasAccount() bool {
 	if err != nil {
 		return false
 	}
-	_, ok := st.Default()
-	return ok
+	acc, ok := st.Default()
+	if !ok {
+		return false
+	}
+	if _, err := account.LoadSecret(acc.ID); err != nil {
+		slog.Warn("account has no stored app password; asking for a sign-in", "err", err)
+		return false
+	}
+	return true
 }
 
 // flyoutHeight is the fixed height of the tray flyout panel; its width follows
@@ -55,6 +67,21 @@ func hasAccount() bool {
 const flyoutHeight = 500
 
 func main() {
+	// FIRST, before anything can create a window: declare per-monitor DPI
+	// awareness. Windows latches the process default at first use, so this has
+	// to precede all Wails setup or the UI renders system-scaled and blurry
+	// above 100% display scaling (Deck #552).
+	if err := setDPIAwareness(); err != nil {
+		// Not fatal — we just render as before, so log it and carry on. (slog
+		// isn't configured yet; this goes to the default handler on stderr.)
+		slog.Debug("could not set per-monitor DPI awareness", "err", err)
+	}
+	// See cloud-file state truthfully: without this, cfapi DISGUISES reparse
+	// points from us wherever we are not the connected provider (live-mode
+	// status roots always, on-demand briefly), and every attribute probe lies —
+	// the live status walk re-converted already-converted files forever.
+	cfapi.ExposePlaceholders()
+
 	// Logging: stderr + a rotating file under the data dir, so the windowless
 	// build still leaves a diagnosable trail. Verbosity comes from settings or
 	// the NEXTCLIENT_DEBUG env var.
@@ -147,17 +174,36 @@ func main() {
 	flyout.OnWindowEvent(events.Common.WindowLostFocus, func(*application.WindowEvent) {
 		flyout.Hide()
 	})
-	// Re-assert the logical size when the panel is shown or the display scale
-	// changes (e.g. a Remote Desktop session switches DPI while it's hidden),
-	// otherwise the attached panel can reappear shrunk.
-	reassertSize := func(*application.WindowEvent) { flyout.SetSize(flyoutWidthFor(svc.FlyoutAppearance().PanelWidth), flyoutHeight) }
-	flyout.OnWindowEvent(events.Common.WindowShow, reassertSize)
-	flyout.OnWindowEvent(events.Common.WindowDPIChanged, reassertSize)
-
 	tray := app.SystemTray.New()
 	tray.SetIcon(trayIcon("idle", 0, false))
 	tray.AttachWindow(flyout)
 	svc.tray = tray
+
+	// Re-assert the logical size AND re-anchor to the tray whenever the panel is
+	// shown or the display scale changes.
+	//
+	// Order matters, and so does the re-anchor. Wails anchors an attached window's
+	// BOTTOM-RIGHT to the work area, computing it from the window's size at that
+	// instant, and it does so on the tray click BEFORE Show(). Our WindowShow
+	// event arrives asynchronously (Wails emits it over a channel), i.e. AFTER
+	// that anchor was computed, and SetSize keeps the existing X/Y and resizes
+	// from the TOP-LEFT. So on the first open after a scale change the panel was
+	// anchored using the stale size and then grew downward past the taskbar —
+	// a 500 DIP panel is 750px at 150%, dropping the bottom edge 250px — which
+	// looked like it had jumped towards the middle of the screen. Re-anchoring
+	// after the resize closes that race; it is the same call ToggleWindow makes,
+	// which is why closing and reopening used to fix it by itself.
+	//
+	// Wails discards this error at its own call sites; we log it, because a failed
+	// anchor silently leaves the panel wherever WM_DPICHANGED put it.
+	reanchor := func(*application.WindowEvent) {
+		flyout.SetSize(flyoutWidthFor(svc.FlyoutAppearance().PanelWidth), flyoutHeight)
+		if err := tray.PositionWindow(flyout, 0); err != nil {
+			slog.Debug("could not re-anchor the flyout to the tray", "err", err)
+		}
+	}
+	flyout.OnWindowEvent(events.Common.WindowShow, reanchor)
+	flyout.OnWindowEvent(events.Common.WindowDPIChanged, reanchor)
 
 	svc.refreshLicence() // load any installed business licence
 
@@ -174,7 +220,10 @@ func main() {
 	}
 
 	err := app.Run()
-	svc.unmountAllOnDemand() // disconnect on-demand mounts cleanly on exit
+	// Disconnect WITHOUT unregistering: unregistering makes Windows strip the
+	// cloud state from the whole tree, which is how every app update used to
+	// flatten the mount (placeholders reverted to plain files on each restart).
+	svc.disconnectAllOnDemand()
 	if err != nil {
 		slog.Error("application exited with error", "err", err)
 		os.Exit(1)

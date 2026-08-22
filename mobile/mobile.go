@@ -433,13 +433,21 @@ func marshalSlice[T any](s []T) (string, error) {
 
 // ---- Sync control ----
 
-// SyncNow triggers an immediate sync pass on every pair.
+// SyncNow triggers an immediate FULL reconcile of every pair — both trees are
+// walked, so local-only changes upload and remote-only changes download.
+//
+// Deliberately not the cheaper remote-delta pass that the desktop tray's "Sync
+// now" fires: on Android, inotify does not reliably report writes made by OTHER
+// apps to shared storage, so this is the user's manual recovery path when the
+// watcher missed something. A "Sync now" that only polls the server could never
+// upload a file the watcher failed to see, which is exactly the complaint it
+// exists to answer.
 func (c *Client) SyncNow() error {
 	e, err := c.eng()
 	if err != nil {
 		return err
 	}
-	e.TriggerSync()
+	e.TriggerFullSync()
 	return nil
 }
 
@@ -571,6 +579,102 @@ func (c *Client) BrowseJSON(remotePath string) (string, error) {
 		return "", err
 	}
 	return marshalSlice(entries)
+}
+
+// ---- File management (the Android file browser) ----
+
+// StatJSON returns one remote entry's metadata as a JSON object, or an error if
+// it does not exist.
+func (c *Client) StatJSON(remotePath string) (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	entry, ok, err := e.StatRemote(ctx, remotePath)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", errors.New("not found: " + remotePath)
+	}
+	return marshal(entry)
+}
+
+// PreviewJPEG returns a server-rendered thumbnail for a file id, at most px
+// pixels per side (0 picks a sensible default). Images, PDFs and office
+// documents all answer; anything else returns an error, which the caller should
+// treat as "show a type icon" rather than as a failure worth reporting.
+func (c *Client) PreviewJPEG(fileID string, px int) ([]byte, error) {
+	e, err := c.eng()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.Preview(ctx, fileID, px)
+}
+
+// DownloadToFile streams a remote file to localPath, creating parent
+// directories and leaving nothing behind if it fails.
+//
+// Deliberately has no overall deadline: a large file over a slow link would trip
+// any fixed ceiling. The transport still bounds the connection phases, so a dead
+// server cannot hang this forever — but a caller that wants to give up early
+// must do so by abandoning the thread it is blocking.
+func (c *Client) DownloadToFile(remotePath, localPath string) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	return e.DownloadTo(context.Background(), remotePath, localPath)
+}
+
+// UploadFile pushes a local file to remotePath, creating parent collections.
+// Chunked for large files. Same deadline reasoning as DownloadToFile.
+func (c *Client) UploadFile(localPath, remotePath string) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	_, uerr := e.Upload(context.Background(), localPath, remotePath)
+	return uerr
+}
+
+// MkdirRemote creates a remote folder (parents included).
+func (c *Client) MkdirRemote(remotePath string) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.MkdirRemote(ctx, remotePath)
+}
+
+// DeleteRemote removes a remote file or folder. On a server with the trashbin
+// enabled this is recoverable; treat it as permanent in the UI unless you have
+// checked.
+func (c *Client) DeleteRemote(remotePath string) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.DeleteRemote(ctx, remotePath)
+}
+
+// MoveRemote moves or renames a remote path.
+func (c *Client) MoveRemote(src, dst string) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.MoveRemote(ctx, src, dst)
 }
 
 // ---- Status & server info ----
