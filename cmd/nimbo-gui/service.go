@@ -3391,7 +3391,11 @@ func (a *App) dispatchToastActivation(args string) {
 	case "notifications":
 		application.InvokeAsync(func() { a.openStatus("notifications") })
 	case "settings":
-		application.InvokeAsync(func() { a.openStatus("settings") })
+		// The "update available" toast's body: open the Settings window on its
+		// General tab, where "Check for updates / Update now" and the release
+		// notes live. (This used to open the sync-status window on a nonexistent
+		// "settings" tab — the wrong menu.)
+		application.InvokeAsync(func() { a.openSettingsTab("general") })
 	case "notify": // a Nextcloud notification's Accept/Decline button
 		acct := v.Get("acct")
 		id, _ := strconv.Atoi(v.Get("id"))
@@ -4399,15 +4403,30 @@ func normalizeServer(s string) string {
 
 // --- Sync settings window ---
 
-// OpenSettings opens (or focuses) the sync-settings window.
-func (a *App) OpenSettings() {
+// OpenSettings opens (or focuses) the sync-settings window on its default tab.
+// Kept as-is (a bound method) so the frontend bindings don't need regenerating.
+func (a *App) OpenSettings() { a.openSettingsTab("") }
+
+// openSettingsTab opens (or focuses) the settings window on a specific tab
+// ("folders" | "sync" | "exclusions" | "appearance" | "general"; "" = default).
+// Internal, NOT a binding — the tab reaches the frontend via the URL-hash query
+// on first open and a "settings-tab" event when the window is already open, so
+// no new App method (and no risky bindings regen) is needed.
+func (a *App) openSettingsTab(tab string) {
 	if a.settingsWin != nil {
 		a.settingsWin.Show()
 		a.settingsWin.Focus()
+		if tab != "" && a.app != nil {
+			a.app.Event.Emit("settings-tab", tab)
+		}
 		return
 	}
+	url := "/#settings"
+	if tab != "" {
+		url += "?tab=" + tab
+	}
 	a.settingsWin = a.app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name: "settings", Title: brand.Current.Name + " — Settings", Width: 720, Height: 600, URL: "/#settings",
+		Name: "settings", Title: brand.Current.Name + " — Settings", Width: 720, Height: 600, URL: url,
 	})
 	a.settingsWin.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) { a.settingsWin = nil })
 }

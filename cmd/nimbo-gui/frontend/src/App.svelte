@@ -88,7 +88,7 @@
   <AppSplash />
 {:else if route === "status"}
   <Status />
-{:else if route === "settings"}
+{:else if route.startsWith("settings")}
   <Settings />
 {:else if route === "login"}
   <Login />

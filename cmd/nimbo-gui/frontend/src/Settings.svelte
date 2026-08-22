@@ -28,7 +28,24 @@
     freezeReason?: string; freezeSample?: string[];
   };
 
-  let tab = $state<"folders" | "sync" | "exclusions" | "appearance" | "general">("folders");
+  type SettingsTab = "folders" | "sync" | "exclusions" | "appearance" | "general";
+  const TABS: SettingsTab[] = ["folders", "sync", "exclusions", "appearance", "general"];
+
+  // Deep-link support: a toast (e.g. "update available") opens this window on a
+  // specific tab. First open carries it in the URL hash (/#settings?tab=general);
+  // an already-open window gets a "settings-tab" event instead.
+  function tabFromHash(): SettingsTab | "" {
+    const h = window.location.hash;
+    const q = h.indexOf("?");
+    if (q < 0) return "";
+    const t = new URLSearchParams(h.slice(q + 1)).get("tab") || "";
+    return (TABS as string[]).includes(t) ? (t as SettingsTab) : "";
+  }
+  let tab = $state<SettingsTab>(tabFromHash() || "folders");
+  Events.On("settings-tab", (e: any) => {
+    const t = e?.data as string;
+    if ((TABS as string[]).includes(t)) tab = t as SettingsTab;
+  });
 
   // Folders
   let cur = $state("");
