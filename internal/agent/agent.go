@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,7 +24,6 @@ import (
 
 	"github.com/otherworld/nimbo/internal/account"
 	"github.com/otherworld/nimbo/internal/activity"
-	"github.com/otherworld/nimbo/internal/syncguard"
 	"github.com/otherworld/nimbo/internal/cfapi"
 	"github.com/otherworld/nimbo/internal/config"
 	"github.com/otherworld/nimbo/internal/engine"
@@ -31,6 +31,7 @@ import (
 	"github.com/otherworld/nimbo/internal/policy"
 	"github.com/otherworld/nimbo/internal/push"
 	"github.com/otherworld/nimbo/internal/state"
+	"github.com/otherworld/nimbo/internal/syncguard"
 	"github.com/otherworld/nimbo/internal/transfer"
 	"github.com/otherworld/nimbo/internal/transport"
 	"github.com/otherworld/nimbo/internal/watch"
@@ -89,6 +90,11 @@ type Engine struct {
 	triggersFull map[string]chan struct{} // key -> force-a-full-local-pass trigger (name-rule changes)
 	watchDone    map[string]chan struct{} // key -> closed when the watcher goroutine exits (for a synchronous, drained stop)
 
+	// Per-pair sync health (see pairhealth.go). Lazily created so a zero-value
+	// Engine — constructed before Run — works without setup.
+	pairHealthOnce  sync.Once
+	pairHealthState *pairHealthState
+
 	// moveExcl enforces move/sync mutual exclusion. A sync pass holds it for
 	// reading (many may run concurrently); a "Move sync folder" holds it for
 	// writing (exclusive). Both use the non-blocking Try variants: a move that
@@ -140,10 +146,14 @@ type Engine struct {
 	overlayRootsMu sync.RWMutex
 	overlayRoots   []string // extra synced dirs with no live pair (on-demand mounts)
 
-	sharedMu       sync.RWMutex
-	sharedRemote   map[string]bool // files-root-relative paths carrying a share
-	receivedShares map[string]bool // the received-from-others subset, for arrival toasts
-	sharesPrimed   bool            // first refresh done — only later arrivals toast
+	sharedMu          sync.RWMutex
+	sharedRemote      map[string]bool // files-root-relative paths carrying a share
+	receivedShares    map[string]bool // the received-from-others subset, for arrival toasts
+	sharesPrimed      bool            // first refresh done — only later arrivals toast
+	sharesRefreshedAt time.Time       // when refreshSharesSoon last ran (its throttle)
+
+	ensuredMu    sync.Mutex
+	ensuredRoots map[string]bool // pair remote roots already MKCOLed this run (#599)
 
 	// scanLastEmit throttles the scan heartbeat (see scanstatus.go): the scan
 	// callbacks fire per directory/entry from worker goroutines, far faster than
@@ -577,9 +587,27 @@ func (e *Engine) UnpinApp(id string) error {
 	})
 }
 
+// SearchByName finds files and folders by name across the whole account,
+// returning them as ordinary entries with real paths (unlike SearchFiles,
+// whose unified-search hits carry only display text and a web URL).
+func (e *Engine) SearchByName(ctx context.Context, term string, limit int) ([]transport.Entry, error) {
+	return e.client.SearchByName(ctx, term, limit)
+}
+
 // Favorites returns the user's favourited files and folders.
 func (e *Engine) Favorites(ctx context.Context) ([]transport.Entry, error) {
 	return e.client.Favorites(ctx)
+}
+
+// Shares returns every share this account takes part in, split into the ones
+// the user created and the ones other people shared with them.
+func (e *Engine) Shares(ctx context.Context) (own, received []transport.Share, err error) {
+	return e.client.ListAllShares(ctx)
+}
+
+// SetFavorite stars or unstars a file or folder.
+func (e *Engine) SetFavorite(ctx context.Context, remotePath string, fav bool) error {
+	return e.client.SetFavorite(ctx, remotePath, fav)
 }
 
 // UserStatus returns the user's Nextcloud presence/status.
@@ -1136,9 +1164,9 @@ func (e *Engine) ResolveConflict(ctx context.Context, item ConflictItem, choice 
 	}
 
 	ex := &transfer.Executor{
-		Client:  e.client,
-		State:   st,
-		PairKey: PairKey(item.LocalDir, item.RemoteRoot),
+		Client:     e.client,
+		State:      st,
+		PairKey:    PairKey(item.LocalDir, item.RemoteRoot),
 		LocalRoot:  item.LocalDir,
 		RemoteRoot: item.RemoteRoot,
 		Escaper:    e.escaper.Load(),
@@ -1337,6 +1365,9 @@ func (e *Engine) AddSyncFolder(remoteRoot string) error {
 			return nil // already synced
 		}
 	}
+	if err := e.forgetCloneStatus(local, remoteRoot); err != nil {
+		return err
+	}
 	pairs = append(pairs, config.SyncPair{LocalDir: local, RemoteRoot: remoteRoot})
 	if err := e.dirs.SavePairs(pairs); err != nil {
 		return err
@@ -1376,11 +1407,34 @@ func (e *Engine) AddSyncPair(localDir, remoteRoot string) error {
 	if err := os.MkdirAll(localDir, 0o755); err != nil {
 		return fmt.Errorf("create local folder: %w", err)
 	}
+	if err := e.forgetCloneStatus(localDir, remoteRoot); err != nil {
+		return err
+	}
 	pairs = append(pairs, config.SyncPair{LocalDir: localDir, RemoteRoot: remoteRoot})
 	if err := e.dirs.SavePairs(pairs); err != nil {
 		return err
 	}
 	return e.ReloadPairs()
+}
+
+// forgetCloneStatus drops any clone-state row already sitting under a pair
+// that is being ADDED. Rows written before removal/reset started clearing
+// them outlive their pair, and a leftover "started" would make the new pair's
+// first sync a clone RESUME — refetching (overwriting) any local file whose
+// size differs from the server — where a fresh pair takes over and never
+// overwrites. Resume is only right for an interrupted clone of a pair that is
+// still configured; a folder the user adds is new from their point of view
+// (GitHub #4 left such a row behind for a populated folder). Runs BEFORE the
+// pair is saved, so a failure adds nothing rather than adding it unprotected.
+func (e *Engine) forgetCloneStatus(localDir, remoteRoot string) error {
+	st, err := e.getStore()
+	if err != nil {
+		return fmt.Errorf("prepare folder state: %w", err)
+	}
+	if err := st.ClearCloneStatus(PairKey(localDir, remoteRoot)); err != nil {
+		return fmt.Errorf("prepare folder state: %w", err)
+	}
+	return nil
 }
 
 // Move/sync mutual exclusion (see the moveExcl field). A sync pass brackets its
@@ -1530,12 +1584,20 @@ func (e *Engine) RemoveSyncFolder(remoteRoot string, deleteLocal bool) error {
 		return err
 	}
 	if removed != nil {
-		// Drop the pair's checkpoint rows — cached dir listings are the big
-		// blobs, and nothing else ever targets this pair_key again. Best-effort;
-		// the 14-day age-out is the backstop.
 		if st, serr := e.getStore(); serr == nil {
-			if cerr := st.ClearScanCheckpoint(PairKey(removed.LocalDir, removed.RemoteRoot)); cerr != nil {
+			pk := PairKey(removed.LocalDir, removed.RemoteRoot)
+			// Drop the pair's checkpoint rows — cached dir listings are the big
+			// blobs. Best-effort; the 14-day age-out is the backstop.
+			if cerr := st.ClearScanCheckpoint(pk); cerr != nil {
 				slog.Warn("scan checkpoint clear on remove failed", "err", cerr)
+			}
+			// And its clone state. The key is (local dir, remote root), so
+			// re-adding the same folder later finds this row again — and a
+			// leftover "started" turns that re-add into a clone RESUME, which
+			// overwrites any local file whose size differs from the server,
+			// where a fresh pair takes over and never overwrites (GitHub #4).
+			if cerr := st.ClearCloneStatus(pk); cerr != nil {
+				slog.Warn("clone status clear on remove failed — re-adding this folder would resume, not take over", "err", cerr)
 			}
 		}
 	}
@@ -1558,6 +1620,12 @@ func (e *Engine) ResetPairState(localDir, remoteRoot string) error {
 	}
 	key := PairKey(localDir, remoteRoot)
 	if err := st.DeleteBaselineAll(key); err != nil {
+		return err
+	}
+	// "Brand new" must include the clone state: a leftover "started" would
+	// make the next sync a clone RESUME (differing local files refetched, i.e.
+	// overwritten) rather than a takeover (never overwrites).
+	if err := st.ClearCloneStatus(key); err != nil {
 		return err
 	}
 	if err := st.ClearScanCheckpoint(key); err != nil {
@@ -1882,7 +1950,12 @@ func (e *Engine) sharesRefreshLoop(ctx context.Context) {
 		}
 	}
 	refresh()
-	t := time.NewTicker(5 * time.Minute)
+	// 30 minutes, not 5: this poll was 43% of an idle client's server traffic
+	// (#599). Freshness for the common case — a share arriving — comes from
+	// refreshSharesSoon riding the server's own notify_notification push; this
+	// ticker only covers servers without push and shares that raise no
+	// notification (e.g. created by yourself elsewhere).
+	t := time.NewTicker(30 * time.Minute)
 	defer t.Stop()
 	for {
 		select {
@@ -1891,6 +1964,29 @@ func (e *Engine) sharesRefreshLoop(ctx context.Context) {
 		case <-t.C:
 			refresh()
 		}
+	}
+}
+
+// sharesEventThrottle coalesces refreshSharesSoon calls: notification events
+// arrive in bursts, and one refresh per window is plenty for share markers.
+const sharesEventThrottle = time.Minute
+
+// refreshSharesSoon refreshes the shared-paths set unless it already ran
+// within sharesEventThrottle. Fired off notify_notification pushes — a new
+// incoming share raises a notification, so this keeps share markers and
+// arrival toasts prompt while the periodic poll idles at 30 minutes.
+func (e *Engine) refreshSharesSoon(ctx context.Context) {
+	e.sharedMu.Lock()
+	if time.Since(e.sharesRefreshedAt) < sharesEventThrottle {
+		e.sharedMu.Unlock()
+		return
+	}
+	e.sharesRefreshedAt = time.Now() // claim before the fetch so a burst coalesces
+	e.sharedMu.Unlock()
+	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := e.RefreshShares(rctx); err != nil {
+		slog.Debug("event-driven share refresh failed", "err", err)
 	}
 }
 
@@ -2466,9 +2562,25 @@ func (e *Engine) ensurePair(ctx context.Context, p Pair) error {
 	if err := os.MkdirAll(p.LocalDir, 0o755); err != nil {
 		return err
 	}
+	// Create the remote root once per run, not once per pass: this sits on the
+	// path of EVERY sync entry point, and re-ensuring cost one MKCOL per path
+	// segment every few minutes, forever (visible in a server's access log as
+	// an endless MKCOL drumbeat — #599). If the root later vanishes
+	// server-side the scan fails loudly, which is the safer outcome anyway.
 	if p.RemoteRoot != "" {
-		if err := e.client.EnsureCollection(ctx, p.RemoteRoot); err != nil {
-			return fmt.Errorf("ensure remote root: %w", err)
+		e.ensuredMu.Lock()
+		done := e.ensuredRoots[p.RemoteRoot]
+		e.ensuredMu.Unlock()
+		if !done {
+			if err := e.client.EnsureCollection(ctx, p.RemoteRoot); err != nil {
+				return fmt.Errorf("ensure remote root: %w", err)
+			}
+			e.ensuredMu.Lock()
+			if e.ensuredRoots == nil {
+				e.ensuredRoots = map[string]bool{}
+			}
+			e.ensuredRoots[p.RemoteRoot] = true
+			e.ensuredMu.Unlock()
 		}
 	}
 	return nil
@@ -4030,13 +4142,26 @@ func (e *Engine) seedDevIgnores() {
 	}
 }
 
+// pollIntervalFor picks the remote poll cadence. Without push the poll is the
+// only source of server→local changes, but 15s meant ~240 PROPFINDs/hour
+// against servers that never asked for it (#599) — 30s matches the official
+// client. With push connected the poll is only a safety net for missed events;
+// 5 minutes keeps the worst case for a dropped push event tolerable (a 15m
+// backoff was tried for #599 and felt too long) at 12 PROPFINDs/hour.
+func pollIntervalFor(pushAvailable bool) time.Duration {
+	if pushAvailable {
+		return 5 * time.Minute
+	}
+	return 30 * time.Second
+}
+
 func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transfer.Stats)) error {
 	e.onSync = onSync
-	_ = e.reloadGuardState()  // before any watcher fires its first scan
-	e.seedDevIgnores()        // before any watcher fires its first scan
+	_ = e.reloadGuardState()    // before any watcher fires its first scan
+	e.seedDevIgnores()          // before any watcher fires its first scan
 	go e.sharesRefreshLoop(ctx) // keeps the shared-folder markers current
 	go e.presenceLoop(ctx)      // keeps the user's Nextcloud presence "online"
-	defer e.closeStoreFinal() // resident baseline cache lives only while running
+	defer e.closeStoreFinal()   // resident baseline cache lives only while running
 	// Drop backup entries whose folder is gone. Here, and only here: the config
 	// is quiescent, no watcher exists yet, and a stale entry is otherwise both
 	// permanent and invisible (BackupViews iterates over pairs).
@@ -4054,9 +4179,8 @@ func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transf
 
 	_ = e.notifier.Prime(ctx)
 
-	e.pollInterval = 15 * time.Second
+	e.pollInterval = pollIntervalFor(e.PushAvailable())
 	if e.PushAvailable() {
-		e.pollInterval = 5 * time.Minute // push handles the common case; poll is a safety net
 		go e.runPush(ctx)
 	}
 	// State this once at startup: "nothing ever shows up under In use" has two
@@ -4073,6 +4197,7 @@ func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transf
 	}
 	go e.watchPause(ctx)      // resume/pause at timed expiry and schedule boundaries
 	go e.runLockLifetime(ctx) // sweep, heartbeat and release the locks WE hold
+	go e.logRequestVolume(ctx)
 	// Attic retention runs on its own clock, deliberately NOT off the sync loop:
 	// every sync entry point early-returns while paused and quiet hours
 	// auto-pauses daily, so a purge driven from there would strand indefinitely
@@ -4083,6 +4208,44 @@ func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transf
 	// overlap two engines' watchers on the same folders and DB this way.
 	e.drainWatchers(30 * time.Second)
 	return nil
+}
+
+// logRequestVolume writes one line every 15 minutes saying how many requests
+// went to the server since the last line, per method. Deck #599 (17.5M login
+// rows from one client) could not be traced from the log because it records
+// sync passes and transfers, never the requests behind them; this line is the
+// answer to "what is Nimbo actually sending", in every log, without verbose.
+// Quiet intervals are skipped so an idle client doesn't fill its log.
+func (e *Engine) logRequestVolume(ctx context.Context) {
+	const every = 15 * time.Minute
+	t := time.NewTicker(every)
+	defer t.Stop()
+	last := e.client.RequestCounts()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			cur := e.client.RequestCounts()
+			attrs := []any{"per", every.String()}
+			var total int64
+			methods := make([]string, 0, len(cur))
+			for m := range cur {
+				methods = append(methods, m)
+			}
+			sort.Strings(methods) // stable order so lines diff cleanly
+			for _, m := range methods {
+				if n := cur[m] - last[m]; n > 0 {
+					attrs = append(attrs, m, n)
+					total += n
+				}
+			}
+			last = cur
+			if total > 0 {
+				slog.Info("http requests", append(attrs, "total", total)...)
+			}
+		}
+	}
 }
 
 // watchPause re-evaluates the effective pause state periodically so a timed
@@ -4180,6 +4343,10 @@ func (e *Engine) startWatcher(p Pair) {
 			} else {
 				stats, err = e.SyncOnce(ctx, p)
 			}
+			// Record per-folder health before returning: the engine's status
+			// string is global, so this is the only place a UI can learn that
+			// THIS folder stopped syncing while others are fine.
+			e.notePairResult(p, err)
 			if err != nil {
 				slog.Error("sync failed", "local", p.LocalDir, "err", err)
 				return err
@@ -4196,6 +4363,7 @@ func (e *Engine) startWatcher(p Pair) {
 		// remote delta instead of a full local-walking sync.
 		pushFn := func(ctx context.Context) error {
 			stats, err := e.syncRemoteDelta(ctx, p)
+			e.notePairResult(p, err)
 			if err == nil && e.onSync != nil {
 				e.onSync(p, stats)
 			}
@@ -4227,6 +4395,7 @@ func (e *Engine) stopWatcher(key string) {
 	delete(e.watchers, key)
 	delete(e.triggers, key)
 	e.watchMu.Unlock()
+	e.forgetPairHealth(key) // a folder that is gone is not a folder that is broken
 	if cancel != nil {
 		cancel()
 	}
@@ -4273,6 +4442,9 @@ func (e *Engine) runPush(ctx context.Context) {
 				if _, err := e.notifier.Check(ctx); err != nil {
 					slog.Warn("notification check failed", "err", err)
 				}
+				// A new incoming share announces itself as a notification, so
+				// this is the moment share markers are stale (throttled inside).
+				e.refreshSharesSoon(ctx)
 			}()
 		}
 	})

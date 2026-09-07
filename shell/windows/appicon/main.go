@@ -1,7 +1,10 @@
 // Command appicon generates the Nimbo application icon used for the
 // Explorer navigation-pane entry (and available for packaging). Run:
 //
-//	go run .   # writes ../../../cmd/nimbo-gui/assets/nimbo.ico
+//	go run .                # writes ../../../cmd/nimbo-gui/assets/nimbo.ico
+//	go run . logos <dir>    # MSIX PNG logo set into <dir>
+//	go run . android [dir]  # Android adaptive-icon layers; defaults to
+//	                        # ../../../android/app/src/main/res
 //
 // Committed; re-run only to change the artwork.
 package main
@@ -54,6 +57,17 @@ func main() {
 	args := flag.Args()
 	if len(args) >= 2 && args[0] == "logos" {
 		writeLogos(args[1])
+		return
+	}
+	// Android adaptive-icon layers, as vectors: go run . android [res-dir].
+	// The Android app is in this repo, so the destination defaults in-tree;
+	// pass a dir only to generate into an out-of-tree checkout.
+	if len(args) >= 1 && args[0] == "android" {
+		res := filepath.Join("..", "..", "..", "android", "app", "src", "main", "res")
+		if len(args) >= 2 {
+			res = args[1]
+		}
+		writeAndroid(res)
 		return
 	}
 	out := filepath.Join("..", "..", "..", "cmd", "nimbo-gui", "assets")

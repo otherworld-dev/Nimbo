@@ -182,6 +182,7 @@ func TestAddSyncPairIdempotentOnExactMatch(t *testing.T) {
 	tmp := t.TempDir()
 	d := config.Dirs{Config: tmp, Data: tmp}.WithAccount("a")
 	e := &Engine{dirs: d}
+	t.Cleanup(e.closeStore) // AddSyncPair opens the state DB (clone-state clear); release it before TempDir cleanup
 	dir := filepath.Join(tmp, "Cloud")
 
 	if err := e.AddSyncPair(dir, ""); err != nil {

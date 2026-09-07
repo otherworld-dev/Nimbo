@@ -10,9 +10,9 @@ import (
 
 // TrashItem is a deleted file/folder in the Nextcloud trashbin.
 type TrashItem struct {
-	Href             string    // DAV href/path, used to restore or delete
-	Name             string    // original filename
-	OriginalLocation string    // files-root-relative path it was deleted from
+	Href             string // DAV href/path, used to restore or delete
+	Name             string // original filename
+	OriginalLocation string // files-root-relative path it was deleted from
 	DeletedAt        time.Time
 	Size             int64
 	IsDir            bool

@@ -98,7 +98,7 @@ func TestVerifyCopy(t *testing.T) {
 func TestDirSize(t *testing.T) {
 	base := t.TempDir()
 	mkfile(t, filepath.Join(base, "a.txt"), "12345")    // 5
-	mkfile(t, filepath.Join(base, "d", "b.txt"), "678")  // 3
+	mkfile(t, filepath.Join(base, "d", "b.txt"), "678") // 3
 	if got := dirSize(base); got != 8 {
 		t.Errorf("dirSize = %d, want 8", got)
 	}

@@ -8,10 +8,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -27,6 +30,10 @@ type Client struct {
 
 	upLimiter   *rate.Limiter // nil = unlimited
 	downLimiter *rate.Limiter
+
+	// Per-method request tally since construction (see RequestCounts).
+	countMu sync.Mutex
+	counts  map[string]int64
 }
 
 // userAgent identifies the client in server logs and session lists.
@@ -47,12 +54,24 @@ var (
 
 // New creates a Client for the given server using basic auth with an app
 // password. The underlying http.Client pools connections for efficiency.
+//
+// It also keeps the server's session cookies. Basic auth still goes on every
+// request, but a request that presents no session is a fresh login to
+// Nextcloud — and every login writes a suspicious_login row (oc_login_address
+// hit 17.5M rows on one account in seven weeks, Deck #599). With the session
+// cookie presented, the server serves the request from the session and no
+// login event fires, which is what the official client does. The jar is
+// per-Client, so accounts never share a session; an expired session just
+// costs one more login server-side.
 func New(server, user, appPassword string) *Client {
+	jar, _ := cookiejar.New(nil) // only errors on a bad Options; nil is fine
 	return &Client{
 		server: strings.TrimRight(server, "/"),
 		user:   user,
 		pass:   appPassword,
+		counts: map[string]int64{},
 		hc: &http.Client{
+			Jar:     jar,
 			Timeout: 0, // whole-request deadlines come from context; phases bounded below
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{
@@ -96,7 +115,7 @@ func (c *Client) NewRequest(ctx context.Context, method, url string, body io.Rea
 // performing uploads should use DoOnce.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if !idempotent(req.Method) || (req.Body != nil && req.GetBody == nil) {
-		return c.hc.Do(req)
+		return c.send(req)
 	}
 	const maxAttempts = 4
 	var lastErr error
@@ -114,7 +133,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			}
 			r.Body = body
 		}
-		resp, err := c.hc.Do(r)
+		resp, err := c.send(r)
 		if err != nil {
 			lastErr = err
 			continue
@@ -171,7 +190,50 @@ func (c *Client) DoOnce(req *http.Request) (*http.Response, error) {
 			}
 		}
 	}
-	return c.hc.Do(req)
+	return c.send(req)
+}
+
+// send is the single point every request passes through: it tallies the
+// method and, at debug level, logs each request with its outcome. #599 cost an
+// evening because nothing could say what Nimbo was actually sending — the sync
+// log only knows about passes and transfers, not the requests behind them.
+// The path is logged, never the query (share tokens, credentials).
+func (c *Client) send(req *http.Request) (*http.Response, error) {
+	c.countMu.Lock()
+	c.counts[req.Method]++
+	c.countMu.Unlock()
+	debug := slog.Default().Enabled(req.Context(), slog.LevelDebug)
+	// session: whether a server session cookie rode along — "false" on every
+	// line is the #599 signature (each request a fresh login). Read before the
+	// send: afterwards the jar holds whatever this response just set.
+	hadSession := debug && len(c.hc.Jar.Cookies(req.URL)) > 0
+	start := time.Now()
+	resp, err := c.hc.Do(req)
+	if !debug {
+		return resp, err
+	}
+	attrs := []any{"method", req.Method, "path", req.URL.Path, "ms", time.Since(start).Milliseconds(),
+		"session", hadSession}
+	if err != nil {
+		attrs = append(attrs, "err", err)
+	} else {
+		attrs = append(attrs, "status", resp.StatusCode)
+	}
+	slog.Debug("http", attrs...)
+	return resp, err
+}
+
+// RequestCounts returns how many requests this client has sent per HTTP
+// method since it was created, retried attempts included. Cheap enough for a
+// periodic log line; the point is to make request volume visible.
+func (c *Client) RequestCounts() map[string]int64 {
+	c.countMu.Lock()
+	defer c.countMu.Unlock()
+	out := make(map[string]int64, len(c.counts))
+	for k, v := range c.counts {
+		out[k] = v
+	}
+	return out
 }
 
 func idempotent(method string) bool {

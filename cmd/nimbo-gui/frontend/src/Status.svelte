@@ -308,6 +308,9 @@
               {l.summary}. Saving your own changes will keep both versions rather
               than overwriting theirs.
             </div>
+            {#if l.since}
+              <div class="locksub">Open since {new Date(l.since).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</div>
+            {/if}
           </div>
         {/each}
       {/if}
@@ -358,6 +361,7 @@
   .card { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
   .card .title { font-weight: 600; font-size: 13px; }
   .card .desc { color: var(--fg2); font-size: 12px; margin: 4px 0 10px; }
+  .locksub { font-size: 11.5px; color: var(--muted); }
   .versions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 12px; }
   .ver { border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; background: var(--panel); }
   .ver.newest { border-color: var(--accent); background: var(--tint); }

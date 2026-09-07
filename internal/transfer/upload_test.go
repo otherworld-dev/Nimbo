@@ -24,13 +24,13 @@ type fakeNC struct {
 	files    map[string][]byte            // destination path -> content
 	sessions map[string]map[string][]byte // uploadID -> chunk name -> bytes
 
-	chunkFail     map[string]int // chunk name -> remaining failures
-	chunkFailCode int            // status to fail chunks with
-	assembleFail  int            // remaining MOVE failures
-	assembleCode  int
-	assembleSilent  bool   // fail the MOVE response but perform the assembly anyway
-	destStatFails   int    // remaining PROPFIND failures on destination paths
-	destChecksum    string // oc:checksums value to include in destination PROPFINDs
+	chunkFail      map[string]int // chunk name -> remaining failures
+	chunkFailCode  int            // status to fail chunks with
+	assembleFail   int            // remaining MOVE failures
+	assembleCode   int
+	assembleSilent bool   // fail the MOVE response but perform the assembly anyway
+	destStatFails  int    // remaining PROPFIND failures on destination paths
+	destChecksum   string // oc:checksums value to include in destination PROPFINDs
 
 	chunkPuts       map[string]int // chunk name -> PUT attempts seen
 	sessionDeletes  []string       // upload IDs DELETEd (whole session)

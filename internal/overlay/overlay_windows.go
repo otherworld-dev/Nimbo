@@ -86,7 +86,7 @@ func handle(conn net.Conn, statusFn func(string) string) {
 }
 
 var (
-	shell32           = windows.NewLazySystemDLL("shell32.dll")
+	shell32            = windows.NewLazySystemDLL("shell32.dll")
 	procSHChangeNotify = shell32.NewProc("SHChangeNotify")
 )
 

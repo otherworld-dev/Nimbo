@@ -1204,6 +1204,8 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 	// delete/move) and pull changes made elsewhere (List). When notify_push is
 	// available the reconcile is driven by push (Poke), so the poll is a long
 	// safety net; otherwise it's the primary trigger.
+	// Same cadence policy as the engine's pollIntervalFor (#599): with push the
+	// poll is only a missed-event safety net.
 	poll := 30 * time.Second
 	if eng.PushAvailable() {
 		poll = 5 * time.Minute
@@ -1211,11 +1213,11 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 	up := a.uploadWithConflictFor(eng, etags)
 	startWatcher := func() *vfs.Watcher {
 		w, werr := vfs.New(a.ctx, localDir, root, poll, vfs.Ops{
-			Upload:         up,
-			Mkdir:          eng.MkdirRemote,
-			Delete:         eng.DeleteRemote,
-			Move:           eng.MoveRemote,
-			List:           listRemote,
+			Upload: up,
+			Mkdir:  eng.MkdirRemote,
+			Delete: eng.DeleteRemote,
+			Move:   eng.MoveRemote,
+			List:   listRemote,
 			// Lost-MOVE detection: after a rename's MOVE "fails", the watcher
 			// asks whether the destination exists — the server may have applied
 			// the move and only the response was lost.

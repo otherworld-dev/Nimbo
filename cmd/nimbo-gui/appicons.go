@@ -36,8 +36,9 @@ var icoSizes = []int{16, 24, 32, 48, 64, 256}
 // existing Start-menu pins pick up the new look at their unchanged paths.
 // rev 2: Nimbo badge composited into the corner (PWA-style "via Nimbo" mark).
 // rev 3: small frames encoded as classic DIBs — the shell's icon extractor
-//        (taskbar pins, .lnk icons) renders PNG-compressed frames below 256px
-//        as a blank page, even though LoadImageW copes.
+//
+//	(taskbar pins, .lnk icons) renders PNG-compressed frames below 256px
+//	as a blank page, even though LoadImageW copes.
 const appIconsRev = "3"
 
 // appIconsDir is the live icon folder: beside the Start-menu shortcuts, whose
@@ -290,14 +291,14 @@ func writeIcoFromImage(path string, src image.Image) error {
 func dibFrame(img image.Image, s int) []byte {
 	var buf bytes.Buffer
 	maskStride := ((s + 31) / 32) * 4
-	binary.Write(&buf, binary.LittleEndian, uint32(40))   // biSize
-	binary.Write(&buf, binary.LittleEndian, int32(s))     // biWidth
-	binary.Write(&buf, binary.LittleEndian, int32(2*s))   // biHeight (XOR + AND)
-	binary.Write(&buf, binary.LittleEndian, uint16(1))    // biPlanes
-	binary.Write(&buf, binary.LittleEndian, uint16(32))   // biBitCount
-	binary.Write(&buf, binary.LittleEndian, uint32(0))    // biCompression = BI_RGB
+	binary.Write(&buf, binary.LittleEndian, uint32(40))                 // biSize
+	binary.Write(&buf, binary.LittleEndian, int32(s))                   // biWidth
+	binary.Write(&buf, binary.LittleEndian, int32(2*s))                 // biHeight (XOR + AND)
+	binary.Write(&buf, binary.LittleEndian, uint16(1))                  // biPlanes
+	binary.Write(&buf, binary.LittleEndian, uint16(32))                 // biBitCount
+	binary.Write(&buf, binary.LittleEndian, uint32(0))                  // biCompression = BI_RGB
 	binary.Write(&buf, binary.LittleEndian, uint32(s*s*4+maskStride*s)) // biSizeImage
-	buf.Write(make([]byte, 16)) // XPels/YPels/ClrUsed/ClrImportant
+	buf.Write(make([]byte, 16))                                         // XPels/YPels/ClrUsed/ClrImportant
 	b := img.Bounds()
 	for y := s - 1; y >= 0; y-- { // bottom-up
 		for x := 0; x < s; x++ {
@@ -329,8 +330,8 @@ func encodeICO(sizes []int, pngs [][]byte) []byte {
 		}
 		buf.WriteByte(byte(w))
 		buf.WriteByte(byte(w))
-		buf.WriteByte(0) // palette
-		buf.WriteByte(0) // reserved
+		buf.WriteByte(0)                                    // palette
+		buf.WriteByte(0)                                    // reserved
 		binary.Write(&buf, binary.LittleEndian, uint16(1))  // planes
 		binary.Write(&buf, binary.LittleEndian, uint16(32)) // bpp
 		binary.Write(&buf, binary.LittleEndian, uint32(len(pngs[i])))

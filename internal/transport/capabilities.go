@@ -40,11 +40,11 @@ type NotifyPush struct {
 // (.htaccess, names with illegal characters, etc.) instead of failing forever.
 // Field names cover both the modern (Nextcloud 30+) and legacy schemas.
 type FilesCapability struct {
-	ForbiddenFilenames    []string `json:"forbidden_filenames"`
-	ForbiddenBasenames    []string `json:"forbidden_filename_basenames"`
-	ForbiddenCharacters   []string `json:"forbidden_filename_characters"`
-	ForbiddenExtensions   []string `json:"forbidden_filename_extensions"`
-	BlacklistedFiles      []string `json:"blacklisted_files"` // legacy
+	ForbiddenFilenames  []string `json:"forbidden_filenames"`
+	ForbiddenBasenames  []string `json:"forbidden_filename_basenames"`
+	ForbiddenCharacters []string `json:"forbidden_filename_characters"`
+	ForbiddenExtensions []string `json:"forbidden_filename_extensions"`
+	BlacklistedFiles    []string `json:"blacklisted_files"` // legacy
 	// Locking is the files_lock app's version ("1.0" on Nextcloud 34). The KEY's
 	// presence is what signals the app is installed, so an empty string means
 	// "no locking", never "locking version unknown".

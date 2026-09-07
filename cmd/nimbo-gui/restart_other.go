@@ -6,5 +6,5 @@ package main
 func relaunchSelf() {}
 
 // canApplyUpdate / applyUpdate: in-app MSIX self-update is Windows-only.
-func canApplyUpdate() bool      { return false }
+func canApplyUpdate() bool     { return false }
 func applyUpdate(string) error { return nil }

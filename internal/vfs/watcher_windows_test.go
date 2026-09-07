@@ -25,17 +25,17 @@ import (
 // is an in-sync placeholder unless listed in dirty (NeedsUpload). Created
 // placeholders become real (empty) files/dirs so os.ReadDir sees them.
 type fakeCf struct {
-	mu         sync.Mutex
-	dirty      map[string]bool   // path -> NeedsUpload
-	refreshed  []string          // paths passed to RefreshPlaceholder
-	repointed  []string          // paths passed to UpdateIdentity
-	marked     []string          // paths passed to MarkInSync
-	identities map[string]string // path -> identity stamped by MarkInSync
-	created    []string          // names passed to CreatePlaceholders
-	plain      map[string]bool   // paths that are NOT placeholders (flattened)
-	notified   []string          // paths passed to the shell change-notify seam
-	settleChecked []string       // paths offered to the pin-settle seam
-	excluded      []string       // paths passed to the exclude-from-sync seam
+	mu            sync.Mutex
+	dirty         map[string]bool   // path -> NeedsUpload
+	refreshed     []string          // paths passed to RefreshPlaceholder
+	repointed     []string          // paths passed to UpdateIdentity
+	marked        []string          // paths passed to MarkInSync
+	identities    map[string]string // path -> identity stamped by MarkInSync
+	created       []string          // names passed to CreatePlaceholders
+	plain         map[string]bool   // paths that are NOT placeholders (flattened)
+	notified      []string          // paths passed to the shell change-notify seam
+	settleChecked []string          // paths offered to the pin-settle seam
+	excluded      []string          // paths passed to the exclude-from-sync seam
 }
 
 // createdNames returns the names reconcile asked to be created. Asserting on
@@ -177,8 +177,8 @@ type recorder struct {
 	deleted   chan string
 	moved     chan [2]string
 
-	uploadFails int          // fail this many uploads before succeeding…
-	uploadErr   error        // …with this error
+	uploadFails int           // fail this many uploads before succeeding…
+	uploadErr   error         // …with this error
 	uploadGate  chan struct{} // when non-nil, Upload blocks until it closes
 	deleteFails int
 	deleteErr   error

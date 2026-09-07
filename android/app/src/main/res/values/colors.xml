@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Platform-level colours only. The real palette lives in Compose
+    (ui/theme/Theme.kt); these exist for the launcher icon and the pre-Compose
+    window background that is visible for the first frame or two.
+-->
+<resources>
+    <!-- Nextcloud brand blue. -->
+    <color name="nimbo_blue">#FF0082C9</color>
+    <color name="nimbo_window_background">#FFFFFFFF</color>
+</resources>

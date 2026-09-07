@@ -240,7 +240,6 @@ func (a *App) maybeOfferBadges() {
 		[]notify.ToastButton{{Label: "Enable badges", Args: "action=badges"}})
 }
 
-
 // runElevatedAndWait launches file through the UAC consent flow (AppInfo
 // service, which is what breaks out of the MSIX container) and waits for it
 // to finish. Returns "" on a completed run, or a user-facing message.

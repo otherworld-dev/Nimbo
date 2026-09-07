@@ -19,12 +19,12 @@ func TestClassifyRepair(t *testing.T) {
 		"newdir/only.go": file(7),
 	}
 	server := map[string]repairEntry{
-		"same.txt":     file(20),  // matches
-		"big.bin":      file(64),  // size mismatch
-		"docs":         dir(),     // matches
-		"docs/note.md": file(5),   // matches
-		"serveronly.x": file(3),   // extra (not local)
-		"a.txt":        dir(),     // local file vs server dir -> missing (type clash)
+		"same.txt":     file(20), // matches
+		"big.bin":      file(64), // size mismatch
+		"docs":         dir(),    // matches
+		"docs/note.md": file(5),  // matches
+		"serveronly.x": file(3),  // extra (not local)
+		"a.txt":        dir(),    // local file vs server dir -> missing (type clash)
 	}
 
 	p := classifyRepair(local, server)

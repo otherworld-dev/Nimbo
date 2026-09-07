@@ -13,8 +13,8 @@ import (
 
 	"github.com/otherworld/nimbo/internal/account"
 	"github.com/otherworld/nimbo/internal/applog"
-	"github.com/otherworld/nimbo/internal/cfapi"
 	"github.com/otherworld/nimbo/internal/brand"
+	"github.com/otherworld/nimbo/internal/cfapi"
 	"github.com/otherworld/nimbo/internal/config"
 	"github.com/otherworld/nimbo/internal/shellmenu"
 )

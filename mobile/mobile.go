@@ -1,6 +1,6 @@
 // Package mobile is the gomobile facade over Nimbo's sync engine — the API
 // surface the Android app binds against (via `gomobile bind`, producing an
-// .aar consumed by the Nimbo-Android repo).
+// .aar consumed by android/ in this same repo).
 //
 // gomobile restricts exported signatures to primitives, strings, []byte,
 // error, bound structs, and interfaces, so collections cross the boundary as
@@ -19,6 +19,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/otherworld/nimbo/internal/config"
 	"github.com/otherworld/nimbo/internal/notify"
 	"github.com/otherworld/nimbo/internal/transfer"
+	"github.com/otherworld/nimbo/internal/transport"
 )
 
 // SecretStore is implemented in Kotlin (Android Keystore / EncryptedSharedPreferences)
@@ -706,6 +708,420 @@ func (c *Client) ConflictsJSON() (string, error) {
 	return marshalSlice(e.PendingConflicts())
 }
 
+// ---- Favourites, search and versions ----
+
+// FavoritesJSON lists the user's starred files and folders as a JSON array of
+// Entry (PascalCase, untagged) — the same shape BrowseJSON returns, so a client
+// can render it with the file-row code it already has.
+//
+// The paths are account-relative and can be opened directly; unlike search
+// hits, a favourite always knows where it lives.
+func (c *Client) FavoritesJSON() (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	entries, err := e.Favorites(ctx)
+	if err != nil {
+		return "", err
+	}
+	return marshalSlice(entries)
+}
+
+// SetFavorite stars (fav = true) or unstars a file or folder by its
+// account-relative path. Starring the account root is refused.
+//
+// BrowseJSON reports the current state as Entry.IsFavorite, so a client can
+// show the star filled before the user touches it.
+func (c *Client) SetFavorite(remotePath string, fav bool) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.SetFavorite(ctx, remotePath, fav)
+}
+
+// SharesOnJSON lists the shares that exist on ONE path, as a JSON array of
+// Share. This is what a "who can see this?" view for a single file reads.
+func (c *Client) SharesOnJSON(remotePath string) (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	shares, err := e.ListShares(ctx, remotePath)
+	if err != nil {
+		return "", err
+	}
+	return marshalSlice(shares)
+}
+
+// CreatePublicLinkJSON publishes remotePath behind a public link and returns
+// the new Share as JSON — its "url" is the link, available immediately so the
+// caller need not re-list to find what it just made.
+//
+// password may be empty, but a server configured to require one will refuse
+// the whole request rather than create an open link; the error says so and
+// must be shown, not swallowed. expiration is "YYYY-MM-DD" or empty for none.
+//
+// Sharing the account root is refused.
+func (c *Client) CreatePublicLinkJSON(remotePath, password, expiration string) (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	share, err := e.CreatePublicLink(ctx, remotePath, transport.PublicLinkOptions{
+		Password:   password,
+		Expiration: expiration,
+	})
+	if err != nil {
+		return "", err
+	}
+	return marshal(share)
+}
+
+// CreateUserShareJSON shares remotePath with another user on this server and
+// returns the new Share as JSON. permissions of 0 means read-only.
+//
+// The user must exist on the server; a wrong username is refused by the server
+// rather than silently creating a share nobody holds.
+func (c *Client) CreateUserShareJSON(remotePath, user string, permissions int) (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	share, err := e.CreateUserShare(ctx, remotePath, user, permissions)
+	if err != nil {
+		return "", err
+	}
+	return marshal(share)
+}
+
+// DeleteShare revokes one share by its id. The FILE is untouched — this takes
+// away access, it does not delete anything.
+func (c *Client) DeleteShare(id string) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.DeleteShare(ctx, id)
+}
+
+// SharesJSON returns every share this account takes part in, as a JSON OBJECT
+// (not an array) with two keys, each an array of Share (camelCase, tagged):
+//
+//	{"own": [...], "received": [...]}
+//
+// "own" is what the user shared out; "received" is what was shared with them.
+// They are kept apart because the two mean opposite things to a user and a
+// single merged list cannot say which is which.
+//
+// Share.path is account-relative for "own" shares. For a RECEIVED share it is
+// the path in the OWNER'S account, which need not exist in the user's own tree
+// — do not feed it to BrowseJSON without checking.
+func (c *Client) SharesJSON() (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	own, received, err := e.Shares(ctx)
+	if err != nil {
+		return "", err
+	}
+	if own == nil {
+		own = []transport.Share{}
+	}
+	if received == nil {
+		received = []transport.Share{}
+	}
+	return marshal(struct {
+		Own      []transport.Share `json:"own"`
+		Received []transport.Share `json:"received"`
+	}{own, received})
+}
+
+// SearchJSON finds files and folders whose NAME contains term, anywhere in the
+// account, returning up to limit of them as a JSON array of Entry — the same
+// shape BrowseJSON returns, so hits render and open like any other row.
+//
+// Names only. The server's unified search can reach file CONTENTS where it
+// indexes them; this cannot, and a client should not imply otherwise.
+//
+// A blank term is an error rather than a match-everything.
+func (c *Client) SearchJSON(term string, limit int) (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	hits, err := e.SearchByName(ctx, term, limit)
+	if err != nil {
+		return "", err
+	}
+	return marshalSlice(hits)
+}
+
+// VersionsJSON lists the stored previous revisions of a file by its oc:fileid
+// (Entry.FileID from BrowseJSON) as a JSON array of FileVersion (PascalCase,
+// untagged): Href, Modified, Size. Newest first.
+//
+// An empty array means the file has no prior versions OR the server's versions
+// app is off — the two look the same from here.
+func (c *Client) VersionsJSON(fileID string) (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	versions, err := e.Versions(ctx, fileID)
+	if err != nil {
+		return "", err
+	}
+	return marshalSlice(versions)
+}
+
+// RestoreVersion makes a previous revision the current one, by the Href from
+// VersionsJSON. The file's present contents become a version in turn, so this
+// is reversible — but only while the versions app keeps them.
+func (c *Client) RestoreVersion(versionHref string) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.RestoreVersion(ctx, versionHref)
+}
+
+// ---- Trash ----
+
+// TrashJSON lists the server trashbin as a JSON array of TrashItem
+// (PascalCase, untagged): Href, Name, OriginalLocation, DeletedAt, Size, IsDir.
+//
+// Href is the handle for RestoreTrash and DeleteTrashItem — treat it as opaque.
+// Empty when the trashbin is empty OR when the server has the app disabled, so
+// an empty list is not evidence that nothing was deleted.
+func (c *Client) TrashJSON() (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	items, err := e.Trash(ctx)
+	if err != nil {
+		return "", err
+	}
+	return marshalSlice(items)
+}
+
+// RestoreTrash puts a trashed item back where it came from. The file returns to
+// the server; a synced pair then pulls it down on the next pass like any other
+// remote change.
+func (c *Client) RestoreTrash(href string) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.RestoreTrash(ctx, href)
+}
+
+// DeleteTrashItem removes one item from the trashbin permanently. There is no
+// second chance after this — present it accordingly.
+func (c *Client) DeleteTrashItem(href string) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.DeleteTrash(ctx, href)
+}
+
+// ---- Per-folder health ----
+
+// folderHealth is one sync folder whose last pass failed.
+type folderHealth struct {
+	LocalDir  string `json:"localDir"`
+	LastError string `json:"lastError"`
+	Since     string `json:"since"`
+}
+
+// FailingFoldersJSON lists the sync folders whose last pass failed, as a JSON
+// array of {localDir, lastError, since}; `[]` when everything is healthy.
+//
+// This exists because the engine's status line is per-ACCOUNT, not per-folder:
+// one healthy folder reporting "Up to date" masks another that has stopped
+// syncing completely. A UI that shows only the status string will tell the user
+// everything is fine while nothing reaches the server — so show these per
+// folder, and do not claim "Up to date" while this list is non-empty.
+//
+// Distinct from FrozenFoldersJSON: a freeze is a deliberate pause awaiting
+// review, this is simply "the last pass errored" (offline, permission lost,
+// folder unmounted). A folder can be in both.
+func (c *Client) FailingFoldersJSON() (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	healths := e.PairHealths()
+	out := make([]folderHealth, 0, len(healths))
+	for localDir, h := range healths {
+		if !h.Failing {
+			continue
+		}
+		since := ""
+		if !h.Since.IsZero() {
+			since = h.Since.Format(time.RFC3339)
+		}
+		out = append(out, folderHealth{LocalDir: localDir, LastError: h.LastError, Since: since})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].LocalDir < out[j].LocalDir })
+	return marshalSlice(out)
+}
+
+// ---- Damage guard ----
+
+// frozenFolder is one sync folder the damage guard has paused. Flattened from
+// the engine's map so the payload is a JSON array like every other collection.
+type frozenFolder struct {
+	LocalDir string   `json:"localDir"`
+	Reason   string   `json:"reason"`
+	Sample   []string `json:"sample"`
+}
+
+// FrozenFoldersJSON lists the folders the damage guard has paused, as a JSON
+// array of {localDir, reason, sample}.
+//
+// The guard pauses a folder rather than applying a pass that would delete or
+// replace a large share of it — the signature of a vanished mount, a revoked
+// storage permission, or server-side ransomware. On Android a folder that lives
+// on shared storage can hit this simply because the permission was withdrawn, so
+// the app must be able to show it and offer a way out.
+//
+// Empty when nothing is paused; sample carries a few affected paths so the user
+// can judge whether the change was theirs.
+func (c *Client) FrozenFoldersJSON() (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	views := e.FrozenViews()
+	out := make([]frozenFolder, 0, len(views))
+	for localDir, v := range views {
+		if !v.Frozen {
+			continue
+		}
+		out = append(out, frozenFolder{
+			LocalDir: localDir,
+			Reason:   v.FreezeReason,
+			Sample:   append([]string{}, v.FreezeSample...),
+		})
+	}
+	// Stable order: the UI renders this as a list and a map's iteration order
+	// would reshuffle it on every poll.
+	sort.Slice(out, func(i, j int) bool { return out[i].LocalDir < out[j].LocalDir })
+	return marshalSlice(out)
+}
+
+// ClearFreeze resumes a folder the guard paused, granting it a single-pass
+// exemption. Errors when the folder is not actually paused, so a stale UI cannot
+// silently "resume" a healthy folder.
+func (c *Client) ClearFreeze(localDir string) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	return e.ClearFreeze(localDir)
+}
+
+// DismissNotification removes one notification by its notification_id. The
+// notification is cleared on the SERVER, so it goes on every device the account
+// is signed in to — not just this one.
+//
+// A notification that is already gone counts as success.
+func (c *Client) DismissNotification(id int) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.DismissNotification(ctx, id)
+}
+
+// DismissAllNotifications clears every notification for the account, on the
+// server and therefore everywhere. There is no undo: dismissed notifications
+// are not archived, they are deleted.
+func (c *Client) DismissAllNotifications() error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.DismissAllNotifications(ctx)
+}
+
+// DoNotificationAction runs one of a notification's own actions (Accept,
+// Decline, and so on) by the link and HTTP method the SERVER supplied with it.
+//
+// Both values must come verbatim from the notification's actions array —
+// never construct them. method may be empty, which means GET.
+func (c *Client) DoNotificationAction(link, method string) error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(link) == "" {
+		return errors.New("notification action: no link")
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.DoNotificationAction(ctx, transport.NotificationAction{
+		Link: link,
+		Type: method,
+	})
+}
+
+// RefreshNotifications re-fetches the notification list from the server and
+// updates what NotificationsJSON returns, firing OnNotificationsChanged.
+//
+// This exists because NotificationsJSON serves a CACHE. The engine refills that
+// cache from a notify_push "notify_notification" event, and its post-sync
+// fallback runs only when push is unavailable — so a push channel that is
+// connected but silent (a dropped websocket the client still believes in, a
+// server not forwarding notification events) leaves the cache stale forever.
+// A client that wants to be sure calls this.
+//
+// Does not toast: the caller is asking, so the engine should not also announce.
+func (c *Client) RefreshNotifications() error {
+	e, err := c.eng()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.Notifier().Refresh(ctx)
+}
+
 // NotificationsJSON returns current server notifications.
 func (c *Client) NotificationsJSON() (string, error) {
 	e, err := c.eng()
@@ -753,6 +1169,25 @@ func (c *Client) ServerURL() (string, error) {
 		return "", err
 	}
 	return e.ServerURL(), nil
+}
+
+// ThemeAppearance reports the appearance the user has enabled in Nextcloud:
+// "dark", "light", or "default" (they follow their OS).
+//
+// Unlike ThemeColor this costs a live request — the server advertises no
+// capability for it, so it is read from the web UI's own markup. Call it when
+// the answer is needed, not on every frame.
+//
+// A client that honours this should still resolve "default" against the
+// device's own setting; there is nothing else to follow.
+func (c *Client) ThemeAppearance() (string, error) {
+	e, err := c.eng()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := opCtx()
+	defer cancel()
+	return e.ThemeAppearance(ctx)
 }
 
 // ThemeColor returns the server's theming colour (e.g. "#0082c9").

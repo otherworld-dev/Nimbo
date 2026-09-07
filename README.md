@@ -17,6 +17,30 @@ It talks to Nextcloud entirely over documented HTTP APIs:
 
 - [Report an issue](https://github.com/otherworld-dev/Nimbo/issues)
 
+## What's new
+
+Recent releases add a lot beyond plain two-way sync:
+
+- **Online-only (virtual files), ready for everyday use.** Browse your whole
+  Nextcloud in File Explorer without downloading it — files fetch when you open
+  them, and Windows' "Free up space" frees them again. Switch any folder into or
+  out of online-only mode with a preview of what will happen first, keeping
+  existing files in place.
+- **Sync-status icons in File Explorer.** Up-to-date, syncing and warning
+  markers on your files, plus a badge for shared folders.
+- **More reliable uploads.** Large files (even hundreds of GB) survive network
+  drops and resume where they left off instead of restarting; a failed upload
+  retries automatically instead of getting silently stuck.
+- **Work alongside colleagues.** Optionally lock an Office or LibreOffice
+  document while you have it open so others don't overwrite you, see who else
+  has a file open, and release stuck locks — all opt-in.
+- **Stronger data protection.** A sync that would delete or replace a large
+  share of a folder pauses for your review first, and files removed to match a
+  server deletion go to the Recycle Bin.
+- **Smarter moves and sharing.** Renaming a file syncs as a real move that
+  keeps its version history; you get a notification naming whoever shares a
+  folder with you.
+
 ## Architecture
 
 A headless **sync daemon** holds all the logic; thin frontends (the CLI and the

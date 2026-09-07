@@ -1,0 +1,26 @@
+# Built core library (produced by scripts/build-core.ps1 from the repo's mobile/ facade)
+core/*.aar
+core/*-sources.jar
+
+# Android / Gradle
+.gradle/
+build/
+app/build/
+local.properties
+captures/
+*.apk
+*.aab
+
+# IDE
+.idea/
+*.iml
+
+# Signing material — never commit
+*.keystore
+*.jks
+keystore.properties
+
+# Claude session files
+.claude/
+CLAUDE.md
+.claudeignore

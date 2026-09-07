@@ -1,9 +1,10 @@
 # Nimbo mobile facade — binding contract
 
-The source of truth for the Kotlin side of the gomobile boundary
-(Nimbo-Android consumes the `.aar` built from this package with
-`gomobile bind ./mobile`). Everything here is API: treat changes to any of it
-as breaking.
+The source of truth for the Kotlin side of the gomobile boundary. The consumer
+lives in this same repo at [`android/`](../android), and builds the `.aar` from
+this package via `android/scripts/build-core.ps1` (`gomobile bind ./mobile`).
+Everything here is API: treat changes to any of it as breaking — and because
+both sides are now one tree, change them in one commit.
 
 ## Lifecycle
 
@@ -115,10 +116,144 @@ None of these touch the sync baseline: deleting or moving a path inside a synced
 pair changes the server, and the next sync pass then propagates that to the local
 copy like any other remote change.
 
+## Damage guard
+
+The engine pauses ("freezes") a sync folder rather than applying a pass that
+would delete or replace at least 50 files and at least half of what it knows
+about, or when a server listing comes back empty or sharply shrunk. The freeze
+survives restarts and state-database resets.
+
+- The freeze is announced through **`OnToast`** — no separate callback — so an
+  app that surfaces toasts already tells the user.
+- `FrozenFoldersJSON()` lists what is paused: `[{localDir, reason, sample}]`,
+  `[]` when nothing is. `sample` carries a few affected paths so the user can
+  judge whether the change was theirs.
+- `ClearFreeze(localDir)` resumes one folder, granting a single-pass exemption.
+  It **errors when that folder is not actually paused**, so a stale list cannot
+  silently "resume" a healthy folder — re-read `FrozenFoldersJSON` after any
+  failure rather than assuming.
+
+This matters more on Android than on desktop: a pair living on shared storage
+looks exactly like a mass deletion when the volume fails to mount or the
+All-files-access permission is withdrawn. Without a resume path in the app, that
+folder stays paused until the user finds a desktop.
+
+## Per-folder health
+
+`OnStatus` is per-ACCOUNT, not per-folder. When one folder syncs happily and
+another cannot, the healthy one's "Up to date" is what the listener receives —
+so a UI built only on the status string tells the user everything is fine while
+a folder has stopped syncing entirely. This was observed on Android: a pair
+whose storage permission was withdrawn failed every pass, raised one alert
+notification, and then looked perfectly healthy in the app.
+
+- `FailingFoldersJSON()` returns `[{localDir, lastError, since}]`, `[]` when all
+  folders are healthy. `since` is RFC 3339 (when the folder STARTED failing, not
+  the latest attempt) or `""` if unknown.
+- **Do not render "Up to date" while that list is non-empty.** Show the failure
+  against the folder it belongs to.
+- The entry clears itself on the folder's next successful pass, and is dropped
+  when the pair is removed.
+
+Distinct from `FrozenFoldersJSON`: a freeze is a deliberate pause awaiting
+review; this is simply "the last pass errored". A folder can be in both lists.
+
+## Trash
+
+- `TrashJSON()` lists the server trashbin. `Href` is the handle for the other
+  two calls — opaque, do not construct or parse it.
+- `RestoreTrash(href)` puts an item back where it was deleted from. It returns
+  to the SERVER; a synced pair pulls it down on the next pass like any other
+  remote change, so the local copy does not reappear instantly.
+- `DeleteTrashItem(href)` is permanent. There is no further undo.
+
+An empty list means the trashbin is empty **or** the server has the trashbin app
+disabled — the two are indistinguishable here, so do not tell the user "nothing
+has been deleted" on the strength of it.
+
+## Favourites, search, shares and versions
+
+- `FavoritesJSON()` returns starred files/folders as `Entry` — the same shape
+  as `BrowseJSON`, so the same row renderer works. Paths are account-relative
+  and can be opened directly.
+- `SetFavorite(remotePath, fav)` stars or unstars one path. `BrowseJSON` now
+  reports the current state as `Entry.IsFavorite`, so a star can be drawn
+  filled before the user touches it. Favouriting the account root is refused.
+- `SearchJSON(term, limit)` finds files and folders whose **name** contains
+  term, anywhere in the account, returning `Entry` — the same shape as
+  `BrowseJSON`, with real account-relative paths, so a hit opens like any
+  other row. Backed by WebDAV `SEARCH`, not the unified-search provider,
+  precisely so the hits carry paths.
+  Names only: the server's unified search can reach file *contents* where it
+  indexes them and this cannot, so do not present it as a full-text search.
+  A blank term is an error, not a match-everything.
+- `SharesJSON()` returns a JSON **object**, not an array:
+  `{"own": [...], "received": [...]}`. `own` is what the user shared out;
+  `received` is what was shared with them. A received share's `path` is the
+  path in the OWNER'S account and need not exist in the user's own tree — do
+  not feed it to `BrowseJSON` unchecked.
+- `SharesOnJSON(remotePath)` lists the shares on ONE path — what a
+  "who can see this?" view for a single file reads.
+- `CreatePublicLinkJSON(remotePath, password, expiration)` publishes a path
+  behind a link and returns the new `Share`, whose `url` is the link — so a
+  client need not re-list to find what it just made. `password` may be empty,
+  but a server configured to require one refuses the whole request rather than
+  creating an open link: **show that error, never swallow it**.
+  `expiration` is `YYYY-MM-DD` or empty.
+- `CreateUserShareJSON(remotePath, user, permissions)` shares with another user
+  on this server; `permissions` of 0 means read-only.
+- `DeleteShare(id)` revokes one share. **The file is untouched** — this removes
+  access, it does not delete anything.
+
+Sharing the **account root is refused** by all three creation calls: `""` and
+`"/"` both resolve to everything the user owns, and one mistyped path should
+not be able to publish an entire account behind a single link. A blank share id
+is likewise refused, since it would aim a DELETE at the shares collection
+rather than at one share.
+
+- `VersionsJSON(fileID)` lists previous revisions of a file by its `oc:fileid`
+  (`Entry.FileID`), newest first. `RestoreVersion(href)` makes one current; the
+  file's present contents become a version in turn.
+  An empty array means no prior versions **or** the versions app is disabled.
+
+## Notifications
+
+- `NotificationsJSON()` lists the account's server notifications. **This is a
+  cache**, not a live read.
+- `RefreshNotifications()` re-fetches it from the server and fires
+  `OnNotificationsChanged`. Needed because the engine refills that cache from a
+  notify_push event, and its post-sync fallback runs only when push is
+  *unavailable* — so a push channel that is connected but silent leaves the
+  cache stale indefinitely. Poll this if your client must not miss anything. The
+  `OnNotificationsChanged(count)` listener fires when the set changes — that
+  callback carries only a count, so re-fetch the list to see what changed.
+- `DismissNotification(id)` clears one by its `notification_id`.
+- `DismissAllNotifications()` clears every one.
+- `DoNotificationAction(link, method)` runs an action the notification
+  itself offered (Accept / Decline / …). Both values must come **verbatim**
+  from that notification's `actions` array — never construct them. An empty
+  method means GET.
+
+Dismissal happens on the **server**, so it applies to every device the account
+is signed in to, and there is no undo: notifications are deleted, not archived.
+
+## Theming
+
+- `ThemeColor()` returns the server's theming colour (e.g. `#0082c9`) from
+  cached capabilities. Use it as the UI accent, as the desktop client does.
+- `ThemeAppearance()` returns `dark`, `light` or `default` — the appearance the
+  user enabled in Nextcloud. **Costs a live HTTP request** (no capability
+  advertises it; it is read from the web UI's markup), so call it on demand,
+  not per frame. Resolve `default` against the device's own setting.
+
+Neither is a brand colour: they are the user's Nextcloud, and a client should
+fall back to its own palette when there is no account yet or the call fails.
+
 ## JSON payloads
 
 All collection-returning methods return a JSON **array** — `[]` when empty,
-never `null`.
+never `null`. The one exception is `SharesJSON`, which returns an object of two
+such arrays (see above).
 
 Field naming is pinned per payload (changing any of these breaks the shipped
 app — there is no compile-time signal across the boundary):
@@ -131,10 +266,16 @@ app — there is no compile-time signal across the boundary):
 | `QuotaJSON` (QuotaInfo) | camelCase | `free`, `used`, `total`, `relative`, `quota` |
 | `AppsJSON` (App) | camelCase | `id`, `name`, `href`, `icon` |
 | `NotificationsJSON` (Notification) | server-style | `notification_id`, `app`, `subject`, `message`, `link`, `object_type`, `datetime`, `actions` |
+| `actions[]` (NotificationAction) | camelCase | `label`, `link`, `type` (HTTP method), `primary` |
 | `OnPairSynced` stats (transfer.Stats) | **PascalCase** (untagged) | `Downloaded`, `Uploaded`, `MkLocal`, `MkRemote`, `DelLocal`, `DelRemote`, `Moved`, `Conflicts`, `ConflictsIdentical`, `ConflictsResurrected`, `Failed` |
+| `TrashJSON` (TrashItem) | **PascalCase** (untagged) | `Href`, `Name`, `OriginalLocation`, `DeletedAt`, `Size`, `IsDir` |
 | `ConflictsJSON` (ConflictItem) | **PascalCase** (untagged) | `LocalDir`, `RemoteRoot`, `Path`, `Kind`, `LocalExists`, `RemoteExists`, `LocalSize`, `LocalMTime`, `RemoteSize`, `RemoteMTime` |
 | `DiagnosticsJSON` (Diagnostic) | **PascalCase** (untagged) | `ServerURL`, `ServerVersion`, `Account`, `PushAvailable`, `PushConnected`, `PushSince`, `LastStatus`, `LastSyncAt` |
-| `BrowseJSON` (webdav Entry) | **PascalCase** (untagged) | `Path`, `IsDir`, `Size`, `ETag`, `FileID`, `LastModified`, `ContentType`, `Checksums` |
+| `FrozenFoldersJSON` | camelCase | `localDir`, `reason`, `sample` |
+| `FailingFoldersJSON` | camelCase | `localDir`, `lastError`, `since` |
+| `BrowseJSON` / `FavoritesJSON` / `SearchJSON` (webdav Entry) | **PascalCase** (untagged) | `Path`, `IsDir`, `Size`, `ETag`, `FileID`, `LastModified`, `ContentType`, `Checksums`, `IsFavorite` |
+| `SharesJSON` (object of Share arrays) | camelCase | `own[]`, `received[]`; each: `id`, `share_type`, `item_type` (`file`/`folder`), `path`, `permissions`, `share_with`, `url`, `token`, `expiration`, `uid_owner`, `displayname_owner` |
+| `VersionsJSON` (FileVersion) | **PascalCase** (untagged) | `Href`, `Modified`, `Size` |
 
 Untagged `time.Time` fields serialise as RFC 3339 strings. Model the
 PascalCase payloads as-is in Kotlin (`@SerialName` per field); do not expect

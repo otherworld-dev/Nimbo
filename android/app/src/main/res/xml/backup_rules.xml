@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Auto Backup rules for API 30 and below (android:fullBackupContent).
+
+    Everything security- or state-sensitive is excluded:
+      * `nimbo_secrets.xml` holds app passwords encrypted with an Android
+        Keystore key. Keystore keys are non-exportable, so a restored
+        ciphertext could never be decrypted — it would only produce an account
+        that silently fails to authenticate. Better to make the user sign in.
+      * The app's files/ directory is the Go engine's root dir (config + sync
+        state database). Restoring it onto a device whose /storage/emulated/0
+        does not contain the matching files would make the engine believe
+        everything was deleted remotely.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="nimbo_secrets.xml" />
+    <exclude domain="file" path="." />
+</full-backup-content>

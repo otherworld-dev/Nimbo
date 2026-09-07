@@ -405,7 +405,6 @@ func registerShellSyncRootWinRT(id, path, displayName, iconResource, version str
 	})
 }
 
-
 // unregisterShellSyncRootWinRT removes a registration made by the brokered API.
 func unregisterShellSyncRootWinRT(id string) error {
 	return winrtDo(func() error {

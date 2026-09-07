@@ -1401,7 +1401,7 @@ const (
 	cfPinStatePinned      = 1 // CF_PIN_STATE_PINNED — always keep on device
 	cfPinStateUnpinned    = 2 // CF_PIN_STATE_UNPINNED — online-only preference
 	cfSetPinFlagRecurse   = 1 // CF_SET_PIN_FLAG_RECURSE — apply to a directory tree
-	cfDehydrateFlagNone = 0
+	cfDehydrateFlagNone   = 0
 )
 
 // openForCloud opens a handle suitable for cloud-state operations (BACKUP_SEMANTICS

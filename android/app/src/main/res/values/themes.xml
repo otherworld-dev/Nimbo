@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The platform theme. It only has to survive from process start until the
+    first Compose frame — NimboTheme (Material 3, in Compose) supplies the real
+    look. The parent is a *framework* theme on purpose: com.google.android.material
+    is not in the pinned dependency set, so Theme.MaterialComponents.* and
+    Theme.AppCompat.* are not available here.
+-->
+<resources>
+
+    <style name="Theme.Nimbo" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/nimbo_window_background</item>
+        <item name="android:colorPrimary">@color/nimbo_blue</item>
+        <item name="android:colorAccent">@color/nimbo_blue</item>
+        <item name="android:statusBarColor">@color/nimbo_blue</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
+
+</resources>

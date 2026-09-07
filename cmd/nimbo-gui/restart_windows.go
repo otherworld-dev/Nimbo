@@ -19,7 +19,7 @@ import (
 )
 
 var (
-	kernel32                       = windows.NewLazySystemDLL("kernel32.dll")
+	kernel32                        = windows.NewLazySystemDLL("kernel32.dll")
 	procGetCurrentPackageFamilyName = kernel32.NewProc("GetCurrentPackageFamilyName")
 )
 

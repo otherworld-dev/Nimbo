@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Paths the FileProvider may hand to other apps as content:// URIs.
+
+  Two cases:
+   * downloads/ — files fetched from the server for viewing, under cacheDir.
+   * external — files that are already synced live on shared storage, and are
+     opened from where they are rather than copied into the cache first.
+-->
+<paths>
+    <cache-path name="downloads" path="files/" />
+    <external-path name="external_storage" path="." />
+</paths>

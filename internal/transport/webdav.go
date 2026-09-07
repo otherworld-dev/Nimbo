@@ -25,6 +25,7 @@ type Entry struct {
 	LastModified time.Time
 	ContentType  string
 	Checksums    string    // raw oc:checksums value, e.g. "SHA1:abc MD5:def"
+	IsFavorite   bool      // oc:favorite — the user starred it; false also when the server does not report the property
 	IsEncrypted  bool      // nc:is-encrypted — an end-to-end encrypted folder (contents are opaque to clients without E2EE keys)
 	Permissions  string    // oc:permissions, e.g. "RGDNVW" (file) / "RMGCK" (dir); empty = unknown
 	Lock         *LockInfo // files_lock state; nil = unlocked OR the server didn't say (see LockInfo)
@@ -124,6 +125,32 @@ func (c *Client) davURL(remotePath string) string {
 	return c.server + c.davBase() + escapePath(remotePath)
 }
 
+// davRel maps an href from a server response back to a files-root-relative
+// path. The href is LOCATED against davBase rather than trimmed of it: a
+// Nextcloud installed at a URL subpath answers with
+// "/nextcloud/remote.php/dav/files/alice/x", and a plain TrimPrefix silently
+// left every such path untouched — re-prepended on the next request, that
+// 404s, so nothing synced against such a server at all (GitHub #3/#4). An href
+// with no files root for this user in it is an error, not a path: passing it
+// through is how a misread listing became planned deletes, and skipping it
+// would read as "deleted on the server".
+func (c *Client) davRel(href string) (string, error) {
+	p, err := unescapeHref(href)
+	if err != nil {
+		return "", fmt.Errorf("href %q: %w", href, err)
+	}
+	base := c.davBase()
+	i := strings.Index(p, base)
+	if i < 0 {
+		return "", fmt.Errorf("href %q is outside %s", p, base)
+	}
+	rest := p[i+len(base):]
+	if rest != "" && rest[0] != '/' {
+		return "", fmt.Errorf("href %q is outside %s", p, base) // ".../alice2/x" is not alice's
+	}
+	return strings.Trim(rest, "/"), nil
+}
+
 // escapePath percent-encodes each segment of a "/"-separated path, preserving
 // the separators and a single leading slash.
 func escapePath(p string) string {
@@ -138,11 +165,11 @@ func escapePath(p string) string {
 	return "/" + strings.Join(parts, "/")
 }
 
-// propfindBody requests exactly the properties Entry exposes.
-const propfindBody = `<?xml version="1.0" encoding="UTF-8"?>
-<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
-  <d:prop>
-    <d:getetag/>
+// entryProps is the property list every Entry is built from. Listing and the
+// favourites REPORT share it deliberately: they return the same type, a client
+// renders both with the same row code, and a shorter list would show files of
+// size 0 with no type and no date rather than fail visibly.
+const entryProps = `    <d:getetag/>
     <d:getlastmodified/>
     <d:getcontentlength/>
     <d:getcontenttype/>
@@ -151,6 +178,7 @@ const propfindBody = `<?xml version="1.0" encoding="UTF-8"?>
     <oc:size/>
     <oc:checksums/>
     <oc:permissions/>
+    <oc:favorite/>
     <nc:is-encrypted/>
     <nc:lock/>
     <nc:lock-owner/>
@@ -160,7 +188,13 @@ const propfindBody = `<?xml version="1.0" encoding="UTF-8"?>
     <nc:lock-time/>
     <nc:lock-timeout/>
     <nc:lock-token/>
-  </d:prop>
+`
+
+// propfindBody requests exactly the properties Entry exposes.
+const propfindBody = `<?xml version="1.0" encoding="UTF-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
+  <d:prop>
+` + entryProps + `  </d:prop>
 </d:propfind>`
 
 // multistatus mirrors the WebDAV PROPFIND XML response.
@@ -191,6 +225,7 @@ type davProp struct {
 	OCSize      string `xml:"size"`
 	IsEncrypted string `xml:"is-encrypted"`
 	Permissions string `xml:"permissions"`
+	Favorite    string `xml:"favorite"`
 	// oc:checksums wraps one or more <oc:checksum> children; the digest text is
 	// in the child, not the wrapper.
 	Checksums string `xml:"checksums>checksum"`
@@ -312,10 +347,12 @@ func (c *Client) propFind(ctx context.Context, remotePath, depth string) ([]Entr
 		return nil, fmt.Errorf("decode PROPFIND response: %w", err)
 	}
 
-	prefix := c.davBase()
 	entries := make([]Entry, 0, len(ms.Responses))
 	for _, r := range ms.Responses {
-		e, ok := c.parseResponse(prefix, r)
+		e, ok, err := c.parseResponse(r)
+		if err != nil {
+			return nil, fmt.Errorf("PROPFIND %q: %w", remotePath, err)
+		}
 		if ok {
 			entries = append(entries, e)
 		}
@@ -324,14 +361,14 @@ func (c *Client) propFind(ctx context.Context, remotePath, depth string) ([]Entr
 }
 
 // parseResponse converts a single PROPFIND <response> into an Entry, selecting
-// the 200-status propstat block. ok is false if the row should be skipped.
-func (c *Client) parseResponse(prefix string, r davResponse) (Entry, bool) {
-	href, err := unescapeHref(r.Href)
+// the 200-status propstat block. ok is false if the row should be skipped; err
+// is set when the row's href cannot be placed under this user's files root
+// (see davRel), which invalidates the whole listing.
+func (c *Client) parseResponse(r davResponse) (Entry, bool, error) {
+	rel, err := c.davRel(r.Href)
 	if err != nil {
-		return Entry{}, false
+		return Entry{}, false, err
 	}
-	rel := strings.TrimPrefix(href, prefix)
-	rel = strings.Trim(rel, "/")
 
 	var prop *davProp
 	for i := range r.Propstat {
@@ -341,7 +378,7 @@ func (c *Client) parseResponse(prefix string, r davResponse) (Entry, bool) {
 		}
 	}
 	if prop == nil {
-		return Entry{}, false
+		return Entry{}, false, nil
 	}
 
 	e := Entry{
@@ -353,6 +390,7 @@ func (c *Client) parseResponse(prefix string, r davResponse) (Entry, bool) {
 		Checksums:   strings.TrimSpace(prop.Checksums),
 		IsEncrypted: prop.IsEncrypted == "1" || strings.EqualFold(prop.IsEncrypted, "true"),
 		Permissions: strings.TrimSpace(prop.Permissions),
+		IsFavorite:  prop.Favorite == "1" || strings.EqualFold(prop.Favorite, "true"),
 	}
 	// Directories report their recursive size via oc:size; files use the
 	// standard content length.
@@ -390,7 +428,7 @@ func (c *Client) parseResponse(prefix string, r davResponse) (Entry, bool) {
 		}
 		e.Lock = li
 	}
-	return e, true
+	return e, true, nil
 }
 
 // Stat returns the entry at remotePath (PROPFIND depth 0). The boolean is false

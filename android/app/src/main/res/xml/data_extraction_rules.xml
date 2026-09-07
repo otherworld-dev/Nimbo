@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Backup / transfer rules for API 31+ (android:dataExtractionRules).
+
+    Same exclusions as backup_rules.xml, applied to both transports:
+      * cloud-backup   — Auto Backup to the user's Google account.
+      * device-transfer — direct device-to-device migration.
+
+    Keystore-wrapped secrets and the Go engine's state database are excluded in
+    both cases; see backup_rules.xml for the reasoning. Note that device
+    transfer does *not* move Keystore key material either, so the ciphertext
+    would be just as dead there.
+-->
+<data-extraction-rules>
+
+    <cloud-backup>
+        <exclude domain="sharedpref" path="nimbo_secrets.xml" />
+        <exclude domain="file" path="." />
+    </cloud-backup>
+
+    <device-transfer>
+        <exclude domain="sharedpref" path="nimbo_secrets.xml" />
+        <exclude domain="file" path="." />
+    </device-transfer>
+
+</data-extraction-rules>

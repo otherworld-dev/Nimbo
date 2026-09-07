@@ -99,7 +99,11 @@ func TestParseResponseIsEncrypted(t *testing.T) {
 	c := New("https://cloud.example.com", "alice", "pw")
 	byPath := map[string]Entry{}
 	for _, r := range ms.Responses {
-		if e, ok := c.parseResponse("/remote.php/dav/files/alice", r); ok {
+		e, ok, err := c.parseResponse(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
 			byPath[e.Path] = e
 		}
 	}
@@ -169,7 +173,11 @@ func TestParseResponseLock(t *testing.T) {
 	c := New("https://cloud.example.com", "alice", "pw")
 	byPath := map[string]Entry{}
 	for _, r := range ms.Responses {
-		if e, ok := c.parseResponse("/remote.php/dav/files/alice", r); ok {
+		e, ok, err := c.parseResponse(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
 			byPath[e.Path] = e
 		}
 	}

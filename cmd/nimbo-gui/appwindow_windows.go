@@ -44,10 +44,10 @@ var iidIPropertyStore = windows.GUID{Data1: 0x886D8EEB, Data2: 0x8CF2, Data3: 0x
 
 // propVariant mirrors PROPVARIANT for VT_LPWSTR (large enough for all uses).
 type propVariant struct {
-	vt       uint16
-	_        [6]byte
-	pwszVal  *uint16
-	_        [8]byte
+	vt      uint16
+	_       [6]byte
+	pwszVal *uint16
+	_       [8]byte
 }
 
 const vtLPWSTR = 31
@@ -110,13 +110,13 @@ func setWindowAUMID(hwnd uintptr, aumid string) error {
 
 // Window-message constants for icons.
 const (
-	wmSetIcon    = 0x0080
-	iconSmall    = 0
-	iconBig      = 1
-	imageIcon    = 1
+	wmSetIcon      = 0x0080
+	iconSmall      = 0
+	iconBig        = 1
+	imageIcon      = 1
 	lrLoadFromFile = 0x0010
-	smCXIcon     = 11
-	smCXSMIcon   = 49
+	smCXIcon       = 11
+	smCXSMIcon     = 49
 )
 
 // appIconCache holds the loaded HICON pair per app id for the process

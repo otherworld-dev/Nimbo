@@ -9,21 +9,21 @@ func TestIgnore_Match(t *testing.T) {
 		want bool
 	}{
 		{"notes.txt", false},
-		{"app.log", true},                    // *.log basename
-		{"sub/dir/app.log", true},            // *.log at depth
-		{"node_modules", true},               // exact segment
-		{"node_modules/lib/x.js", true},      // under an ignored dir (ancestor match)
-		{"src/node_modules/y.js", true},      // ignored segment at depth
-		{"build/out", true},                  // path pattern
-		{"build/out/file.bin", true},         // under path pattern
-		{"build/other.txt", false},           // build/out doesn't match build/other
-		{"secret/passwords", true},           // trailing-slash dir pattern + ancestor
-		{"a.tmp", true},                      // default pattern
-		{"~$doc.docx", true},                 // default pattern
-		{".sync_abc123.db", true},            // official client journal (default)
-		{".sync_abc123.db-wal", true},        // its WAL
-		{"Docs/.owncloudsync.log", true},     // official client log at depth
-		{"real-database.db", false},          // a genuine user .db is NOT ignored
+		{"app.log", true},                // *.log basename
+		{"sub/dir/app.log", true},        // *.log at depth
+		{"node_modules", true},           // exact segment
+		{"node_modules/lib/x.js", true},  // under an ignored dir (ancestor match)
+		{"src/node_modules/y.js", true},  // ignored segment at depth
+		{"build/out", true},              // path pattern
+		{"build/out/file.bin", true},     // under path pattern
+		{"build/other.txt", false},       // build/out doesn't match build/other
+		{"secret/passwords", true},       // trailing-slash dir pattern + ancestor
+		{"a.tmp", true},                  // default pattern
+		{"~$doc.docx", true},             // default pattern
+		{".sync_abc123.db", true},        // official client journal (default)
+		{".sync_abc123.db-wal", true},    // its WAL
+		{"Docs/.owncloudsync.log", true}, // official client log at depth
+		{"real-database.db", false},      // a genuine user .db is NOT ignored
 	}
 	for _, c := range cases {
 		if got := ig.Match(c.path); got != c.want {

@@ -220,11 +220,11 @@ func (w *Watcher) Close() {
 
 // FILE_NOTIFY_INFORMATION action codes.
 const (
-	fileActionAdded       = 0x1
-	fileActionRemoved     = 0x2
-	fileActionModified    = 0x3
-	fileActionRenamedOld  = 0x4
-	fileActionRenamedNew  = 0x5
+	fileActionAdded      = 0x1
+	fileActionRemoved    = 0x2
+	fileActionModified   = 0x3
+	fileActionRenamedOld = 0x4
+	fileActionRenamedNew = 0x5
 	// ATTRIBUTES is load-bearing for the pin contract: Explorer's "Free up
 	// space" / "Always keep" verbs change only the PINNED/UNPINNED attributes,
 	// and without this flag the watcher never hears about them.

@@ -126,4 +126,3 @@ func TestGuardAppliesOnlyAfterAFirstCompletedPass(t *testing.T) {
 		t.Fatal("an approved resume grants a one-pass exemption")
 	}
 }
-

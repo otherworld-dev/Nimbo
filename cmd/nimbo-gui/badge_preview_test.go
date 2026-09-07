@@ -10,6 +10,7 @@ import (
 // inspection. Runs only when NIMBO_BADGE_SRC is set (a dev/QA aid, not CI):
 //
 //	NIMBO_BADGE_SRC=in.png NIMBO_BADGE_OUT=out.png go test -run TestBadgePreview ./cmd/nimbo-gui/
+//
 // TestIcoPreview writes a full badged .ico via the production encoder for
 // shell-decode QA. Same env gating as TestBadgePreview; OUT must end in .ico.
 func TestIcoPreview(t *testing.T) {

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The only string resource in the project. Everything else is inline English
+    in the Compose screens for now; localisation is post-prototype work.
+-->
+<resources>
+    <string name="app_name">Nimbo</string>
+</resources>

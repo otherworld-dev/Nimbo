@@ -355,6 +355,20 @@ func (s *Store) SetCloneStatus(pairKey, status string) error {
 	return err
 }
 
+// ClearCloneStatus forgets a pair's initial-clone state, so the pair reads as
+// never cloned ("") again. Run when a pair is removed or reset: the row is
+// keyed by (local dir, remote root), so re-adding the same folder later would
+// find a leftover "started" and RESUME — refetching (overwriting) any local
+// file whose size differs — where a fresh pair takes over and never overwrites.
+// Clearing a pair with no row is a no-op.
+func (s *Store) ClearCloneStatus(pairKey string) error {
+	_, err := s.db.Exec(
+		`DELETE FROM clone_state WHERE account_id = ? AND pair_key = ?`,
+		s.accountID, pairKey,
+	)
+	return err
+}
+
 // UpsertBaseline records (or replaces) a single path's synced state. Used by the
 // transfer layer (Phase 3) after a successful operation.
 func (s *Store) UpsertBaseline(pairKey string, b engine.BaselineState) error {

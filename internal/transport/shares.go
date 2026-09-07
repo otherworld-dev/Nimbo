@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -31,6 +32,7 @@ type Share struct {
 	ID           flexString `json:"id"`
 	ShareType    int        `json:"share_type"`
 	Path         string     `json:"path"`
+	ItemType     string     `json:"item_type"` // "file" or "folder"
 	Permissions  int        `json:"permissions"`
 	ShareWith    string     `json:"share_with"`
 	URL          string     `json:"url"`               // public-link URL
@@ -96,11 +98,26 @@ type PublicLinkOptions struct {
 	Expiration  string // YYYY-MM-DD, optional
 }
 
+// sharePath validates the target of a new share. The account root is refused:
+// "" and "/" both resolve to everything the user owns, and one mistyped path
+// should not be able to publish an entire account behind a single link.
+func sharePath(path string) (string, error) {
+	clean := strings.Trim(strings.TrimSpace(path), "/")
+	if clean == "" {
+		return "", fmt.Errorf("create share: refusing to share the account root")
+	}
+	return clean, nil
+}
+
 // CreatePublicLink creates a public-link share for a path and returns it
 // (Share.URL is the shareable link).
 func (c *Client) CreatePublicLink(ctx context.Context, path string, opt PublicLinkOptions) (Share, error) {
+	clean, err := sharePath(path)
+	if err != nil {
+		return Share{}, err
+	}
 	form := url.Values{
-		"path":      {"/" + strings.Trim(path, "/")},
+		"path":      {"/" + clean},
 		"shareType": {strconv.Itoa(ShareTypePublic)},
 	}
 	if opt.Password != "" {
@@ -117,13 +134,23 @@ func (c *Client) CreatePublicLink(ctx context.Context, path string, opt PublicLi
 
 // CreateUserShare shares a path with another user.
 func (c *Client) CreateUserShare(ctx context.Context, path, user string, permissions int) (Share, error) {
+	clean, err := sharePath(path)
+	if err != nil {
+		return Share{}, err
+	}
+	recipient := strings.TrimSpace(user)
+	if recipient == "" {
+		// Some server versions accept this and record a share with nobody,
+		// which then sits in the user's share list unexplainable.
+		return Share{}, fmt.Errorf("create share: no one to share with")
+	}
 	if permissions <= 0 {
 		permissions = PermRead
 	}
 	form := url.Values{
-		"path":        {"/" + strings.Trim(path, "/")},
+		"path":        {"/" + clean},
 		"shareType":   {strconv.Itoa(ShareTypeUser)},
-		"shareWith":   {user},
+		"shareWith":   {recipient},
 		"permissions": {strconv.Itoa(permissions)},
 	}
 	return c.createShare(ctx, form)
@@ -138,6 +165,12 @@ func (c *Client) createShare(ctx context.Context, form url.Values) (Share, error
 
 // DeleteShare removes a share by ID.
 func (c *Client) DeleteShare(ctx context.Context, id string) error {
-	u := c.ocsURL(sharesPath + "/" + id)
+	clean := strings.Trim(strings.TrimSpace(id), "/")
+	if clean == "" {
+		// An empty id builds ".../shares/" — a DELETE aimed at the shares
+		// collection rather than at one share.
+		return fmt.Errorf("delete share: no share id")
+	}
+	u := c.ocsURL(sharesPath + "/" + clean)
 	return c.doOCS(ctx, http.MethodDelete, u, nil, "", nil)
 }

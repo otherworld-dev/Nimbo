@@ -46,7 +46,9 @@ type iClassFactoryVtbl struct {
 	LockServer     uintptr
 }
 
-type iNotificationActivationCallback struct{ vtbl *iNotificationActivationCallbackVtbl }
+type iNotificationActivationCallback struct {
+	vtbl *iNotificationActivationCallbackVtbl
+}
 
 type iNotificationActivationCallbackVtbl struct {
 	ole.IUnknownVtbl

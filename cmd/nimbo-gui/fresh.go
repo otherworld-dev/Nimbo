@@ -60,7 +60,7 @@ func (a *App) freshLive() string {
 	if err := a.resetPairStatesUnder(base); err != nil {
 		return "Couldn't reset the sync state: " + err.Error()
 	}
-	a.pendingRevert = nil // the scan's convert-in-place plan no longer applies
+	a.pendingRevert = nil     // the scan's convert-in-place plan no longer applies
 	a.forgetRememberedPairs() // start fresh = no automatic folder restore either
 	slog.Info("start fresh: unmounting before clearing the folder")
 	a.unmountAllOnDemand()

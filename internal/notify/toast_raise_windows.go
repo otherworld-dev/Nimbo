@@ -41,9 +41,9 @@ import (
 
 // Runtime-class names (ASCII → go-ole's internal NewHString is safe for these).
 const (
-	classXmlDocument           = "Windows.Data.Xml.Dom.XmlDocument"
-	classToastNotification     = "Windows.UI.Notifications.ToastNotification"
-	classToastNotificationMgr  = "Windows.UI.Notifications.ToastNotificationManager"
+	classXmlDocument          = "Windows.Data.Xml.Dom.XmlDocument"
+	classToastNotification    = "Windows.UI.Notifications.ToastNotification"
+	classToastNotificationMgr = "Windows.UI.Notifications.ToastNotificationManager"
 )
 
 // Interface IIDs (verified against the winmd / winrt-go-gen bindings).

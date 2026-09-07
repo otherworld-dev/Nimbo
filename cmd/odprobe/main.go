@@ -138,11 +138,11 @@ func main() {
 	fidStore := map[string]string{} // remote path -> fileid (down-sync rename detection)
 	etStore := map[string]string{}  // remote path -> last-synced ETag (change detection)
 	w, werr := vfs.New(context.Background(), dir, "", time.Minute, vfs.Ops{
-		Upload: func(_ context.Context, local, remote string) error { uploaded <- remote; return nil },
-		Mkdir:  func(_ context.Context, remote string) error { uploaded <- "DIR:" + remote; return nil },
-		Delete: func(_ context.Context, remote string) error { deleted <- remote; return nil },
-		Move:   func(_ context.Context, src, dst string) error { moved <- src + " -> " + dst; return nil },
-		List:   func(rel string) ([]cfapi.PlaceholderInfo, error) { return list(rel), nil },
+		Upload:         func(_ context.Context, local, remote string) error { uploaded <- remote; return nil },
+		Mkdir:          func(_ context.Context, remote string) error { uploaded <- "DIR:" + remote; return nil },
+		Delete:         func(_ context.Context, remote string) error { deleted <- remote; return nil },
+		Move:           func(_ context.Context, src, dst string) error { moved <- src + " -> " + dst; return nil },
+		List:           func(rel string) ([]cfapi.PlaceholderInfo, error) { return list(rel), nil },
 		RecordBaseline: func(remote, etag string) { fidMu.Lock(); etStore[remote] = etag; fidMu.Unlock() },
 		Baseline: func(remote string) (string, bool) {
 			fidMu.Lock()
