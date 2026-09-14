@@ -262,6 +262,19 @@ func NewEngineFor(ctx context.Context, accountID string) (*Engine, error) {
 	if s, serr := d.LoadSettings(); serr == nil {
 		client.SetLimits(s.UploadKBps, s.DownloadKBps)
 	}
+	// The local network route, if set up. Probing BEFORE FetchCapabilities is
+	// deliberate: a start with the internet down but the LAN up still works.
+	// Away from the LAN this costs at most the 3 s dial timeout.
+	if lr := acc.Local; lr != nil {
+		if err := client.SetLocalRoute(lr.Address, lr.Pin, lr.RootID); err != nil {
+			slog.Warn("local network route ignored", "err", err)
+		} else if perr := client.ProbeLocal(ctx); perr == nil {
+			slog.Info(routeSwitchMessage(transport.RouteLocal, "", client.LocalAddress()))
+		} else {
+			_, reason := client.Route()
+			slog.Info(routeSwitchMessage(transport.RoutePublic, reason, lr.Address), "err", perr)
+		}
+	}
 	caps, err := client.FetchCapabilities(ctx)
 	if err != nil {
 		return nil, err
@@ -2363,6 +2376,11 @@ type Diagnostic struct {
 	PushSince     time.Time
 	LastStatus    string
 	LastSyncAt    time.Time
+	// Local network route (spec 2026-09-13): "local"/"public", why public, and
+	// the configured dial target ("" = none).
+	Route        string
+	RouteReason  string
+	LocalAddress string
 }
 
 // Diagnostics returns a current health snapshot (no network calls).
@@ -2377,6 +2395,8 @@ func (e *Engine) Diagnostics() Diagnostic {
 	e.diagMu.Unlock()
 	d.ServerURL = e.Account.ServerURL
 	d.Account = e.Account.LoginName
+	d.Route, d.RouteReason = e.client.Route()
+	d.LocalAddress = e.client.LocalAddress()
 	d.PushAvailable = e.PushAvailable()
 	if e.caps != nil {
 		d.ServerVersion = e.caps.Version.String
@@ -4161,6 +4181,7 @@ func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transf
 	e.seedDevIgnores()          // before any watcher fires its first scan
 	go e.sharesRefreshLoop(ctx) // keeps the shared-folder markers current
 	go e.presenceLoop(ctx)      // keeps the user's Nextcloud presence "online"
+	go e.routeLoop(ctx)         // re-tries the local network address while on public
 	defer e.closeStoreFinal()   // resident baseline cache lives only while running
 	// Drop backup entries whose folder is gone. Here, and only here: the config
 	// is quiescent, no watcher exists yet, and a stale entry is otherwise both
@@ -4429,6 +4450,7 @@ func (e *Engine) stopWatcherSync(key string) {
 // runPush connects to notify_push and fans events out to all active watchers.
 func (e *Engine) runPush(ctx context.Context) {
 	c := push.New(e.caps.NotifyPush.Websocket, e.Account.LoginName, e.secret)
+	c.SetHTTPClient(e.client.HTTPClient()) // follow the local network route; share the session
 	c.SetStatusFunc(e.setPushState)
 	_ = c.Run(ctx, func(ev push.Event) {
 		switch ev.Type {

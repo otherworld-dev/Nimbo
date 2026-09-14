@@ -27,6 +27,7 @@ type Client struct {
 	user   string
 	pass   string // app password
 	hc     *http.Client
+	router *router // hc's transport: public + optional local network route (route.go)
 
 	upLimiter   *rate.Limiter // nil = unlimited
 	downLimiter *rate.Limiter
@@ -63,28 +64,35 @@ var (
 // login event fires, which is what the official client does. The jar is
 // per-Client, so accounts never share a session; an expired session just
 // costs one more login server-side.
+//
+// The transport is a router (route.go): today's transport plus an optional
+// local network route.
 func New(server, user, appPassword string) *Client {
 	jar, _ := cookiejar.New(nil) // only errors on a bad Options; nil is fine
+	server = strings.TrimRight(server, "/")
+	public := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+	r := newRouter(public, server)
 	return &Client{
-		server: strings.TrimRight(server, "/"),
+		server: server,
 		user:   user,
 		pass:   appPassword,
 		counts: map[string]int64{},
+		router: r,
 		hc: &http.Client{
-			Jar:     jar,
-			Timeout: 0, // whole-request deadlines come from context; phases bounded below
-			Transport: &http.Transport{
-				DialContext: (&net.Dialer{
-					Timeout:   dialTimeout,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				TLSHandshakeTimeout:   tlsHandshakeTimeout,
-				ResponseHeaderTimeout: responseHeaderTimeout,
-				MaxIdleConns:          100,
-				MaxIdleConnsPerHost:   16,
-				IdleConnTimeout:       90 * time.Second,
-				ForceAttemptHTTP2:     true,
-			},
+			Jar:       jar,
+			Timeout:   0, // whole-request deadlines come from context; phases bounded below
+			Transport: r,
 		},
 	}
 }

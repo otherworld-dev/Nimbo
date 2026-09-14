@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -41,11 +42,19 @@ type Client struct {
 	pass      string
 	pingEvery time.Duration        // keepalive ping interval (tests shorten it)
 	onStatus  func(connected bool) // optional: connection state for diagnostics
+	hc        *http.Client         // handshake client (nil = http.DefaultClient); see SetHTTPClient
 }
 
 // SetStatusFunc registers a callback notified when the connection comes up
 // (authenticated) or drops, for surfacing push health in the UI.
 func (c *Client) SetStatusFunc(f func(connected bool)) { c.onStatus = f }
+
+// SetHTTPClient makes the websocket handshake go through hc — the sync
+// client's routed http.Client — so push follows the local network route and
+// shares the session cookies. Go's net/http sends an Upgrade: websocket
+// request over HTTP/1.1 regardless of the transport's HTTP/2 setting, so the
+// same transport serves both. nil (the default) uses http.DefaultClient.
+func (c *Client) SetHTTPClient(hc *http.Client) { c.hc = hc }
 
 func (c *Client) status(up bool) {
 	if c.onStatus != nil {
@@ -94,7 +103,7 @@ func (c *Client) Run(ctx context.Context, onEvent func(Event)) error {
 
 // session runs a single connection: dial, authenticate, then read until error.
 func (c *Client) session(ctx context.Context, onEvent func(Event)) error {
-	conn, _, err := websocket.Dial(ctx, c.wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, c.wsURL, &websocket.DialOptions{HTTPClient: c.hc})
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}

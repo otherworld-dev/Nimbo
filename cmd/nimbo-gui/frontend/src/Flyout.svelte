@@ -12,7 +12,7 @@
     quotaUsed: number; quotaTotal: number; quotaPct: number; unlimited: boolean;
   };
 
-  type Activity = { time: string; kind: string; path: string; remotePath: string; err: string };
+  type Activity = { time: string; kind: string; path: string; remotePath: string; localPath: string; err: string };
   type Attention = { conflicts: number; blocked: number; locked: number };
   type Progress = { active: boolean; current: string; done: number; total: number; speed: number; avgSpeed: number; doneBytes: number; totalBytes: number; enumerating: boolean };
 
@@ -186,12 +186,23 @@
     apps = (await App.Apps()) ?? [];
   };
   const hasShortcut = (a: AppInfo) => (a as any).shortcut === true;
-  // Clicking a recent-activity row opens the Sync status window on the Activity
-  // tab and flashes that row. The target is newline-joined into OpenStatusTab's
-  // single string arg as "<tab>\n<path>\n<kind>" (a newline never occurs in a tab
-  // name or a file path), so this needs no new Go binding. Status splits it back.
-  const openActivity = (r: Activity) =>
+  // Clicking a recent-activity row shows the file in its folder (selected in
+  // Explorer; a deleted file opens the folder it was in). A row with no local
+  // folder to show — or one whose folder tree has since gone — falls back to
+  // the Sync status window's Activity tab, which is also what right-click
+  // opens. That target is newline-joined into OpenStatusTab's single string
+  // arg as "<tab>\n<path>\n<kind>" (a newline never occurs in a tab name or a
+  // file path); Status splits it back and flashes that row.
+  const openInStatus = (r: Activity) =>
     App.OpenStatusTab("activity\n" + r.path + "\n" + r.kind);
+  const openActivity = async (r: Activity) => {
+    if (r.localPath && (await App.RevealPath(r.localPath))) return;
+    openInStatus(r);
+  };
+  const activityTitle = (r: Activity) =>
+    (r.localPath ? "Show in folder" : "Open in Sync status") +
+    ` · ${kindLabel(r.kind)} · ${r.path}${r.err ? " · " + r.err : ""}` +
+    (r.localPath ? " · right-click for Sync status" : "");
   const pauseFor = (m: number) => { App.PauseFor(m); pauseMenu = false; setTimeout(refresh, 150); };
   const untilTomorrow = () => { App.PauseUntilTomorrow(); pauseMenu = false; setTimeout(refresh, 150); };
   const resume = () => { App.Resume(); setTimeout(refresh, 150); };
@@ -431,7 +442,8 @@
       <div class="activity">
         {#each recent.slice(0, 6) as r}
           <button class="act" class:err={r.err} onclick={() => openActivity(r)}
-                  title={`Open in Sync status · ${kindLabel(r.kind)} · ${r.path}${r.err ? " · " + r.err : ""}`}>
+                  oncontextmenu={(e) => { e.preventDefault(); openInStatus(r); }}
+                  title={activityTitle(r)}>
             <span class="aicon {r.kind}">{kindIcon(r.kind)}</span>
             <span class="abody">
               <span class="apath">{basename(r.path)}</span>

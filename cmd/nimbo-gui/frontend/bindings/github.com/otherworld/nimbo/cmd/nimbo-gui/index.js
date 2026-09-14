@@ -23,6 +23,8 @@ export {
     FolderInfo,
     HeaderInfo,
     LimitsDTO,
+    LocalTestDTO,
+    LockDTO,
     NotifAction,
     NotifItem,
     OfflineEntry,

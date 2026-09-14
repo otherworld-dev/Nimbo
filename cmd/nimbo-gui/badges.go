@@ -23,7 +23,7 @@ import (
 
 // In-app, opt-in registration of the Explorer corner badges — the one piece of
 // shell integration an MSIX cannot carry itself (HKLM-only identifier list;
-// see setup-steps.ps1, which does the same job during a direct-download
+// see InstallBadges in packaging/msix/Nimbo.iss, which does the same job during a direct-download
 // install's elevated moment). Store and in-app-updated installs have no
 // elevated moment, so the user triggers one here: a single UAC consent runs a
 // one-shot elevated PowerShell that copies the signed DLL to Program Files
@@ -137,7 +137,7 @@ func (a *App) enableBadges() string {
 	// The elevated step is passed INLINE via -EncodedCommand: no script file on
 	// disk for a non-admin to tamper with between write and elevated read. It
 	// verifies the staged DLL (hash pin + Authenticode) before trusting it,
-	// then mirrors setup-steps.ps1 (side-dir upgrade when Explorer holds the
+	// then mirrors Nimbo.iss's InstallBadges (side-dir upgrade when Explorer holds the
 	// old DLL open).
 	body := `$ErrorActionPreference = 'Stop'
 $stage = ` + psSingleQuote(stage) + `

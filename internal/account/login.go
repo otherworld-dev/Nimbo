@@ -174,6 +174,11 @@ func Complete(store *Store, creds Credentials) (Account, error) {
 		ServerURL: server,
 		LoginName: creds.LoginName,
 	}
+	// A re-login replaces the whole record (Upsert), so carry the local route
+	// over — it belongs to the server, not to this sign-in.
+	if prev, ok := store.Find(a.ID); ok {
+		a.Local = prev.Local
+	}
 	if err := store.ensureDir(); err != nil {
 		return Account{}, err
 	}

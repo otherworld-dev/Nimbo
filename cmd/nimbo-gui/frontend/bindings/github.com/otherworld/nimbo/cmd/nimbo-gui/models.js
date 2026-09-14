@@ -36,6 +36,23 @@ export class AccountDTO {
              */
             this["server"] = "";
         }
+        if (!("localAddress" in $$source)) {
+            /**
+             * Local network route (spec 2026-09-13): the saved address as the user
+             * typed it, and whether its certificate is pinned. Live route state is on
+             * DiagnosticsDTO, which Settings already polls.
+             * @member
+             * @type {string}
+             */
+            this["localAddress"] = "";
+        }
+        if (!("localPinned" in $$source)) {
+            /**
+             * @member
+             * @type {boolean}
+             */
+            this["localPinned"] = false;
+        }
 
         Object.assign(this, $$source);
     }
@@ -96,6 +113,14 @@ export class AccountEntryDTO {
              */
             this["status"] = "";
         }
+        if (!("route" in $$source)) {
+            /**
+             * "local" while syncing over the local network, else "public"
+             * @member
+             * @type {string}
+             */
+            this["route"] = "";
+        }
 
         Object.assign(this, $$source);
     }
@@ -149,6 +174,14 @@ export class ActivityItem {
              * @type {string}
              */
             this["remotePath"] = "";
+        }
+        if (!("localPath" in $$source)) {
+            /**
+             * absolute local path (for "show in folder"); "" when the event has no owning folder
+             * @member
+             * @type {string}
+             */
+            this["localPath"] = "";
         }
         if (!("err" in $$source)) {
             /**
@@ -272,6 +305,15 @@ export class AttentionInfo {
              * @type {number}
              */
             this["blocked"] = 0;
+        }
+        if (!("locked" in $$source)) {
+            /**
+             * Locked: files someone else has open. Informational, not a fault — the UI
+             * wording should reflect that.
+             * @member
+             * @type {number}
+             */
+            this["locked"] = 0;
         }
 
         Object.assign(this, $$source);
@@ -664,6 +706,136 @@ export class DiagnosticsDTO {
              */
             this["lastSync"] = "";
         }
+        if (!("adoptScanDirs" in $$source)) {
+            /**
+             * AdoptScanDirs is the adopt scan's live heartbeat: directories listed so
+             * far, 0 when no scan is running. Rides this already-polled DTO so the
+             * scanning overlay gets a moving number without a new binding.
+             * @member
+             * @type {number}
+             */
+            this["adoptScanDirs"] = 0;
+        }
+        if (!("adoptConvertDone" in $$source)) {
+            /**
+             * AdoptConvertDone/Total is the background conversion's heartbeat (files
+             * marked so far / plan size); Total 0 = no conversion running.
+             * @member
+             * @type {number}
+             */
+            this["adoptConvertDone"] = 0;
+        }
+        if (!("adoptConvertTotal" in $$source)) {
+            /**
+             * @member
+             * @type {number}
+             */
+            this["adoptConvertTotal"] = 0;
+        }
+        if (!("revertDone" in $$source)) {
+            /**
+             * RevertDone/Total: the leave-VFS pass, same shape.
+             * @member
+             * @type {number}
+             */
+            this["revertDone"] = 0;
+        }
+        if (!("revertTotal" in $$source)) {
+            /**
+             * @member
+             * @type {number}
+             */
+            this["revertTotal"] = 0;
+        }
+        if (!("escapeExtensions" in $$source)) {
+            /**
+             * EscapeExtensions: file types currently synced under disguised names
+             * (server-forbidden names only). Rides here so the Exclusions UI can list
+             * them without a new binding.
+             * @member
+             * @type {string[]}
+             */
+            this["escapeExtensions"] = [];
+        }
+        if (!("lockingAvailable" in $$source)) {
+            /**
+             * LockingAvailable: the server has the files_lock app. When false the UI must
+             * say it CANNOT KNOW who has a file open — "nobody has this open" would be a
+             * different and untrue claim. Rides here rather than adding a binding.
+             * @member
+             * @type {boolean}
+             */
+            this["lockingAvailable"] = false;
+        }
+        if (!("observedLocks" in $$source)) {
+            /**
+             * ObservedLocks: files other users currently have open, across every account.
+             * @member
+             * @type {LockDTO[]}
+             */
+            this["observedLocks"] = [];
+        }
+        if (!("fileLocking" in $$source)) {
+            /**
+             * FileLocking: whether Nimbo takes locks of its own (off by default).
+             * @member
+             * @type {boolean}
+             */
+            this["fileLocking"] = false;
+        }
+        if (!("fileLockout" in $$source)) {
+            /**
+             * FileLockout: whether Nimbo also holds other people's locked files open
+             * locally, so the editor here refuses them (off by default).
+             * @member
+             * @type {boolean}
+             */
+            this["fileLockout"] = false;
+        }
+        if (!("badgesRegistered" in $$source)) {
+            /**
+             * BadgesRegistered: the current generation of Explorer corner badges is
+             * registered on this machine (badges.go). When false in live mode, the UI
+             * offers the one-UAC enable step.
+             * @member
+             * @type {boolean}
+             */
+            this["badgesRegistered"] = false;
+        }
+        if (!("heldLocks" in $$source)) {
+            /**
+             * HeldLocks: locks NIMBO holds, across every account. Surfaced so the user can
+             * see and clear them — the server will never expire one on its own.
+             * @member
+             * @type {LockDTO[]}
+             */
+            this["heldLocks"] = [];
+        }
+        if (!("route" in $$source)) {
+            /**
+             * Local network route (spec 2026-09-13).
+             * "local" | "public"
+             * @member
+             * @type {string}
+             */
+            this["route"] = "";
+        }
+        if (!("routeReason" in $$source)) {
+            /**
+             * why public, when a local address is set
+             * @member
+             * @type {string}
+             */
+            this["routeReason"] = "";
+        }
+        if (!("localAddress" in $$source)) {
+            /**
+             * configured dial target, "" = none
+             * @member
+             * @type {string}
+             */
+            this["localAddress"] = "";
+        }
 
         Object.assign(this, $$source);
     }
@@ -674,7 +846,19 @@ export class DiagnosticsDTO {
      * @returns {DiagnosticsDTO}
      */
     static createFrom($$source = {}) {
+        const $$createField13_0 = $$createType1;
+        const $$createField15_0 = $$createType3;
+        const $$createField19_0 = $$createType3;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("escapeExtensions" in $$parsedSource) {
+            $$parsedSource["escapeExtensions"] = $$createField13_0($$parsedSource["escapeExtensions"]);
+        }
+        if ("observedLocks" in $$parsedSource) {
+            $$parsedSource["observedLocks"] = $$createField15_0($$parsedSource["observedLocks"]);
+        }
+        if ("heldLocks" in $$parsedSource) {
+            $$parsedSource["heldLocks"] = $$createField19_0($$parsedSource["heldLocks"]);
+        }
         return new DiagnosticsDTO(/** @type {Partial<DiagnosticsDTO>} */($$parsedSource));
     }
 }
@@ -908,6 +1092,154 @@ export class LimitsDTO {
 }
 
 /**
+ * LocalTestDTO is the outcome of TestLocalAddress. Result is one of "ok",
+ * "invalid", "unreachable", "not-https", "untrusted", "different-server",
+ * "error"; Message is user-facing. The certificate fields are filled for
+ * "untrusted" (the trust dialog) and "ok". Address is the canonical form of
+ * what was typed — Save stores that.
+ */
+export class LocalTestDTO {
+    /**
+     * Creates a new LocalTestDTO instance.
+     * @param {Partial<LocalTestDTO>} [$$source = {}] - The source object to create the LocalTestDTO.
+     */
+    constructor($$source = {}) {
+        if (!("result" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["result"] = "";
+        }
+        if (!("message" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["message"] = "";
+        }
+        if (!("fingerprint" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["fingerprint"] = "";
+        }
+        if (!("subject" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["subject"] = "";
+        }
+        if (!("issuer" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["issuer"] = "";
+        }
+        if (!("expires" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["expires"] = "";
+        }
+        if (!("address" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["address"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new LocalTestDTO instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {LocalTestDTO}
+     */
+    static createFrom($$source = {}) {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new LocalTestDTO(/** @type {Partial<LocalTestDTO>} */($$parsedSource));
+    }
+}
+
+/**
+ * LockDTO is one file another user holds open, for the Settings list.
+ */
+export class LockDTO {
+    /**
+     * Creates a new LockDTO instance.
+     * @param {Partial<LockDTO>} [$$source = {}] - The source object to create the LockDTO.
+     */
+    constructor($$source = {}) {
+        if (!("path" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["path"] = "";
+        }
+        if (!("owner" in $$source)) {
+            /**
+             * display name where the server gave one, else the login
+             * @member
+             * @type {string}
+             */
+            this["owner"] = "";
+        }
+        if (!("summary" in $$source)) {
+            /**
+             * ready-made one-liner; an app lock names no person
+             * @member
+             * @type {string}
+             */
+            this["summary"] = "";
+        }
+        if (!("ownerType" in $$source)) {
+            /**
+             * 0 manual, 1 an app (Text/Office), 2 token
+             * @member
+             * @type {number}
+             */
+            this["ownerType"] = 0;
+        }
+        if (!("since" in $$source)) {
+            /**
+             * RFC3339; empty when the server gave no time
+             * @member
+             * @type {string}
+             */
+            this["since"] = "";
+        }
+        if (!("account" in $$source)) {
+            /**
+             * login name of the account it belongs to
+             * @member
+             * @type {string}
+             */
+            this["account"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new LockDTO instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {LockDTO}
+     */
+    static createFrom($$source = {}) {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new LockDTO(/** @type {Partial<LockDTO>} */($$parsedSource));
+    }
+}
+
+/**
  * NotifAction is a button on a notification.
  */
 export class NotifAction {
@@ -999,7 +1331,7 @@ export class NotifItem {
      * @returns {NotifItem}
      */
     static createFrom($$source = {}) {
-        const $$createField5_0 = $$createType3;
+        const $$createField5_0 = $$createType5;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("actions" in $$parsedSource) {
             $$parsedSource["actions"] = $$createField5_0($$parsedSource["actions"]);
@@ -1108,6 +1440,10 @@ export class OtherAttention {
 
 /**
  * PairDTO describes a configured sync pair.
+ * 
+ * The backup fields ride here rather than on a new bound method: DTO fields
+ * carry no hashed method ids, so adding them needs no bindings regen (the
+ * generated model copies unknown fields straight through).
  */
 export class PairDTO {
     /**
@@ -1136,6 +1472,30 @@ export class PairDTO {
              */
             this["excludes"] = [];
         }
+        if (!("frozen" in $$source)) {
+            /**
+             * Frozen is true when the damage guard paused this folder pending review.
+             * @member
+             * @type {boolean}
+             */
+            this["frozen"] = false;
+        }
+        if (/** @type {any} */(false)) {
+            /**
+             * FreezeReason is the human-readable explanation shown in the banner.
+             * @member
+             * @type {string | undefined}
+             */
+            this["freezeReason"] = undefined;
+        }
+        if (/** @type {any} */(false)) {
+            /**
+             * FreezeSample is a few affected paths, so the user can judge the trip.
+             * @member
+             * @type {string[] | undefined}
+             */
+            this["freezeSample"] = undefined;
+        }
 
         Object.assign(this, $$source);
     }
@@ -1147,9 +1507,13 @@ export class PairDTO {
      */
     static createFrom($$source = {}) {
         const $$createField2_0 = $$createType1;
+        const $$createField5_0 = $$createType1;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("excludes" in $$parsedSource) {
             $$parsedSource["excludes"] = $$createField2_0($$parsedSource["excludes"]);
+        }
+        if ("freezeSample" in $$parsedSource) {
+            $$parsedSource["freezeSample"] = $$createField5_0($$parsedSource["freezeSample"]);
         }
         return new PairDTO(/** @type {Partial<PairDTO>} */($$parsedSource));
     }
@@ -1843,5 +2207,7 @@ export class VersionDTO {
 // Private type creation functions
 const $$createType0 = SidePreview.createFrom;
 const $$createType1 = $Create.Array($Create.Any);
-const $$createType2 = NotifAction.createFrom;
+const $$createType2 = LockDTO.createFrom;
 const $$createType3 = $Create.Array($$createType2);
+const $$createType4 = NotifAction.createFrom;
+const $$createType5 = $Create.Array($$createType4);

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -2344,6 +2345,7 @@ type ActivityItem struct {
 	Kind       string `json:"kind"`
 	Path       string `json:"path"`       // pair-relative path
 	RemotePath string `json:"remotePath"` // files-root-relative path (for sharing)
+	LocalPath  string `json:"localPath"`  // absolute local path (for "show in folder"); "" when the event has no owning folder
 	Err        string `json:"err"`
 	Account    string `json:"account"` // owning account's user name (set when several accounts are configured)
 }
@@ -2379,9 +2381,19 @@ func (a *App) RecentActivity() []ActivityItem {
 			if root := roots[e.Local]; root != "" {
 				rp = root + "/" + rp
 			}
+			// On-demand events are files-root-relative (the watcher reports
+			// remoteFor()), so the mount's remote root must come off before the
+			// path can be joined to its local dir; live events are pair-relative.
+			mountRoot := ""
+			if m := a.onDemandMounts[e.Local]; m != nil {
+				mountRoot = m.remoteRoot
+			}
 			all = append(all, timed{
-				at:   e.Time,
-				item: ActivityItem{Time: e.Time.Format("15:04:05"), Kind: e.Kind, Path: e.Path, RemotePath: rp, Err: e.Err, Account: acct},
+				at: e.Time,
+				item: ActivityItem{
+					Time: e.Time.Format("15:04:05"), Kind: e.Kind, Path: e.Path, RemotePath: rp,
+					LocalPath: activityLocalPath(e.Local, mountRoot, e.Path), Err: e.Err, Account: acct,
+				},
 			})
 		}
 	}
@@ -2699,6 +2711,10 @@ type DiagnosticsDTO struct {
 	// HeldLocks: locks NIMBO holds, across every account. Surfaced so the user can
 	// see and clear them — the server will never expire one on its own.
 	HeldLocks []LockDTO `json:"heldLocks"`
+	// Local network route (spec 2026-09-13).
+	Route        string `json:"route"`        // "local" | "public"
+	RouteReason  string `json:"routeReason"`  // why public, when a local address is set
+	LocalAddress string `json:"localAddress"` // configured dial target, "" = none
 }
 
 // releaseAllLocks drops every lock Nimbo holds, across the shown account and
@@ -2762,6 +2778,9 @@ func (a *App) Diagnostics() DiagnosticsDTO {
 		AdoptConvertTotal: int(a.adoptConvertTotal.Load()),
 		RevertDone:        int(a.revertDone.Load()),
 		RevertTotal:       int(a.revertTotal.Load()),
+		Route:             d.Route,
+		RouteReason:       d.RouteReason,
+		LocalAddress:      d.LocalAddress,
 	}
 	if s, err := config.Resolve(); err == nil {
 		if set, e := s.LoadSettings(); e == nil {
@@ -3955,6 +3974,11 @@ type AccountDTO struct {
 	SignedIn bool   `json:"signedIn"`
 	User     string `json:"user"`
 	Server   string `json:"server"`
+	// Local network route (spec 2026-09-13): the saved address as the user
+	// typed it, and whether its certificate is pinned. Live route state is on
+	// DiagnosticsDTO, which Settings already polls.
+	LocalAddress string `json:"localAddress"`
+	LocalPinned  bool   `json:"localPinned"`
 }
 
 // AccountInfo returns the current account, if signed in.
@@ -3962,7 +3986,17 @@ func (a *App) AccountInfo() AccountDTO {
 	if a.eng == nil {
 		return AccountDTO{}
 	}
-	return AccountDTO{SignedIn: true, User: a.eng.Account.LoginName, Server: a.eng.Account.ServerURL}
+	dto := AccountDTO{SignedIn: true, User: a.eng.Account.LoginName, Server: a.eng.Account.ServerURL}
+	// Read the store rather than the engine's copy: SaveLocalAddress updates
+	// the store without restarting the engine.
+	if d, err := config.Resolve(); err == nil {
+		if st, err := account.LoadStore(d.AccountsFile()); err == nil {
+			if acc, ok := st.Find(a.eng.Account.ID); ok && acc.Local != nil {
+				dto.LocalAddress, dto.LocalPinned = acc.Local.Address, acc.Local.Pin != ""
+			}
+		}
+	}
+	return dto
 }
 
 // AccountEntryDTO is one configured account in the account list.
@@ -3972,6 +4006,7 @@ type AccountEntryDTO struct {
 	Server string `json:"server"`
 	Active bool   `json:"active"`
 	Status string `json:"status"` // latest engine status line ("" if not running)
+	Route  string `json:"route"`  // "local" while syncing over the local network, else "public"
 }
 
 // ListAccounts returns every configured account. All of them sync
@@ -3990,9 +4025,14 @@ func (a *App) ListAccounts() []AccountEntryDTO {
 	defer a.acctMu.Unlock()
 	out := make([]AccountEntryDTO, 0, len(st.Accounts))
 	for _, ac := range st.Accounts {
+		route := ""
+		if eng := a.engineFor(ac.ID); eng != nil && eng.Account.ID == ac.ID {
+			route, _ = eng.Route()
+		}
 		out = append(out, AccountEntryDTO{
 			ID: ac.ID, User: ac.LoginName, Server: ac.ServerURL,
 			Active: ac.ID == def.ID, Status: a.acctStatus[ac.ID],
+			Route: route,
 		})
 	}
 	return out
@@ -4126,6 +4166,160 @@ func (a *App) SignOut(clearData bool) string {
 	}
 	a.rebuildTrayMenu()
 	a.showLogin()
+	return ""
+}
+
+// LocalTestDTO is the outcome of TestLocalAddress. Result is one of "ok",
+// "invalid", "unreachable", "not-https", "not-nextcloud", "untrusted",
+// "different-server", "error"; Message is user-facing. The certificate fields
+// are filled for "untrusted" (the trust dialog) and "ok". Address is the
+// canonical form of what was typed — Save stores that.
+type LocalTestDTO struct {
+	Result      string `json:"result"`
+	Message     string `json:"message"`
+	Fingerprint string `json:"fingerprint"`
+	Subject     string `json:"subject"`
+	Issuer      string `json:"issuer"`
+	Expires     string `json:"expires"`
+	Address     string `json:"address"`
+}
+
+// testLocalAddress runs the whole setup check for the SHOWN account: validate,
+// bare TLS handshake (no request, no credentials), then the same-server
+// comparison. The second value is the route to store, non-nil only on "ok".
+func (a *App) testLocalAddress(ctx context.Context, addr, pin string) (LocalTestDTO, *account.LocalRoute) {
+	eng := a.eng
+	if eng == nil {
+		return LocalTestDTO{Result: "error", Message: "Not signed in."}, nil
+	}
+	u, err := url.Parse(eng.Account.ServerURL)
+	if err != nil || u.Scheme != "https" {
+		return LocalTestDTO{Result: "error", Message: "A local network address needs an https:// account."}, nil
+	}
+	canon, err := account.ParseLocalAddress(addr, u.Hostname())
+	if err != nil {
+		return LocalTestDTO{Result: "invalid", Message: err.Error()}, nil
+	}
+	dial := canon
+	if _, _, e := net.SplitHostPort(canon); e != nil {
+		port := u.Port()
+		if port == "" {
+			port = "443"
+		}
+		dial = canon + ":" + port
+	}
+	p, err := transport.ProbeTLS(ctx, dial, u.Hostname(), pin)
+	if err != nil {
+		return LocalTestDTO{Result: "unreachable", Address: canon, Message: "Nothing answered at " + canon + " (" + err.Error() + ")."}, nil
+	}
+	dto := LocalTestDTO{Address: canon, Fingerprint: p.Fingerprint, Subject: p.Subject, Issuer: p.Issuer}
+	if !p.NotAfter.IsZero() {
+		dto.Expires = p.NotAfter.Format("2006-01-02")
+	}
+	switch {
+	case p.PlainHTTP:
+		dto.Result = "not-https"
+		dto.Message = "This address doesn't use HTTPS. Nimbo needs HTTPS here too; a self-signed certificate is fine. If Nextcloud sits behind a reverse proxy, use the proxy's address, not the Nextcloud machine's."
+		return dto, nil
+	case !p.Verified && !p.Pinned:
+		// Before anyone is asked to trust this certificate, check that a
+		// Nextcloud is even answering there. status.php is public, so this
+		// sends no credentials, and the connection is pinned to the leaf just
+		// seen so nothing else can answer. The common mistake is a wrong LAN
+		// host — a router or NAS admin page with its own certificate — and it
+		// used to draw the trust dialog. This is a wrong-host guard, not a
+		// security check: an impostor faking status.php is still caught by
+		// the oc:id comparison after Trust.
+		nc, nerr := transport.ProbeNextcloud(ctx, eng.Account.ServerURL, dial, p.Fingerprint)
+		if nerr != nil || !nc.Nextcloud {
+			detail := nc.Detail
+			if nerr != nil {
+				detail = nerr.Error()
+			}
+			dto.Result = "not-nextcloud"
+			dto.Message = "Nothing at " + canon + " answers as a Nextcloud server (" + detail + "). Check the address — the certificate there is for " + p.Subject + "."
+			return dto, nil
+		}
+		dto.Result = "untrusted"
+		dto.Message = "Windows doesn't trust this certificate for " + u.Hostname() + " (" + p.VerifyError + "). It answers as " + nc.Product + " " + nc.Version + ". If it's your own server's certificate, you can trust exactly this one."
+		return dto, nil
+	}
+	usePin := ""
+	if !p.Verified {
+		usePin = strings.ToLower(pin) // pinned only when the store can't verify it: a verified cert survives rotation, a pin doesn't
+	}
+	rootID, err := eng.CheckLocalRoute(ctx, dial, usePin)
+	switch {
+	case errors.Is(err, agent.ErrDifferentServer):
+		dto.Result, dto.Message = "different-server", err.Error()
+		return dto, nil
+	case err != nil:
+		dto.Result, dto.Message = "error", err.Error()
+		return dto, nil
+	}
+	dto.Result = "ok"
+	if p.Verified {
+		dto.Message = "Same server; the certificate is trusted."
+	} else {
+		dto.Message = "Same server; this certificate will be pinned."
+	}
+	return dto, &account.LocalRoute{Address: canon, Pin: usePin, RootID: rootID}
+}
+
+// TestLocalAddress checks a candidate local network address for the shown
+// account without saving anything. pin is "" or a SHA-256 fingerprint the user
+// chose to trust from a previous "untrusted" result.
+func (a *App) TestLocalAddress(addr, pin string) LocalTestDTO {
+	ctx, cancel := context.WithTimeout(a.ctx, 25*time.Second)
+	defer cancel()
+	dto, _ := a.testLocalAddress(ctx, addr, pin)
+	return dto
+}
+
+// SaveLocalAddress re-runs the check in Go (never trusting what the frontend
+// passes back), stores the route on the shown account and applies it to that
+// account's running engine. An empty addr removes the route. Returns "" or a
+// user-facing error.
+func (a *App) SaveLocalAddress(addr, pin string) string {
+	eng := a.eng
+	if eng == nil {
+		return "Not signed in."
+	}
+	d, err := config.Resolve()
+	if err != nil {
+		return err.Error()
+	}
+	st, err := account.LoadStore(d.AccountsFile())
+	if err != nil {
+		return err.Error()
+	}
+	acc, ok := st.Find(eng.Account.ID)
+	if !ok {
+		return "Account not found."
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 25*time.Second)
+	defer cancel()
+	if strings.TrimSpace(addr) == "" {
+		acc.Local = nil
+		if err := st.Upsert(acc); err != nil {
+			return err.Error()
+		}
+		if err := eng.ApplyLocalRoute(ctx, nil); err != nil {
+			return err.Error()
+		}
+		return ""
+	}
+	dto, lr := a.testLocalAddress(ctx, addr, pin)
+	if lr == nil {
+		return dto.Message
+	}
+	acc.Local = lr
+	if err := st.Upsert(acc); err != nil {
+		return err.Error()
+	}
+	if err := eng.ApplyLocalRoute(ctx, lr); err != nil {
+		return err.Error()
+	}
 	return ""
 }
 
@@ -4805,17 +4999,4 @@ func openPath(path string) {
 		cmd = exec.Command("xdg-open", path)
 	}
 	_ = cmd.Start()
-}
-
-// revealPath opens the file manager with the given file selected (falling back
-// to opening its folder where selection isn't supported).
-func revealPath(path string) {
-	switch runtime.GOOS {
-	case "windows":
-		_ = exec.Command("explorer", "/select,"+path).Start()
-	case "darwin":
-		_ = exec.Command("open", "-R", path).Start()
-	default:
-		openPath(filepath.Dir(path))
-	}
 }

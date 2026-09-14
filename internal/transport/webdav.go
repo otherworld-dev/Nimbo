@@ -221,7 +221,11 @@ type davProp struct {
 	ResourceType    struct {
 		Collection *struct{} `xml:"collection"`
 	} `xml:"resourcetype"`
-	FileID      string `xml:"fileid"`
+	FileID string `xml:"fileid"`
+	// oc:id — the file id zero-padded to 8 digits followed by the server's
+	// instance id. Unlike fileid it changes when the INSTANCE changes, which is
+	// what the local-route same-server check needs. Only rootIDBody asks for it.
+	ID          string `xml:"id"`
 	OCSize      string `xml:"size"`
 	IsEncrypted string `xml:"is-encrypted"`
 	Permissions string `xml:"permissions"`

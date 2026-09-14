@@ -361,7 +361,7 @@
   function rmAllowed(p: string) { allowed = allowed.filter(x => x !== p); App.SetAllowedFilenames(allowed); }
 
   // General
-  let account = $state<{ signedIn: boolean; user: string; server: string }>({ signedIn: false, user: "", server: "" });
+  let account = $state<{ signedIn: boolean; user: string; server: string; localAddress?: string; localPinned?: boolean }>({ signedIn: false, user: "", server: "" });
   (async () => { account = await App.AccountInfo(); })();
   let signOutOpen = $state(false);
   let clearOnSignOut = $state(false);
@@ -381,6 +381,47 @@
   let acctBusy = $state(false);
   async function loadAccounts() { accounts = (await App.ListAccounts()) ?? []; }
   loadAccounts();
+
+  // Local network route (spec 2026-09-13). Test → (Trust) → Use this address.
+  // The saved address comes from AccountInfo; live route state rides the 3 s
+  // Diagnostics poll below (diag.route / diag.routeReason).
+  type LocalTest = { result: string; message: string; fingerprint: string; subject: string; issuer: string; expires: string; address: string };
+  let localAddr = $state("");
+  let localPin = $state("");
+  let localBusy = $state(false);
+  let localTest = $state<LocalTest | null>(null);
+  $effect(() => { localAddr = account.localAddress ?? ""; });
+  async function testLocal(pin = "") {
+    localBusy = true; localTest = null; localPin = pin;
+    try { localTest = await App.TestLocalAddress(localAddr, pin); }
+    finally { localBusy = false; }
+  }
+  async function saveLocal() {
+    localBusy = true;
+    try {
+      const err = await App.SaveLocalAddress(localAddr, localPin);
+      if (err) { alert(err); return; }
+      localTest = null; localPin = "";
+      account = await App.AccountInfo();
+      flashSaved("local");
+    } finally { localBusy = false; }
+  }
+  async function clearLocal() {
+    localBusy = true;
+    try {
+      const err = await App.SaveLocalAddress("", "");
+      if (err) { alert(err); return; }
+      localTest = null; localPin = ""; localAddr = "";
+      account = await App.AccountInfo();
+    } finally { localBusy = false; }
+  }
+  function routeText(d: any): string {
+    if (!d || !account.localAddress) return "";
+    if (d.route === "local") return "Connected directly over your local network.";
+    if (d.routeReason === "certificate changed") return "The certificate at the local address isn't the one Nimbo trusts, so Nimbo is using the internet. If you renewed your server's certificate, test the address again while you're on your own network. If you're away from home, another device may be answering at that address — leave it.";
+    if (d.routeReason === "different server") return "The local address answers, but it's a different server or account, so Nimbo is using the internet.";
+    return "Using the internet — the local address isn't reachable right now.";
+  }
   async function switchAccount(id: string) {
     acctBusy = true;
     const err = await App.SwitchAccount(id);
@@ -1290,6 +1331,36 @@
             </div>
           </div>
         {/if}
+        {#if account.server.toLowerCase().startsWith("https://")}
+          <div class="field localroute">
+            <label>Local network address</label>
+            <p class="fhint">Sync directly with your server when you're on the same network; Nimbo uses the internet address whenever the local one isn't reachable. Needs HTTPS on that address — a self-signed certificate is fine. Leave empty if your server isn't on your network. Your local address must serve the same site, including the /push/ws notification socket.</p>
+            <div class="baserow">
+              <input placeholder="192.168.1.100" bind:value={localAddr} disabled={localBusy} oninput={() => { localTest = null; localPin = ""; }} onkeydown={(e) => { if (e.key === "Enter" && localAddr.trim()) testLocal(); }} />
+              <button class="small" disabled={localBusy || !localAddr.trim()} onclick={() => testLocal()}>{localBusy ? "Testing…" : "Test"}</button>
+              {#if account.localAddress}<button class="link danger" disabled={localBusy} onclick={clearLocal}>Remove</button>{/if}
+              {#if savedFlash === "local"}<span class="saved">Saved ✓</span>{/if}
+            </div>
+            {#if localTest}
+              {#if localTest.result === "ok"}
+                <p class="fhint">✓ {localTest.message}</p>
+                <div class="addbtns"><button class="primary small" disabled={localBusy} onclick={saveLocal}>Use this address</button></div>
+              {:else if localTest.result === "untrusted"}
+                <p class="fhint">{localTest.message}</p>
+                <pre class="cert">{localTest.subject}
+Issued by: {localTest.issuer}
+Expires: {localTest.expires}
+SHA-256: {localTest.fingerprint}</pre>
+                <p class="fhint">Compare the SHA-256 fingerprint with the one shown on your server before trusting it. If you use your own certificate authority, you can instead import it into Windows and no pin is needed. Trusting pins exactly this certificate; if it is later replaced, you'll need to trust the new one.</p>
+                <div class="addbtns"><button class="primary small" disabled={localBusy} onclick={() => testLocal(localTest?.fingerprint ?? "")}>Trust this certificate</button></div>
+              {:else}
+                <pre class="err">{localTest.message}</pre>
+              {/if}
+            {:else if account.localAddress}
+              <p class="fhint">{routeText(diag)}{#if account.localPinned}{" (certificate pinned)"}{/if}</p>
+            {/if}
+          </div>
+        {/if}
       {:else}
         <p class="empty">Signed out — use the sign-in window to connect an account.</p>
       {/if}
@@ -1587,6 +1658,11 @@
   .acctinfo { display: flex; flex-direction: column; min-width: 0; }
   .acctinfo b { font-size: 14px; }
   .acctinfo span { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .localroute { margin-top: 10px; max-width: 480px; }
+  .localroute .baserow { margin-bottom: 6px; }
+  .localroute .baserow button.small { padding: 6px 12px; font-size: 12.5px; border: 1px solid var(--border-2); border-radius: 6px; background: var(--bg); color: var(--fg); cursor: pointer; }
+  .localroute .baserow button.small:disabled { opacity: .45; cursor: not-allowed; }
+  .cert { font-size: 11px; white-space: pre-wrap; word-break: break-all; border: 1px solid var(--border-2); border-radius: 5px; background: var(--bg); color: var(--fg); padding: 6px 8px; margin: 4px 0; font-family: ui-monospace, Consolas, monospace; }
   .signout { flex: 0 0 auto; padding: 7px 14px; border: 1px solid var(--border-2); border-radius: 6px;
              background: var(--bg); color: #c0392b; cursor: pointer; font-size: 13px; }
   .signout:hover { background: #fdeceb; }

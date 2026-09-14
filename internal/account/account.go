@@ -16,6 +16,18 @@ type Account struct {
 	ID        string `json:"id"`        // stable identifier, derived from server + user
 	ServerURL string `json:"serverURL"` // base URL, no trailing slash
 	LoginName string `json:"loginName"` // the Nextcloud login/user name
+	// Local is the optional local network route: an address Nimbo dials
+	// instead of ServerURL's host while it is reachable and proves to be the
+	// same server. nil = off. Only ever set on https:// accounts. Spec:
+	// docs/specs/2026-09-13-local-network-route-design.md.
+	Local *LocalRoute `json:"local,omitempty"`
+}
+
+// LocalRoute is the saved setup of an account's local network address.
+type LocalRoute struct {
+	Address string `json:"address"`       // host or host:port (IPv6 in brackets); no scheme, no path
+	Pin     string `json:"pin,omitempty"` // lowercase hex SHA-256 of the leaf certificate; "" = verify via the OS store
+	RootID  string `json:"rootID"`        // oc:id of the DAV root, captured over the public URL at setup
 }
 
 // newID derives a stable, filesystem- and keychain-safe identifier from the

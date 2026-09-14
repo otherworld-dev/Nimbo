@@ -170,3 +170,53 @@ func readText(ctx context.Context, c *websocket.Conn) string {
 	}
 	return string(b)
 }
+
+// countingTransport counts handshakes that pass through a custom HTTP client.
+type countingTransport struct{ n atomic.Int32 }
+
+func (t *countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	t.n.Add(1)
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// The websocket handshake goes through the client SetHTTPClient provides —
+// that is how push follows the sync client's local network route.
+func TestDialsThroughHTTPClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close(websocket.StatusNormalClosure, "")
+		ctx := r.Context()
+		_ = readText(ctx, c)
+		_ = readText(ctx, c)
+		_ = c.Write(ctx, websocket.MessageText, []byte("authenticated"))
+		_ = c.Write(ctx, websocket.MessageText, []byte("notify_file"))
+		for ctx.Err() == nil {
+			if _, _, err := c.Read(ctx); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ct := &countingTransport{}
+	c := New(wsURL(srv.URL), "alice", "s3cret")
+	c.SetHTTPClient(&http.Client{Transport: ct})
+	events := make(chan Event, 1)
+	go c.Run(ctx, func(ev Event) { events <- ev })
+	select {
+	case ev := <-events:
+		if ev.Type != "notify_file" {
+			t.Fatalf("event = %q", ev.Type)
+		}
+	case <-ctx.Done():
+		t.Fatal("no event")
+	}
+	if ct.n.Load() == 0 {
+		t.Fatal("handshake did not go through the provided http.Client")
+	}
+}

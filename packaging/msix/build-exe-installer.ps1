@@ -28,11 +28,30 @@ function Find-SdkTool($name) {
 
 if ($Build) { & (Join-Path $root "package.ps1") -Version $Version -SignSubject $SignSubject -AzureSign:$AzureSign -AzureCertProfile $AzureCertProfile }
 
-$required = @("Nimbo.msix", "setup-steps.ps1", "Nimbo.iss")
+$required = @("Nimbo.msix", "Nimbo.iss")
 if (-not $AzureSign) { $required += "NimboDev.cer" }  # Azure builds don't bundle/trust the dev cert
 foreach ($f in $required) {
     if (-not (Test-Path (Join-Path $root $f))) { throw "$f not found in $root" }
 }
+
+# Setup's launch step and version info come from the MSIX being bundled, so they
+# can't drift from it (dev-cert and white-label builds have other family names).
+# PackageFamilyName = Name + "_" + Crockford base32 of the first 8 bytes of
+# SHA-256(UTF-16LE Publisher), the same derivation Windows uses.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$zip = [IO.Compression.ZipFile]::OpenRead((Join-Path $root "Nimbo.msix"))
+try {
+    $entry = $zip.Entries | Where-Object FullName -eq "AppxManifest.xml"
+    $reader = New-Object IO.StreamReader($entry.Open())
+    try { [xml]$manifest = $reader.ReadToEnd() } finally { $reader.Close() }
+} finally { $zip.Dispose() }
+$identity = $manifest.Package.Identity
+$appId = @($manifest.Package.Applications.Application)[0].Id
+$sha = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::Unicode.GetBytes($identity.Publisher))
+$bits = (($sha[0..7] | ForEach-Object { [Convert]::ToString($_, 2).PadLeft(8, '0') }) -join '') + '0'
+$alphabet = '0123456789abcdefghjkmnpqrstvwxyz'
+$pfn = $identity.Name + "_" + (-join (0..12 | ForEach-Object { $alphabet[[Convert]::ToInt32($bits.Substring($_ * 5, 5), 2)] }))
+Write-Host "Bundling $($identity.Name) $($identity.Version) ($pfn!$appId)"
 
 # Locate the Inno Setup compiler.
 $iscc = Get-ChildItem "$env:LOCALAPPDATA\Programs", "C:\Program Files (x86)", "C:\Program Files" `
@@ -40,7 +59,7 @@ $iscc = Get-ChildItem "$env:LOCALAPPDATA\Programs", "C:\Program Files (x86)", "C
     Select-Object -First 1 -ExpandProperty FullName
 if (-not $iscc) { throw "ISCC.exe not found. Install Inno Setup: winget install --id JRSoftware.InnoSetup" }
 
-$isccArgs = @("/DAppVer=$Version")
+$isccArgs = @("/DAppVer=$Version", "/DFileVer=$($identity.Version)", "/DPfn=$pfn", "/DPkgAppId=$appId")
 if ($AzureSign) { $isccArgs += "/DNoDevCert=1" }
 & $iscc @isccArgs (Join-Path $root "Nimbo.iss")
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compile failed ($LASTEXITCODE)" }

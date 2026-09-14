@@ -687,6 +687,11 @@ export function OpenFolder(localDir) {
 
 /**
  * OpenLogFolder reveals the log directory in the file manager.
+ * 
+ * The path needs de-virtualising first: MSIX filesystem redirection means the
+ * app WRITES its logs under the package's LocalCache while SEEING the classic
+ * AppData path — and Explorer, unpackaged, sees only the real (empty or
+ * absent) classic directory, so the button appeared to do nothing.
  * @returns {$CancellablePromise<void>}
  */
 export function OpenLogFolder() {
@@ -701,7 +706,8 @@ export function OpenLogs() {
 }
 
 /**
- * OpenSettings opens (or focuses) the sync-settings window.
+ * OpenSettings opens (or focuses) the sync-settings window on its default tab.
+ * Kept as-is (a bound method) so the frontend bindings don't need regenerating.
  * @returns {$CancellablePromise<void>}
  */
 export function OpenSettings() {
@@ -965,6 +971,31 @@ export function RestoreVersion(href) {
  */
 export function Resume() {
     return $Call.ByID(2476070530);
+}
+
+/**
+ * RevealPath shows a local file or folder in the file manager: the item
+ * selected in its folder when it exists, otherwise the nearest folder that
+ * still does. Returns false when there is nothing to show (the folder tree
+ * has gone), so the caller can fall back to something else.
+ * @param {string} path
+ * @returns {$CancellablePromise<boolean>}
+ */
+export function RevealPath(path) {
+    return $Call.ByID(77851903, path);
+}
+
+/**
+ * SaveLocalAddress re-runs the check in Go (never trusting what the frontend
+ * passes back), stores the route on the shown account and applies it to that
+ * account's running engine. An empty addr removes the route. Returns "" or a
+ * user-facing error.
+ * @param {string} addr
+ * @param {string} pin
+ * @returns {$CancellablePromise<string>}
+ */
+export function SaveLocalAddress(addr, pin) {
+    return $Call.ByID(1068667433, addr, pin);
 }
 
 /**
@@ -1257,6 +1288,12 @@ export function ShowSearch() {
 
 /**
  * SidebarEnabled reports whether the Nimbo sidebar root is registered.
+ * 
+ * Answered from our own recorded choice, not the registry: a packaged build
+ * reads HKCU through the MSIX container, which returns the package's private
+ * copy rather than the keys Explorer actually uses. The registry is consulted
+ * only when nothing has been recorded yet — a fresh install (nothing there) or
+ * an entry left by an older unpackaged build (which is real, and ours).
  * @returns {$CancellablePromise<boolean>}
  */
 export function SidebarEnabled() {
@@ -1336,6 +1373,20 @@ export function TailLog() {
 }
 
 /**
+ * TestLocalAddress checks a candidate local network address for the shown
+ * account without saving anything. pin is "" or a SHA-256 fingerprint the user
+ * chose to trust from a previous "untrusted" result.
+ * @param {string} addr
+ * @param {string} pin
+ * @returns {$CancellablePromise<$models.LocalTestDTO>}
+ */
+export function TestLocalAddress(addr, pin) {
+    return $Call.ByID(176774928, addr, pin).then(/** @type {($result: any) => any} */(($result) => {
+        return $$createType42($result);
+    }));
+}
+
+/**
  * ThemeColor returns the user's Nextcloud primary theme colour (hex) to accent
  * the UI, or "" to use the default.
  * @returns {$CancellablePromise<string>}
@@ -1358,7 +1409,7 @@ export function TogglePause() {
  */
 export function TrashList() {
     return $Call.ByID(2716350569).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType43($result);
+        return $$createType44($result);
     }));
 }
 
@@ -1392,7 +1443,7 @@ export function Version() {
  */
 export function VersionList() {
     return $Call.ByID(3868762695).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType45($result);
+        return $$createType46($result);
     }));
 }
 
@@ -1447,7 +1498,8 @@ const $$createType38 = $models.SearchItem.createFrom;
 const $$createType39 = $Create.Array($$createType38);
 const $$createType40 = $models.ShareDTO.createFrom;
 const $$createType41 = $Create.Array($$createType40);
-const $$createType42 = $models.TrashDTO.createFrom;
-const $$createType43 = $Create.Array($$createType42);
-const $$createType44 = $models.VersionDTO.createFrom;
-const $$createType45 = $Create.Array($$createType44);
+const $$createType42 = $models.LocalTestDTO.createFrom;
+const $$createType43 = $models.TrashDTO.createFrom;
+const $$createType44 = $Create.Array($$createType43);
+const $$createType45 = $models.VersionDTO.createFrom;
+const $$createType46 = $Create.Array($$createType45);
