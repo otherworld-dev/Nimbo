@@ -2,13 +2,14 @@
 # the IExplorerCommand DLL, stages them with the manifest + logos, packs with
 # makeappx, and signs if a code-signing cert is available.
 #
-# Usage:  .\package.ps1 [-Version 0.1.0]
+# Usage:  .\package.ps1 [-Version X.Y.Z] [-Revision N]   # -Version defaults to packaging/msix/VERSION
 #         .\package.ps1 -StoreChannel        # installable build that behaves as the Store one
 # Prereqs: Go + w64devkit gcc on PATH; Windows SDK (makeappx/signtool); a cert
 #          from make-cert.ps1 in Cert:\CurrentUser\My (CN=Nimbo Dev) to sign.
 param(
-    [string]$Version = "0.1.0",
-    [int]$Revision = 0,                    # explicit 4th component; 0 = auto-bump above max(.build-rev, newest GitHub release) - see rev-common.ps1
+    [string]$Version = "",                 # X.Y.Z; empty = packaging/msix/VERSION
+    [int]$Revision = -1,                   # 4th component: -1 = auto-bump above max(.build-rev, newest GitHub release) - see rev-common.ps1;
+                                           # 0 = a stable release (tagged vX.Y.Z by /release); N > 0 = exactly N
     [string]$SignSubject = "CN=Nimbo Dev", # signing cert subject; change when moving to a real CA cert (must match the manifest Publisher)
 
     # --- Azure Trusted Signing (-AzureSign) ---
@@ -71,6 +72,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $here = $PSScriptRoot
+. (Join-Path $here "rev-common.ps1")
+if (-not $Version) { $Version = Get-BaseVersion }
 $repo = (Resolve-Path (Join-Path $here "..\..")).Path
 $stage = Join-Path $here "stage"
 if ($Store -and (-not $StoreIdentityName -or -not $StorePublisher)) {
@@ -106,8 +109,9 @@ if ($Store) {
     $pkgVersion = "$Version.0"
     Write-Host "Store package version: $pkgVersion (revision pinned to 0 for the Store)"
 } else {
-    if ($Revision -gt 0) {
-        # Caller supplied the revision explicitly - trust it verbatim.
+    if ($Revision -ge 0) {
+        # Caller supplied the revision explicitly - trust it verbatim (0 = a
+        # stable release, which /release tags vX.Y.Z).
         $rev = $Revision
     } else {
         # Unified sequence (see rev-common.ps1): go one above the HIGHER of the
@@ -116,7 +120,6 @@ if ($Store) {
         # github remote quietly falls back to the local counter alone.
         $rev = 0
         if (Test-Path $revFile) { $rev = [int]((Get-Content $revFile -Raw).Trim()) }
-        . (Join-Path $here "rev-common.ps1")
         $gr = Resolve-GitHubOwnerRepo -RepoRoot $here
         if ($gr) {
             $ghMax = Get-HighestReleaseRevision -Owner $gr.Owner -Repo $gr.Repo

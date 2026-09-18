@@ -9,7 +9,7 @@
 # (winget install --id JRSoftware.InnoSetup).
 param(
     [switch]$Build,
-    [string]$Version = "0.1.0",
+    [string]$Version = "",
     [string]$SignSubject = "CN=Nimbo Dev", # installer signing cert subject (see SIGNING.md)
 
     # Azure Trusted Signing: sign Setup.exe via azure-sign.ps1 and build it
@@ -20,6 +20,8 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
+. (Join-Path $root "rev-common.ps1")
+if (-not $Version) { $Version = Get-BaseVersion }   # X.Y.Z from packaging/msix/VERSION
 
 function Find-SdkTool($name) {
     Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter $name -Recurse -ErrorAction SilentlyContinue |
