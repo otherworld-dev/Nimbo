@@ -2,19 +2,20 @@
 # the IExplorerCommand DLL, stages them with the manifest + logos, packs with
 # makeappx, and signs if a code-signing cert is available.
 #
-# Usage:  .\package.ps1 [-Version 0.1.0]
+# Usage:  .\package.ps1 [-Version X.Y.Z] [-Revision N]   # -Version defaults to packaging/msix/VERSION
 #         .\package.ps1 -StoreChannel        # installable build that behaves as the Store one
 # Prereqs: Go + w64devkit gcc on PATH; Windows SDK (makeappx/signtool); a cert
 #          from make-cert.ps1 in Cert:\CurrentUser\My (CN=Nimbo Dev) to sign.
 param(
-    [string]$Version = "0.1.0",
-    [int]$Revision = 0,                    # explicit 4th component; 0 = auto-bump above max(.build-rev, newest GitHub release) - see rev-common.ps1
+    [string]$Version = "",                 # X.Y.Z; empty = packaging/msix/VERSION
+    [int]$Revision = -1,                   # 4th component: -1 = auto-bump above max(.build-rev, newest GitHub release) - see rev-common.ps1;
+                                           # 0 = a stable release (tagged vX.Y.Z by /release); N > 0 = exactly N
     [string]$SignSubject = "CN=Nimbo Dev", # signing cert subject; change when moving to a real CA cert (must match the manifest Publisher)
 
     # --- Azure Trusted Signing (-AzureSign) ---
     # Signs with the company's public CA-trusted cert via azure-sign.ps1 instead
     # of a local cert. -SignSubject must then be the EXACT subject issued by the
-    # certificate profile (it still drives the manifest Publisher). See SIGNING.md.
+    # certificate profile (it still drives the manifest Publisher). See the signing runbook.
     [switch]$AzureSign,
     [string]$AzureCertProfile = "otherworld-dev-ltd",
 
@@ -71,6 +72,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $here = $PSScriptRoot
+. (Join-Path $here "rev-common.ps1")
+if (-not $Version) { $Version = Get-BaseVersion }
 $repo = (Resolve-Path (Join-Path $here "..\..")).Path
 $stage = Join-Path $here "stage"
 if ($Store -and (-not $StoreIdentityName -or -not $StorePublisher)) {
@@ -78,7 +81,7 @@ if ($Store -and (-not $StoreIdentityName -or -not $StorePublisher)) {
 }
 if ($AzureSign -and $SignSubject -eq "CN=Nimbo Dev") {
     # A Publisher that doesn't equal the Azure cert's subject is rejected at install.
-    throw "-AzureSign needs -SignSubject set to the exact issued cert subject (portal: Trusted Signing account -> Certificate profiles -> $AzureCertProfile -> Subject). See SIGNING.md."
+    throw "-AzureSign needs -SignSubject set to the exact issued cert subject (portal: Trusted Signing account -> Certificate profiles -> $AzureCertProfile -> Subject). See the signing runbook."
 }
 # -StoreChannel gets its own filename deliberately: it must never be mistakable
 # for a release artifact, since `release.ps1 -SkipBuild` publishes whatever sits
@@ -106,8 +109,9 @@ if ($Store) {
     $pkgVersion = "$Version.0"
     Write-Host "Store package version: $pkgVersion (revision pinned to 0 for the Store)"
 } else {
-    if ($Revision -gt 0) {
-        # Caller supplied the revision explicitly - trust it verbatim.
+    if ($Revision -ge 0) {
+        # Caller supplied the revision explicitly - trust it verbatim (0 = a
+        # stable release, which /release tags vX.Y.Z).
         $rev = $Revision
     } else {
         # Unified sequence (see rev-common.ps1): go one above the HIGHER of the
@@ -116,7 +120,6 @@ if ($Store) {
         # github remote quietly falls back to the local counter alone.
         $rev = 0
         if (Test-Path $revFile) { $rev = [int]((Get-Content $revFile -Raw).Trim()) }
-        . (Join-Path $here "rev-common.ps1")
         $gr = Resolve-GitHubOwnerRepo -RepoRoot $here
         if ($gr) {
             $ghMax = Get-HighestReleaseRevision -Owner $gr.Owner -Repo $gr.Repo
@@ -225,7 +228,7 @@ if ($AzureSign -or $Store) {
 # the package Identity in lock-step with the signing cert (a mismatch is rejected
 # by Windows) so switching certs is just -SignSubject. NOTE: changing Publisher
 # changes the PackageFamilyName = a new app identity (not an upgrade) -- see
-# SIGNING.md before doing it on installed machines.
+# the signing runbook before doing it on installed machines.
 $manifest = Get-Content (Join-Path $here "AppxManifest.xml") -Raw
 # Stamp ONLY the <Identity> Version. The (?<![A-Za-z]) lookbehind stops this also
 # matching the Version= inside TargetDeviceFamily MinVersion="10.0.22000.0" (which
@@ -274,7 +277,7 @@ Write-Host "Packed: $msix"
 # --- sign (optional; needs the signing cert) ---
 # NOTE: the signing cert's Subject must equal the manifest Identity Publisher
 # (AppxManifest.xml) or Windows rejects the package. Keep -SignSubject, the
-# manifest Publisher, and make-appinstaller's -Publisher in sync. See SIGNING.md.
+# manifest Publisher, and make-appinstaller's -Publisher in sync. See the signing runbook.
 if ($Store) {
     # Store packages are signed by Microsoft at ingestion, so we deliberately do
     # NOT sign here. Upload $msix to Partner Center -> your submission -> Packages.

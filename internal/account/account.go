@@ -19,7 +19,7 @@ type Account struct {
 	// Local is the optional local network route: an address Nimbo dials
 	// instead of ServerURL's host while it is reachable and proves to be the
 	// same server. nil = off. Only ever set on https:// accounts. Spec:
-	// docs/specs/2026-09-13-local-network-route-design.md.
+	// the local-network-route design (2026-09-13).
 	Local *LocalRoute `json:"local,omitempty"`
 }
 

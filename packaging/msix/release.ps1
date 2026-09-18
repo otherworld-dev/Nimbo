@@ -1,16 +1,22 @@
-# Builds, signs, and publishes a Nimbo release to GitHub so installed copies
-# auto-update via the App Installer feed. One command per release:
+# Builds and signs a Nimbo release, and publishes betas to GitHub so installed
+# copies auto-update via the App Installer feed.
 #
-#   .\release.ps1                       # build+sign, publish to the 'github' remote's repo
-#   .\release.ps1 -Owner you -Repo Nimbo
-#   .\release.ps1 -SkipBuild            # reuse the existing signed Nimbo.msix
-#   .\release.ps1 -PreRelease           # publish as a pre-release (beta channel only)
+# Stable releases go through /release (merge dev into main, vX.Y.Z tag, changelog
+# as release notes). This script is only its build step there; it publishes
+# nothing but betas:
+#
+#   .\release.ps1 -NoPublish -Revision 0   # /release's build step: stable X.Y.Z.0, publish nothing
+#   .\release.ps1 -PreRelease              # build + publish a beta X.Y.Z.N (beta channel only)
+#   .\release.ps1 -PreRelease -SkipBuild   # re-publish the existing signed Nimbo.msix
+#
+# X.Y.Z comes from packaging/msix/VERSION unless -Version is given.
 #
 # What it does:
 #   1. package.ps1 -> signed Nimbo.msix (bumps .build-rev for an in-place update)
 #   2. make-appinstaller.ps1 -> Nimbo.appinstaller pointing at the repo's stable
 #      releases/latest/download URLs (version auto-derived from .build-rev)
-#   3. gh release create/upload -> a release tagged v<version> carrying BOTH files
+#   3. gh release create/upload -> a pre-release tagged vX.Y.Z.N carrying the files
+#      (skipped with -NoPublish, where /release creates the vX.Y.Z release)
 #
 # Installed copies that were added via the .appinstaller feed re-check it on
 # launch (HoursBetweenUpdateChecks) and update themselves.
@@ -20,12 +26,13 @@
 param(
     [string]$Owner = "",
     [string]$Repo = "Nimbo",
-    [string]$Version = "0.1.0",
-    [string]$SignSubject = "CN=Nimbo Dev",  # one knob for the signer/Publisher across MSIX, feed and installer (see SIGNING.md)
+    [string]$Version = "",                 # X.Y.Z; empty = packaging/msix/VERSION
+    [int]$Revision = -1,                   # passed to package.ps1: -1 = auto, 0 = stable (vX.Y.Z)
+    [string]$SignSubject = "CN=Nimbo Dev",  # one knob for the signer/Publisher across MSIX, feed and installer (see the signing runbook)
 
     # Azure Trusted Signing release: pass -AzureSign AND -SignSubject "<exact
     # issued subject>" (Trusted Signing account -> Certificate profiles ->
-    # profile -> Subject). Prereq: az login as adam@otherworld.dev. See SIGNING.md.
+    # profile -> Subject). Prereq: az login as adam@otherworld.dev. See the signing runbook.
     [switch]$AzureSign,
     [string]$AzureCertProfile = "otherworld-dev-ltd",
     [switch]$SkipBuild,
@@ -34,17 +41,23 @@ param(
     # sees them. Both update paths skip pre-releases - the in-app updater filters
     # them (internal/update), and the .appinstaller feed points at
     # releases/latest/download, which GitHub excludes them from. Only installs
-    # with the beta channel enabled in Settings pick it up. Promote later with
-    #   gh release edit <tag> --prerelease=false --latest
-    # which publishes the SAME signed artefacts - no rebuild, no re-sign. (--latest
-    # re-points GitHub's "latest" flag, which --prerelease=false alone does not
-    # reliably do - see the printed promotion command below for why.)
+    # with the beta channel enabled in Settings pick it up. Betas are never
+    # promoted: the stable comes from /release (promotion retired 2026-09-18).
     [switch]$PreRelease,
+    [switch]$NoPublish,  # build, sign, feed and Setup.exe only - /release publishes
     [switch]$Force   # skip the clean-tree guard (deliberate WIP/test releases only)
 )
 $ErrorActionPreference = "Stop"
 $here = $PSScriptRoot
 $repoRoot = (Resolve-Path (Join-Path $here "..\..")).Path
+. (Join-Path $here "rev-common.ps1")
+if (-not $Version) { $Version = Get-BaseVersion }
+
+# Stable releases are published by /release, so a stable publish from here would
+# skip main, the vX.Y.Z tag and the changelog.
+if (-not $NoPublish -and -not $PreRelease) {
+    throw "stable releases go through /release - use -NoPublish for its build step, or -PreRelease for a beta"
+}
 
 # --- clean-tree guard: a release builds the WORKING TREE, not a commit, so a
 # dirty checkout would silently ship uncommitted/half-finished work. Refuse
@@ -57,6 +70,18 @@ if (-not $Force) {
         $dirty | ForEach-Object { Write-Host "  $_" }
         throw "release aborted: $($dirty.Count) uncommitted change(s) - commit first (or re-run with -Force to ship them anyway)"
     }
+}
+
+# --- a published beta's tag must point at a commit GitHub already has ---
+# The release is created with --target (not whatever GitHub's default branch
+# points at), so it names exactly the commit that was built.
+if (-not $NoPublish) {
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    & git -C $repoRoot fetch --quiet github 2>$null
+    $target = (& git -C $repoRoot rev-parse HEAD 2>$null)
+    $onGithub = @(& git -C $repoRoot branch -r --contains $target --list 'github/*' 2>$null) | Where-Object { $_ }
+    $ErrorActionPreference = $eap
+    if (-not $onGithub) { throw "HEAD $target isn't on GitHub yet - push it first, so the release tag points at a published commit" }
 }
 
 # --- locate gh (winget installs it here but it may not be on PATH yet) ---
@@ -84,7 +109,7 @@ Write-Host "Publishing to $Owner/$Repo"
 # then collide with an existing tag and `gh release create` fails loudly
 # rather than shipping a duplicate.
 if (-not $SkipBuild) {
-    & (Join-Path $here "package.ps1") -Version $Version -SignSubject $SignSubject -AzureSign:$AzureSign -AzureCertProfile $AzureCertProfile
+    & (Join-Path $here "package.ps1") -Version $Version -Revision $Revision -SignSubject $SignSubject -AzureSign:$AzureSign -AzureCertProfile $AzureCertProfile
 }
 $msix = Join-Path $here "Nimbo.msix"
 if (-not (Test-Path $msix)) { throw "Nimbo.msix not found - build first (omit -SkipBuild)" }
@@ -92,11 +117,17 @@ if (-not (Test-Path $msix)) { throw "Nimbo.msix not found - build first (omit -S
 # --- 2. version from the revision package.ps1 just stamped ---
 $rev = ((Get-Content (Join-Path $here ".build-rev") -Raw).Trim())
 $pkgVersion = "$Version.$rev"
-$tag = "v$pkgVersion"
+$tag = Get-ReleaseTag -Version $Version -Revision ([int]$rev)   # vX.Y.Z for a stable, vX.Y.Z.N for a beta
+if ($PreRelease -and [int]$rev -eq 0) {
+    # Revision 0 is the stable's number, and its vX.Y.Z tag belongs to /release.
+    throw "a beta can't be revision 0 (that is the $tag stable) - rebuild without -Revision 0"
+}
 
 # --- 3. App Installer feed pointing at the stable latest/download URLs ---
+# -Tag matters: the feed links the MSIX by its release tag, and a stable's tag
+# (vX.Y.Z) is not its 4-part package version.
 $base = "https://github.com/$Owner/$Repo/releases/latest/download"
-& (Join-Path $here "make-appinstaller.ps1") -BaseUrl $base -Publisher $SignSubject   # -Version auto-derives from .build-rev
+& (Join-Path $here "make-appinstaller.ps1") -BaseUrl $base -Publisher $SignSubject -Version $pkgVersion -Tag $tag
 $appinstaller = Join-Path $here "Nimbo.appinstaller"
 
 # Assets to publish: the MSIX + feed always; the offline Setup.exe too when it
@@ -115,6 +146,14 @@ try {
     }
 } catch {
     Write-Warning "Setup.exe build failed ($($_.Exception.Message)); publishing without it."
+}
+
+# --- /release's build step stops here: /release creates the vX.Y.Z release ---
+if ($NoPublish) {
+    Write-Host ""
+    Write-Host "Built $pkgVersion for release tag $tag (not published). Assets:"
+    $assets | ForEach-Object { Write-Host "  $_" }
+    return
 }
 
 # --- changelog: commit subjects since the previous release was published ---
@@ -158,7 +197,7 @@ if ($exists) {
     $extra = @()
     if ($PreRelease) { $extra += "--prerelease" }
     & $gh release create $tag @assets --repo "$Owner/$Repo" `
-        --title "Nimbo $tag" --notes-file $notesFile @extra
+        --title "Nimbo $tag" --target $target --notes-file $notesFile @extra
 }
 if ($LASTEXITCODE -ne 0) { throw "gh release failed" }
 
@@ -189,13 +228,7 @@ Write-Host ""
 Write-Host "Published $tag to https://github.com/$Owner/$Repo/releases"
 if ($isPrerelease -eq "true") {
     Write-Host "This is a PRE-RELEASE - only installs with the beta channel enabled will see it." -ForegroundColor Yellow
-    Write-Host "Promote it to everyone (same signed artefacts, no rebuild):"
-    # --latest is required alongside --prerelease=false: GitHub tracks "latest"
-    # as its own per-release flag, and a bare --prerelease=false does not
-    # reliably re-point it - without it, releases/latest/download (the App
-    # Installer feed and the website's download links) can keep serving the
-    # pre-promotion release indefinitely, with no error.
-    Write-Host "  gh release edit $tag --repo `"$Owner/$Repo`" --prerelease=false --latest"
+    Write-Host "The next stable comes from /release, not from promoting this beta."
 } else {
     Write-Host "First-time install (so Windows tracks updates):"
     Write-Host "  Add-AppxPackage -AppInstallerFile `"$base/Nimbo.appinstaller`""

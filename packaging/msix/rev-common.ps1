@@ -1,4 +1,9 @@
-# Shared revision derivation, dot-sourced by package.ps1 and release.ps1.
+# Shared version + revision derivation, dot-sourced by package.ps1, release.ps1,
+# make-appinstaller.ps1, build-exe-installer.ps1 and build-installer.ps1.
+#
+# Every build is X.Y.Z.<revision>. X.Y.Z comes from packaging/msix/VERSION, which
+# /release bumps. A stable release is revision 0 and is tagged vX.Y.Z by /release;
+# betas and local builds take the next revision and are tagged vX.Y.Z.N.
 #
 # Local test builds and GitHub releases share ONE monotonic revision sequence
 # (Adam's call, 2026-07-26): every build - local or released - goes one above
@@ -18,9 +23,9 @@
 # the derivation.
 #
 # `release list` sorts by createdAt, which is the TAGGED COMMIT's date, not the
-# release's publish time. In this repo tags land on the github snapshot branch
-# HEAD, so many releases routinely share one createdAt (ties are the norm here,
-# not the exception) - position 0 under a tie is not guaranteed to be the
+# release's publish time. Several releases can share one commit (before the
+# 2026-09-18 move to mirrored history every tag landed on the latest source
+# snapshot), so ties happen - position 0 under a tie is not guaranteed to be the
 # highest revision. Take the max revision across a window of recent releases
 # instead of trusting sort order, so a tie can never derive a revision that
 # collides with an existing release.
@@ -40,10 +45,33 @@ function Get-HighestReleaseRevision {
     $ok = ($LASTEXITCODE -eq 0)
     $ErrorActionPreference = $eap
     if (-not $ok) { return -1 }
-    $maxRev = ($tags | ForEach-Object { if ($_ -match '\.(\d+)\s*$') { [int]$Matches[1] } } |
+    # Only 4-part tags carry a revision. A stable's vX.Y.Z tag would otherwise
+    # read as revision Z.
+    $maxRev = ($tags | ForEach-Object { if ($_ -match '^v?\d+\.\d+\.\d+\.(\d+)\s*$') { [int]$Matches[1] } } |
                Measure-Object -Maximum).Maximum
     if ($null -eq $maxRev) { return -1 }
     return [int]$maxRev
+}
+
+# Get-BaseVersion returns X.Y.Z from packaging/msix/VERSION.
+function Get-BaseVersion {
+    $file = Join-Path $PSScriptRoot "VERSION"
+    if (-not (Test-Path $file)) { throw "packaging/msix/VERSION not found" }
+    $v = (Get-Content $file -Raw).Trim()
+    if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "packaging/msix/VERSION must be X.Y.Z, got '$v'" }
+    return $v
+}
+
+# Get-ReleaseTag names the GitHub release for a build: vX.Y.Z for a stable
+# (revision 0), vX.Y.Z.N for anything else. The App Installer feed links the
+# MSIX by this tag, so it has to match the release exactly.
+function Get-ReleaseTag {
+    param(
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][int]$Revision
+    )
+    if ($Revision -eq 0) { return "v$Version" }
+    return "v$Version.$Revision"
 }
 
 # Resolve-GitHubOwnerRepo derives owner/repo from the 'github' git remote.

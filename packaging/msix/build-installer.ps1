@@ -9,10 +9,12 @@
 # package.ps1 has produced a signed Nimbo.msix (or pass -Build to do it here).
 param(
     [switch]$Build,
-    [string]$Version = "0.1.0"
+    [string]$Version = ""
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
+. (Join-Path $root "rev-common.ps1")
+if (-not $Version) { $Version = Get-BaseVersion }   # X.Y.Z from packaging/msix/VERSION
 
 if ($Build) { & (Join-Path $root "package.ps1") -Version $Version }
 
