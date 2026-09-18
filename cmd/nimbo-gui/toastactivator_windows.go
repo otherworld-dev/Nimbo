@@ -26,7 +26,7 @@ import (
 
 // toastActivatorCLSID MUST match packaging/msix/AppxManifest.xml's
 // ToastActivatorCLSID and com:Class Id. Permanent — part of the app's toast
-// identity (see docs/specs/2026-07-22-actionable-toast-notifications.md).
+// identity (see the actionable-toast-notifications spec, 2026-07-22).
 var toastActivatorCLSID = ole.NewGUID("{00EEDCE7-5C4E-4573-85C2-98790F8F98AE}")
 
 var (

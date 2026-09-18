@@ -54,11 +54,18 @@ Thumbs.db
 # Licence signing private key (NEVER commit)
 /tools/licensegen/.signing-key
 
-# Claude Code local harness config
-/.claude/
+# Claude
+.claude/
 CLAUDE.md
-.claudeignore
+.mcp.json
 
 # Playwright MCP preview artifacts
 /.playwright-mcp/
 /website-preview-*.png
+
+# Private docs (kept outside the repo, never committed)
+/docs/
+/android/docs/
+/packaging/msix/SIGNING.md
+/packaging/msix/STORE.md
+/packaging/msix/store-listing.md

@@ -213,14 +213,26 @@ contact@otherworld.dev.
 
 ## Contributing
 
-Bug reports and feature requests are very welcome on the
-[issue tracker](https://github.com/otherworld-dev/Nimbo/issues). Code
-contributions aren't accepted at the moment — keeping sole copyright is what
-makes the free-personal / paid-commercial licensing work. (If that ever
-changes, a CLA will come first.)
+Bug reports and feature requests are welcome on the
+[issue tracker](https://github.com/otherworld-dev/Nimbo/issues).
 
-The **Nimbo** name and icon aren't covered by the licence — don't ship rebuilds
-under the same name.
+This repository carries Nimbo's real development history. `dev` is the default
+branch, where changes are integrated, and `main` only changes when a release is
+made. Up to 18 September 2026 the source was published as squashed snapshots,
+which is why the history up to that date is only eight commits.
+
+Code contributions are not accepted yet. Nimbo is dual licensed: anyone can use
+it under the PolyForm Noncommercial licence above, and Otherworld Dev Ltd also
+sells commercial licences, which only works while every part of Nimbo can be
+offered under both. Pull requests will be accepted once a contributor licence
+agreement (CLA) is in place to cover this, and should then be opened against
+`dev`.
+
+Translations cannot be accepted yet either. Nimbo is English only at the moment,
+and the desktop app has no translation support to add them to.
+
+The **Nimbo** name and icon are not covered by the licence, so please do not
+distribute builds of your own under the Nimbo name.
 
 Nimbo is an independent client, not affiliated with or endorsed by
 Nextcloud GmbH.

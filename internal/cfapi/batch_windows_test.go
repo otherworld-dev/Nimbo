@@ -34,7 +34,7 @@ import (
 // reproduce the fault for real: the poisoned placeholders they leave in the
 // test's temp directory cannot be opened, repaired or deleted by any normal
 // means (t.TempDir's cleanup fails too), so they sit under %TEMP% until
-// somebody runs the fltmc detach recipe from docs/TROUBLESHOOTING.md.
+// somebody runs the fltmc detach recipe from the troubleshooting guide.
 
 const batchProbeShort = 10
 

@@ -14,14 +14,21 @@
 # both files. Windows re-checks the feed (HoursBetweenUpdateChecks) and updates.
 #
 # -Version is optional: when omitted it is derived from packaging/msix/.build-rev
-# as 0.1.0.<rev> so the feed always matches the last package.ps1 build.
+# as X.Y.Z.<rev> (X.Y.Z from packaging/msix/VERSION) so the feed always matches
+# the last package.ps1 build.
+#
+# -Tag is the GitHub release the MSIX is attached to. It defaults to vX.Y.Z for
+# revision 0 (a stable, tagged by /release) and vX.Y.Z.N otherwise - the same
+# rule as release.ps1 (Get-ReleaseTag in rev-common.ps1).
 param(
     [string]$Version = "",
+    [string]$Tag = "",                               # release tag holding the MSIX; empty = derived from -Version
     [Parameter(Mandatory = $true)][string]$BaseUrl,  # e.g. https://github.com/adam/Nimbo/releases/latest/download
-    [string]$Publisher = "CN=Nimbo Dev",             # MUST match the signing cert subject + manifest Publisher (see SIGNING.md)
+    [string]$Publisher = "CN=Nimbo Dev",             # MUST match the signing cert subject + manifest Publisher (see the signing runbook)
     [string]$Name = "Nimbo"                          # MSIX Identity Name + feed/MSIX file basename; white-label passes the partner's
 )
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "rev-common.ps1")
 
 # Derive the version from the last build's revision unless one was passed, so the
 # feed can never advertise a version the hosted MSIX doesn't actually have.
@@ -29,25 +36,26 @@ if (-not $Version) {
     $revFile = Join-Path $PSScriptRoot ".build-rev"
     if (-not (Test-Path $revFile)) { throw "no .build-rev yet - run package.ps1 first, or pass -Version" }
     $rev = ((Get-Content $revFile -Raw).Trim())
-    $Version = "0.1.0.$rev"
+    $Version = "$(Get-BaseVersion).$rev"
 }
 
 # Normalise to a 4-part version (Major.Minor.Build.Revision).
 $parts = $Version.TrimStart('v').Split('.')
 while ($parts.Count -lt 4) { $parts += "0" }
 $ver = ($parts[0..3] -join '.')
+if (-not $Tag) { $Tag = Get-ReleaseTag -Version ($parts[0..2] -join '.') -Revision ([int]$parts[3]) }
 $base = $BaseUrl.TrimEnd('/')
 
 # The .appinstaller itself stays at the stable latest/download URL so update
 # CHECKS always find the newest release. But the MSIX it pulls must use the
-# IMMUTABLE per-version asset URL (.../releases/download/v<ver>/Nimbo.msix): the
+# IMMUTABLE per-release asset URL (.../releases/download/<tag>/Nimbo.msix): the
 # latest/download/Nimbo.msix alias is a CDN-cached redirect that can serve the
 # PREVIOUS release's MSIX for a while after publishing — which made updates
 # silently reinstall the old version ("installed ok", but no version change).
 # A versioned URL is unique per release and never stale.
 $msixUri = "$base/$Name.msix"
 if ($base -match '^(?<root>.*)/releases/latest/download$') {
-    $msixUri = "$($Matches.root)/releases/download/v$ver/$Name.msix"
+    $msixUri = "$($Matches.root)/releases/download/$Tag/$Name.msix"
 }
 
 $xml = @"

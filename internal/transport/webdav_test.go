@@ -125,7 +125,7 @@ func TestParseResponseIsEncrypted(t *testing.T) {
 
 // TestParseResponseLock covers the files_lock properties. The fixture mirrors
 // what a live Nextcloud 34.0.2 actually returns (see
-// docs/plans/2026-08-08-file-locking-findings.md): an UNLOCKED file reports
+// the 2026-08-08 file-locking findings): an UNLOCKED file reports
 // nc:lock as an empty string in the 200 block and puts every other lock property
 // in a 404 propstat, and nc:lock-timeout can be negative.
 func TestParseResponseLock(t *testing.T) {

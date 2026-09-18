@@ -25,7 +25,7 @@ package vfs
 //	                marks). Mutates nothing locally except the final mark, so
 //	                it is safe to run in the background under a live watcher.
 //
-// Design: docs/specs/2026-07-26-vfs-adopt-existing-folder-design.md.
+// Design: the VFS adopt-existing-folder spec (2026-07-26).
 
 import (
 	"context"

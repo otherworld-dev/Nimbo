@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// Local network route — docs/specs/2026-09-13-local-network-route-design.md.
+// Local network route (see the 2026-09-13 design spec).
 //
 // The account keeps one URL. While the local route is up, a connection to the
 // account host is dialled to the LAN address instead; the Host header, SNI,
