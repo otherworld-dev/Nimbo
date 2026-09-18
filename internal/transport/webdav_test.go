@@ -1,7 +1,13 @@
 package transport
 
 import (
+	"bytes"
+	"context"
 	"encoding/xml"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -316,6 +322,96 @@ func TestServerReadOnly(t *testing.T) {
 		if got := e.ServerReadOnly(); got != c.want {
 			t.Errorf("ServerReadOnly(perm=%q dir=%v) = %v, want %v", c.perm, c.dir, got, c.want)
 		}
+	}
+}
+
+// OnMount reads the two oc:permissions letters that say "this node lives on a
+// storage that can be detached from the account": S (a share received from
+// someone else) and M (an external storage or group folder mount). The letters
+// were sampled from a live Nextcloud; a home-storage node carries neither.
+func TestEntryOnMount(t *testing.T) {
+	cases := []struct {
+		perm string
+		want bool
+	}{
+		{"SRGDNVCK", true}, // a folder shared with me (root or any descendant)
+		{"SRGDNVW", true},  // a file inside a received share
+		{"MG", true},       // .Collectives root: a mount
+		{"RMGCK", true},    // a collective inside the mount
+		{"RGDNVCK", false}, // my own folder
+		{"RGDNVW", false},  // my own file
+		{"", false},        // unknown: never guess "detachable"
+	}
+	for _, c := range cases {
+		if got := (Entry{Permissions: c.perm}).OnMount(); got != c.want {
+			t.Errorf("OnMount(%q) = %v, want %v", c.perm, got, c.want)
+		}
+	}
+}
+
+// GetRange is what hydration uses instead of GetFrom's open-ended "download
+// from here to EOF": one GET for exactly the caller's span, so a large file
+// no longer costs one HTTP request per megabyte.
+func TestGetRangeSendsABoundedRange(t *testing.T) {
+	var gotRange string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRange = r.Header.Get("Range")
+		w.Header().Set("Content-Range", "bytes 4096-8191/16384")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(bytes.Repeat([]byte{7}, 4096))
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "adam", "app-password")
+	body, _, err := c.GetRange(context.Background(), "f.bin", 4096, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	data, _ := io.ReadAll(body)
+	if gotRange != "bytes=4096-8191" {
+		t.Errorf("Range = %q, want bytes=4096-8191", gotRange)
+	}
+	if len(data) != 4096 {
+		t.Errorf("read %d bytes, want 4096", len(data))
+	}
+}
+
+// A 200 to a ranged request means the server ignored the Range header and is
+// about to hand back the WHOLE file starting at byte 0 — silently accepting
+// that for a non-zero offset would splice unrelated bytes into the caller's
+// buffer as if they were the requested range.
+func TestGetRangeRejectsAFullBodyForANonZeroOffset(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK) // the server ignored the Range header
+		w.Write(make([]byte, 100))
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "adam", "app-password")
+	if _, _, err := c.GetRange(context.Background(), "f.bin", 50, 10); !errors.Is(err, ErrRangeIgnored) {
+		t.Fatalf("err = %v, want ErrRangeIgnored", err)
+	}
+}
+
+// A 200 at offset 0 is fine either way: reading from the start is still the
+// right bytes, whether or not the server bothered with 206. (Trimming the
+// body to exactly the requested length is the engine's OpenRange, layered on
+// top; GetRange itself just hands back whatever the server sent.)
+func TestGetRangeAcceptsAFullBodyAtOffsetZero(t *testing.T) {
+	want := bytes.Repeat([]byte{9}, 20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(want)
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "adam", "app-password")
+	body, _, err := c.GetRange(context.Background(), "f.bin", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	data, _ := io.ReadAll(body)
+	if !bytes.Equal(data, want) {
+		t.Errorf("read %q, want %q", data, want)
 	}
 }
 

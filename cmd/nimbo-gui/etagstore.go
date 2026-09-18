@@ -59,6 +59,33 @@ func (s *etagStore) del(remote string) {
 	_ = os.WriteFile(s.path, b, 0o644)
 }
 
+// delUnder removes remote and every entry beneath it, with a single persist.
+// Used when a share is detached from the account (Deck #557): a stale entry
+// under a vanished path would let the state heal read the parked copy as
+// server content.
+func (s *etagStore) delUnder(remote string) {
+	key := etagKey(remote)
+	if key == "" {
+		return
+	}
+	prefix := key + "/"
+	s.mu.Lock()
+	n := 0
+	for k := range s.m {
+		if k == key || strings.HasPrefix(k, prefix) {
+			delete(s.m, k)
+			n++
+		}
+	}
+	if n == 0 {
+		s.mu.Unlock()
+		return
+	}
+	b, _ := json.Marshal(s.m)
+	s.mu.Unlock()
+	_ = os.WriteFile(s.path, b, 0o644)
+}
+
 // setMany records several baselines with a single persist (for directory
 // population / reconcile).
 func (s *etagStore) setMany(pairs map[string]string) {
@@ -70,6 +97,46 @@ func (s *etagStore) setMany(pairs map[string]string) {
 		if e != "" {
 			s.m[etagKey(r)] = e
 		}
+	}
+	b, _ := json.Marshal(s.m)
+	s.mu.Unlock()
+	_ = os.WriteFile(s.path, b, 0o644)
+}
+
+// moveMany carries baselines across a move — each pair is (src, dst) and dst
+// takes src's recorded ETag, src is dropped — with a SINGLE persist.
+//
+// Nextcloud leaves a file's ETag unchanged when it moves it, so the
+// placeholder mirrors exactly the version it did before under its new name.
+// The batch form exists because every write here rewrites the whole JSON file:
+// carrying a moved directory's baselines one descendant at a time meant two
+// full rewrites per file — gigabytes of synchronous writes for a large folder,
+// inside the move itself.
+func (s *etagStore) moveMany(pairs [][2]string) {
+	if len(pairs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	changed := 0
+	for _, p := range pairs {
+		src, dst := etagKey(p[0]), etagKey(p[1])
+		// A blank end, or the same path twice, cannot move anything — and
+		// must not be read as "forget src": a dropped baseline costs a
+		// spurious conflict the next time that file is edited.
+		if src == "" || dst == "" || strings.EqualFold(src, dst) {
+			continue
+		}
+		e, ok := s.m[src]
+		if !ok || e == "" {
+			continue // nothing recorded under the old name: nothing to carry
+		}
+		s.m[dst] = e
+		delete(s.m, src)
+		changed++
+	}
+	if changed == 0 {
+		s.mu.Unlock()
+		return
 	}
 	b, _ := json.Marshal(s.m)
 	s.mu.Unlock()

@@ -30,6 +30,9 @@ var (
 		d, ok := fi.Sys().(*syscall.Win32FileAttributeData)
 		return ok && d.FileAttributes&windowsFileAttributeReparsePoint != 0
 	}
+	// cfIsDehydrated reports whether a placeholder is an online-only stub with
+	// no bytes on disk. Attribute-only.
+	cfIsDehydrated = func(fi os.FileInfo, _ string) bool { return cfapi.IsDehydrated(fi) }
 )
 
 const windowsFileAttributeReparsePoint = 0x00000400
@@ -81,7 +84,7 @@ func ScanRevert(localDir string) (RevertPlan, error) {
 		if !cfIsPlaceholder(fi, filepath.ToSlash(path)) {
 			return nil // plain file — live mode already understands it
 		}
-		if cfapi.IsDehydrated(fi) {
+		if cfIsDehydrated(fi, path) {
 			plan.Dehydrated = append(plan.Dehydrated, rel)
 			plan.DownloadBytes += fi.Size()
 		} else {

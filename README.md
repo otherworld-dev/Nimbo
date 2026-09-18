@@ -35,8 +35,9 @@ Recent releases add a lot beyond plain two-way sync:
   document while you have it open so others don't overwrite you, see who else
   has a file open, and release stuck locks — all opt-in.
 - **Stronger data protection.** A sync that would delete or replace a large
-  share of a folder pauses for your review first, and files removed to match a
-  server deletion go to the Recycle Bin.
+  share of a folder pauses for your review first, files removed to match a
+  server deletion go to the Recycle Bin, and a folder that stops being shared
+  with you is kept and parked until you say whether to keep, move or delete it.
 - **Smarter moves and sharing.** Renaming a file syncs as a real move that
   keeps its version history; you get a notification naming whoever shares a
   folder with you.

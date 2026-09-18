@@ -107,6 +107,7 @@ type App struct {
 	lastVfsToast  time.Time  // rate-limits on-demand error toasts
 	etags         *etagStore // last-synced server ETag per remote path (conflict baseline)
 	fileids       *etagStore // remote path -> oc:fileid, for down-sync rename detection
+	mountroots    *etagStore // remote paths that are the ROOT of a received share / mount (Deck #557)
 
 	// Side-by-side accounts: a.eng is the PRIMARY (default) account the UI
 	// shows; every other configured account runs a secondary engine that syncs
@@ -252,6 +253,7 @@ func (a *App) start(ctx context.Context) {
 	forwardEvents(runCtx, eng.SubscribeConflicts(), func() { a.emit("conflicts") })
 	forwardEvents(runCtx, eng.SubscribeBlocked(), func() { a.emit("blocked") })
 	forwardEvents(runCtx, eng.SubscribeLocked(), func() { a.emit("locks") })
+	forwardEvents(runCtx, eng.SubscribeDetached(), func() { a.emit("detached") })
 
 	go a.updateCheckLoop(runCtx) // periodic background "update available" toast
 
@@ -409,8 +411,8 @@ func (a *App) mountSecondaryOnDemand(eng *agent.Engine) {
 			slog.Warn("secondary on-demand: could not record account root", "account", eng.Account.LoginName, "err", err)
 		}
 	}
-	etags, fileids := a.vfsStoresFor(eng.Account.ID)
-	if err := a.mountOnDemandWith(eng, etags, fileids, root, ""); err != nil {
+	etags, fileids, mountroots := a.vfsStoresFor(eng.Account.ID)
+	if err := a.mountOnDemandWith(eng, etags, fileids, mountroots, root, ""); err != nil {
 		slog.Warn("secondary on-demand mount failed", "account", eng.Account.LoginName, "dir", root, "err", err)
 	}
 }
@@ -1071,17 +1073,18 @@ func (a *App) mountAccountOnDemand() {
 }
 
 // vfsStoresFor opens (or reuses) an account's persistent on-demand stores: the
-// remote-path -> ETag conflict baselines and the remote-path -> oc:fileid map
-// for down-sync rename detection. Per ACCOUNT — remote paths from two servers
-// must never mix.
-func (a *App) vfsStoresFor(accountID string) (etags, fileids *etagStore) {
-	ep, fp := "vfs-etags.json", "vfs-fileids.json"
+// remote-path -> ETag conflict baselines, the remote-path -> oc:fileid map for
+// down-sync rename detection, and the set of share/mount roots that tells an
+// unshare from a deletion. Per ACCOUNT — remote paths from two servers must
+// never mix.
+func (a *App) vfsStoresFor(accountID string) (etags, fileids, mountroots *etagStore) {
+	ep, fp, mp := "vfs-etags.json", "vfs-fileids.json", "vfs-mountroots.json"
 	if d, derr := config.Resolve(); derr == nil {
 		d = d.WithAccount(accountID)
 		d.MigratePairs()
-		ep, fp = d.VFSETagsFile(), d.VFSFileIDsFile()
+		ep, fp, mp = d.VFSETagsFile(), d.VFSFileIDsFile(), d.VFSMountRootsFile()
 	}
-	return newEtagStore(ep), newEtagStore(fp)
+	return newEtagStore(ep), newEtagStore(fp), newEtagStore(mp)
 }
 
 // mountOnDemand connects localDir as a cloud sync root for the PRIMARY account.
@@ -1089,16 +1092,61 @@ func (a *App) mountOnDemand(localDir, remoteRoot string) error {
 	if a.eng == nil {
 		return fmt.Errorf("not signed in")
 	}
-	if a.etags == nil || a.fileids == nil {
-		a.etags, a.fileids = a.vfsStoresFor(a.eng.Account.ID)
+	if a.etags == nil || a.fileids == nil || a.mountroots == nil {
+		a.etags, a.fileids, a.mountroots = a.vfsStoresFor(a.eng.Account.ID)
 	}
-	return a.mountOnDemandWith(a.eng, a.etags, a.fileids, localDir, remoteRoot)
+	return a.mountOnDemandWith(a.eng, a.etags, a.fileids, a.mountroots, localDir, remoteRoot)
+}
+
+// hydrateReadCloser wraps a hydration reader (the SetHydrateStream closure in
+// mountOnDemandWith, below) so a failure that only shows up partway through
+// the transfer still reaches the activity feed and toast. That closure's own
+// report call fires at open — once OpenRange has returned response headers —
+// so a connection dropped mid-body would otherwise leave a clean "download"
+// activity entry for a hydration that never actually finished. Read reports
+// the first non-EOF error it sees, once; a context-cancellation error (the
+// request withdrawn by CANCEL_FETCH_DATA or a shutdown cancel, not a failure)
+// is never reported. Close is forwarded via the embedded io.ReadCloser.
+//
+// A CLEAN end that arrives early is reported too. The body can legitimately
+// finish before length bytes — the file shrank on the server after the
+// placeholder was created, or a proxy clamped the range — and cfapi then fails
+// the request, so the app gets "The cloud operation was unsuccessful" while
+// the feed would otherwise show a successful download. length is 0 for a
+// caller that does not know how much to expect, which disables the check.
+type hydrateReadCloser struct {
+	io.ReadCloser
+	remotePath string
+	length     int64 // bytes the request asked for; 0 = unknown
+	got        int64
+	report     func(kind, remotePath string, err error)
+	reported   bool
+}
+
+func (r *hydrateReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.got += int64(n)
+	switch {
+	case err == nil, errors.Is(err, context.Canceled):
+		// Still going, or withdrawn — neither is a failure.
+	case errors.Is(err, io.EOF):
+		if r.length > 0 && r.got < r.length && !r.reported {
+			r.reported = true
+			r.report("download", r.remotePath, fmt.Errorf("short download: got %d of %d bytes", r.got, r.length))
+		}
+	default:
+		if !r.reported {
+			r.reported = true
+			r.report("download", r.remotePath, err)
+		}
+	}
+	return n, err
 }
 
 // mountOnDemandWith connects localDir as a cloud sync root mirroring remoteRoot
 // on the given account's engine, and starts the write-back watcher. Each
 // account's mounts use that account's own etag/fileid stores.
-func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, localDir, remoteRoot string) error {
+func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *etagStore, localDir, remoteRoot string) error {
 	if !cfapi.Supported() {
 		return fmt.Errorf("on-demand files aren't supported on this system")
 	}
@@ -1136,6 +1184,19 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 		if err != nil {
 			return nil, err
 		}
+		// Share/mount ROOTS (Deck #557): an entry on a share or mount whose
+		// parent — this directory, per its own row — is not. Recorded so a later
+		// listing that no longer has the entry reads as an unshare rather than
+		// a deletion; cleared for anything listed that is not one, so a folder
+		// re-created under a former share's name never inherits the mark.
+		selfOnMount, selfKnown := false, false
+		for _, e := range entries {
+			if strings.Trim(e.Path, "/") == remote {
+				selfOnMount, selfKnown = e.OnMount(), true
+				break
+			}
+		}
+		roots := map[string]string{}
 		// Non-nil from the start: an empty-but-successful listing must be
 		// distinguishable from a failed one, because cfapi only marks a directory
 		// permanently populated for the former. Returning nil here would make a
@@ -1145,6 +1206,12 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 			p := strings.Trim(e.Path, "/")
 			if p == remote || p == "" {
 				continue // the directory itself
+			}
+			isRoot := e.OnMount() && selfKnown && !selfOnMount
+			if isRoot {
+				roots[p] = "1"
+			} else {
+				mountroots.del(p)
 			}
 			name := p
 			if i := strings.LastIndex(p, "/"); i >= 0 {
@@ -1158,9 +1225,10 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 			}
 			items = append(items, cfapi.PlaceholderInfo{
 				Name: name, Size: e.Size, IsDir: e.IsDir, ModTime: e.LastModified,
-				Identity: []byte(p), ETag: e.ETag, FileID: e.FileID,
+				Identity: []byte(p), ETag: e.ETag, FileID: e.FileID, MountRoot: isRoot,
 			})
 		}
+		mountroots.setMany(roots)
 		// On-demand mode has no sync pairs, so applyPlan — where the live path
 		// notices other people's locks — never runs. This listing is the only
 		// place lock state passes through, so feed it in here.
@@ -1201,6 +1269,34 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 		return err
 	}
 	slog.Info("cloud sync root connected", "dir", localDir)
+	// Stream the fetch instead of the byte-slice hydrate above: one reader for
+	// the whole request rather than a separate HTTP GET per 1 MB piece the
+	// filter asks for (Task 1/2). ctx here is the individual request's own
+	// context, cancelled by the filter on CANCEL_FETCH_DATA; app shutdown is
+	// already covered one layer down, not by this closure — app.Run() returning
+	// calls disconnectAllOnDemand (below), which calls cfapi.Disconnect, which
+	// calls the provider's cancelFetches and so cancels every in-flight request
+	// context the same way a live cancel does.
+	cfapi.SetHydrateStream(connKey, func(ctx context.Context, identity []byte, offset, length int64) (io.ReadCloser, error) {
+		rc, err := eng.OpenRange(ctx, string(identity), offset, length)
+		// One activity entry per file-open, as today — but never for a
+		// withdrawn request. OpenRange can outlast the filter's 60s cancel (a
+		// silently dropping network gives each attempt up to 30s to dial), and
+		// the cancel then surfaces here as context.Canceled: an error entry
+		// plus a toast, repeated per re-request, for something that is not a
+		// failure. The wrapper below has always skipped cancellation; this
+		// agrees with it.
+		if offset == 0 && !errors.Is(err, context.Canceled) {
+			report("download", string(identity), err)
+		}
+		if err != nil {
+			return nil, err
+		}
+		// The report above only covers the open; wrap so a body failure — or a
+		// clean end short of length — reports too (see hydrateReadCloser's doc
+		// comment, above mountOnDemandWith).
+		return &hydrateReadCloser{ReadCloser: rc, remotePath: string(identity), length: length, report: report}, nil
+	})
 	// Write-back + down-sync: watch the mount for user changes (upload/mkdir/
 	// delete/move) and pull changes made elsewhere (List). When notify_push is
 	// available the reconcile is driven by push (Poke), so the poll is a long
@@ -1212,6 +1308,11 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 		poll = 5 * time.Minute
 	}
 	up := a.uploadWithConflictFor(eng, etags)
+	forgetUnder := func(remote string) {
+		etags.delUnder(remote)
+		fileids.delUnder(remote)
+		mountroots.delUnder(remote)
+	}
 	startWatcher := func() *vfs.Watcher {
 		w, werr := vfs.New(a.ctx, localDir, root, poll, vfs.Ops{
 			Upload: up,
@@ -1231,9 +1332,38 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 			Report:         report,
 			RecordBaseline: func(remote, etag string) { etags.set(remote, etag) },
 			Baseline:       func(remote string) (string, bool) { e := etags.get(remote); return e, e != "" },
-			RecordFileID:   func(remote, fid string) { fileids.set(remote, fid) },
-			FileID:         func(remote string) (string, bool) { f := fileids.get(remote); return f, f != "" },
-			DropFileID:     func(remote string) { fileids.del(remote) },
+			ForgetBaseline: func(remote string) { etags.del(remote) },
+			// Batch forms: each store write rewrites the whole JSON file, so a
+			// moved directory's carry and a directory's pull each have to be
+			// ONE write rather than one per item.
+			MoveBaselines:   func(pairs [][2]string) { etags.moveMany(pairs) },
+			RecordBaselines: func(m map[string]string) { etags.setMany(m) },
+			RecordFileID:    func(remote, fid string) { fileids.set(remote, fid) },
+			FileID:          func(remote string) (string, bool) { f := fileids.get(remote); return f, f != "" },
+			DropFileID:      func(remote string) { fileids.del(remote) },
+			MountRoot:       func(remote string) bool { return mountroots.get(remote) != "" },
+			// A vanished share's salvaged copy (Deck #557): park it beside the
+			// sync folder and tell the user. The watcher then calls Forget; the
+			// one case it cannot is a copy that was moved out but could not be
+			// recorded (an error to the watcher, yet the copy has left the
+			// mount), so the stores are dropped here for that case too.
+			Detached: func(localPath, remote string) error {
+				rel, rerr := filepath.Rel(localDir, localPath)
+				if rerr != nil {
+					return rerr
+				}
+				parked, perr := eng.ParkDetachedCopy(localDir, root, filepath.ToSlash(rel), localPath)
+				if perr != nil && parked != "" {
+					forgetUnder(remote)
+				}
+				return perr
+			},
+			// Everything recorded under a share that has gone from the account —
+			// parked or removed as empty. A stale etag would let the state heal
+			// read a later folder of the same name as server content and turn it
+			// into a placeholder pointing at nothing; a stale root mark would
+			// then park that folder as "unshared".
+			Forget: forgetUnder,
 			// Disguised file types: the server stores ".htaccess" as
 			// ".htaccess.nimboesc". The escaper is loaded PER CALL, never captured —
 			// it's an atomic pointer the engine swaps whenever the user toggles a
@@ -1244,6 +1374,12 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids *etagStore, lo
 		})
 		if werr != nil {
 			slog.Warn("vfs write-back watcher not started", "dir", localDir, "err", werr)
+		}
+		if werr == nil {
+			// The filter reports every rename and move inside the root —
+			// including moves between directories, which the watcher's own
+			// ReadDirectoryChanges events show only as REMOVED + ADDED.
+			cfapi.SetRenameHandler(connKey, w.NotifyRenamed)
 		}
 		return w
 	}
@@ -1299,6 +1435,16 @@ func (a *App) vfsErrorToast(kind, remotePath string, err error) {
 	a.lastVfsToast = time.Now()
 	a.vfsToastMu.Unlock()
 
+	if kind == "corrupt" {
+		// A Windows Cloud Files fault, not a sync failure: the entry cannot be
+		// opened, repaired or deleted normally. The recipe that clears it is
+		// several elevated commands long, so the toast points at the activity
+		// feed, which carries the whole thing (vfs.corruptRecovery) — never at
+		// a document, since the only one that has it is origin-only.
+		notify.Toast(brand.Current.Name+" — on-demand sync",
+			filepath.Base(remotePath)+" has corrupt cloud-file metadata (a Windows fault). Your server copy is safe; the activity feed shows how to clear it.", "")
+		return
+	}
 	verb := map[string]string{
 		"upload": "upload", "download": "download", "delete-remote": "delete",
 		"move": "move", "mkdir-remote": "create folder",
@@ -1445,9 +1591,10 @@ func (a *App) BrowseOffline(rel string) []OfflineEntry {
 	return out
 }
 
-// SetOfflinePin pins (always keep on this device — fully downloads and stays
-// current) or unpins (back to online-only preference) a folder subtree in the
-// shown account's virtual root.
+// SetOfflinePin pins (always keep on this device — the watcher downloads any
+// online-only content once it hears the attribute change or meets it during
+// reconcile, and keeps it current) or unpins (back to online-only preference)
+// a folder subtree in the shown account's virtual root.
 func (a *App) SetOfflinePin(rel string, pinned bool) string {
 	if a.eng == nil {
 		return "not signed in"
@@ -1939,6 +2086,9 @@ type AttentionInfo struct {
 	// Locked: files someone else has open. Informational, not a fault — the UI
 	// wording should reflect that.
 	Locked int `json:"locked"`
+	// Detached: folders that stopped being shared with the user (or whose
+	// storage was unmounted) and whose kept local copy awaits a decision.
+	Detached int `json:"detached"`
 }
 
 // Attention reports how many conflicts and can't-sync files are outstanding.
@@ -1950,6 +2100,7 @@ func (a *App) Attention() AttentionInfo {
 		Conflicts: len(a.eng.PendingConflicts()),
 		Blocked:   len(a.eng.BlockedFiles()),
 		Locked:    len(a.eng.LockedFiles()),
+		Detached:  len(a.eng.DetachedFolders()),
 	}
 	// Background accounts' conflicts/blocked count toward the badge so they
 	// can't go unnoticed; their lists live behind a "Show" switch (the resolve
@@ -2895,6 +3046,47 @@ func (a *App) ResolveConflict(localDir, path, choice string) {
 	}
 }
 
+// DetachedDTO is a folder that stopped being shared with the user (or whose
+// storage was unmounted) and whose kept local copy is waiting for a decision.
+type DetachedDTO struct {
+	LocalDir  string `json:"localDir"`
+	Rel       string `json:"rel"`
+	Name      string `json:"name"`
+	LocalPath string `json:"localPath"` // where the copy is — the key ResolveDetached takes
+	MovedOut  bool   `json:"movedOut"`  // parked beside the sync folder (on-demand), not inside it
+	At        string `json:"at"`
+}
+
+// DetachedFolders lists the folders awaiting a decision (Status → No longer shared).
+func (a *App) DetachedFolders() []DetachedDTO {
+	if a.eng == nil {
+		return nil
+	}
+	out := []DetachedDTO{}
+	for _, d := range a.eng.DetachedFolders() {
+		out = append(out, DetachedDTO{
+			LocalDir: d.LocalDir, Rel: d.Rel, Name: d.Name, LocalPath: d.LocalPath, MovedOut: d.MovedOut,
+			At: d.At.Format("2006-01-02 15:04"),
+		})
+	}
+	return out
+}
+
+// ResolveDetached applies the user's decision for the kept copy at localPath
+// (DetachedDTO.LocalPath): "keep" (it becomes their own and syncs to their
+// account — a copy parked beside an on-demand folder is moved back in first),
+// "move" (into dest, a folder they picked outside their sync folders) or
+// "delete" (to the Recycle Bin). Returns "" on success or an error string.
+func (a *App) ResolveDetached(localPath, choice, dest string) string {
+	if a.eng == nil {
+		return "not signed in"
+	}
+	if err := a.eng.ResolveDetached(localPath, choice, dest); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 // NotifAction is a button on a notification.
 type NotifAction struct {
 	Label string `json:"label"`
@@ -3077,7 +3269,7 @@ func (a *App) DeleteAllBlocked() int {
 func (a *App) OpenStatus() { a.openStatus("") }
 
 // OpenStatusTab opens (or focuses) the status window on a specific tab
-// ("activity", "conflicts", "notifications", "blocked", "trash").
+// ("activity", "conflicts", "notifications", "blocked", "inuse", "detached", "trash").
 func (a *App) OpenStatusTab(tab string) { a.openStatus(tab) }
 
 // InitialStatusTab returns (and clears) the tab the status window should open
@@ -3394,6 +3586,10 @@ func (a *App) dispatchToastActivation(args string) {
 	case "inuse":
 		// A "File in use" toast: show WHO has WHAT open, in context.
 		application.InvokeAsync(func() { a.openStatus("inuse") })
+	case "detached":
+		// A "no longer shared with you" toast: the kept copy is waiting for a
+		// decision — keep, move out, or delete.
+		application.InvokeAsync(func() { a.openStatus("detached") })
 	case "explorer-restart":
 		// The sync-icons toast after a mode switch: the user consented to the
 		// restart by clicking. Off the UI thread — it waits on processes.
@@ -3505,8 +3701,9 @@ func (a *App) warnNotOnDemand(localAbs string) {
 	}
 }
 
-// keepLocalPath pins a file/folder so it's always kept on the device (pinning
-// also triggers download of any online-only content).
+// keepLocalPath pins a file/folder so it's always kept on the device; the
+// watcher downloads any online-only content once it hears the attribute
+// change or meets the file during reconcile.
 func (a *App) keepLocalPath(localAbs string) {
 	if localAbs == "" {
 		return
@@ -4342,6 +4539,7 @@ func (a *App) clearSyncData(d config.Dirs, accountID string) {
 		d.PairsFile(),
 		d.VFSETagsFile(),
 		d.VFSFileIDsFile(),
+		d.VFSMountRootsFile(),
 		d.GuardStateFile(),
 	}
 	if accountID != "" {
@@ -4806,6 +5004,8 @@ func (a *App) PickLocalFolder(start string) string {
 	}
 	if a.settingsWin != nil {
 		d = d.AttachToWindow(a.settingsWin)
+	} else if a.statusWin != nil {
+		d = d.AttachToWindow(a.statusWin) // "Move it out…" for a folder no longer shared
 	} else if a.loginWin != nil {
 		d = d.AttachToWindow(a.loginWin)
 	}

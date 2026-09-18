@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS baseline (
   local_size        INTEGER NOT NULL,
   local_mtime_nanos INTEGER NOT NULL,
   content_sha1      TEXT    NOT NULL DEFAULT '',
+  mount_root        INTEGER NOT NULL DEFAULT 0,  -- the root of a received share / mount (engine.BaselineState.MountRoot)
   PRIMARY KEY (account_id, pair_key, path)
 );
 CREATE TABLE IF NOT EXISTS clone_state (
@@ -104,7 +105,71 @@ func Open(path, accountID string, cacheBaseline bool) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
+	if err := ensureColumns(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db, accountID: accountID, cacheEnabled: cacheBaseline, cache: make(map[string]map[string]engine.BaselineState)}, nil
+}
+
+// ensureColumns brings a database created by an older build up to the schema
+// above. CREATE TABLE IF NOT EXISTS leaves an existing table exactly as it was,
+// so a column added to the schema only ever reaches NEW databases without this.
+// Older rows read the column's default. Idempotent, and tolerant of a
+// concurrent opener (the CLI beside the GUI) adding the same column first.
+func ensureColumns(db *sql.DB) error {
+	have, err := columnsOf(db, "baseline")
+	if err != nil {
+		return err
+	}
+	if !have["mount_root"] {
+		if _, err := db.Exec(`ALTER TABLE baseline ADD COLUMN mount_root INTEGER NOT NULL DEFAULT 0`); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("add baseline.mount_root: %w", err)
+		}
+		// The flag is only ever learned by LISTING a share's parent, and the
+		// ETag prune skips an unchanged parent forever — so an existing install
+		// would never flag the shares it already has until each parent changed,
+		// which for an unshare is exactly one pass too late. Dirty the top-level
+		// directories (an empty etag never prunes): one PROPFIND each, once, and
+		// every share directly under them is flagged on the next pass. Nextcloud
+		// mounts received shares at the root or under one configured folder, so
+		// this covers the common layouts without a full crawl.
+		if _, err := db.Exec(`UPDATE baseline SET remote_etag = '' WHERE is_dir = 1 AND path NOT LIKE '%/%'`); err != nil {
+			return fmt.Errorf("dirty top-level dirs for the mount_root migration: %w", err)
+		}
+	}
+	return nil
+}
+
+// columnsOf lists a table's column names.
+func columnsOf(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s: %w", table, err)
+	}
+	defer rows.Close()
+	have := make(map[string]bool)
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, typ        string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return nil, fmt.Errorf("inspect %s: %w", table, err)
+		}
+		have[name] = true
+	}
+	return have, rows.Err()
+}
+
+// boolInt stores a bool the way SQLite likes it.
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // Close releases the database handle.
@@ -143,7 +208,7 @@ func (s *Store) baselineLocked(pairKey string) (map[string]engine.BaselineState,
 // queryBaseline reads a pair's full baseline from the database.
 func (s *Store) queryBaseline(pairKey string) (map[string]engine.BaselineState, error) {
 	rows, err := s.db.Query(
-		`SELECT path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1
+		`SELECT path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1, mount_root
 		   FROM baseline WHERE account_id = ? AND pair_key = ?`,
 		s.accountID, pairKey,
 	)
@@ -155,11 +220,12 @@ func (s *Store) queryBaseline(pairKey string) (map[string]engine.BaselineState, 
 	out := make(map[string]engine.BaselineState)
 	for rows.Next() {
 		var b engine.BaselineState
-		var isDir int
-		if err := rows.Scan(&b.Path, &isDir, &b.RemoteETag, &b.RemoteFileID, &b.LocalSize, &b.LocalMTimeNanos, &b.ContentSHA1); err != nil {
+		var isDir, mountRoot int
+		if err := rows.Scan(&b.Path, &isDir, &b.RemoteETag, &b.RemoteFileID, &b.LocalSize, &b.LocalMTimeNanos, &b.ContentSHA1, &mountRoot); err != nil {
 			return nil, fmt.Errorf("scan baseline row: %w", err)
 		}
 		b.IsDir = isDir != 0
+		b.MountRoot = mountRoot != 0
 		out[b.Path] = b
 	}
 	return out, rows.Err()
@@ -196,7 +262,7 @@ func (s *Store) LoadBaselineScoped(pairKey, scope string) (map[string]engine.Bas
 // queryBaselineScoped reads only a subtree's rows directly from the DB (no-cache).
 func (s *Store) queryBaselineScoped(pairKey, scope string) (map[string]engine.BaselineState, error) {
 	rows, err := s.db.Query(
-		`SELECT path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1
+		`SELECT path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1, mount_root
 		   FROM baseline WHERE account_id = ? AND pair_key = ? AND path LIKE ? ESCAPE '\'`,
 		s.accountID, pairKey, escapeLike(scope)+"/%",
 	)
@@ -207,11 +273,12 @@ func (s *Store) queryBaselineScoped(pairKey, scope string) (map[string]engine.Ba
 	out := make(map[string]engine.BaselineState)
 	for rows.Next() {
 		var b engine.BaselineState
-		var isDir int
-		if err := rows.Scan(&b.Path, &isDir, &b.RemoteETag, &b.RemoteFileID, &b.LocalSize, &b.LocalMTimeNanos, &b.ContentSHA1); err != nil {
+		var isDir, mountRoot int
+		if err := rows.Scan(&b.Path, &isDir, &b.RemoteETag, &b.RemoteFileID, &b.LocalSize, &b.LocalMTimeNanos, &b.ContentSHA1, &mountRoot); err != nil {
 			return nil, fmt.Errorf("scan baseline row: %w", err)
 		}
 		b.IsDir = isDir != 0
+		b.MountRoot = mountRoot != 0
 		out[b.Path] = b
 	}
 	return out, rows.Err()
@@ -264,7 +331,7 @@ func (s *Store) queryBaselinePaths(pairKey string, paths []string) (map[string]e
 		}
 		ph := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
 		rows, err := s.db.Query(
-			`SELECT path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1
+			`SELECT path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1, mount_root
 			   FROM baseline WHERE account_id = ? AND pair_key = ? AND path IN (`+ph+`)`,
 			args...,
 		)
@@ -273,12 +340,13 @@ func (s *Store) queryBaselinePaths(pairKey string, paths []string) (map[string]e
 		}
 		for rows.Next() {
 			var b engine.BaselineState
-			var isDir int
-			if err := rows.Scan(&b.Path, &isDir, &b.RemoteETag, &b.RemoteFileID, &b.LocalSize, &b.LocalMTimeNanos, &b.ContentSHA1); err != nil {
+			var isDir, mountRoot int
+			if err := rows.Scan(&b.Path, &isDir, &b.RemoteETag, &b.RemoteFileID, &b.LocalSize, &b.LocalMTimeNanos, &b.ContentSHA1, &mountRoot); err != nil {
 				rows.Close()
 				return nil, fmt.Errorf("scan baseline row: %w", err)
 			}
 			b.IsDir = isDir != 0
+			b.MountRoot = mountRoot != 0
 			out[b.Path] = b
 		}
 		if err := rows.Err(); err != nil {
@@ -380,16 +448,17 @@ func (s *Store) UpsertBaseline(pairKey string, b engine.BaselineState) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
 		`INSERT INTO baseline
-		   (account_id, pair_key, path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		   (account_id, pair_key, path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1, mount_root)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(account_id, pair_key, path) DO UPDATE SET
 		   is_dir=excluded.is_dir,
 		   remote_etag=excluded.remote_etag,
 		   remote_fileid=excluded.remote_fileid,
 		   local_size=excluded.local_size,
 		   local_mtime_nanos=excluded.local_mtime_nanos,
-		   content_sha1=excluded.content_sha1`,
-		s.accountID, pairKey, b.Path, isDir, b.RemoteETag, b.RemoteFileID, b.LocalSize, b.LocalMTimeNanos, b.ContentSHA1,
+		   content_sha1=excluded.content_sha1,
+		   mount_root=excluded.mount_root`,
+		s.accountID, pairKey, b.Path, isDir, b.RemoteETag, b.RemoteFileID, b.LocalSize, b.LocalMTimeNanos, b.ContentSHA1, boolInt(b.MountRoot),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert baseline %q: %w", b.Path, err)
@@ -417,15 +486,16 @@ func (s *Store) UpsertBaselineBatch(pairKey string, rows []engine.BaselineState)
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 	stmt, err := tx.Prepare(
 		`INSERT INTO baseline
-		   (account_id, pair_key, path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		   (account_id, pair_key, path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1, mount_root)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(account_id, pair_key, path) DO UPDATE SET
 		   is_dir=excluded.is_dir,
 		   remote_etag=excluded.remote_etag,
 		   remote_fileid=excluded.remote_fileid,
 		   local_size=excluded.local_size,
 		   local_mtime_nanos=excluded.local_mtime_nanos,
-		   content_sha1=excluded.content_sha1`)
+		   content_sha1=excluded.content_sha1,
+		   mount_root=excluded.mount_root`)
 	if err != nil {
 		return fmt.Errorf("upsert baseline batch: %w", err)
 	}
@@ -435,7 +505,7 @@ func (s *Store) UpsertBaselineBatch(pairKey string, rows []engine.BaselineState)
 		if b.IsDir {
 			isDir = 1
 		}
-		if _, err := stmt.Exec(s.accountID, pairKey, b.Path, isDir, b.RemoteETag, b.RemoteFileID, b.LocalSize, b.LocalMTimeNanos, b.ContentSHA1); err != nil {
+		if _, err := stmt.Exec(s.accountID, pairKey, b.Path, isDir, b.RemoteETag, b.RemoteFileID, b.LocalSize, b.LocalMTimeNanos, b.ContentSHA1, boolInt(b.MountRoot)); err != nil {
 			return fmt.Errorf("upsert baseline %q: %w", b.Path, err)
 		}
 	}

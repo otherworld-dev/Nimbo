@@ -125,6 +125,59 @@ func TestMaintainDirBaselinesConflictPoisons(t *testing.T) {
 	}
 }
 
+// Re-stamping a directory's etag must not erase the share/mount-root flag —
+// neither on a healed row (rewritten from the fresh listing) nor on a dirtied
+// one (rewritten from whatever was known).
+func TestMaintainDirBaselinesKeepsMountRoot(t *testing.T) {
+	st := maintTestStore(t)
+	const pk = "P"
+	base := map[string]engine.BaselineState{
+		"Team":  {Path: "Team", IsDir: true, RemoteETag: "old", MountRoot: true},
+		"Group": {Path: "Group", IsDir: true, RemoteETag: "old2", MountRoot: true},
+	}
+	for _, b := range base {
+		if err := st.UpsertBaseline(pk, b); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	remote := map[string]engine.RemoteState{
+		"Team":  {Path: "Team", IsDir: true, ETag: "NEW", MountRoot: true},
+		"Group": {Path: "Group", IsDir: true, ETag: "NEW2", MountRoot: true},
+	}
+	// Team is healed (re-stamped); Group is dirtied by a failure beneath it.
+	maintainDirBaselines(st, pk, base, remote, []string{"Group/file.doc"})
+
+	got, _ := st.LoadBaseline(pk)
+	if got["Team"].RemoteETag != "NEW" || !got["Team"].MountRoot {
+		t.Errorf("healed share root lost its flag: %+v", got["Team"])
+	}
+	if got["Group"].RemoteETag != "" || !got["Group"].MountRoot {
+		t.Errorf("dirtied share root lost its flag: %+v", got["Group"])
+	}
+
+	// A dirtied dir the listing did not contain falls back to the baseline's flag.
+	maintainDirBaselines(st, pk, base, map[string]engine.RemoteState{}, []string{"Team/file.doc"})
+	got, _ = st.LoadBaseline(pk)
+	if !got["Team"].MountRoot {
+		t.Errorf("dirtied-from-baseline share root lost its flag: %+v", got["Team"])
+	}
+
+	// The listing is the authority when it has the dir: a folder the user
+	// re-created under a former share's name is NOT a root, however the old
+	// row read — a stale flag there would park a real deletion later.
+	own := map[string]engine.RemoteState{"Team": {Path: "Team", IsDir: true, ETag: "MINE", MountRoot: false}}
+	maintainDirBaselines(st, pk, base, own, nil)
+	got, _ = st.LoadBaseline(pk)
+	if got["Team"].MountRoot {
+		t.Errorf("healed row kept a stale flag against the listing: %+v", got["Team"])
+	}
+	maintainDirBaselines(st, pk, base, own, []string{"Team/file.doc"})
+	got, _ = st.LoadBaseline(pk)
+	if got["Team"].MountRoot {
+		t.Errorf("dirtied row kept a stale flag against the listing: %+v", got["Team"])
+	}
+}
+
 func TestDirParent(t *testing.T) {
 	for in, want := range map[string]string{
 		"a/b/c": "a/b", "a/b": "a", "a": "", "": "",

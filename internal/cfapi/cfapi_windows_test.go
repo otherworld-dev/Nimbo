@@ -3,8 +3,10 @@
 package cfapi
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -203,5 +205,112 @@ func TestLiveRoundTrip(t *testing.T) {
 	}
 	if ch.NeedsUpload {
 		t.Error("converted placeholder still flagged for upload")
+	}
+}
+
+func TestNormalizedRel(t *testing.T) {
+	const defaultRoot = `C:\Users\Adam\NimboRoot`
+	cases := []struct {
+		root string
+		in   string
+		rel  string
+		ok   bool
+	}{
+		{defaultRoot, `\Users\Adam\NimboRoot\a\x.bin`, "a/x.bin", true},
+		{defaultRoot, `\Users\Adam\NimboRoot`, "", true},
+		{defaultRoot, `\users\adam\nimboroot\Sub\Y`, "Sub/Y", true},
+		{defaultRoot, `C:\Users\Adam\NimboRoot\a\x.bin`, "a/x.bin", true},
+		{defaultRoot, `\Users\Adam\NimboRoot2\x.bin`, "", false}, // sibling with the root as a prefix
+		{defaultRoot, `\Users\Adam\Desktop\x.bin`, "", false},
+		// An unanchored match (strings.Index) would find the root's name
+		// buried mid-path here, wrongly accepting a path that isn't inside
+		// the root at all. Found in review, 2026-09-14.
+		{`C:\Nimbo`, `\Users\Adam\Nimbo\x.bin`, "", false},
+		{`D:\Nimbo`, `D:\Backup\Nimbo\x.bin`, "", false},
+	}
+	for _, c := range cases {
+		rel, ok := normalizedRel(c.root, c.in)
+		if rel != c.rel || ok != c.ok {
+			t.Errorf("normalizedRel(%q, %q) = (%q, %v), want (%q, %v)", c.root, c.in, rel, ok, c.rel, c.ok)
+		}
+	}
+}
+
+// TestProviderEnqueueRenameOrdered is a pure-Go unit test (no driver): it
+// drives provider.enqueueRename directly to pin two things found in review
+// (2026-09-14) about the old per-event "go fn(oldAbs, newAbs)" delivery —
+// unordered and unbounded — that a single worker goroutine per provider now
+// fixes. It asserts (1) 200 renames enqueued from this test's own goroutine
+// are all delivered, IN ORDER, to the current handler, and (2) stopRenames
+// stops delivery for good: further enqueues are dropped, not queued.
+func TestProviderEnqueueRenameOrdered(t *testing.T) {
+	const fakeKey = int64(-135792468) // won't collide with a real connKey
+	p := &provider{path: `C:\fake\root`}
+	providers.Store(fakeKey, p)
+	t.Cleanup(func() { providers.Delete(fakeKey) })
+
+	var mu sync.Mutex
+	var got [][2]string
+	allSeen := make(chan struct{})
+	SetRenameHandler(fakeKey, func(oldPath, newPath string) {
+		mu.Lock()
+		got = append(got, [2]string{oldPath, newPath})
+		n := len(got)
+		mu.Unlock()
+		if n == 200 {
+			close(allSeen)
+		}
+	})
+
+	want := make([][2]string, 200)
+	for i := 0; i < 200; i++ {
+		old := fmt.Sprintf(`C:\fake\root\old\%d`, i)
+		newp := fmt.Sprintf(`C:\fake\root\new\%d`, i)
+		want[i] = [2]string{old, newp}
+		p.enqueueRename(old, newp) // called from this goroutine, not a spawned one
+	}
+
+	select {
+	case <-allSeen:
+	case <-time.After(5 * time.Second):
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		t.Fatalf("handler saw %d/200 renames within 5s", n)
+	}
+
+	mu.Lock()
+	gotCopy := append([][2]string(nil), got...)
+	mu.Unlock()
+	if len(gotCopy) != 200 {
+		t.Fatalf("handler saw %d renames, want 200", len(gotCopy))
+	}
+	for i, pair := range gotCopy {
+		if pair != want[i] {
+			t.Fatalf("rename %d = %v, want %v (delivery order not preserved)", i, pair, want[i])
+		}
+	}
+
+	p.stopRenames()
+
+	// Further enqueues after stop must be dropped, not queued or delivered —
+	// proves the worker has actually stopped consuming, not merely paused.
+	p.enqueueRename("late-old-1", "late-new-1")
+	p.enqueueRename("late-old-2", "late-new-2")
+
+	select {
+	case _, open := <-p.renames:
+		if open {
+			t.Error("p.renames still open after stopRenames")
+		}
+	case <-time.After(time.Second):
+		t.Error("p.renames did not appear closed after stopRenames")
+	}
+
+	mu.Lock()
+	n := len(got)
+	mu.Unlock()
+	if n != 200 {
+		t.Errorf("handler count after stopRenames = %d, want 200 (stable, no late deliveries)", n)
 	}
 }

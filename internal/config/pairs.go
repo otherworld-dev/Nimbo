@@ -45,6 +45,16 @@ func (d Dirs) VFSFileIDsFile() string {
 	return filepath.Join(d.Config, "vfs-fileids.json")
 }
 
+// VFSMountRootsFile is the on-demand set of remote paths that are the ROOT of
+// a share received from someone else or of a mount — what tells an unshare from
+// a deletion once the path has vanished (Deck #557). Scoped like PairsFile.
+func (d Dirs) VFSMountRootsFile() string {
+	if d.acct != "" {
+		return filepath.Join(d.Config, "vfs-mountroots-"+d.acct+".json")
+	}
+	return filepath.Join(d.Config, "vfs-mountroots.json")
+}
+
 // MigratePairs adopts the legacy unscoped files into this account's scoped
 // ones — a one-time rename for installs that predate multi-account. It only
 // acts when the Dirs is account-bound, the scoped file doesn't exist yet, and

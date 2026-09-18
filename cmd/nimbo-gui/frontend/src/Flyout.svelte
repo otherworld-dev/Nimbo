@@ -13,7 +13,7 @@
   };
 
   type Activity = { time: string; kind: string; path: string; remotePath: string; localPath: string; err: string };
-  type Attention = { conflicts: number; blocked: number; locked: number };
+  type Attention = { conflicts: number; blocked: number; locked: number; detached: number };
   type Progress = { active: boolean; current: string; done: number; total: number; speed: number; avgSpeed: number; doneBytes: number; totalBytes: number; enumerating: boolean };
 
   function etaText(p: Progress): string {
@@ -41,7 +41,7 @@
   let showSearch = $state(true);
   let notifCount = $state(0);
   let header = $state<Header>({ user: "", server: "", statusType: "", statusMsg: "", statusIcon: "", quotaUsed: 0, quotaTotal: 0, quotaPct: 0, unlimited: false });
-  let attention = $state<Attention>({ conflicts: 0, blocked: 0, locked: 0 });
+  let attention = $state<Attention>({ conflicts: 0, blocked: 0, locked: 0, detached: 0 });
   let pauseInfo = $state<{ paused: boolean; reason: string; until: string }>({ paused: false, reason: "", until: "" });
   let pauseMenu = $state(false);
   let editStatus = $state(false);
@@ -123,21 +123,26 @@
   const fetchAttention = async (): Promise<Attention> =>
     (await App.Attention()) as unknown as Attention;
 
-  let attentionTotal = $derived(attention.conflicts + attention.blocked);
+  let attentionTotal = $derived(attention.conflicts + attention.blocked + attention.detached);
   let attentionText = $derived(
     [attention.conflicts && `${attention.conflicts} conflict${attention.conflicts > 1 ? "s" : ""}`,
-     attention.blocked && `${attention.blocked} can’t sync`].filter(Boolean).join(" · ")
+     attention.blocked && `${attention.blocked} can’t sync`,
+     attention.detached && `${attention.detached} folder${attention.detached > 1 ? "s" : ""} no longer shared`].filter(Boolean).join(" · ")
   );
+  // Where "Review →" lands: the most urgent kind first.
+  let attentionTab = $derived(attention.conflicts > 0 ? "conflicts" : attention.blocked > 0 ? "blocked" : "detached");
 
   const basename = (p: string) => p.replace(/\/+$/, "").split("/").pop() || p;
   const kindIcon = (k: string) =>
     ({ download: "↓", upload: "↑", "delete-local": "🗑", "delete-remote": "🗑",
        "move-local": "↪", "move-remote": "↪", "mkdir-local": "📁", "mkdir-remote": "📁",
-       conflict: "⚠" } as Record<string, string>)[k] ?? "•";
+       conflict: "⚠", unshared: "🔗" } as Record<string, string>)[k] ?? "•";
   const kindLabel = (k: string) =>
     ({ download: "Downloaded", upload: "Uploaded", "delete-local": "Deleted locally",
        "delete-remote": "Deleted on server", "move-local": "Moved", "move-remote": "Moved",
-       "mkdir-local": "New folder", "mkdir-remote": "New folder", conflict: "Conflict" } as Record<string, string>)[k] ?? k;
+       "mkdir-local": "New folder", "mkdir-remote": "New folder", conflict: "Conflict",
+       unshared: "No longer shared with you — copy kept",
+       "unshared-empty": "No longer shared with you — nothing was downloaded" } as Record<string, string>)[k] ?? k;
   refresh();
   Events.On("status", (e: any) => {
     status = e.data;
@@ -167,6 +172,7 @@
   Events.On("conflicts", async () => { attention = await fetchAttention(); });
   Events.On("blocked", async () => { attention = await fetchAttention(); });
   Events.On("locks", async () => { attention = await fetchAttention(); });
+  Events.On("detached", async () => { attention = await fetchAttention(); });
 
   const presenceLabel = (s: string) =>
     s === "online" ? "Online" : s === "away" ? "Away" : s === "dnd" ? "Do not disturb"
@@ -336,7 +342,7 @@
   </header>
 
   {#if attentionTotal > 0}
-    <button class="alert" onclick={() => App.OpenStatusTab(attention.conflicts > 0 ? "conflicts" : "blocked")}>
+    <button class="alert" onclick={() => App.OpenStatusTab(attentionTab)}>
       <span class="warn">⚠</span>
       <span class="atext">{attentionText} need{attentionTotal === 1 ? "s" : ""} attention</span>
       <span class="go">Review →</span>

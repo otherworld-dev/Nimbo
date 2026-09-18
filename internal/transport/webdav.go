@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -113,6 +114,15 @@ func (e Entry) ServerReadOnly() bool {
 		return !strings.ContainsAny(e.Permissions, "CK")
 	}
 	return !strings.Contains(e.Permissions, "W")
+}
+
+// OnMount reports whether this entry lives on a storage that can be DETACHED
+// from the account rather than deleted: S marks every node of a share received
+// from someone else, M every node of an external storage or group folder mount
+// (both letters cover the whole subtree, not just its root). Unknown permissions
+// read as not-on-mount, so nothing is ever guessed to be detachable.
+func (e Entry) OnMount() bool {
+	return strings.ContainsAny(e.Permissions, "SM")
 }
 
 // davBase is the path prefix for this account's files endpoint.
@@ -459,19 +469,30 @@ func (c *Client) Get(ctx context.Context, remotePath string) (io.ReadCloser, htt
 	return body, hdr, err
 }
 
+// getRequest builds a GET request for remotePath, optionally carrying a Range
+// header, and sends it. The caller owns resp.Body (on a nil error) and must
+// close it.
+func (c *Client) getRequest(ctx context.Context, remotePath, rangeHeader string) (*http.Response, error) {
+	req, err := c.NewRequest(ctx, http.MethodGet, c.davURL(remotePath), nil)
+	if err != nil {
+		return nil, err
+	}
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+	return c.Do(req)
+}
+
 // GetFrom opens the file at remotePath for reading starting at byte offset. When
 // offset is 0 it performs a normal GET; otherwise it requests a Range. The
 // returned status is 200 (full body — caller must restart from 0) or 206
 // (partial — caller may append). The caller must close the body.
 func (c *Client) GetFrom(ctx context.Context, remotePath string, offset int64) (io.ReadCloser, http.Header, int, error) {
-	req, err := c.NewRequest(ctx, http.MethodGet, c.davURL(remotePath), nil)
-	if err != nil {
-		return nil, nil, 0, err
-	}
+	rangeHeader := ""
 	if offset > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		rangeHeader = fmt.Sprintf("bytes=%d-", offset)
 	}
-	resp, err := c.Do(req)
+	resp, err := c.getRequest(ctx, remotePath, rangeHeader)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -481,6 +502,57 @@ func (c *Client) GetFrom(ctx context.Context, remotePath string, offset int64) (
 	}
 	body := limitReadCloser(ctx, resp.Body, c.downLimiter)
 	return body, resp.Header, resp.StatusCode, nil
+}
+
+// ErrRangeIgnored means a ranged GET for a non-zero offset came back 200
+// instead of 206: the server ignored the Range header and is about to hand
+// back the whole file starting at byte 0. Returning that body to a caller
+// that asked for bytes starting partway through the file would silently
+// splice unrelated bytes into its buffer, so it is refused instead.
+var ErrRangeIgnored = errors.New("transport: server ignored the Range header")
+
+// GetRange opens remotePath for the bounded byte range [offset, offset+length)
+// — one GET, however large the range, unlike GetFrom's open-ended "stream from
+// offset to EOF" (which is what forced hydration into a new HTTP request per
+// chunk). A length <= 0 together with offset == 0 requests the whole file with
+// no Range header at all; any other (offset, length) sends
+// "Range: bytes=<offset>-<offset+length-1>" (or an open-ended
+// "bytes=<offset>-" when length <= 0 but offset > 0).
+//
+// A 206 response is always accepted. A 200 response is accepted only when
+// offset == 0 (some servers answer a Range they chose not to honour with the
+// full body, which still starts at the right byte); a 200 for a non-zero
+// offset is ErrRangeIgnored rather than silently the wrong bytes. The caller
+// must close the returned body — trimming it to exactly length bytes is the
+// caller's job (see engine.OpenRange), not this method's.
+func (c *Client) GetRange(ctx context.Context, remotePath string, offset, length int64) (io.ReadCloser, http.Header, error) {
+	rangeHeader := ""
+	switch {
+	case offset == 0 && length <= 0:
+		// Full GET: no Range header.
+	case length > 0:
+		rangeHeader = fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	default:
+		rangeHeader = fmt.Sprintf("bytes=%d-", offset)
+	}
+	resp, err := c.getRequest(ctx, remotePath, rangeHeader)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch {
+	case resp.StatusCode == http.StatusPartialContent:
+		// Partial content as requested.
+	case resp.StatusCode == http.StatusOK && offset == 0:
+		// Whole file from the start — still the right bytes.
+	case resp.StatusCode == http.StatusOK:
+		defer resp.Body.Close()
+		return nil, nil, fmt.Errorf("GET %s: %w", remotePath, ErrRangeIgnored)
+	default:
+		defer resp.Body.Close()
+		return nil, nil, statusError("GET", remotePath, resp)
+	}
+	body := limitReadCloser(ctx, resp.Body, c.downLimiter)
+	return body, resp.Header, nil
 }
 
 // Put uploads data to remotePath with a single PUT. It is intended for small

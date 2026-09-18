@@ -58,6 +58,30 @@ func TestIgnore_Defaults(t *testing.T) {
 	}
 }
 
+// An exact exclusion names ONE pair-relative path (and everything under it),
+// unlike a pattern without "/" which matches that name at any depth. It is what
+// keeps a detached share's kept copy out of sync without also hiding some
+// other folder that happens to share its name.
+func TestIgnore_Exact(t *testing.T) {
+	ig := NewIgnore(nil)
+	ig.AddExact("Team", "Projects/Group")
+	for _, p := range []string{"Team", "Team/Budget.xlsx", "Team/sub/x", "Projects/Group", "Projects/Group/a"} {
+		if !ig.Match(p) {
+			t.Errorf("exact exclusion should match %q", p)
+		}
+	}
+	for _, p := range []string{"Teams", "Projects/Team", "Group", "Projects/Groups/a", "other/Team/x"} {
+		if ig.Match(p) {
+			t.Errorf("exact exclusion should NOT match %q", p)
+		}
+	}
+	var nilIg *Ignore
+	nilIg.AddExact("Team") // a nil matcher stays a no-op
+	if nilIg.Match("Team") {
+		t.Error("nil matcher matched")
+	}
+}
+
 func TestIgnore_FilterMaps(t *testing.T) {
 	ig := NewIgnore([]string{"*.log"})
 	local := map[string]LocalState{"a.txt": {Path: "a.txt"}, "b.log": {Path: "b.log"}}

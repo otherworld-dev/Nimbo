@@ -395,16 +395,11 @@ func (e *Executor) applyTransfer(ctx context.Context, a engine.Action) error {
 // its baseline row.
 func (e *Executor) applyDelete(ctx context.Context, a engine.Action) error {
 	if a.Kind == engine.ActDeleteLocal {
-		clearReadOnlyTree(e.localPath(a.Path)) // mirrored read-only files block deletion on Windows
 		// Recycle Bin first: a deletion mirrored FROM the server is the one
 		// this PC never chose, so it keeps an undo. Below the damage guard's
 		// thresholds this is the only safety net a server-side deletion has.
-		// Falls back to a plain delete where no bin exists (non-Windows, or a
-		// path the shell refuses).
-		if err := recycle(e.localPath(a.Path)); err != nil {
-			if err := os.RemoveAll(e.localPath(a.Path)); err != nil {
-				return err
-			}
+		if err := RemoveToBin(e.localPath(a.Path)); err != nil {
+			return err
 		}
 	} else {
 		if err := e.Client.Delete(ctx, e.remotePath(a.Path)); err != nil {
@@ -413,6 +408,18 @@ func (e *Executor) applyDelete(ctx context.Context, a engine.Action) error {
 	}
 	slog.Info(a.Kind.String(), "path", a.Path)
 	return e.deleteBaseline(a.Path)
+}
+
+// RemoveToBin removes a local path the way a mirrored server deletion does:
+// to the Recycle Bin where there is one, by a plain delete where there is not
+// (non-Windows, or a path the shell refuses). Mirrored read-only attributes
+// are cleared first, since they block deletion on Windows.
+func RemoveToBin(path string) error {
+	clearReadOnlyTree(path)
+	if err := recycle(path); err == nil {
+		return nil
+	}
+	return os.RemoveAll(path)
 }
 
 // clearReadOnlyTree strips the read-only attribute from a path and everything
@@ -438,7 +445,7 @@ func (e *Executor) makeLocalDir(rel string) error {
 	}
 	r := e.Remote[rel]
 	_ = setReadOnly(e.localPath(rel), r.ReadOnly) // mirror a read-only server folder
-	return e.saveDirBaseline(rel, r.ETag, r.FileID)
+	return e.saveDirBaseline(rel, r.ETag, r.FileID, r.MountRoot)
 }
 
 func (e *Executor) makeRemoteDir(ctx context.Context, rel string) error {
@@ -451,7 +458,7 @@ func (e *Executor) makeRemoteDir(ctx context.Context, rel string) error {
 	if ent, ok, err := e.Client.Stat(ctx, remote); err == nil && ok {
 		etag, fileID = ent.ETag, ent.FileID
 	}
-	return e.saveDirBaseline(rel, etag, fileID)
+	return e.saveDirBaseline(rel, etag, fileID, false) // our own new folder: never a share root
 }
 
 // remotePath maps a pair-relative path to a files-root-relative path.
@@ -476,14 +483,18 @@ func (e *Executor) saveFileBaseline(rel string, res FileResult) error {
 		RemoteETag: res.ETag, RemoteFileID: res.FileID,
 		LocalSize: res.Size, LocalMTimeNanos: res.MTimeNanos,
 		ContentSHA1: res.ContentSHA1,
+		// A single file shared with the user is a mount root of its own; the
+		// listing said so. A path the listing never saw (a fresh upload) reads
+		// as the zero value, i.e. not one.
+		MountRoot: e.Remote[rel].MountRoot,
 	})
 }
 
-func (e *Executor) saveDirBaseline(rel, etag, fileID string) error {
+func (e *Executor) saveDirBaseline(rel, etag, fileID string, mountRoot bool) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.State.UpsertBaseline(e.PairKey, engine.BaselineState{
-		Path: rel, IsDir: true, RemoteETag: etag, RemoteFileID: fileID,
+		Path: rel, IsDir: true, RemoteETag: etag, RemoteFileID: fileID, MountRoot: mountRoot,
 	})
 }
 

@@ -5,7 +5,9 @@
 package cfapi
 
 import (
+	"context"
 	"errors"
+	"io"
 	"os"
 	"time"
 )
@@ -18,13 +20,14 @@ func IsDehydrated(os.FileInfo) bool { return false }
 // PlaceholderInfo mirrors the Windows type so cross-platform code referencing it
 // (e.g. the vfs stub) compiles.
 type PlaceholderInfo struct {
-	Name     string
-	Size     int64
-	IsDir    bool
-	ModTime  time.Time
-	Identity []byte
-	ETag     string
-	FileID   string
+	Name      string
+	Size      int64
+	IsDir     bool
+	ModTime   time.Time
+	Identity  []byte
+	ETag      string
+	FileID    string
+	MountRoot bool
 }
 
 // Debug is a diagnostic hook (used on Windows); unused here.
@@ -46,6 +49,20 @@ func Purge(string) error { return nil }
 type HydrateFunc func(identity []byte, offset, length int64) ([]byte, error)
 type ListFunc func(rel string) []PlaceholderInfo
 
+// HydrateStreamFunc mirrors the Windows provider's streaming hydration type.
+type HydrateStreamFunc func(ctx context.Context, identity []byte, offset, length int64) (io.ReadCloser, error)
+
+// SetHydrateStream is a no-op on non-Windows platforms (cross-platform code
+// calls it unconditionally after a Mount that cannot succeed here anyway).
+func SetHydrateStream(int64, HydrateStreamFunc) {}
+
+// RenameFunc mirrors the Windows provider's rename-completion callback type.
+type RenameFunc func(oldPath, newPath string)
+
+// SetRenameHandler is a no-op on non-Windows platforms (cross-platform code,
+// e.g. the vfs watcher, calls it unconditionally).
+func SetRenameHandler(int64, RenameFunc) {}
+
 // Mount is unavailable off Windows (Supported() gates all callers).
 func Mount(string, string, string, HydrateFunc, ListFunc) (int64, error) {
 	return 0, errors.New("on-demand files are Windows-only")
@@ -62,6 +79,11 @@ func PinStateOf(string) string { return "" }
 
 // Dehydrate is unavailable off Windows.
 func Dehydrate(string) error { return errors.New("on-demand files are Windows-only") }
+
+// UpdateIdentityKeepState is unavailable off Windows.
+func UpdateIdentityKeepState(string, []byte) error {
+	return errors.New("on-demand files are Windows-only")
+}
 
 // RevertPlaceholder is unavailable off Windows.
 func RevertPlaceholder(string) error { return errors.New("on-demand files are Windows-only") }
@@ -89,3 +111,11 @@ func ExcludeFromSync(string) error { return nil }
 
 // ExposePlaceholders is Windows-only; no-op elsewhere.
 func ExposePlaceholders() {}
+
+// PlaceholderModified is unavailable off Windows (no cloud placeholders).
+func PlaceholderModified(string) (bool, error) {
+	return false, errors.New("on-demand files are Windows-only")
+}
+
+// SetInSync is unavailable off Windows (no cloud placeholders to mark).
+func SetInSync(string) error { return errors.New("on-demand files are Windows-only") }

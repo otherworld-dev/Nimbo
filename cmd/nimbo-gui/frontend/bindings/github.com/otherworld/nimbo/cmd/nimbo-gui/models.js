@@ -315,6 +315,15 @@ export class AttentionInfo {
              */
             this["locked"] = 0;
         }
+        if (!("detached" in $$source)) {
+            /**
+             * Detached: folders that stopped being shared with the user (or whose
+             * storage was unmounted) and whose kept local copy awaits a decision.
+             * @member
+             * @type {number}
+             */
+            this["detached"] = 0;
+        }
 
         Object.assign(this, $$source);
     }
@@ -638,6 +647,75 @@ export class ConflictPreview {
             $$parsedSource["remote"] = $$createField1_0($$parsedSource["remote"]);
         }
         return new ConflictPreview(/** @type {Partial<ConflictPreview>} */($$parsedSource));
+    }
+}
+
+/**
+ * DetachedDTO is a folder that stopped being shared with the user (or whose
+ * storage was unmounted) and whose kept local copy is waiting for a decision.
+ */
+export class DetachedDTO {
+    /**
+     * Creates a new DetachedDTO instance.
+     * @param {Partial<DetachedDTO>} [$$source = {}] - The source object to create the DetachedDTO.
+     */
+    constructor($$source = {}) {
+        if (!("localDir" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["localDir"] = "";
+        }
+        if (!("rel" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["rel"] = "";
+        }
+        if (!("name" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["name"] = "";
+        }
+        if (!("localPath" in $$source)) {
+            /**
+             * where the copy is — the key ResolveDetached takes
+             * @member
+             * @type {string}
+             */
+            this["localPath"] = "";
+        }
+        if (!("movedOut" in $$source)) {
+            /**
+             * parked beside the sync folder (on-demand), not inside it
+             * @member
+             * @type {boolean}
+             */
+            this["movedOut"] = false;
+        }
+        if (!("at" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["at"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new DetachedDTO instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {DetachedDTO}
+     */
+    static createFrom($$source = {}) {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new DetachedDTO(/** @type {Partial<DetachedDTO>} */($$parsedSource));
     }
 }
 
@@ -1093,10 +1171,10 @@ export class LimitsDTO {
 
 /**
  * LocalTestDTO is the outcome of TestLocalAddress. Result is one of "ok",
- * "invalid", "unreachable", "not-https", "untrusted", "different-server",
- * "error"; Message is user-facing. The certificate fields are filled for
- * "untrusted" (the trust dialog) and "ok". Address is the canonical form of
- * what was typed — Save stores that.
+ * "invalid", "unreachable", "not-https", "not-nextcloud", "untrusted",
+ * "different-server", "error"; Message is user-facing. The certificate fields
+ * are filled for "untrusted" (the trust dialog) and "ok". Address is the
+ * canonical form of what was typed — Save stores that.
  */
 export class LocalTestDTO {
     /**

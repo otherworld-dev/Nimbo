@@ -39,6 +39,22 @@ var defaultIgnore = []string{
 //     exclusion is handled by also testing every ancestor segment.
 type Ignore struct {
 	patterns []string
+	exact    []string // whole pair-relative paths, subtree included — see AddExact
+}
+
+// AddExact excludes exactly the given pair-relative paths and everything under
+// them. Unlike a pattern without "/", which matches that NAME at any depth, an
+// exact exclusion names one folder: it is how a detached share's parked copy
+// is kept out of sync without also hiding some other folder of the same name.
+func (ig *Ignore) AddExact(rels ...string) {
+	if ig == nil {
+		return
+	}
+	for _, r := range rels {
+		if r = strings.Trim(r, "/"); r != "" {
+			ig.exact = append(ig.exact, r)
+		}
+	}
 }
 
 // NewIgnore builds a matcher from the given patterns plus the built-in defaults.
@@ -59,6 +75,11 @@ func NewIgnore(patterns []string) *Ignore {
 func (ig *Ignore) Match(rel string) bool {
 	if ig == nil || rel == "" {
 		return false
+	}
+	for _, x := range ig.exact {
+		if rel == x || strings.HasPrefix(rel, x+"/") {
+			return true
+		}
 	}
 	parts := strings.Split(rel, "/")
 	for i := 1; i <= len(parts); i++ {

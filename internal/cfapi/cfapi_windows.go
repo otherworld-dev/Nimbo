@@ -8,9 +8,11 @@
 package cfapi
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log/slog"
 	"os"
 	"os/user"
@@ -41,6 +43,8 @@ var (
 	procCfSetPinState                    = cldapi.NewProc("CfSetPinState")
 	procCfDehydratePlaceholder           = cldapi.NewProc("CfDehydratePlaceholder")
 	procCfRevertPlaceholder              = cldapi.NewProc("CfRevertPlaceholder")
+	procCfGetPlaceholderInfo             = cldapi.NewProc("CfGetPlaceholderInfo")
+	procCfHydratePlaceholder             = cldapi.NewProc("CfHydratePlaceholder")
 )
 
 var procSHChangeNotify = windows.NewLazySystemDLL("shell32.dll").NewProc("SHChangeNotify")
@@ -403,23 +407,70 @@ func dbg(format string, args ...any) {
 // HydrateFunc returns up to length bytes of the file identified by identity
 // starting at offset. identity is the blob set when the placeholder was created
 // (we use the UTF-8 remote path).
+//
+// It is the FALLBACK hydration path: one call — and therefore one HTTP request
+// — per transfer chunk. Install a HydrateStreamFunc instead (SetHydrateStream)
+// to serve a whole request from a single reader.
 type HydrateFunc func(identity []byte, offset, length int64) ([]byte, error)
+
+// HydrateStreamFunc opens a reader over the byte range [offset, offset+length)
+// of the file identified by identity — one reader for the whole of one
+// FETCH_DATA request, however large, instead of HydrateFunc's request per
+// chunk. The caller closes the reader.
+//
+// ctx is cancelled when the filter withdraws the request — measured cause: the
+// request stopped making progress for 60s (a stream that keeps flowing is
+// never cancelled, however long it runs). Abandon the download promptly: once
+// withdrawn, the request is the filter's to re-issue, and nothing more should
+// be transferred against its key.
+type HydrateStreamFunc func(ctx context.Context, identity []byte, offset, length int64) (io.ReadCloser, error)
 
 // ListFunc returns the children of a directory (rel is relative to the sync
 // root, "" for the root, forward-slash separated) so they can be populated on
 // demand.
 type ListFunc func(rel string) []PlaceholderInfo
 
+// RenameFunc receives a completed rename or move inside a sync root. Both
+// arguments are absolute local paths (old, then new). Calls are delivered
+// one at a time, in the order the filter reported them, on a goroutine owned
+// by the mount; return promptly.
+type RenameFunc func(oldPath, newPath string)
+
 type provider struct {
 	path    string
 	hydrate HydrateFunc
 	list    ListFunc
+	mu      sync.Mutex
+	rename  RenameFunc     // set after Mount via SetRenameHandler; nil = ignore
+	renames chan [2]string // queued (old, new) pairs; created on first SetRenameHandler(fn != nil)
+	worker  bool           // a delivery goroutine is running
+	closed  bool           // stopRenames has run; enqueue/worker must stop
+
+	// Hydration state, under its own lock: the FETCH_DATA and
+	// CANCEL_FETCH_DATA callbacks run on threads the OS is waiting on and
+	// must never queue behind rename delivery.
+	fetchMu       sync.Mutex
+	hydrateStream HydrateStreamFunc       // set after Mount via SetHydrateStream; nil = use hydrate
+	inflight      map[int64]*fetchRequest // transferKey -> the download serving it
+	fetchClosed   bool                    // cancelFetches has run; no new download may start
+}
+
+// fetchRequest identifies ONE download so the bookkeeping can tell two
+// requests apart even when the filter reuses a transfer key value. Keying
+// `inflight` by the key alone was enough to cancel the right download, but not
+// to untrack it: a finishing goroutine's deferred delete would remove a
+// successor that had just claimed the same key, leaving the newcomer
+// uncancellable. Identity is the pointer, so the zero-field struct is fine.
+type fetchRequest struct {
+	cancel context.CancelFunc
 }
 
 var (
 	providers            sync.Map // connKey int64 -> *provider
 	fetchDataCallbackPtr = syscall.NewCallback(fetchDataCallback)
+	cancelFetchDataPtr   = syscall.NewCallback(cancelFetchDataCallback)
 	fetchPlaceholdersPtr = syscall.NewCallback(fetchPlaceholdersCallback)
+	renameCompletionPtr  = syscall.NewCallback(renameCompletionCallback)
 )
 
 // CF_CALLBACK_REGISTRATION { CF_CALLBACK_TYPE Type; CF_CALLBACK Callback; }
@@ -430,14 +481,21 @@ type callbackRegistration struct {
 }
 
 const (
-	cfCallbackTypeFetchData             = 0
-	cfCallbackTypeFetchPlaceholders     = 3
-	cfCallbackTypeNone                  = -1
-	cfConnectFlagNone                   = 0
-	cfConnectFlagRequireProcessInfo     = 2 // CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO
-	cfConnectFlagRequireFullFilePath    = 4 // CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH
-	cfOperationTypeTransferData         = 0
-	cfOperationTypeTransferPlaceholders = 4
+	cfCallbackTypeFetchData              = 0
+	cfCallbackTypeCancelFetchData        = 2 // CF_CALLBACK_TYPE_CANCEL_FETCH_DATA
+	cfCallbackTypeFetchPlaceholders      = 3
+	cfCallbackTypeNotifyRenameCompletion = 12 // CF_CALLBACK_TYPE_NOTIFY_RENAME_COMPLETION
+	cfCallbackTypeNone                   = -1
+	cfConnectFlagNone                    = 0
+	cfConnectFlagRequireProcessInfo      = 2 // CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO
+	cfConnectFlagRequireFullFilePath     = 4 // CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH
+	cfOperationTypeTransferData          = 0
+	cfOperationTypeTransferPlaceholders  = 4
+	// CF_CALLBACK_PARAMETERS.RenameCompletion.SourcePath: ParamSize@0, the
+	// union at 8 (Flags@8), SourcePath@16 — verified by compiling cfapi.h
+	// 10.0.26100 with MSVC 14.50 (2026-09-14). Pinned by
+	// TestStructLayoutsMatchCfapiH.
+	cpRenameSourcePath = 16
 )
 
 // Mount registers path as a sync root and connects a provider that hydrates
@@ -463,7 +521,15 @@ func Mount(path, displayName, iconPath string, hydrate HydrateFunc, list ListFun
 	}
 	table := []callbackRegistration{
 		{Type: cfCallbackTypeFetchData, Callback: fetchDataCallbackPtr},
+		// The withdrawal notice for a FETCH_DATA already in flight. Unlike
+		// NOTIFY_RENAME it needs no acknowledgement of any kind — registering
+		// it only ever stops work nobody is waiting for.
+		{Type: cfCallbackTypeCancelFetchData, Callback: cancelFetchDataPtr},
 		{Type: cfCallbackTypeFetchPlaceholders, Callback: fetchPlaceholdersPtr},
+		// Completion only: the filter has already applied the rename and
+		// expects no ACK. NOTIFY_RENAME (the pre-op, type 11) is deliberately
+		// NOT registered — it must be acknowledged or every rename fails.
+		{Type: cfCallbackTypeNotifyRenameCompletion, Callback: renameCompletionPtr},
 		{Type: cfCallbackTypeNone},
 	}
 	var connKey int64
@@ -544,6 +610,10 @@ func dirEmpty(path string) bool {
 // Disconnect: the registration persists across sessions BY DESIGN, exactly as
 // OneDrive's does while OneDrive isn't running.
 func Unmount(path string, connKey int64) {
+	if pv, ok := providers.Load(connKey); ok {
+		pv.(*provider).stopRenames()
+		pv.(*provider).cancelFetches()
+	}
 	providers.Delete(connKey)
 	_, _, _ = procCfDisconnectSyncRoot.Call(uintptr(connKey))
 	UnregisterShellSyncRoot(path)
@@ -555,6 +625,10 @@ func Unmount(path string, connKey int64) {
 // shutdown / pause counterpart to Mount; the next Mount reconnects in place.
 func Disconnect(path string, connKey int64) {
 	_ = path
+	if pv, ok := providers.Load(connKey); ok {
+		pv.(*provider).stopRenames()
+		pv.(*provider).cancelFetches()
+	}
 	providers.Delete(connKey)
 	_, _, _ = procCfDisconnectSyncRoot.Call(uintptr(connKey))
 }
@@ -605,6 +679,10 @@ type PlaceholderInfo struct {
 	Identity []byte // opaque per-file blob (we use the UTF-8 remote path)
 	ETag     string // server ETag (carried for the write-back conflict baseline; not stored in the placeholder)
 	FileID   string // server oc:fileid — stable across renames; used for down-sync rename detection
+	// MountRoot marks the top of a share received from someone else or of a
+	// mount: the one entry whose later disappearance from a listing means
+	// "detached from this account", not "deleted" (Deck #557).
+	MountRoot bool
 }
 
 // CF_FS_METADATA { FILE_BASIC_INFO BasicInfo; LARGE_INTEGER FileSize; }
@@ -699,6 +777,56 @@ func CreatePlaceholders(baseDir string, items []PlaceholderInfo) error {
 	if err != nil {
 		return err
 	}
+	// One long identity poisons its batch-mates (see longIdentityBytes): the
+	// short ones go together, each long one goes alone.
+	short, long := splitLongIdentities(items)
+	if len(short) > 0 {
+		if err := createPlaceholdersRaw(baseW, short); err != nil {
+			return err
+		}
+	}
+	for _, it := range long {
+		if err := createPlaceholdersRaw(baseW, []PlaceholderInfo{it}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// longIdentityBytes is the FileIdentity length from which a placeholder must
+// be created in a batch of its own.
+//
+// Measured on Windows 11 10.0.26200 (2026-09-15/16, test VM and dev box, via
+// the public API from a plain process): when CfCreatePlaceholders or
+// CfExecute(TRANSFER_PLACEHOLDERS) is handed an array in which one entry's
+// FileIdentity is ~133 bytes or longer, that entry is created correctly and
+// the OTHER entries of the same call come out with corrupt cloud-file
+// metadata — ERROR_CLOUD_FILE_METADATA_CORRUPT (363) on every open, even as
+// the connected provider; undeletable; permanent. 132 bytes is fine, 136 is
+// not, the name's length is irrelevant, and a long identity created alone is
+// healthy. Our identity is the raw server path, so any directory holding an
+// entry that deep stranded all its siblings on population and on reconcile's
+// pull (GitHub #7's "corrupt metadata" placeholders). 128 leaves a margin
+// under the measured edge; batch_windows_test.go pins both the fault and
+// this defence.
+const longIdentityBytes = 128
+
+// splitLongIdentities partitions items into those safe to create together
+// and those that must each be created alone. Order within each part is kept.
+func splitLongIdentities(items []PlaceholderInfo) (short, long []PlaceholderInfo) {
+	for _, it := range items {
+		if len(it.Identity) >= longIdentityBytes {
+			long = append(long, it)
+		} else {
+			short = append(short, it)
+		}
+	}
+	return short, long
+}
+
+// createPlaceholdersRaw is one CfCreatePlaceholders call; callers split the
+// batch first (see longIdentityBytes).
+func createPlaceholdersRaw(baseW *uint16, items []PlaceholderInfo) error {
 	arr, names, ids, err := buildPlaceholders(items)
 	if err != nil {
 		return err
@@ -747,7 +875,63 @@ const (
 	// CF_CALLBACK_PARAMETERS (FetchData) offsets.
 	cpRequiredOffset = 16
 	cpRequiredLength = 24
+	// CF_CALLBACK_PARAMETERS (Cancel.FetchData) offsets. Cancel nests a second
+	// union inside itself, so its Flags takes the outer union's slot at 8 and
+	// the withdrawn range follows at 16/24 — the same places FETCH_DATA's
+	// required range sits. Pinned by TestStructLayoutsMatchCfapiH.
+	cpCancelFlags  = 8
+	cpCancelOffset = 16
+	cpCancelLength = 24
 )
+
+// cfTransferChunk is the MOST of a hydration request handed to the filter in
+// one CfExecute(TRANSFER_DATA) — the piece size a link fast enough to fill it
+// promptly will actually use. 4 MiB replaced 1 MiB when hydration stopped
+// costing an HTTP request per piece: with one reader serving the whole
+// request, a bigger piece is simply fewer syscalls (VM, v0.1.0.292: 64
+// transfers for 256 MB).
+const cfTransferChunk = 4 << 20
+
+// cfTransferAlign is the sector alignment the filter requires of every
+// transfer that does not finish the request: a mid-file piece not landing on a
+// 4 KiB boundary is rejected. Only the piece completing the request may be any
+// length.
+const cfTransferAlign = 4096
+
+// cfPieceFlushAfter bounds how long one piece may spend filling before
+// whatever is in hand (its 4096-aligned prefix) is handed over anyway. The
+// filter withdraws a request that goes ~60s without a TRANSFER_DATA, so
+// waiting for a whole piece imposed a MINIMUM SUSTAINABLE RATE of
+// 4 MiB / 60s ≈ 70 KiB/s — and below it hydration could never finish at all:
+// cancelled before the first piece, re-requested at the same offset, cancelled
+// again, until the opener's own ~180s timeout, discarding up to 4 MiB per
+// cycle. Not hypothetical: the download cap in Settings (and the DownloadKBps
+// policy) has no lower bound in the UI, so 68 KiB/s is a setting a user can
+// type. The 1 MiB loop had the same shape with a ~17 KiB/s floor. Flushing on
+// a timer instead drops the floor to cfTransferAlign / 60s ≈ 68 BYTES/s while
+// leaving a fast link's full 4 MiB pieces untouched.
+const cfPieceFlushAfter = 15 * time.Second
+
+// testPieceFlushAfter overrides cfPieceFlushAfter when non-zero. Set ONLY by
+// the slow-link test, which would otherwise have to run for a minute to
+// observe a timed flush at all.
+var testPieceFlushAfter time.Duration
+
+func pieceFlushAfter() time.Duration {
+	if testPieceFlushAfter > 0 {
+		return testPieceFlushAfter
+	}
+	return cfPieceFlushAfter
+}
+
+// statusUnsuccessful is STATUS_UNSUCCESSFUL (ntstatus.h:2074), the completion
+// status for a hydration request the provider could not satisfy. cfapi.h says
+// nothing beyond "NTSTATUS CompletionStatus", and the documented generic
+// failure is this one; STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE (0xC000CF11)
+// exists but claims a specific cause we usually do not know (the reader may
+// have failed for any reason), so the generic code is used and the real error
+// goes to the debug log instead.
+const statusUnsuccessful = int32(-1073741823) // 0xC0000001
 
 // callbackProcess names the process whose access triggered a callback, for
 // hydration forensics ("who is re-downloading freed files?"). Requires the
@@ -795,31 +979,210 @@ func fetchDataCallback(info, params uintptr) uintptr {
 		dbg("FETCH_DATA: no provider for conn=%d", connKey)
 		return 0
 	}
-	hyd := pv.(*provider).hydrate
+	p := pv.(*provider)
+	p.fetchMu.Lock()
+	stream := p.hydrateStream
+	p.fetchMu.Unlock()
 
 	identity := make([]byte, idLen) // copy — the OS buffer is only valid during the callback
 	if idLen > 0 {
 		copy(identity, unsafe.Slice((*byte)(unsafe.Pointer(idPtr)), idLen))
 	}
 
+	if stream != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		req, ok := p.trackFetch(transferKey, cancel)
+		if !ok {
+			// The mount is going away; the connection key is already dead, so
+			// there is nothing to complete and nothing worth downloading.
+			dbg("FETCH_DATA %q: the provider is shutting down, dropped", idStr)
+			return 0
+		}
+		go func() {
+			defer p.untrackFetch(transferKey, req)
+			defer cancel()
+			p.streamFetch(ctx, stream, connKey, transferKey, idStr, identity, reqOffset, reqLength)
+		}()
+		return 0
+	}
+
+	hyd := p.hydrate
 	go func() {
-		const chunk = 1 << 20
 		off := reqOffset
 		remaining := reqLength
 		for remaining > 0 {
-			n := int64(chunk)
+			n := int64(cfTransferChunk)
 			if n > remaining {
 				n = remaining
 			}
 			data, err := hyd(identity, off, n)
 			if err != nil || len(data) == 0 {
-				return // incomplete transfer → the open fails, but Explorer isn't blocked
+				// Complete the request as FAILED rather than walking away:
+				// an abandoned request leaves the caller's open blocked
+				// until the filter's own time-out (measured: 180s).
+				dbg("FETCH_DATA %q: hydrate offset=%d len=%d: %v", idStr, off, n, err)
+				cfTransferFail(connKey, transferKey, off, remaining)
+				return
 			}
-			cfTransfer(connKey, transferKey, off, data)
+			if !cfTransfer(connKey, transferKey, off, data) {
+				cfTransferFail(connKey, transferKey, off, remaining)
+				return
+			}
 			off += int64(len(data))
 			remaining -= int64(len(data))
 		}
 	}()
+	return 0
+}
+
+// streamFetch serves one whole FETCH_DATA request from a single reader,
+// handing the bytes to the filter a piece at a time. A piece is up to
+// cfTransferChunk bytes, but it is also flushed once cfPieceFlushAfter has
+// passed with at least cfTransferAlign bytes in hand, so the filter keeps
+// seeing progress on a link too slow to fill 4 MiB inside its ~60s stall
+// timeout (see cfPieceFlushAfter — below ~70 KiB/s, waiting for full pieces
+// meant hydration never completed at all). A fast link still fills every
+// piece and transfers exactly as before (VM, v0.1.0.292: 1 GET and 64
+// transfers in 10s for 256 MB, where the per-chunk request loop needed 256
+// GETs and 60s).
+//
+// Alignment holds either way: a flushed piece hands over only its
+// 4096-aligned prefix and CARRIES THE TAIL into the next piece, so every
+// transfer but the request's last lands on a sector boundary.
+//
+// Whatever happens, the request is COMPLETED: fully transferred, or failed for
+// the part that could not be served. Returning without doing either is the
+// defect this replaces — the caller's open then hangs on the filter's time-out.
+func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, connKey, transferKey int64, idStr string, identity []byte, reqOffset, reqLength int64) {
+	rc, err := stream(ctx, identity, reqOffset, reqLength)
+	if err != nil {
+		if ctx.Err() != nil {
+			// The request was withdrawn while the stream was being opened —
+			// err is that cancellation, not a download failure, and the
+			// transfer key is gone. Completing it would only log a rejection.
+			dbg("FETCH_DATA %q: withdrawn while opening the stream", idStr)
+			return
+		}
+		dbg("FETCH_DATA %q: open stream: %v", idStr, err)
+		cfTransferFail(connKey, transferKey, reqOffset, reqLength)
+		return
+	}
+	if rc == nil {
+		// A broken HydrateStreamFunc, not a download failure — but the
+		// request still has to be answered, and a nil-interface Close would
+		// panic on a callback goroutine and take the process with it.
+		dbg("FETCH_DATA %q: the stream func returned no reader and no error", idStr)
+		cfTransferFail(connKey, transferKey, reqOffset, reqLength)
+		return
+	}
+	defer rc.Close()
+
+	buf := make([]byte, cfTransferChunk)
+	flushAfter := pieceFlushAfter()
+	off, remaining := reqOffset, reqLength
+	held := 0 // bytes at the front of buf: a previous piece's unaligned tail
+	for remaining > 0 {
+		if ctx.Err() != nil {
+			// Cancelled: the transfer key is dead, so there is nothing to
+			// complete — the filter has already failed the caller's I/O.
+			dbg("FETCH_DATA %q: cancelled with %d bytes left", idStr, remaining)
+			return
+		}
+		want := len(buf)
+		if int64(want) > remaining {
+			want = int(remaining)
+		}
+
+		// Fill the piece, but never past flushAfter once there is an aligned
+		// prefix to hand over. Each Read returns whatever has arrived, so on a
+		// slow link this loop wakes often and the deadline is honoured
+		// closely; on a fast one it simply fills.
+		n, started := held, time.Now()
+		var rerr error
+		for n < want {
+			rn, err := rc.Read(buf[n:want])
+			n += rn
+			if n >= want {
+				break // piece full; any error travels with the next read
+			}
+			if err != nil {
+				rerr = err
+				break
+			}
+			if n >= cfTransferAlign && time.Since(started) >= flushAfter {
+				dbg("FETCH_DATA %q: slow link, flushing %d of %d bytes after %v", idStr, n, want, time.Since(started).Round(time.Millisecond))
+				break
+			}
+		}
+
+		if rerr != nil {
+			// The stream could not deliver the rest of the range, so the open
+			// is going to fail either way and the n bytes in hand are
+			// deliberately DROPPED: they would buy the caller nothing, and a
+			// partial piece is the one shape that can land off a sector
+			// boundary.
+			if ctx.Err() == nil {
+				dbg("FETCH_DATA %q: stream ended %d bytes short (%d in hand, dropped): %v", idStr, remaining, n, rerr)
+				cfTransferFail(connKey, transferKey, off, remaining)
+			} else {
+				dbg("FETCH_DATA %q: cancelled with %d bytes left", idStr, remaining)
+			}
+			return
+		}
+		// Re-check: reading is where a download waits, so this is the one
+		// place a cancel can land mid-piece. Without it, a withdrawn request
+		// still pushes a piece at a dead transfer key.
+		if ctx.Err() != nil {
+			dbg("FETCH_DATA %q: cancelled with %d bytes left", idStr, remaining)
+			return
+		}
+
+		// Only the transfer that completes the request may be unaligned; a
+		// piece flushed early keeps its ragged tail for next time.
+		send := n
+		if int64(n) < remaining {
+			send -= n % cfTransferAlign
+		}
+		if send <= 0 {
+			// Unreachable: the fill loop only stops short of a full piece
+			// once cfTransferAlign bytes are in hand. Fail the request rather
+			// than spin on a piece that cannot grow or hand CfExecute an
+			// empty buffer (which would panic on a callback goroutine).
+			dbg("FETCH_DATA %q: nothing sendable from %d bytes with %d left", idStr, n, remaining)
+			cfTransferFail(connKey, transferKey, off, remaining)
+			return
+		}
+		if !cfTransfer(connKey, transferKey, off, buf[:send]) {
+			// The filter refused the piece; fail the rest from here so it
+			// never waits for a gap we are not going to fill.
+			cfTransferFail(connKey, transferKey, off, remaining)
+			return
+		}
+		off += int64(send)
+		remaining -= int64(send)
+		held = copy(buf, buf[send:n])
+	}
+}
+
+// cancelFetchDataCallback fires when the filter withdraws a hydration request
+// — measured cause (see the live test): the request went 60s without
+// progress, reported as CF_CALLBACK_CANCEL_FLAG_IO_TIMEOUT. Stop the download.
+// Nothing is executed in response: a withdrawn request needs no completion,
+// and the filter re-issues the unserved remainder under a NEW transfer key
+// when anyone is still waiting for it.
+func cancelFetchDataCallback(info, params uintptr) uintptr {
+	connKey := *(*int64)(unsafe.Pointer(info + ciConnectionKey))
+	transferKey := *(*int64)(unsafe.Pointer(info + ciTransferKey))
+	flags := *(*uint32)(unsafe.Pointer(params + cpCancelFlags))
+	offset := *(*int64)(unsafe.Pointer(params + cpCancelOffset))
+	length := *(*int64)(unsafe.Pointer(params + cpCancelLength))
+	pv, ok := providers.Load(connKey)
+	if !ok {
+		dbg("CANCEL_FETCH_DATA: no provider for conn=%d", connKey)
+		return 0
+	}
+	stopped := pv.(*provider).cancelFetch(transferKey)
+	dbg("CANCEL_FETCH_DATA flags=0x%x offset=%d length=%d stopped=%v", flags, offset, length, stopped)
 	return 0
 }
 
@@ -860,7 +1223,34 @@ type opParamsTransfer struct {
 	Length           int64
 }
 
-func cfTransfer(connKey, transferKey, offset int64, data []byte) {
+// CF_CALLBACK_PARAMETERS as the NOTIFY_RENAME_COMPLETION callback sees it — a
+// prefix of the real 64-byte union, enough to pin SourcePath's offset.
+type callbackParamsRenameCompletion struct {
+	ParamSize  uint32
+	_          uint32 // union alignment — see opParamsTransfer
+	Flags      uint32
+	_          uint32
+	SourcePath uintptr
+}
+
+// CF_CALLBACK_PARAMETERS as the CANCEL_FETCH_DATA callback sees it. Cancel's
+// own nested union holds LARGE_INTEGERs, so there is a second four bytes of
+// padding after Flags. Exists only to pin cpCancel* in the layout test — the
+// callback reads the fields by offset like its neighbours do.
+type callbackParamsCancelFetchData struct {
+	ParamSize  uint32
+	_          uint32 // outer union alignment — see opParamsTransfer
+	Flags      uint32
+	_          uint32 // Cancel's nested union is 8-aligned
+	FileOffset int64
+	Length     int64
+}
+
+// cfTransfer hands one piece of a hydration request to the filter. Reports
+// whether the filter accepted it: a refusal (most often a dead transfer key
+// after a cancel) leaves a gap the caller must account for rather than keep
+// feeding bytes into.
+func cfTransfer(connKey, transferKey, offset int64, data []byte) bool {
 	oi := operationInfo{Type: cfOperationTypeTransferData, ConnectionKey: connKey, TransferKey: transferKey}
 	oi.StructSize = uint32(unsafe.Sizeof(oi))
 	op := opParamsTransfer{
@@ -873,8 +1263,38 @@ func cfTransfer(connKey, transferKey, offset int64, data []byte) {
 	runtime.KeepAlive(data)
 	if int32(hr) < 0 {
 		dbg("CfExecute(TRANSFER_DATA) offset=%d len=%d -> 0x%08x", offset, len(data), uint32(hr))
+		return false
+	}
+	dbg("CfExecute(TRANSFER_DATA) offset=%d len=%d -> ok", offset, len(data))
+	return true
+}
+
+// cfTransferFail completes a hydration request the provider could not satisfy:
+// a TRANSFER_DATA carrying no data, a failure CompletionStatus, and the length
+// left unserved at offset. That is what turns the caller's blocked open into a
+// prompt error instead of a three-minute wait on the filter's own time-out
+// (measured: 180s before this existed).
+//
+// Buffer is deliberately nil — a failed completion carries no bytes, and
+// cfapi.h only annotates Buffer with the size of Length (it never says a
+// failure needs one). Verified live: the filter accepts the nil buffer and
+// fails the open at once. Also verified end-to-end on the VM (v0.1.0.292):
+// with the server blocked, opening an online-only file fails in 7s and the
+// placeholder is left online-only, rather than hanging for three minutes.
+func cfTransferFail(connKey, transferKey, offset, length int64) {
+	oi := operationInfo{Type: cfOperationTypeTransferData, ConnectionKey: connKey, TransferKey: transferKey}
+	oi.StructSize = uint32(unsafe.Sizeof(oi))
+	op := opParamsTransfer{
+		CompletionStatus: statusUnsuccessful,
+		Offset:           offset,
+		Length:           length,
+	}
+	op.ParamSize = uint32(unsafe.Sizeof(op))
+	hr, _, _ := procCfExecute.Call(uintptr(unsafe.Pointer(&oi)), uintptr(unsafe.Pointer(&op)))
+	if int32(hr) < 0 {
+		dbg("CfExecute(TRANSFER_DATA fail) offset=%d len=%d -> 0x%08x", offset, length, uint32(hr))
 	} else {
-		dbg("CfExecute(TRANSFER_DATA) offset=%d len=%d -> ok", offset, len(data))
+		dbg("CfExecute(TRANSFER_DATA fail) offset=%d len=%d -> ok", offset, length)
 	}
 }
 
@@ -898,7 +1318,16 @@ func readUTF16(ptr uintptr) string {
 // directory being populated. NormalizedPath is volume-relative with NO drive
 // letter (e.g. `\Users\Adam\Desktop\test1\sub`), so we drop the sync root's
 // drive before matching, then strip the sync-root prefix.
+//
+// Tries the anchored match (normalizedRel) first so the two can't diverge;
+// falls back to the old unanchored substring match for whatever it used to
+// accept that normalizedRel's stricter boundary check now rejects. This path
+// only ever feeds FETCH_PLACEHOLDERS population, not a security-relevant
+// decision, so the looser fallback is harmless.
 func relFromNormalized(syncRoot, normalized string) string {
+	if rel, ok := normalizedRel(syncRoot, normalized); ok {
+		return rel
+	}
 	root := syncRoot
 	if len(root) >= 2 && root[1] == ':' {
 		root = root[2:] // "C:\Users\..." -> "\Users\..."
@@ -934,7 +1363,7 @@ func fetchPlaceholdersCallback(info, params uintptr) uintptr {
 		defer close(syncDone)
 		items := p.list(rel)
 		dbg("FETCH_PLACEHOLDERS rel=%q -> %d entries", rel, len(items))
-		cfTransferPlaceholders(connKey, transferKey, items)
+		cfTransferPlaceholders(connKey, transferKey, filepath.Join(p.path, filepath.FromSlash(rel)), items)
 		// Deliberately NOT marked in-sync here. Marking the directory while the
 		// enumeration that triggered this fetch is still in flight makes that
 		// enumeration return EMPTY (measured on the live driver — the first
@@ -945,6 +1374,234 @@ func fetchPlaceholdersCallback(info, params uintptr) uintptr {
 	if experimentSyncFetch {
 		<-syncDone // EXPERIMENT: complete before the callback returns
 	}
+	return 0
+}
+
+// SetHydrateStream installs (nil clears) the streaming hydration function for
+// the mount identified by connKey. While one is installed it serves every
+// FETCH_DATA request — one reader per request — and the byte-slice HydrateFunc
+// passed to Mount is not used at all. Set it right after Mount, before
+// anything can open a placeholder.
+func SetHydrateStream(connKey int64, f HydrateStreamFunc) {
+	pv, ok := providers.Load(connKey)
+	if !ok {
+		return
+	}
+	p := pv.(*provider)
+	p.fetchMu.Lock()
+	p.hydrateStream = f
+	p.fetchMu.Unlock()
+}
+
+// trackFetch registers an in-flight download so CANCEL_FETCH_DATA (and
+// teardown) can stop it, returning the handle its goroutine must pass back to
+// untrackFetch. It reports false — having already cancelled — when the
+// provider is being torn down: a FETCH_DATA that loaded the provider just
+// before Unmount or Disconnect must not start a download that outlives the
+// connection, nor re-create the map cancelFetches just cleared.
+func (p *provider) trackFetch(transferKey int64, cancel context.CancelFunc) (*fetchRequest, bool) {
+	p.fetchMu.Lock()
+	if p.fetchClosed {
+		p.fetchMu.Unlock()
+		cancel()
+		return nil, false
+	}
+	req := &fetchRequest{cancel: cancel}
+	if p.inflight == nil {
+		p.inflight = make(map[int64]*fetchRequest)
+	}
+	p.inflight[transferKey] = req
+	p.fetchMu.Unlock()
+	return req, true
+}
+
+// untrackFetch forgets a finished download — the map must not be allowed to
+// grow forever, since every hydration in the session passes through it. The
+// delete is conditional on the entry still being OURS: if the filter has
+// meanwhile reused the key value for a new request, that successor's entry
+// must survive (see fetchRequest).
+func (p *provider) untrackFetch(transferKey int64, req *fetchRequest) {
+	p.fetchMu.Lock()
+	defer p.fetchMu.Unlock()
+	if p.inflight[transferKey] == req {
+		delete(p.inflight, transferKey)
+	}
+}
+
+// cancelFetch stops the download serving transferKey, if one is still running.
+// Reports whether there was one (a cancel for an already-finished request is
+// normal and not worth a complaint).
+func (p *provider) cancelFetch(transferKey int64) bool {
+	p.fetchMu.Lock()
+	req, ok := p.inflight[transferKey]
+	p.fetchMu.Unlock()
+	if ok {
+		req.cancel()
+	}
+	return ok
+}
+
+// cancelFetches stops every in-flight download and refuses any later one.
+// Unmount and Disconnect call it: past that point the connection key is dead,
+// so a download still running can only burn bandwidth and log rejected
+// transfers. Final, like stopRenames — a provider is never reconnected, Mount
+// builds a new one.
+func (p *provider) cancelFetches() {
+	p.fetchMu.Lock()
+	inflight := p.inflight
+	p.inflight = nil
+	p.fetchClosed = true
+	p.fetchMu.Unlock()
+	for _, req := range inflight {
+		req.cancel()
+	}
+}
+
+// SetRenameHandler installs (nil clears) the function told about completed
+// renames and moves under the mount identified by connKey. The first call
+// with a non-nil fn starts one delivery goroutine for the provider (see
+// runRenameWorker); a later call just swaps the handler the running
+// goroutine calls — it never restarts anything.
+func SetRenameHandler(connKey int64, fn RenameFunc) {
+	pv, ok := providers.Load(connKey)
+	if !ok {
+		return
+	}
+	p := pv.(*provider)
+	p.mu.Lock()
+	p.rename = fn
+	if fn != nil && !p.worker && !p.closed {
+		if p.renames == nil {
+			p.renames = make(chan [2]string, 256)
+		}
+		p.worker = true
+		go p.runRenameWorker()
+	}
+	p.mu.Unlock()
+}
+
+// runRenameWorker delivers queued renames to the CURRENT handler one at a
+// time, in the order the filter reported them, until stopRenames closes the
+// queue. Reading p.rename under mu on every iteration (rather than once at
+// startup) is what lets a later SetRenameHandler swap the handler without
+// restarting this goroutine. One worker per provider bounds concurrency to
+// exactly one in-flight call, so a same-item double-rename or an Explorer
+// multi-select move can't be delivered out of order or spawn unbounded
+// goroutines — both measured problems with the previous "go fn(...)" per
+// event. Found in review, 2026-09-14.
+func (p *provider) runRenameWorker() {
+	for pair := range p.renames {
+		p.mu.Lock()
+		fn := p.rename
+		p.mu.Unlock()
+		if fn != nil {
+			fn(pair[0], pair[1])
+		}
+	}
+}
+
+// enqueueRename hands a completed rename to the provider's delivery queue
+// with a non-blocking send: the filter's callback thread must never block,
+// so a full queue drops the event (logging it) rather than waiting, and a
+// provider with no handler installed yet (or already stopped) drops it
+// silently. Factored out of renameCompletionCallback so a unit test can
+// drive it directly, without the live driver.
+func (p *provider) enqueueRename(old, new string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.renames == nil {
+		return
+	}
+	select {
+	case p.renames <- [2]string{old, new}:
+	default:
+		dbg("NOTIFY_RENAME_COMPLETION: queue full, dropped %q -> %q", old, new)
+	}
+}
+
+// stopRenames shuts down rename delivery for good: Unmount and Disconnect
+// both call this (before dropping the provider from the registry) so the
+// worker goroutine, if any, exits instead of leaking past the connection's
+// lifetime.
+func (p *provider) stopRenames() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return
+	}
+	p.closed = true
+	if p.renames != nil {
+		close(p.renames)
+	}
+}
+
+// normalizedRel maps a callback's NormalizedPath (volume-relative, no drive
+// letter, e.g. `\Users\Adam\NimboRoot\a\x`) — or a full path — to the
+// sync-root-relative forward-slash path. ok is false for a path outside the
+// root, including a sibling whose name merely starts with the root's.
+//
+// The match is ANCHORED: root and input both have any leading "X:" drive
+// stripped, then the input must have the root as a genuine PREFIX
+// (strings.HasPrefix), not merely contain it anywhere. An unanchored
+// strings.Index (the original implementation) let root `D:\Nimbo` match
+// input `\Users\Adam\Nimbo\x.bin` (the root's name buried mid-path) or
+// `D:\Backup\Nimbo\x.bin` (a different tree that happens to contain a `Nimbo`
+// component) — both wrongly accepted as "inside the root". Found in review,
+// 2026-09-14.
+func normalizedRel(root, normalized string) (string, bool) {
+	r := root
+	if len(r) >= 2 && r[1] == ':' {
+		r = r[2:]
+	}
+	p := normalized
+	if len(p) >= 2 && p[1] == ':' {
+		p = p[2:]
+	}
+	lp, lr := strings.ToLower(p), strings.ToLower(r)
+	if !strings.HasPrefix(lp, lr) {
+		return "", false
+	}
+	rest := p[len(r):]
+	if rest != "" && rest[0] != '\\' {
+		return "", false
+	}
+	return strings.Trim(strings.ReplaceAll(rest, `\`, "/"), "/"), true
+}
+
+// renameCompletionCallback fires after the filter has applied a rename or a
+// move of any item inside the sync root — including a move between
+// directories, which ReadDirectoryChangesW reports only as REMOVED + ADDED
+// (issue #7: that pair became a server DELETE of the source). The work runs
+// on a goroutine so the filter's thread returns at once. Moves that cross the
+// root boundary are ignored here; the watcher's own events cover them.
+//
+// Two measured facts (2026-09-14, Windows 10.0.26200), neither documented in
+// cfapi.h: the filter does NOT report renames made by the connected
+// provider's own process (only renames from another process arrive here),
+// and it does NOT report renames of plain (non-placeholder) files or
+// directories — only placeholders. Both gaps are already covered elsewhere:
+// Nimbo's own renames are down-sync pulls the watcher already suppresses,
+// and the watcher's REMOVED+ADDED pairing by placeholder identity covers
+// plain items.
+func renameCompletionCallback(info, params uintptr) uintptr {
+	connKey := *(*int64)(unsafe.Pointer(info + ciConnectionKey))
+	newNorm := readUTF16(*(*uintptr)(unsafe.Pointer(info + ciNormalizedPath)))
+	oldNorm := readUTF16(*(*uintptr)(unsafe.Pointer(params + cpRenameSourcePath)))
+	dbg("NOTIFY_RENAME_COMPLETION conn=%d %q -> %q", connKey, oldNorm, newNorm)
+	pv, ok := providers.Load(connKey)
+	if !ok {
+		return 0
+	}
+	p := pv.(*provider)
+	oldRel, okOld := normalizedRel(p.path, oldNorm)
+	newRel, okNew := normalizedRel(p.path, newNorm)
+	if !okOld || !okNew || oldRel == "" || newRel == "" {
+		dbg("NOTIFY_RENAME_COMPLETION: outside the root, ignored")
+		return 0
+	}
+	oldAbs := filepath.Join(p.path, filepath.FromSlash(oldRel))
+	newAbs := filepath.Join(p.path, filepath.FromSlash(newRel))
+	p.enqueueRename(oldAbs, newAbs)
 	return 0
 }
 
@@ -973,9 +1630,52 @@ type opParamsTransferPlaceholders struct {
 // populated so the shell stops re-requesting it) is 0x2.
 const cfOpTransferPlaceholdersFlagDisableOnDemandPopulation = 0x00000002
 
-// cfTransferPlaceholders delivers items and reports whether the transfer was
-// accepted, so the caller can mark the directory in-sync only on success.
-func cfTransferPlaceholders(connKey, transferKey int64, items []PlaceholderInfo) bool {
+// cfTransferPlaceholders delivers items and reports whether the whole delivery
+// took. dir is the local directory being populated.
+//
+// The return value is informational: the sole caller
+// (fetchPlaceholdersCallback) discards it, because the directory is
+// deliberately NOT marked in-sync there, so a failure shows up as the debug
+// lines below and heals through reconcile's pull rather than through the
+// caller. Keep that in mind before reading a "false" as if anything acted on
+// it.
+//
+// Two things are taken out of the batch before it is handed to the filter:
+//   - entries that already exist locally. The shell re-asks the ROOT to
+//     populate after every (re)connect, and a directory's listing always
+//     includes what is already there; the kernel would answer ALREADY_EXISTS
+//     per entry, but an existing entry with a long identity poisons the
+//     batch just like a new one (measured), and the reporter's stranded
+//     files were root additions made while Nimbo was closed, created by
+//     exactly such a re-fetch.
+//   - entries with a long identity (longIdentityBytes). They are created
+//     alone through CfCreatePlaceholders, which is allowed while the
+//     enumeration is pending, and the transfer then carries the rest.
+func cfTransferPlaceholders(connKey, transferKey int64, dir string, items []PlaceholderInfo) bool {
+	longOK := true
+	if items != nil {
+		fresh := items[:0:0]
+		for _, it := range items {
+			if _, serr := os.Lstat(filepath.Join(dir, it.Name)); serr == nil || !os.IsNotExist(serr) {
+				continue // already there (or unreadable): not ours to create
+			}
+			fresh = append(fresh, it)
+		}
+		var long []PlaceholderInfo
+		items, long = splitLongIdentities(fresh)
+		if items == nil {
+			// Everything was filtered out or created alone: the listing still
+			// SUCCEEDED, and nil below means "listing failed, do not mark the
+			// directory populated" — the shell would then re-ask forever.
+			items = []PlaceholderInfo{}
+		}
+		for _, it := range long {
+			if cerr := CreatePlaceholders(dir, []PlaceholderInfo{it}); cerr != nil {
+				dbg("TRANSFER_PLACEHOLDERS: long-identity entry %q created alone -> %v", it.Name, cerr)
+				longOK = false
+			}
+		}
+	}
 	arr, names, ids, err := buildPlaceholders(items)
 	if err != nil {
 		dbg("TRANSFER_PLACEHOLDERS build error: %v", err)
@@ -1033,11 +1733,17 @@ func cfTransferPlaceholders(connKey, transferKey int64, items []PlaceholderInfo)
 			dbg("TRANSFER_PLACEHOLDERS entry %q -> 0x%08x (not created)", name, uint32(arr[i].Result))
 		}
 	}
-	// Success for the caller means the whole delivery took: a failed entry
-	// leaves the directory partially populated with the shell re-requesting it,
-	// and a directory in that state must NOT be marked in-sync (an in-sync
-	// directory is never asked to populate — see TestInSyncDirStillPopulates).
-	return int32(hr) >= 0 && entriesOK
+	// A failed entry leaves the directory partially populated with the shell
+	// re-requesting it, and a directory in that state must NOT be marked
+	// in-sync (an in-sync directory is never asked to populate — see
+	// TestInSyncDirStillPopulates). Nothing does that on this path today, so
+	// say the long-alone failure out loud: it is the one outcome the
+	// per-entry results above cannot show, since such an entry was never in
+	// the array.
+	if !longOK {
+		dbg("TRANSFER_PLACEHOLDERS: transfer incomplete: a long-identity entry failed; the shell may re-ask")
+	}
+	return int32(hr) >= 0 && entriesOK && longOK
 }
 
 // --- Write-back: detect user changes + mark synced after upload ---
@@ -1080,11 +1786,32 @@ func findAttrTag(path string) (attrs, tag uint32, err error) {
 type Change struct {
 	IsDir       bool
 	NeedsUpload bool // user created/modified content that should be pushed up
+	// Placeholder reports whether the item is a cloud placeholder at all (a
+	// plain file or directory is not).
+	Placeholder bool
+	// InSync is the RAW in-sync bit, which NeedsUpload deliberately no longer
+	// echoes: the filter clears it for a rename as readily as for an edit, so
+	// a clean placeholder that was merely moved reads InSync == false with
+	// NeedsUpload == false. Callers that need to tell that state apart — to
+	// restore the bit rather than upload — look here.
+	InSync bool
 }
 
-// Inspect classifies path for write-back: a dirty placeholder (user edited a
-// hydrated file) or a brand-new non-placeholder file/dir needs uploading; a
-// clean in-sync placeholder (incl. one we just hydrated) does not.
+// Inspect classifies path for write-back: a placeholder holding unsynced local
+// content (the user edited a hydrated file) or a brand-new non-placeholder
+// file/dir needs uploading; a clean placeholder — including one we just
+// hydrated, and one another process just renamed — does not.
+//
+// The in-sync bit is a PRE-FILTER here, not the verdict. Measured live
+// 2026-09-15 (Windows 10.0.26200): the cloud filter clears a placeholder's
+// in-sync bit on any rename or move by another process, content untouched, and
+// a cross-directory move also delivers FILE_ACTION_MODIFIED for the
+// destination — so reading the bit as "dirty" made every move of an
+// online-only stub schedule an upload of a file holding no local data, which
+// parked the just-moved server copy as a conflicted copy. For a file that is
+// not in sync, the real question is whether it holds local bytes the server
+// has not got, and only unsyncedLocalData can answer that. The extra metadata
+// open costs nothing in steady state: an in-sync file never reaches it.
 func Inspect(path string) (Change, error) {
 	attrs, tag, err := findAttrTag(path)
 	if err != nil {
@@ -1098,21 +1825,27 @@ func Inspect(path string) (Change, error) {
 	}
 	isPlaceholder := state&cfPlaceholderStatePlaceholder != 0
 	inSync := state&cfPlaceholderStateInSync != 0
-	var need bool
-	if isDir {
+	ch := Change{IsDir: isDir, Placeholder: isPlaceholder, InSync: inSync}
+	switch {
+	case isDir:
 		// Our directory placeholders are deliberately NOT in-sync (that's how
 		// lazy FETCH_PLACEHOLDERS population is triggered), so "not in sync" must
 		// NOT be read as a change. Only a non-placeholder dir is a folder the
 		// user just created and needs MKCOL.
-		need = !isPlaceholder
-	} else {
-		// A file needs upload when it's non-placeholder (freshly created) or a
-		// placeholder whose in-sync flag was cleared (edited after hydration).
-		// A clean in-sync placeholder — including one we just hydrated — is
-		// skipped.
-		need = !(isPlaceholder && inSync)
+		ch.NeedsUpload = !isPlaceholder
+	case !isPlaceholder:
+		ch.NeedsUpload = true // never uploaded: all of it is local-only content
+	case inSync:
+		ch.NeedsUpload = false
+	default:
+		// Not in sync: an edit, or just a rename. Ask the data.
+		mod, merr := unsyncedLocalData(path)
+		// Unreadable (a sharing violation, say) — keep the old, conservative
+		// answer. A needless upload retries harmlessly; a missed one is an
+		// edit the server never hears about.
+		ch.NeedsUpload = merr != nil || mod
 	}
-	return Change{IsDir: isDir, NeedsUpload: need}, nil
+	return ch, nil
 }
 
 // MarkInSync records that path now matches the server: a regular file/dir is
@@ -1124,15 +1857,11 @@ func MarkInSync(path string, identity []byte) error {
 	if err != nil {
 		return err
 	}
-	flag := uint32(windows.FILE_FLAG_BACKUP_SEMANTICS) // needed to open directories
-	pathW, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return err
-	}
-	h, err := windows.CreateFile(pathW,
-		windows.GENERIC_READ|windows.GENERIC_WRITE,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil, windows.OPEN_EXISTING, flag, 0)
+	// openForCloud's attrs-only handle is enough for both branches below,
+	// CfSetInSyncState on an existing placeholder and CfConvertToPlaceholder
+	// on a plain file — verified live 2026-09-14 even when the plain file
+	// carries real local content (the convert leaves the bytes untouched).
+	h, err := openForCloud(path)
 	if err != nil {
 		return err
 	}
@@ -1361,14 +2090,21 @@ const (
 // UpdateIdentity rewrites a placeholder's file identity (used after a rename so
 // hydration fetches the file from its new remote path) and keeps it in-sync.
 func UpdateIdentity(path string, identity []byte) error {
-	pathW, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return err
-	}
-	h, err := windows.CreateFile(pathW,
-		windows.GENERIC_READ|windows.GENERIC_WRITE,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	return updateIdentity(path, identity, cfUpdateFlagMarkInSync)
+}
+
+// UpdateIdentityKeepState rewrites the identity and leaves the placeholder's
+// in-sync state exactly as it was. For a file with an edit still waiting to
+// upload, MARK_IN_SYNC is a lie the rest of the system then acts on: the
+// write-back gate reads it as "nothing to send" and the next refresh
+// dehydrates the edit away. Renaming such a file has to repoint it without
+// touching that bit.
+func UpdateIdentityKeepState(path string, identity []byte) error {
+	return updateIdentity(path, identity, 0 /* CF_UPDATE_FLAG_NONE */)
+}
+
+func updateIdentity(path string, identity []byte, flags uintptr) error {
+	h, err := openForCloud(path)
 	if err != nil {
 		return err
 	}
@@ -1383,7 +2119,7 @@ func UpdateIdentity(path string, identity []byte) error {
 		0, // FsMetadata (unchanged)
 		idPtr, uintptr(len(identity)),
 		0, 0, // no dehydrate ranges
-		uintptr(cfUpdateFlagMarkInSync),
+		flags,
 		uintptr(unsafe.Pointer(&usn)),
 		0, // Overlapped
 	)
@@ -1392,6 +2128,200 @@ func UpdateIdentity(path string, identity []byte) error {
 		return fmt.Errorf("CfUpdatePlaceholder: 0x%08x", uint32(hr))
 	}
 	return nil
+}
+
+// CF_PLACEHOLDER_STANDARD_INFO (cfapi.h 10.0.26100). Offsets verified by
+// compiling the header with MSVC 14.50 (2026-09-14): PinState@32,
+// InSyncState@36, FileId@40, SyncRootFileId@48, FileIdentityLength@56,
+// FileIdentity@60, sizeof 64. The identity bytes continue past the struct in
+// the same buffer.
+type placeholderStandardInfo struct {
+	OnDiskDataSize     int64
+	ValidatedDataSize  int64
+	ModifiedDataSize   int64
+	PropertiesSize     int64
+	PinState           uint32
+	InSyncState        uint32
+	FileId             int64
+	SyncRootFileId     int64
+	FileIdentityLength uint32
+	FileIdentity       [1]byte
+}
+
+// ErrNotPlaceholder reports that a path is a plain file or directory, not a
+// cloud placeholder (HRESULT_FROM_WIN32(ERROR_NOT_A_CLOUD_FILE)).
+var ErrNotPlaceholder = errors.New("not a cloud placeholder")
+
+// ErrIsDirectory reports that a call refused a DIRECTORY placeholder. Only
+// SetInSync returns it: the filter couples a directory's in-sync state to its
+// population, so a directory marked in-sync enumerates EMPTY forever
+// (measured live — TestInSyncDirStillPopulates), which is why ours are
+// created not in sync in the first place.
+var ErrIsDirectory = errors.New("cloud placeholder is a directory")
+
+const (
+	cfPlaceholderInfoStandard = 1          // CF_PLACEHOLDER_INFO_STANDARD
+	hrNotACloudFile           = 0x80070178 // ERROR_NOT_A_CLOUD_FILE (376)
+)
+
+// standardInfo reads CF_PLACEHOLDER_STANDARD_INFO for path into a buffer big
+// enough to hold the identity that follows the fixed header (the platform caps
+// it at 4 KB). ErrNotPlaceholder for a plain file or directory.
+func standardInfo(path string) ([]byte, error) {
+	h, err := openForCloud(path)
+	if err != nil {
+		return nil, err
+	}
+	defer windows.CloseHandle(h)
+	buf := make([]byte, unsafe.Sizeof(placeholderStandardInfo{})+4096)
+	var ret uint32
+	hr, _, _ := procCfGetPlaceholderInfo.Call(
+		uintptr(h),
+		uintptr(cfPlaceholderInfoStandard),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+		uintptr(unsafe.Pointer(&ret)),
+	)
+	runtime.KeepAlive(buf)
+	if uint32(hr) == hrNotACloudFile {
+		return nil, ErrNotPlaceholder
+	}
+	if int32(hr) < 0 {
+		return nil, fmt.Errorf("CfGetPlaceholderInfo: 0x%08x", uint32(hr))
+	}
+	return buf, nil
+}
+
+// PlaceholderModified reports whether a file holds LOCAL content the server
+// has not got. A plain (non-placeholder) file counts as modified: it is
+// content that was never uploaded.
+//
+// This, NOT the in-sync bit, is what "dirty" has to mean around a rename.
+// Measured live 2026-09-15 on Windows 10.0.26200
+// (TestRenameClearsInSyncButNotModifiedData): the cloud filter CLEARS a
+// placeholder's in-sync bit whenever another process renames or moves it,
+// content untouched — an online-only stub moved between folders went
+// state 0x39 -> 0x31 (InSyncState 1 -> 0) with ModifiedDataSize still 0, so
+// Inspect reported NeedsUpload for a file with no local data at all. A
+// hydrated file written locally went the same way on the bit but with
+// ModifiedDataSize 4096 (the whole file), and kept that across a move. So the
+// in-sync bit says "renamed or edited"; the data says "edited".
+// Treating the first as the second made every move of a clean stub schedule
+// an upload, which parked the just-moved server copy as a conflicted copy.
+func PlaceholderModified(path string) (bool, error) {
+	return unsyncedLocalData(path)
+}
+
+// unsyncedLocalData is the one definition of "this file holds bytes the server
+// has not got", shared by Inspect and PlaceholderModified.
+//
+// ModifiedDataSize answers it for every case but one, measured live
+// 2026-09-15 on Windows 10.0.26200 (all sizes in bytes, of a 4096-byte file):
+//
+//	hydrated, clean               OnDisk 4096 Valid 4096 Modified 0    InSync 1
+//	hydrated, 10 bytes written    OnDisk 4096 Valid 0    Modified 4096 InSync 0
+//	hydrated, truncated to 100    OnDisk 100  Valid 0    Modified 100  InSync 0
+//	hydrated, O_TRUNC + rewrite   OnDisk 11   Valid 0    Modified 11   InSync 0
+//	hydrated, TRUNCATED TO ZERO   OnDisk 0    Valid 0    Modified 0    InSync 0  <-- blind spot
+//	hydrated, clean, then moved   OnDisk 4096 Valid 4096 Modified 0    InSync 0
+//	online-only stub, then moved  OnDisk 0    Valid 0    Modified 0    InSync 0
+//	after MarkInSync (either one) Modified back to 0
+//
+// Truncating a hydrated file to exactly ZERO leaves ModifiedDataSize 0 — the
+// value was re-read at 200ms, 1s and 3s and after a subsequent move, and never
+// moved off 0. A file in that state is indistinguishable, from the placeholder
+// info alone, from an empty in-sync placeholder whose bit a rename cleared. So
+// the tie is broken in the direction that cannot lose data: an EMPTY file whose
+// data is fully local (no RECALL_ON_DATA_ACCESS) and whose in-sync bit is clear
+// counts as unsynced content. The cost when the guess is wrong is a redundant
+// upload of a zero-byte file; the cost of guessing the other way is a
+// truncation silently discarded, and then undone by the next dehydrate.
+//
+// Online-only stubs are untouched by that tie-break (they keep
+// RECALL_ON_DATA_ACCESS), which is what makes it safe: the move-of-a-stub case
+// this whole predicate exists for still reads clean.
+func unsyncedLocalData(path string) (bool, error) {
+	buf, err := standardInfo(path)
+	if errors.Is(err, ErrNotPlaceholder) {
+		return true, nil // never uploaded: all of it is local-only content
+	}
+	if err != nil {
+		return false, err
+	}
+	info := (*placeholderStandardInfo)(unsafe.Pointer(&buf[0]))
+	if info.ModifiedDataSize > 0 {
+		return true, nil
+	}
+	if info.InSyncState != 0 || info.OnDiskDataSize != 0 {
+		return false, nil
+	}
+	// Empty on disk: either a truncated-to-zero file (data present, nothing in
+	// it) or a stub (no data present at all). Only the attributes tell them
+	// apart. A directory is never either.
+	attrs, _, aerr := findAttrTag(path)
+	if aerr != nil || attrs&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
+		return false, nil
+	}
+	return attrs&fileAttrRecallOnDataAccess == 0, nil
+}
+
+// SetInSync restores a placeholder's in-sync state and nothing else — no
+// identity rewrite, no convert, no data access. It is the repair for a bit the
+// cloud filter cleared on a rename or move that turned out to carry no local
+// change: without it the item (and every ancestor folder) wears Explorer's
+// "sync pending" arrows forever, because nothing else will ever look at it
+// again. ErrNotPlaceholder if path is a plain file, ErrIsDirectory for any
+// directory at all (see the sentinel).
+//
+// Never call this on a file holding unsynced local content: the bit is what
+// keeps that upload alive, and clearing the debt without paying it lets the
+// next refresh or "free up space" dehydrate the only copy of the edit away.
+func SetInSync(path string) error {
+	attrs, _, err := findAttrTag(path)
+	if err != nil {
+		return err
+	}
+	// A DIRECTORY never gets the bit from here. The filter couples a
+	// directory's in-sync state to its population, so one marked in-sync
+	// enumerates EMPTY forever (TestInSyncDirStillPopulates) — the reason our
+	// directory placeholders are created not in sync at all. Refusing it in
+	// the call means no future caller has to remember.
+	if attrs&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
+		return ErrIsDirectory
+	}
+	h, err := openForCloud(path)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	var usn int64
+	hr, _, _ := procCfSetInSyncState.Call(uintptr(h), uintptr(cfInSyncStateInSync), uintptr(cfSetInSyncFlagNone), uintptr(unsafe.Pointer(&usn)))
+	if uint32(hr) == hrNotACloudFile {
+		return ErrNotPlaceholder
+	}
+	if int32(hr) < 0 {
+		return fmt.Errorf("CfSetInSyncState: 0x%08x", uint32(hr))
+	}
+	return nil
+}
+
+// PlaceholderIdentity returns the file identity stamped on a placeholder —
+// for Nimbo's placeholders, the RAW server path hydration fetches from. It is
+// what tells a placeholder that was MOVED to a new folder apart from a new
+// file: its identity still names the old path. ErrNotPlaceholder for a plain
+// item.
+func PlaceholderIdentity(path string) ([]byte, error) {
+	buf, err := standardInfo(path)
+	if err != nil {
+		return nil, err
+	}
+	info := (*placeholderStandardInfo)(unsafe.Pointer(&buf[0]))
+	n := int(info.FileIdentityLength)
+	start := int(unsafe.Offsetof(info.FileIdentity))
+	if n < 0 || start+n > len(buf) {
+		return nil, fmt.Errorf("CfGetPlaceholderInfo: identity length %d out of range", n)
+	}
+	return append([]byte(nil), buf[start:start+n]...), nil
 }
 
 // --- Pin / free-up-space (CfSetPinState + CfDehydratePlaceholder) ---
@@ -1404,15 +2334,34 @@ const (
 	cfDehydrateFlagNone   = 0
 )
 
-// openForCloud opens a handle suitable for cloud-state operations (BACKUP_SEMANTICS
-// so directories can be opened too).
+// openForCloud opens a handle suitable for cloud-STATE (metadata) operations —
+// BACKUP_SEMANTICS so directories can be opened too, and deliberately
+// ATTRIBUTES-ONLY access, not data access. Measured live 2026-09-14 (Windows
+// 10.0.26200): opening a dehydrated placeholder for ANY data access —
+// GENERIC_READ alone is enough, GENERIC_WRITE isn't required — makes the
+// cloud filter hydrate it on the open itself, before any cfapi call runs and
+// whether or not one follows. FILE_READ_ATTRIBUTES|FILE_WRITE_ATTRIBUTES never
+// triggers this, and CfGetPlaceholderInfo, CfSetPinState, CfUpdatePlaceholder,
+// CfConvertToPlaceholder (even converting a plain file with real local
+// content), CfDehydratePlaceholder, CfHydratePlaceholder and
+// CfRevertPlaceholder all accept a handle opened this way
+// (FILE_FLAG_OPEN_REPARSE_POINT made no measured difference either way, so
+// it's omitted). Before this, every metadata-only call here on an
+// online-only file silently downloaded the whole file first as a side effect
+// of the open.
+//
+// CfRevertPlaceholder was the last of those confirmed (2026-09-15, the
+// revert leg of TestMetadataOpensDoNotHydrate): Microsoft's docs contradict
+// themselves about it — the CfRevertPlaceholder page says an attribute
+// handle suffices, a remark elsewhere mentions WRITE_DATA — and live it
+// reverts a hydrated placeholder through this handle with its data intact.
 func openForCloud(path string) (windows.Handle, error) {
 	pathW, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, err
 	}
 	return windows.CreateFile(pathW,
-		windows.GENERIC_READ|windows.GENERIC_WRITE,
+		windows.FILE_READ_ATTRIBUTES|windows.FILE_WRITE_ATTRIBUTES,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
 }
@@ -1469,11 +2418,16 @@ func SetPinState(path string, pinned, recurse bool) error {
 // placeholder), freeing disk space. Only valid on files; a no-op/err on an
 // already-online-only file is harmless to ignore.
 func Dehydrate(path string) error {
-	// Already dehydrated = done. This guard is NOT an optimisation:
-	// CfDehydratePlaceholder on a dataless placeholder makes the filter FETCH
-	// the full content first and then discard it (measured live,
-	// TestDehydrateAlreadyDehydratedDoesNotFetch) — so a blind re-dehydrate of
-	// a freed tree re-downloads every file just to throw it away.
+	// Already dehydrated = done. This guard is NOT an optimisation: skipping it
+	// used to make the filter FETCH the full content first and then discard it
+	// (measured live, TestDehydrateAlreadyDehydratedDoesNotFetch) — but the
+	// culprit was opening the handle via openForCloud with data access
+	// (GENERIC_READ|GENERIC_WRITE), which itself hydrated the file before
+	// CfDehydratePlaceholder ever ran; it was never CfDehydratePlaceholder
+	// refetching a dataless placeholder. openForCloud is attrs-only now (see
+	// its doc comment), so the open alone no longer re-downloads — this guard
+	// still saves that open (and the round trip through cfapi) on files that
+	// don't need it, so it stays.
 	if attrs, _, aerr := findAttrTag(path); aerr == nil && attrs&0x400000 != 0 {
 		return nil // RECALL_ON_DATA_ACCESS: no local data to drop
 	}
@@ -1488,6 +2442,92 @@ func Dehydrate(path string) error {
 		return fmt.Errorf("CfDehydratePlaceholder: 0x%08x", uint32(hr))
 	}
 	return nil
+}
+
+// FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: the placeholder has no local data —
+// the online-only state Explorer draws with the cloud glyph.
+const fileAttrRecallOnDataAccess = 0x00400000
+
+const cfHydrateFlagNone = 0 // CF_HYDRATE_FLAG_NONE
+
+// Hydrate downloads a placeholder's full content through the provider (the
+// same FETCH_DATA path an application read takes), leaving a hydrated
+// placeholder behind. A no-op on a file that already has its data.
+func Hydrate(path string) error {
+	h, err := openForCloud(path)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	// StartingOffset 0, Length -1 (to EOF), passed by value as LARGE_INTEGER —
+	// the same convention Dehydrate uses.
+	hr, _, _ := procCfHydratePlaceholder.Call(uintptr(h), 0, ^uintptr(0), uintptr(cfHydrateFlagNone), 0)
+	if int32(hr) < 0 {
+		return fmt.Errorf("CfHydratePlaceholder: 0x%08x", uint32(hr))
+	}
+	return nil
+}
+
+// PinnedDehydrated reports whether path is a FILE placeholder the user pinned
+// ("Always keep on this device") that still has no local data — the state
+// Explorer shows as "sync pending" until somebody downloads it. Directories
+// carry the pin only as the recursive preference marker and never qualify.
+func PinnedDehydrated(path string) bool {
+	attrs, tag, err := findAttrTag(path)
+	if err != nil || attrs&fileAttrDirectory != 0 {
+		return false
+	}
+	if attrs&fileAttrPinned == 0 || attrs&fileAttrRecallOnDataAccess == 0 {
+		return false
+	}
+	r1, _, _ := procCfGetPlaceholderStateFromAttrTag.Call(uintptr(attrs), uintptr(tag))
+	state := uint32(r1)
+	return state != cfPlaceholderStateInvalid && state&cfPlaceholderStatePlaceholder != 0
+}
+
+// DirPopulated reports whether a DIRECTORY already holds everything the server
+// has for it — i.e. whether an empty listing on disk means "empty" or "not
+// fetched yet".
+//
+// A directory placeholder is created lazily: the shell issues
+// FETCH_PLACEHOLDERS the first time it is opened, and the transfer that answers
+// passes DISABLE_ON_DEMAND_POPULATION whenever the listing SUCCEEDED — zero
+// entries included. That clears FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS from the
+// directory and the flag is permanent: the shell never asks again. So a
+// directory that was populated EMPTY looks exactly like one that was never
+// populated if you only count its entries, and anything the server adds inside
+// it afterwards has nobody left to fetch it — which is why reconcile has to
+// ask this question instead (measured on the VM, build 0.1.0.284: a populated
+// /Notes at attrs 0x100410 never showed a subfolder added on another device).
+//
+// A plain directory has no such state and is always populated: everything in
+// it is real. A non-directory answers false — there is nothing to populate.
+// FindFirstFile only, like the other attribute probes: no handle, no open, and
+// nothing that could hydrate anything.
+func DirPopulated(path string) (bool, error) {
+	attrs, _, err := findAttrTag(path)
+	if err != nil {
+		return false, err
+	}
+	if attrs&fileAttrDirectory == 0 {
+		return false, nil
+	}
+	return attrs&fileAttrRecallOnDataAccess == 0, nil
+}
+
+// HydrateIfPinned completes the pin contract for one file: Explorer's own
+// verb hydrates as it pins, but Nimbo's context-menu entry and pins applied
+// while Nimbo wasn't running only set the attribute (issue #7). Returns true
+// when it downloaded the file.
+func HydrateIfPinned(path string) (bool, error) {
+	if !PinnedDehydrated(path) {
+		return false, nil
+	}
+	if err := Hydrate(path); err != nil {
+		return false, err
+	}
+	ShellNotifyUpdated(path)
+	return true, nil
 }
 
 // RefreshPlaceholder updates an in-sync placeholder to a changed server version:

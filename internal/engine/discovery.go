@@ -90,10 +90,18 @@ type ScanCheckpoint interface {
 // baseline prune fails SAFE on a stale etag (it replays the baseline); a
 // checkpoint hit replays an old server listing, so it must not run where the
 // invariant is weak.
+//
+// onMount / onMountKnown say whether the directory itself sits on a share or
+// mount (per its parent's listing), which is what its children are compared
+// against to find a mount ROOT. Carried on the item rather than re-read from the
+// listing because a cached listing holds children only. The root is the one
+// directory nobody listed: its status comes from its own row, when present.
 type scanItem struct {
-	dir     string
-	etag    string
-	noCache bool
+	dir          string
+	etag         string
+	noCache      bool
+	onMount      bool
+	onMountKnown bool
 }
 
 // RemoteScan walks the remote tree under root (a files-root-relative path; ""
@@ -164,6 +172,17 @@ func RemoteScan(ctx context.Context, c PropFinder, root string, opts ScanOpts) (
 			}
 			return
 		}
+		// The root's own status is only knowable from its own row (nobody listed
+		// its parent). Absent that row, its children are never marked as mount
+		// roots: "unknown" must never read as "not on a mount".
+		if !it.onMountKnown {
+			for _, e := range entries {
+				if strings.Trim(e.Path, "/") == it.dir {
+					it.onMount, it.onMountKnown = e.OnMount(), true
+					break
+				}
+			}
+		}
 		for _, e := range entries {
 			full := strings.Trim(e.Path, "/")
 			if full == it.dir {
@@ -194,6 +213,7 @@ func RemoteScan(ctx context.Context, c PropFinder, root string, opts ScanOpts) (
 				LastModified: e.LastModified,
 				SHA1:         parseChecksumSHA1(e.Checksums),
 				ReadOnly:     e.ServerReadOnly(),
+				MountRoot:    e.OnMount() && it.onMountKnown && !it.onMount,
 				Lock:         e.Lock,
 				LockKnown:    true, // straight off a listing, so Lock is authoritative
 			}
@@ -204,9 +224,11 @@ func RemoteScan(ctx context.Context, c PropFinder, root string, opts ScanOpts) (
 				addBaselineSubtree(out, base, childrenOf, rel) // unchanged subtree — reuse baseline
 			} else {
 				queue = append(queue, scanItem{
-					dir:     full,
-					etag:    e.ETag,
-					noCache: it.noCache || strings.Contains(e.Permissions, "M"),
+					dir:          full,
+					etag:         e.ETag,
+					noCache:      it.noCache || strings.Contains(e.Permissions, "M"),
+					onMount:      e.OnMount(),
+					onMountKnown: true,
 				})
 				pending++
 			}
@@ -285,11 +307,12 @@ func addBaselineSubtree(out map[string]RemoteState, base map[string]BaselineStat
 	for _, child := range childrenOf[prefix] {
 		b := base[child]
 		out[child] = RemoteState{
-			Path:   child,
-			IsDir:  b.IsDir,
-			ETag:   b.RemoteETag,
-			FileID: b.RemoteFileID,
-			Size:   b.LocalSize, // sizes match at sync time; good enough for planning
+			Path:      child,
+			IsDir:     b.IsDir,
+			ETag:      b.RemoteETag,
+			FileID:    b.RemoteFileID,
+			Size:      b.LocalSize, // sizes match at sync time; good enough for planning
+			MountRoot: b.MountRoot, // nobody re-read the permissions; keep what was recorded
 		}
 		if b.IsDir {
 			addBaselineSubtree(out, base, childrenOf, child)

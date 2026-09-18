@@ -13,8 +13,11 @@
   type Blocked = { abs: string; path: string; reason: string; ext: string; escapable: boolean; escaping: boolean };
   type Lock = { path: string; owner: string; summary: string; ownerType: number; since: string; account: string };
   type Trash = { href: string; name: string; originalLocation: string; deletedAt: string; size: number; isDir: boolean };
+  // A folder that stopped being shared with the user (or whose storage was
+  // unmounted): the local copy was kept and parked, and awaits a decision.
+  type Detached = { localDir: string; rel: string; name: string; localPath: string; movedOut: boolean; at: string };
 
-  let tab = $state<"activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "trash">("activity");
+  let tab = $state<"activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "detached" | "trash">("activity");
   let activity = $state<Activity[]>([]);
   let conflicts = $state<Conflict[]>([]);
   let notifs = $state<Notif[]>([]);
@@ -24,6 +27,8 @@
   let trash = $state<Trash[]>([]);
   let trashBusy = $state(false);
   let otherAttn = $state<OtherAttention[]>([]);
+  let detached = $state<Detached[]>([]);
+  let detachedBusy = $state("");
 
   async function loadActivity() { activity = (await App.RecentActivity()) ?? []; }
   async function loadConflicts() {
@@ -47,8 +52,25 @@
     lockingAvailable = !!d?.lockingAvailable;
   }
   async function loadTrash() { trashBusy = true; trash = (await App.TrashList()) ?? []; trashBusy = false; }
-  function loadAll() { loadActivity(); loadConflicts(); loadNotifs(); loadBlocked(); loadLocks(); }
+  async function loadDetached() { detached = (await App.DetachedFolders()) ?? []; }
+  function loadAll() { loadActivity(); loadConflicts(); loadNotifs(); loadBlocked(); loadLocks(); loadDetached(); }
   loadAll();
+
+  // The user's decision for a kept copy. "move" first asks where; the folder
+  // must be outside every sync folder, which the engine enforces.
+  const dkey = (d: Detached) => d.localDir + NL + d.rel;
+  async function resolveDetached(d: Detached, choice: "keep" | "move" | "delete") {
+    let dest = "";
+    if (choice === "move") {
+      dest = await App.PickLocalFolder("");
+      if (!dest) return;
+    }
+    detachedBusy = dkey(d);
+    const err = await App.ResolveDetached(d.localPath, choice, dest);
+    detachedBusy = "";
+    if (err) { alert(err); return; }
+    await loadDetached();
+  }
 
   const restoreTrash = async (t: Trash) => { await App.RestoreTrash(t.href); await loadTrash(); };
   const deleteTrash = async (t: Trash) => { await App.DeleteTrash(t.href); await loadTrash(); };
@@ -58,7 +80,7 @@
   // bare "<tab>" or "<tab>" + newline + "<highlight-key>": the flyout newline-
   // joins the target row's key into OpenStatusTab's one string arg (so no extra
   // Go binding is needed), and we flash + scroll to the matching row.
-  type Tab = "activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "trash";
+  type Tab = "activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "detached" | "trash";
   const NL = String.fromCharCode(10); // newline — never occurs in a tab name or file path
   let highlight = $state("");
   let hlTimer: ReturnType<typeof setTimeout>;
@@ -80,7 +102,7 @@
   Events.On("status-tab", (e: any) => applyDeepLink(e.data as string));
   // Once the active tab's list has rendered, scroll the flashed row into view.
   $effect(() => {
-    void (activity.length + conflicts.length + notifs.length + blocked.length + locks.length + trash.length);
+    void (activity.length + conflicts.length + notifs.length + blocked.length + locks.length + trash.length + detached.length);
     if (!highlight) return;
     requestAnimationFrame(() =>
       document.querySelector(".body .hl")?.scrollIntoView({ block: "center", behavior: "smooth" }));
@@ -91,6 +113,7 @@
   Events.On("notifications", loadNotifs);
   Events.On("blocked", loadBlocked);
   Events.On("locks", loadLocks);
+  Events.On("detached", loadDetached);
 
   const conflictDesc = (k: string) =>
     k === "deleted-locally" ? "You deleted this; it changed on the server."
@@ -167,6 +190,10 @@
     <button class:active={tab==="notifications"} onclick={() => tab="notifications"}>Notifications{notifs.length ? ` (${notifs.length})` : ""}</button>
     <button class:active={tab==="blocked"} onclick={() => tab="blocked"}>Can't sync{realBlocked.length ? ` (${realBlocked.length})` : ""}</button>
     <button class:active={tab==="inuse"} onclick={() => tab="inuse"}>In use{locks.length ? ` (${locks.length})` : ""}</button>
+    <!-- Rare, so the tab only appears while there is something to decide. -->
+    {#if detached.length || tab === "detached"}
+      <button class:active={tab==="detached"} onclick={() => tab="detached"}>No longer shared{detached.length ? ` (${detached.length})` : ""}</button>
+    {/if}
     <button class:active={tab==="trash"} onclick={() => { tab="trash"; loadTrash(); }}>Trash</button>
   </nav>
 
@@ -237,6 +264,20 @@
             <button class="primary" onclick={() => resolve(c, "local")}>Keep mine</button>
             <button onclick={() => resolve(c, "remote")}>Keep server</button>
             <button onclick={() => resolve(c, "both")}>Keep both</button>
+          </div>
+        </div>
+      {/each}
+
+    {:else if tab === "detached"}
+      {#if detached.length === 0}<p class="empty">Nothing waiting. A folder that stops being shared with you shows up here, with its local copy kept.</p>{/if}
+      {#each detached as d}
+        <div class="card" class:hl={dkey(d) === highlight}>
+          <div class="title">{d.name}</div>
+          <div class="desc">No longer shared with you (or its storage was unmounted) since {d.at}. Nothing was deleted: your copy is {d.movedOut ? "beside your sync folder, at" : "still at"} {d.localPath}, and it is not syncing until you choose.</div>
+          <div class="btns">
+            <button class="primary" disabled={detachedBusy === dkey(d)} onclick={() => resolveDetached(d, "keep")} title={d.movedOut ? "Moves it back into your sync folder; it becomes your own and uploads to your account" : "It becomes your own folder and uploads to your account"}>Keep as my own</button>
+            <button disabled={detachedBusy === dkey(d)} onclick={() => resolveDetached(d, "move")} title="Move it to a folder outside your sync folders">Move it out…</button>
+            <button disabled={detachedBusy === dkey(d)} onclick={() => resolveDetached(d, "delete")} title="Send your copy to the Recycle Bin">Delete my copy</button>
           </div>
         </div>
       {/each}

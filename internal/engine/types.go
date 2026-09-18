@@ -28,6 +28,12 @@ type RemoteState struct {
 	SHA1         string    // content SHA1 from oc:checksums, when the server provides it
 	LastModified time.Time // server mtime; populated where needed (e.g. takeover adoption)
 	ReadOnly     bool      // server marks this not-writable (oc:permissions) -> mirror as a local read-only attribute
+	// MountRoot marks the top of a share received from someone else, or of an
+	// external-storage / group-folder mount: the one node whose disappearance
+	// from a listing means "detached from this account", not "deleted". Derived
+	// from oc:permissions at scan time (on a mount, parent not) and carried into
+	// the baseline so KeepDetached can recognise it after it has gone.
+	MountRoot bool
 	// Lock is files_lock state, when the server has the app. nil is ambiguous on
 	// its own — see LockKnown.
 	Lock *transport.LockInfo
@@ -59,6 +65,7 @@ type BaselineState struct {
 	LocalSize       int64
 	LocalMTimeNanos int64
 	ContentSHA1     string // SHA1 of the content at last sync; enables move detection
+	MountRoot       bool   // it was the root of a received share or a mount (see RemoteState.MountRoot)
 }
 
 // ActionKind enumerates the reconciliation operations the diff can emit.

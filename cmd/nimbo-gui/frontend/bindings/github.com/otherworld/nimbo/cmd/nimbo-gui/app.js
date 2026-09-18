@@ -370,12 +370,22 @@ export function DeselectFolder(localDir, rel, deleteLocal) {
 }
 
 /**
+ * DetachedFolders lists the folders awaiting a decision (Status → No longer shared).
+ * @returns {$CancellablePromise<$models.DetachedDTO[]>}
+ */
+export function DetachedFolders() {
+    return $Call.ByID(2276673220).then(/** @type {($result: any) => any} */(($result) => {
+        return $$createType16($result);
+    }));
+}
+
+/**
  * Diagnostics returns Nimbo's current health (no network calls) for the UI.
  * @returns {$CancellablePromise<$models.DiagnosticsDTO>}
  */
 export function Diagnostics() {
     return $Call.ByID(4058123183).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType15($result);
+        return $$createType17($result);
     }));
 }
 
@@ -421,7 +431,7 @@ export function EnterSetup() {
  */
 export function FlyoutAppearance() {
     return $Call.ByID(1978346652).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType16($result);
+        return $$createType18($result);
     }));
 }
 
@@ -432,7 +442,7 @@ export function FlyoutAppearance() {
  */
 export function Folders() {
     return $Call.ByID(727328098).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType18($result);
+        return $$createType20($result);
     }));
 }
 
@@ -454,7 +464,7 @@ export function FreeSpace(dir) {
  */
 export function GetAllowedFilenames() {
     return $Call.ByID(1844951149).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType19($result);
+        return $$createType21($result);
     }));
 }
 
@@ -479,7 +489,7 @@ export function GetConflictPolicy() {
  */
 export function GetIgnore() {
     return $Call.ByID(1021506421).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType19($result);
+        return $$createType21($result);
     }));
 }
 
@@ -491,7 +501,7 @@ export function GetIgnore() {
  */
 export function GetIgnorePatterns() {
     return $Call.ByID(4086853534).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType19($result);
+        return $$createType21($result);
     }));
 }
 
@@ -500,7 +510,7 @@ export function GetIgnorePatterns() {
  */
 export function GetLimits() {
     return $Call.ByID(3287149099).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType20($result);
+        return $$createType22($result);
     }));
 }
 
@@ -510,7 +520,7 @@ export function GetLimits() {
  */
 export function GetPairs() {
     return $Call.ByID(1028120708).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType22($result);
+        return $$createType24($result);
     }));
 }
 
@@ -520,7 +530,7 @@ export function GetPairs() {
  */
 export function GetPauseSchedule() {
     return $Call.ByID(3662115662).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType23($result);
+        return $$createType25($result);
     }));
 }
 
@@ -530,7 +540,7 @@ export function GetPauseSchedule() {
  */
 export function GetSetupInfo() {
     return $Call.ByID(4057305580).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType24($result);
+        return $$createType26($result);
     }));
 }
 
@@ -557,7 +567,7 @@ export function GetTheme() {
  */
 export function Header() {
     return $Call.ByID(3679066424).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType25($result);
+        return $$createType27($result);
     }));
 }
 
@@ -576,7 +586,7 @@ export function InitialStatusTab() {
  */
 export function LicenceInfo() {
     return $Call.ByID(2163230976).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType26($result);
+        return $$createType28($result);
     }));
 }
 
@@ -587,7 +597,7 @@ export function LicenceInfo() {
  */
 export function ListAccounts() {
     return $Call.ByID(2919187697).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType28($result);
+        return $$createType30($result);
     }));
 }
 
@@ -656,7 +666,7 @@ export function NotificationCount() {
  */
 export function NotificationList() {
     return $Call.ByID(2567004906).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType30($result);
+        return $$createType32($result);
     }));
 }
 
@@ -732,7 +742,7 @@ export function OpenStatus() {
 
 /**
  * OpenStatusTab opens (or focuses) the status window on a specific tab
- * ("activity", "conflicts", "notifications", "blocked", "trash").
+ * ("activity", "conflicts", "notifications", "blocked", "inuse", "detached", "trash").
  * @param {string} tab
  * @returns {$CancellablePromise<void>}
  */
@@ -776,7 +786,7 @@ export function OpenVersions(remotePath) {
  */
 export function OtherAccountAttention() {
     return $Call.ByID(3107861882).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType32($result);
+        return $$createType34($result);
     }));
 }
 
@@ -795,7 +805,7 @@ export function PauseFor(minutes) {
  */
 export function PauseInfo() {
     return $Call.ByID(3615706181).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType33($result);
+        return $$createType35($result);
     }));
 }
 
@@ -840,7 +850,7 @@ export function PinApp(id) {
  */
 export function PolicyInfo() {
     return $Call.ByID(4136447139).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType34($result);
+        return $$createType36($result);
     }));
 }
 
@@ -850,7 +860,7 @@ export function PolicyInfo() {
  */
 export function Progress() {
     return $Call.ByID(1801045022).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType35($result);
+        return $$createType37($result);
     }));
 }
 
@@ -870,7 +880,7 @@ export function Quit() {
  */
 export function RecentActivity() {
     return $Call.ByID(3561310187).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType37($result);
+        return $$createType39($result);
     }));
 }
 
@@ -948,6 +958,21 @@ export function ResolveConflict(localDir, path, choice) {
 }
 
 /**
+ * ResolveDetached applies the user's decision for the kept copy at localPath
+ * (DetachedDTO.LocalPath): "keep" (it becomes their own and syncs to their
+ * account — a copy parked beside an on-demand folder is moved back in first),
+ * "move" (into dest, a folder they picked outside their sync folders) or
+ * "delete" (to the Recycle Bin). Returns "" on success or an error string.
+ * @param {string} localPath
+ * @param {string} choice
+ * @param {string} dest
+ * @returns {$CancellablePromise<string>}
+ */
+export function ResolveDetached(localPath, choice, dest) {
+    return $Call.ByID(2712691749, localPath, choice, dest);
+}
+
+/**
  * RestoreTrash restores a trashed item by href. Returns "" on success.
  * @param {string} href
  * @returns {$CancellablePromise<string>}
@@ -1005,7 +1030,7 @@ export function SaveLocalAddress(addr, pin) {
  */
 export function Search(term) {
     return $Call.ByID(3097496321, term).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType39($result);
+        return $$createType41($result);
     }));
 }
 
@@ -1240,7 +1265,7 @@ export function SetVerbose(on) {
  */
 export function ShareList() {
     return $Call.ByID(427148648).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType41($result);
+        return $$createType43($result);
     }));
 }
 
@@ -1360,7 +1385,7 @@ export function SyncNow() {
  */
 export function SyncedRemotes() {
     return $Call.ByID(1824770878).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType19($result);
+        return $$createType21($result);
     }));
 }
 
@@ -1382,7 +1407,7 @@ export function TailLog() {
  */
 export function TestLocalAddress(addr, pin) {
     return $Call.ByID(176774928, addr, pin).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType42($result);
+        return $$createType44($result);
     }));
 }
 
@@ -1409,7 +1434,7 @@ export function TogglePause() {
  */
 export function TrashList() {
     return $Call.ByID(2716350569).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType44($result);
+        return $$createType46($result);
     }));
 }
 
@@ -1443,7 +1468,7 @@ export function Version() {
  */
 export function VersionList() {
     return $Call.ByID(3868762695).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType46($result);
+        return $$createType48($result);
     }));
 }
 
@@ -1471,35 +1496,37 @@ const $$createType11 = $models.UpdateDTO.createFrom;
 const $$createType12 = $models.ConflictPreview.createFrom;
 const $$createType13 = $models.ConflictItem.createFrom;
 const $$createType14 = $Create.Array($$createType13);
-const $$createType15 = $models.DiagnosticsDTO.createFrom;
-const $$createType16 = $models.FlyoutAppearanceDTO.createFrom;
-const $$createType17 = $models.FolderInfo.createFrom;
-const $$createType18 = $Create.Array($$createType17);
-const $$createType19 = $Create.Array($Create.Any);
-const $$createType20 = $models.LimitsDTO.createFrom;
-const $$createType21 = $models.PairDTO.createFrom;
-const $$createType22 = $Create.Array($$createType21);
-const $$createType23 = $models.ScheduleDTO.createFrom;
-const $$createType24 = $models.SetupInfo.createFrom;
-const $$createType25 = $models.HeaderInfo.createFrom;
-const $$createType26 = license$0.Info.createFrom;
-const $$createType27 = $models.AccountEntryDTO.createFrom;
-const $$createType28 = $Create.Array($$createType27);
-const $$createType29 = $models.NotifItem.createFrom;
+const $$createType15 = $models.DetachedDTO.createFrom;
+const $$createType16 = $Create.Array($$createType15);
+const $$createType17 = $models.DiagnosticsDTO.createFrom;
+const $$createType18 = $models.FlyoutAppearanceDTO.createFrom;
+const $$createType19 = $models.FolderInfo.createFrom;
+const $$createType20 = $Create.Array($$createType19);
+const $$createType21 = $Create.Array($Create.Any);
+const $$createType22 = $models.LimitsDTO.createFrom;
+const $$createType23 = $models.PairDTO.createFrom;
+const $$createType24 = $Create.Array($$createType23);
+const $$createType25 = $models.ScheduleDTO.createFrom;
+const $$createType26 = $models.SetupInfo.createFrom;
+const $$createType27 = $models.HeaderInfo.createFrom;
+const $$createType28 = license$0.Info.createFrom;
+const $$createType29 = $models.AccountEntryDTO.createFrom;
 const $$createType30 = $Create.Array($$createType29);
-const $$createType31 = $models.OtherAttention.createFrom;
+const $$createType31 = $models.NotifItem.createFrom;
 const $$createType32 = $Create.Array($$createType31);
-const $$createType33 = $models.PauseDTO.createFrom;
-const $$createType34 = $models.PolicyDTO.createFrom;
-const $$createType35 = $models.ProgressDTO.createFrom;
-const $$createType36 = $models.ActivityItem.createFrom;
-const $$createType37 = $Create.Array($$createType36);
-const $$createType38 = $models.SearchItem.createFrom;
+const $$createType33 = $models.OtherAttention.createFrom;
+const $$createType34 = $Create.Array($$createType33);
+const $$createType35 = $models.PauseDTO.createFrom;
+const $$createType36 = $models.PolicyDTO.createFrom;
+const $$createType37 = $models.ProgressDTO.createFrom;
+const $$createType38 = $models.ActivityItem.createFrom;
 const $$createType39 = $Create.Array($$createType38);
-const $$createType40 = $models.ShareDTO.createFrom;
+const $$createType40 = $models.SearchItem.createFrom;
 const $$createType41 = $Create.Array($$createType40);
-const $$createType42 = $models.LocalTestDTO.createFrom;
-const $$createType43 = $models.TrashDTO.createFrom;
-const $$createType44 = $Create.Array($$createType43);
-const $$createType45 = $models.VersionDTO.createFrom;
+const $$createType42 = $models.ShareDTO.createFrom;
+const $$createType43 = $Create.Array($$createType42);
+const $$createType44 = $models.LocalTestDTO.createFrom;
+const $$createType45 = $models.TrashDTO.createFrom;
 const $$createType46 = $Create.Array($$createType45);
+const $$createType47 = $models.VersionDTO.createFrom;
+const $$createType48 = $Create.Array($$createType47);

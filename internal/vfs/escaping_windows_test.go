@@ -142,7 +142,11 @@ func TestWriteBackNeverEscapesADirectory(t *testing.T) {
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	f.markDirty(dir)
+	// A folder the user just made: PLAIN, not a placeholder. That — not a
+	// cleared in-sync bit — is what makes a directory need MKCOL, because a
+	// directory placeholder is deliberately left not-in-sync so the shell will
+	// ask it to populate.
+	f.markPlain(dir)
 
 	rec := newRecorder()
 	w := bareWatcher(root, escapingOps(rec))

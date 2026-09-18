@@ -39,11 +39,14 @@ import (
 const davPrefix = "/remote.php/dav/files/alice"
 
 // davNode is one remote object served by fakeDAV, keyed files-root-relative
-// ("" is the root dir). Dirs carry an etag; files an etag and a body.
+// ("" is the root dir). Dirs carry an etag; files an etag and a body. perm
+// overrides the oc:permissions served (default: a plain own dir/file), so a
+// test can present a folder shared with the user (S) or a mount (M).
 type davNode struct {
 	isDir bool
 	etag  string
 	body  string
+	perm  string
 }
 
 // fakeDAV serves just enough WebDAV for real sync passes: PROPFIND depth 1
@@ -58,6 +61,7 @@ type fakeDAV struct {
 	failGET map[string]int    // file -> status served instead of its body
 	pfCalls map[string]int    // PROPFINDs seen per dir, failures included
 	puts    map[string]string // file -> body of the last PUT accepted
+	putN    map[string]int    // file -> PUTs accepted (a re-upload of identical bytes still counts)
 	mkcols  map[string]int    // dir -> MKCOLs seen
 	deletes []string          // paths DELETEd, in order
 }
@@ -69,6 +73,7 @@ func newFakeDAV(nodes map[string]davNode) *fakeDAV {
 		failGET: map[string]int{},
 		pfCalls: map[string]int{},
 		puts:    map[string]string{},
+		putN:    map[string]int{},
 		mkcols:  map[string]int{},
 	}
 }
@@ -159,6 +164,7 @@ func (f *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// back to record the baseline.
 		body, _ := io.ReadAll(r.Body)
 		f.puts[rel] = string(body)
+		f.putN[rel]++
 		etag := "e-put-" + rel
 		f.nodes[rel] = davNode{etag: etag, body: string(body)}
 		w.Header().Set("ETag", `"`+etag+`"`)
@@ -209,17 +215,24 @@ func (f *fakeDAV) multistatus(dir string, deep bool) string {
 
 func (f *fakeDAV) row(p string, n davNode) string {
 	href := davPrefix + "/" + p
+	perm := n.perm
 	if n.isDir {
 		if p == "" {
 			href = davPrefix + "/"
 		} else {
 			href += "/"
 		}
-		return fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:resourcetype><d:collection/></d:resourcetype><d:getetag>&quot;%s&quot;</d:getetag><oc:permissions>RGDNVCK</oc:permissions></d:prop></d:propstat></d:response>`, href, n.etag)
+		if perm == "" {
+			perm = "RGDNVCK"
+		}
+		return fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:resourcetype><d:collection/></d:resourcetype><d:getetag>&quot;%s&quot;</d:getetag><oc:permissions>%s</oc:permissions></d:prop></d:propstat></d:response>`, href, n.etag, perm)
+	}
+	if perm == "" {
+		perm = "RGDNVW"
 	}
 	// Files carry a fixed Last-Modified (unix 1700000000): the adopt scan
 	// classifies against it, so tests must see it survive cold AND warm scans.
-	return fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:resourcetype/><d:getetag>&quot;%s&quot;</d:getetag><d:getcontentlength>%d</d:getcontentlength><d:getlastmodified>Tue, 14 Nov 2023 22:13:20 GMT</d:getlastmodified><oc:permissions>RGDNVW</oc:permissions></d:prop></d:propstat></d:response>`, href, n.etag, len(n.body))
+	return fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:resourcetype/><d:getetag>&quot;%s&quot;</d:getetag><d:getcontentlength>%d</d:getcontentlength><d:getlastmodified>Tue, 14 Nov 2023 22:13:20 GMT</d:getlastmodified><oc:permissions>%s</oc:permissions></d:prop></d:propstat></d:response>`, href, n.etag, len(n.body), perm)
 }
 
 func davUnder(p, dir string) bool {

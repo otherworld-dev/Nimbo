@@ -139,6 +139,9 @@ type Engine struct {
 	conflicts    map[string][]ConflictItem // key = pair LocalDir
 	conflictSubs []chan struct{}
 
+	detachedMu   sync.Mutex
+	detachedSubs []chan struct{} // notified when the parked-folder list changes (see detach.go)
+
 	inflightMu       sync.Mutex
 	inflight         map[string]bool // absolute paths currently being transferred
 	onOverlayRefresh func(string)    // notified when a path's sync state changes
@@ -451,10 +454,29 @@ func (e *Engine) StatRemote(ctx context.Context, remotePath string) (transport.E
 	return e.client.Stat(ctx, remotePath)
 }
 
+// OpenRange streams up to length bytes starting at offset in a remote file —
+// one bounded GET, however large the range, rather than an open-ended stream
+// that gets abandoned after each caller-sized chunk. A server that sends
+// fewer bytes than requested ends the reader early (EOF); it is up to the
+// caller to judge whether that's acceptable. Callers must Close the reader.
+func (e *Engine) OpenRange(ctx context.Context, remotePath string, offset, length int64) (io.ReadCloser, error) {
+	body, _, err := e.client.GetRange(ctx, remotePath, offset, length)
+	if err != nil {
+		return nil, err
+	}
+	if length > 0 {
+		return struct {
+			io.Reader
+			io.Closer
+		}{io.LimitReader(body, length), body}, nil
+	}
+	return body, nil
+}
+
 // DownloadRange returns up to length bytes of a remote file starting at offset
 // (used to hydrate on-demand placeholders).
 func (e *Engine) DownloadRange(ctx context.Context, remotePath string, offset, length int64) ([]byte, error) {
-	body, _, _, err := e.client.GetFrom(ctx, remotePath, offset)
+	body, err := e.OpenRange(ctx, remotePath, offset, length)
 	if err != nil {
 		return nil, err
 	}
@@ -2623,8 +2645,7 @@ func (e *Engine) computePlan(ctx context.Context, st *state.Store, p Pair) ([]en
 	// not deleted): global patterns + this pair's own excludes. Passing ig.Match to
 	// RemoteScan also prunes the PROPFIND descent so ignored trees (node_modules,
 	// .git, …) don't hammer the server; FilterRemote then stays as a safety net.
-	globalIgnore, _ := e.dirs.LoadIgnore()
-	ig := engine.NewIgnore(append(append([]string{}, globalIgnore...), p.Excludes...))
+	ig := e.ignoreFor(p)
 	cp := newScanCheckpoint(st, pk)
 	e.scanPhase("Checking server…")
 	remote, err := engine.RemoteScan(ctx, e.client, p.RemoteRoot, engine.ScanOpts{
@@ -2687,8 +2708,7 @@ func (e *Engine) computePlanScoped(ctx context.Context, st *state.Store, p Pair,
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	globalIgnore, _ := e.dirs.LoadIgnore()
-	ig := engine.NewIgnore(append(append([]string{}, globalIgnore...), p.Excludes...))
+	ig := e.ignoreFor(p)
 	// RemoteScan keys relative to its root, so root it at the subtree (re-keying the
 	// baseline down) and lift the result back to pair-relative keys. The scan keys
 	// are scope-relative, but ig's patterns are pair-relative, so prefix the scope
@@ -2983,8 +3003,7 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 	e.prog.Enumerating = true // indeterminate until the whole tree is listed
 	e.progMu.Unlock()
 	root := strings.Trim(p.RemoteRoot, "/")
-	globalIgnore, _ := e.dirs.LoadIgnore()
-	ig := engine.NewIgnore(append(append([]string{}, globalIgnore...), p.Excludes...))
+	ig := e.ignoreFor(p)
 
 	esc := e.escaper.Load()
 	relOf := func(full string) string {
@@ -3072,13 +3091,14 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 	}
 	rootRemote := make(map[string]engine.RemoteState)
 	var topDirs []string
+	rootOnMount, rootKnown := listingSelf(rootEntries, root)
 	for _, en := range rootEntries {
 		full := strings.Trim(en.Path, "/")
 		if full == root {
 			continue
 		}
 		rel := relOf(full)
-		rootRemote[rel] = engine.RemoteState{Path: rel, IsDir: en.IsDir, ETag: en.ETag, FileID: en.FileID, Size: en.Size, LastModified: en.LastModified}
+		rootRemote[rel] = cloneRemoteState(rel, en, rootOnMount, rootKnown)
 		if en.IsDir {
 			topDirs = append(topDirs, full)
 		}
@@ -3154,12 +3174,23 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 				return
 			}
 			sub := make(map[string]engine.RemoteState, len(entries))
+			// Every ancestor of an entry is in the same recursive listing, except
+			// the top folder's own parent — the pair root, read above.
+			onMount := make(map[string]bool, len(entries))
 			for _, en := range entries {
-				rel := relOf(strings.Trim(en.Path, "/"))
+				onMount[strings.Trim(en.Path, "/")] = en.OnMount()
+			}
+			for _, en := range entries {
+				full := strings.Trim(en.Path, "/")
+				rel := relOf(full)
 				if rel == "" {
 					continue
 				}
-				sub[rel] = engine.RemoteState{Path: rel, IsDir: en.IsDir, ETag: en.ETag, FileID: en.FileID, Size: en.Size, LastModified: en.LastModified}
+				parentOnMount, parentKnown := rootOnMount, rootKnown
+				if parent := dirParent(full); parent != root {
+					parentOnMount, parentKnown = onMount[parent]
+				}
+				sub[rel] = cloneRemoteState(rel, en, parentOnMount, parentKnown)
 			}
 			actions, dlF, dlB := plan(sub)
 			e.progAddTotal(dlF, dlB)
@@ -3313,7 +3344,7 @@ func decideCloneFile(takeover bool, localFI os.FileInfo, dehydrated bool, r engi
 // (size/mtime from disk, etag/fileid from the server) so a resumed clone keeps it
 // out of future re-downloads. ContentSHA1 is left empty; a later sync fills it.
 func baselineForLocal(localRoot, rel string, r engine.RemoteState) engine.BaselineState {
-	b := engine.BaselineState{Path: rel, RemoteETag: r.ETag, RemoteFileID: r.FileID, LocalSize: r.Size}
+	b := engine.BaselineState{Path: rel, RemoteETag: r.ETag, RemoteFileID: r.FileID, LocalSize: r.Size, MountRoot: r.MountRoot}
 	if fi, err := os.Stat(filepath.Join(localRoot, filepath.FromSlash(rel))); err == nil {
 		b.LocalSize = fi.Size()
 		b.LocalMTimeNanos = fi.ModTime().UnixNano()
@@ -3385,16 +3416,34 @@ func maintainDirBaselines(st *state.Store, pk string, base map[string]engine.Bas
 			if b, ok := base[pth]; ok && b.IsDir && b.RemoteETag == r.ETag {
 				continue // still fresh — was pruned or genuinely unchanged
 			}
-			rows = append(rows, engine.BaselineState{Path: pth, IsDir: true, RemoteETag: r.ETag, RemoteFileID: r.FileID})
+			rows = append(rows, engine.BaselineState{Path: pth, IsDir: true, RemoteETag: r.ETag, RemoteFileID: r.FileID, MountRoot: r.MountRoot})
 		}
 	}
 	healed := len(rows)
+	// Dirtying REWRITES the row, so the share/mount-root flag has to be carried
+	// over or the next unshare of that folder deletes it. The listing knows it
+	// for a dir it listed; otherwise the row that exists does — read those rows
+	// when the caller passed no baseline (the stat-built SyncPaths route).
+	known := base
+	if known == nil && len(dirty) > 0 {
+		paths := make([]string, 0, len(dirty))
+		for d := range dirty {
+			paths = append(paths, d)
+		}
+		if rows, err := st.LoadBaselinePaths(pk, paths); err == nil {
+			known = rows
+		}
+	}
 	for d := range dirty {
 		row := engine.BaselineState{Path: d, IsDir: true} // empty etag = never prunes
 		if r, ok := remote[d]; ok {
+			// The listing is the authority: a folder the user re-created under a
+			// former share's name is NOT a root, whatever the old row said.
 			row.RemoteFileID = r.FileID
-		} else if b, ok := base[d]; ok {
+			row.MountRoot = r.MountRoot
+		} else if b, ok := known[d]; ok {
 			row.RemoteFileID = b.RemoteFileID
+			row.MountRoot = b.MountRoot
 		}
 		rows = append(rows, row)
 	}
@@ -3441,6 +3490,16 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	}
 
 	pk := PairKey(p.LocalDir, p.RemoteRoot)
+
+	// A share or mount detached from the account vanishes from the listing and
+	// plans as a local delete of everything under it; keep the copy instead
+	// (Deck #557). Before the damage guard on purpose: a big unshare is then
+	// recognised for what it is rather than frozen for review.
+	kept, derr := e.keepDetached(st, pk, p, actions, base)
+	if derr != nil {
+		return transfer.Stats{}, derr
+	}
+	actions = kept
 
 	// The damage guard: refuse a pass that looks like the SERVER lost data — a
 	// restore from an old snapshot, a shared folder someone emptied, ransomware
@@ -3517,7 +3576,11 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	// restore rather than delete. See Deck #571: this cost a real shared file.
 	if e.dirs.IsPostRevert(p.LocalDir) {
 		var restored []string
-		actions, restored = engine.RestoreInsteadOfDelete(actions, remote)
+		missingLocally := func(rel string) bool {
+			_, err := os.Lstat(filepath.Join(p.LocalDir, filepath.FromSlash(rel)))
+			return err != nil
+		}
+		actions, restored = engine.RestoreInsteadOfDelete(actions, remote, missingLocally)
 		if len(restored) > 0 {
 			slog.Warn("first pass after leaving virtual files: restoring missing files instead of deleting them on the server",
 				"dir", p.LocalDir, "count", len(restored))
@@ -3837,8 +3900,7 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 		}
 	}
 
-	globalIgnore, _ := e.dirs.LoadIgnore()
-	ig := engine.NewIgnore(append(append([]string{}, globalIgnore...), p.Excludes...))
+	ig := e.ignoreFor(p)
 	ig.FilterLocal(local)
 	ig.FilterRemote(remote)
 
@@ -3936,8 +3998,7 @@ func (e *Engine) syncRemoteDelta(ctx context.Context, p Pair) (transfer.Stats, e
 	baselineLoad := time.Since(tBase)
 	// Build the ignore matcher up front so it also prunes the PROPFIND descent
 	// (not just filters the result) — ignored trees never get walked on the server.
-	globalIgnore, _ := e.dirs.LoadIgnore()
-	ig := engine.NewIgnore(append(append([]string{}, globalIgnore...), p.Excludes...))
+	ig := e.ignoreFor(p)
 	tScan := time.Now()
 	cp := newScanCheckpoint(st, pk)
 	remote, err := engine.RemoteScan(ctx, e.client, p.RemoteRoot, engine.ScanOpts{

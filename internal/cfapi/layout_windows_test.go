@@ -35,4 +35,55 @@ func TestStructLayoutsMatchCfapiH(t *testing.T) {
 	if got := unsafe.Sizeof(op); got != 48 {
 		t.Errorf("operationInfo size = %d, want 48", got)
 	}
+
+	var psi placeholderStandardInfo
+	if got := unsafe.Offsetof(psi.PinState); got != 32 {
+		t.Errorf("placeholderStandardInfo.PinState offset = %d, want 32", got)
+	}
+	if got := unsafe.Offsetof(psi.FileIdentityLength); got != 56 {
+		t.Errorf("placeholderStandardInfo.FileIdentityLength offset = %d, want 56", got)
+	}
+	if got := unsafe.Offsetof(psi.FileIdentity); got != 60 {
+		t.Errorf("placeholderStandardInfo.FileIdentity offset = %d, want 60", got)
+	}
+	if got := unsafe.Sizeof(psi); got != 64 {
+		t.Errorf("placeholderStandardInfo size = %d, want 64", got)
+	}
+
+	var rc callbackParamsRenameCompletion
+	// Split into two ifs (rather than got != 16 || got != cpRenameSourcePath)
+	// because `go vet`'s bools check flags that literal form as a suspect
+	// "x != c1 || x != c2" typo; behaviour is identical.
+	if got := unsafe.Offsetof(rc.SourcePath); got != 16 {
+		t.Errorf("callbackParamsRenameCompletion.SourcePath offset = %d, want 16 (== cpRenameSourcePath)", got)
+	} else if got != cpRenameSourcePath {
+		t.Errorf("callbackParamsRenameCompletion.SourcePath offset = %d, want 16 (== cpRenameSourcePath)", got)
+	}
+	// CANCEL_FETCH_DATA's parameters nest a second union inside Cancel:
+	// { CF_CALLBACK_CANCEL_FLAGS Flags; union { struct { LARGE_INTEGER
+	// FileOffset; LARGE_INTEGER Length; } FetchData; }; } — so Flags sits at 8
+	// (after ParamSize + the outer union's 4 pad bytes) and the range at 16/24,
+	// the same offsets FETCH_DATA's RequiredFileOffset/RequiredLength use.
+	// cfapi.h 10.0.26100 lines 397-421.
+	var cf callbackParamsCancelFetchData
+	if got := unsafe.Offsetof(cf.Flags); got != 8 {
+		t.Errorf("callbackParamsCancelFetchData.Flags offset = %d, want 8", got)
+	} else if got != cpCancelFlags {
+		t.Errorf("callbackParamsCancelFetchData.Flags offset = %d, want 8 (== cpCancelFlags)", got)
+	}
+	if got := unsafe.Offsetof(cf.FileOffset); got != 16 {
+		t.Errorf("callbackParamsCancelFetchData.FileOffset offset = %d, want 16", got)
+	} else if got != cpCancelOffset {
+		t.Errorf("callbackParamsCancelFetchData.FileOffset offset = %d, want 16 (== cpCancelOffset)", got)
+	}
+	if got := unsafe.Offsetof(cf.Length); got != 24 {
+		t.Errorf("callbackParamsCancelFetchData.Length offset = %d, want 24", got)
+	} else if got != cpCancelLength {
+		t.Errorf("callbackParamsCancelFetchData.Length offset = %d, want 24 (== cpCancelLength)", got)
+	}
+
+	var reg2 callbackRegistration
+	if got := unsafe.Offsetof(reg2.Callback); got != 8 || unsafe.Sizeof(reg2) != 16 {
+		t.Errorf("callbackRegistration: Callback offset %d size %d, want 8 / 16", got, unsafe.Sizeof(reg2))
+	}
 }

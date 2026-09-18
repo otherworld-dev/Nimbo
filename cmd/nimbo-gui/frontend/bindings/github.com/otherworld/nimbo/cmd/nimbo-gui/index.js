@@ -18,6 +18,7 @@ export {
     BrowseEntry,
     ConflictItem,
     ConflictPreview,
+    DetachedDTO,
     DiagnosticsDTO,
     FlyoutAppearanceDTO,
     FolderInfo,
