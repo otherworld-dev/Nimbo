@@ -12,7 +12,7 @@ package main
 // correctness constraint, not a preference: a watcher that sees adopt's stub
 // deletes or conflict renames pushes them to the server as user actions.
 //
-// Design: docs/specs/2026-07-26-vfs-adopt-existing-folder-design.md.
+// Design: the VFS adopt-existing-folder spec (2026-07-26).
 
 import (
 	"context"

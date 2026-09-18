@@ -11,7 +11,7 @@ import (
 	"github.com/otherworld/nimbo/internal/transport"
 )
 
-// Local network route — docs/specs/2026-09-13-local-network-route-design.md.
+// Local network route (see the 2026-09-13 design spec).
 // The transport does the routing; this file owns WHEN the local address is
 // re-tried and everything setup needs from a running engine.
 

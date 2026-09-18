@@ -62,7 +62,7 @@ func Toast(title, message, link string) {
 // neutralise the `]]>` CDATA break so markup can't be injected either.
 //
 // This is a focused stopgap. The native in-process WinRT raiser (see
-// docs/specs/2026-07-22-actionable-toast-notifications.md) removes the PowerShell
+// the 2026-07-22 actionable-toast-notifications spec) removes the PowerShell
 // layer entirely and lets these characters through safely.
 func sanitizeToastText(s string) string {
 	var b strings.Builder

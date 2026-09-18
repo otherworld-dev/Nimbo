@@ -10,11 +10,11 @@
 param(
     [switch]$Build,
     [string]$Version = "",
-    [string]$SignSubject = "CN=Nimbo Dev", # installer signing cert subject (see SIGNING.md)
+    [string]$SignSubject = "CN=Nimbo Dev", # installer signing cert subject (see the signing runbook)
 
     # Azure Trusted Signing: sign Setup.exe via azure-sign.ps1 and build it
     # WITHOUT the dev-cert trust step (the cert chains to a public root, so
-    # nothing needs importing on user machines). See SIGNING.md.
+    # nothing needs importing on user machines). See the signing runbook.
     [switch]$AzureSign,
     [string]$AzureCertProfile = "otherworld-dev-ltd"
 )

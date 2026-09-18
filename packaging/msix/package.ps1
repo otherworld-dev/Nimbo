@@ -15,7 +15,7 @@ param(
     # --- Azure Trusted Signing (-AzureSign) ---
     # Signs with the company's public CA-trusted cert via azure-sign.ps1 instead
     # of a local cert. -SignSubject must then be the EXACT subject issued by the
-    # certificate profile (it still drives the manifest Publisher). See SIGNING.md.
+    # certificate profile (it still drives the manifest Publisher). See the signing runbook.
     [switch]$AzureSign,
     [string]$AzureCertProfile = "otherworld-dev-ltd",
 
@@ -81,7 +81,7 @@ if ($Store -and (-not $StoreIdentityName -or -not $StorePublisher)) {
 }
 if ($AzureSign -and $SignSubject -eq "CN=Nimbo Dev") {
     # A Publisher that doesn't equal the Azure cert's subject is rejected at install.
-    throw "-AzureSign needs -SignSubject set to the exact issued cert subject (portal: Trusted Signing account -> Certificate profiles -> $AzureCertProfile -> Subject). See SIGNING.md."
+    throw "-AzureSign needs -SignSubject set to the exact issued cert subject (portal: Trusted Signing account -> Certificate profiles -> $AzureCertProfile -> Subject). See the signing runbook."
 }
 # -StoreChannel gets its own filename deliberately: it must never be mistakable
 # for a release artifact, since `release.ps1 -SkipBuild` publishes whatever sits
@@ -228,7 +228,7 @@ if ($AzureSign -or $Store) {
 # the package Identity in lock-step with the signing cert (a mismatch is rejected
 # by Windows) so switching certs is just -SignSubject. NOTE: changing Publisher
 # changes the PackageFamilyName = a new app identity (not an upgrade) -- see
-# SIGNING.md before doing it on installed machines.
+# the signing runbook before doing it on installed machines.
 $manifest = Get-Content (Join-Path $here "AppxManifest.xml") -Raw
 # Stamp ONLY the <Identity> Version. The (?<![A-Za-z]) lookbehind stops this also
 # matching the Version= inside TargetDeviceFamily MinVersion="10.0.22000.0" (which
@@ -277,7 +277,7 @@ Write-Host "Packed: $msix"
 # --- sign (optional; needs the signing cert) ---
 # NOTE: the signing cert's Subject must equal the manifest Identity Publisher
 # (AppxManifest.xml) or Windows rejects the package. Keep -SignSubject, the
-# manifest Publisher, and make-appinstaller's -Publisher in sync. See SIGNING.md.
+# manifest Publisher, and make-appinstaller's -Publisher in sync. See the signing runbook.
 if ($Store) {
     # Store packages are signed by Microsoft at ingestion, so we deliberately do
     # NOT sign here. Upload $msix to Partner Center -> your submission -> Packages.

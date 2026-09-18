@@ -2,7 +2,7 @@ package state
 
 // Scan-checkpoint rows cache raw remote directory listings during a crawl so a
 // failed scan resumes instead of restarting cold (Deck #231; design in
-// docs/specs/2026-07-23-scan-checkpointing-design.md). They are a pure cache:
+// the 2026-07-23 scan-checkpointing spec). They are a pure cache:
 // a row is only reused when its ETag still matches what the parent's listing
 // reports, and rows are cleared after a clean pass. Accessors follow the
 // CloneStatus pattern — direct DB calls, no s.mu, no cacheEnabled branch — so

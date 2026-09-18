@@ -28,11 +28,11 @@ param(
     [string]$Repo = "Nimbo",
     [string]$Version = "",                 # X.Y.Z; empty = packaging/msix/VERSION
     [int]$Revision = -1,                   # passed to package.ps1: -1 = auto, 0 = stable (vX.Y.Z)
-    [string]$SignSubject = "CN=Nimbo Dev",  # one knob for the signer/Publisher across MSIX, feed and installer (see SIGNING.md)
+    [string]$SignSubject = "CN=Nimbo Dev",  # one knob for the signer/Publisher across MSIX, feed and installer (see the signing runbook)
 
     # Azure Trusted Signing release: pass -AzureSign AND -SignSubject "<exact
     # issued subject>" (Trusted Signing account -> Certificate profiles ->
-    # profile -> Subject). Prereq: az login as adam@otherworld.dev. See SIGNING.md.
+    # profile -> Subject). Prereq: az login as adam@otherworld.dev. See the signing runbook.
     [switch]$AzureSign,
     [string]$AzureCertProfile = "otherworld-dev-ltd",
     [switch]$SkipBuild,

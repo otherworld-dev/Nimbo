@@ -24,7 +24,7 @@ param(
     [string]$Version = "",
     [string]$Tag = "",                               # release tag holding the MSIX; empty = derived from -Version
     [Parameter(Mandatory = $true)][string]$BaseUrl,  # e.g. https://github.com/adam/Nimbo/releases/latest/download
-    [string]$Publisher = "CN=Nimbo Dev",             # MUST match the signing cert subject + manifest Publisher (see SIGNING.md)
+    [string]$Publisher = "CN=Nimbo Dev",             # MUST match the signing cert subject + manifest Publisher (see the signing runbook)
     [string]$Name = "Nimbo"                          # MSIX Identity Name + feed/MSIX file basename; white-label passes the partner's
 )
 $ErrorActionPreference = "Stop"

@@ -7,7 +7,7 @@
 # -Years controls validity: 10 by default so the cert doesn't silently expire in
 # a year (an expired signer breaks new builds, and a *replacement* self-signed
 # cert isn't trusted by existing installs until they re-trust it -- see
-# SIGNING.md). Regenerating (delete the old cert first) changes the thumbprint,
+# the signing runbook). Regenerating (delete the old cert first) changes the thumbprint,
 # so you must re-trust it and re-release; do it deliberately, not routinely.
 param(
     [string]$Subject = "CN=Nimbo Dev",
