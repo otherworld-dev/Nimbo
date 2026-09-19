@@ -110,6 +110,22 @@ func runLoop(ctx context.Context, opts Options, sync SyncFunc, events <-chan str
 		note(err)
 		return err
 	}
+	// A sync of local changes keeps its own failure count. Fed into note(), a
+	// change that keeps failing (a path the server refuses) held pushes and
+	// polls back for hours with every retry (Deck #691).
+	var changeFails int
+	runChange := func(changed []string) error {
+		slog.Info("sync triggered", "reason", "change")
+		err := sync(ctx, changed)
+		switch {
+		case err == nil:
+			changeFails = 0
+		case ctx.Err() == nil:
+			changeFails++
+			slog.Error("sync failed", "err", err)
+		}
+		return err
+	}
 	runPush := func(reason string) {
 		slog.Info("sync triggered", "reason", reason)
 		err := opts.OnPush(ctx)
@@ -191,11 +207,11 @@ func runLoop(ctx context.Context, opts Options, sync SyncFunc, events <-chan str
 			// Local changes carry their paths (scoped/targeted reconcile). A push
 			// reconciles the remote delta separately — both can fire in one window.
 			if len(paths) > 0 {
-				if err := runSync("change", paths); err != nil && ctx.Err() == nil {
+				if err := runChange(paths); err != nil && ctx.Err() == nil {
 					for _, p := range paths {
 						retryPaths[p] = struct{}{}
 					}
-					d := opts.RetryChanges << uint(min(failStreak-1, 12))
+					d := opts.RetryChanges << uint(min(changeFails-1, 12))
 					if d > time.Hour || d <= 0 {
 						d = time.Hour
 					}

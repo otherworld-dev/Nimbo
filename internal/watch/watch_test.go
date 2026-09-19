@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -250,6 +251,48 @@ func TestAFailedChangeSyncIsRetried(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("a failed change sync was never retried (%d calls)", n)
 		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// Retrying a change that keeps failing (a path the server refuses) must not
+// hold back syncing FROM the server: each retry fed the same failure streak
+// that pauses pushes and polls, so one bad path could keep them waiting for
+// hours. Change retries keep their own count.
+func TestFailingChangeRetriesDoNotHoldBackPushes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan string, 1)
+	ext := make(chan struct{}, 1)
+	var changes, pushes atomic.Int32
+	syncFn := func(_ context.Context, changed []string) error {
+		if changed == nil {
+			return nil
+		}
+		changes.Add(1)
+		return errors.New("the server refuses this path")
+	}
+	onPush := func(context.Context) error { pushes.Add(1); return nil }
+	go func() {
+		_ = runLoop(ctx, Options{Root: t.TempDir(), Debounce: 10 * time.Millisecond, PollInterval: time.Hour,
+			OnPush: onPush, External: ext, RetryChanges: 10 * time.Millisecond}, syncFn, events)
+	}()
+	events <- `C:\Sync\refused.txt`
+	deadline := time.After(2 * time.Second)
+	for changes.Load() < 3 {
+		select {
+		case <-deadline:
+			t.Fatalf("only %d change attempts", changes.Load())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	ext <- struct{}{}
+	deadline = time.After(2 * time.Second)
+	for pushes.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("a server push was held back by failing change retries")
+		case <-time.After(5 * time.Millisecond):
 		}
 	}
 }
