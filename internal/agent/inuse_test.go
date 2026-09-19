@@ -136,3 +136,44 @@ func TestAWaitingFileThatIsDeletedStopsTheWait(t *testing.T) {
 		}
 	}
 }
+
+// The Waiting entry lives as long as its wait. Cleared only by a successful
+// upload, it stuck for good when the wait ended any other way: the file settled
+// as a conflict, the folder removed or excluded, or the upload failing for some
+// other reason once the program had closed.
+func TestTheWaitingEntryEndsWithTheWait(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		watcher bool
+	}{{"nudged", true}, {"folder no longer synced", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			p := Pair{LocalDir: t.TempDir()}
+			nudges := map[string]chan string{}
+			if tc.watcher {
+				nudges[PairKey(p.LocalDir, p.RemoteRoot)] = make(chan string, 1)
+			}
+			e := &Engine{runCtx: ctx, nudges: nudges}
+			ow, oe := writerGone, closedCheckEvery
+			writerGone = func(string) bool { return true }
+			closedCheckEvery = 10 * time.Millisecond
+			t.Cleanup(func() { writerGone, closedCheckEvery = ow, oe })
+
+			abs := filepath.Join(p.LocalDir, "archive.pst")
+			if err := os.WriteFile(abs, []byte("pst"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			e.noteBusy(abs, "archive.pst")
+			e.awaitClosed(p, abs)
+			deadline := time.After(2 * time.Second)
+			for e.busyStatus() != "" {
+				select {
+				case <-deadline:
+					t.Fatal("the Waiting entry outlived its wait")
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
+		})
+	}
+}

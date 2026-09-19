@@ -72,6 +72,11 @@ func (e *Engine) awaitClosed(p Pair, abs string) {
 			e.watchMu.Lock()
 			delete(e.awaiting, abs)
 			e.watchMu.Unlock()
+			// The Waiting entry lives exactly as long as the wait. A nudged
+			// sync that still finds the file in use notes it again; any other
+			// end (settled as a conflict, folder gone, a different failure)
+			// must not leave the status saying Waiting until restart.
+			e.clearBusy(abs)
 		}()
 		t := time.NewTicker(closedCheckEvery)
 		defer t.Stop()
@@ -82,8 +87,7 @@ func (e *Engine) awaitClosed(p Pair, abs string) {
 			case <-t.C:
 			}
 			if _, err := os.Stat(abs); os.IsNotExist(err) {
-				e.clearBusy(abs) // gone: nothing left to wait for
-				return
+				return // gone: nothing left to wait for
 			}
 			if !writerGone(abs) {
 				continue
