@@ -165,3 +165,55 @@ func TestBaselineCacheWriteThrough(t *testing.T) {
 		t.Fatal("BaselineEmpty should be false with rows present")
 	}
 }
+
+// BaselineCountUnder backs the damage guards' weighing of a directory delete.
+// Both read paths must agree, and "under" must mean strictly beneath: not the
+// directory's own row, and not a sibling whose name merely starts the same
+// ("dir b", "dir.txt", "dir0" all sort between "dir" and "dir/").
+func TestBaselineCountUnder(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cached=%v", cached), func(t *testing.T) {
+			st, err := Open(filepath.Join(t.TempDir(), "state.db"), "acct", cached)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer st.Close()
+			for _, p := range []string{
+				"dir", "dir/a.txt", "dir/sub", "dir/sub/b.txt",
+				"dir b", "dir b/c.txt", "dir.txt", "dir0/d.txt",
+				"other", "other/e.txt",
+			} {
+				if err := st.UpsertBaseline("P", engine.BaselineState{Path: p}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := st.UpsertBaseline("Q", engine.BaselineState{Path: "dir/not-this-pair"}); err != nil {
+				t.Fatal(err)
+			}
+			if cached {
+				if _, err := st.LoadBaseline("P"); err != nil { // fill the cache
+					t.Fatal(err)
+				}
+			}
+			for _, tc := range []struct {
+				dirs []string
+				want int
+			}{
+				{nil, 0},
+				{[]string{"dir"}, 3},
+				{[]string{"dir/sub"}, 1},
+				{[]string{"dir", "other"}, 4},
+				{[]string{"dir.txt"}, 0}, // a file: nothing beneath it
+				{[]string{"missing"}, 0},
+			} {
+				got, err := st.BaselineCountUnder("P", tc.dirs)
+				if err != nil {
+					t.Fatalf("BaselineCountUnder(%v): %v", tc.dirs, err)
+				}
+				if got != tc.want {
+					t.Errorf("BaselineCountUnder(%v) = %d, want %d", tc.dirs, got, tc.want)
+				}
+			}
+		})
+	}
+}

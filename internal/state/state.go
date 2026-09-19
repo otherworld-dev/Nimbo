@@ -399,6 +399,49 @@ func (s *Store) BaselineCount(pairKey string) (int, error) {
 	return n, err
 }
 
+// BaselineCountUnder counts the rows strictly beneath any of dirs, which must
+// not nest (a row under two of them would count twice). The damage guards need
+// it: deleting a directory is one action, but it removes everything beneath.
+func (s *Store) BaselineCountUnder(pairKey string, dirs []string) (int, error) {
+	if len(dirs) == 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	if m, ok := s.cache[pairKey]; ok {
+		set := make(map[string]struct{}, len(dirs))
+		for _, d := range dirs {
+			set[d] = struct{}{}
+		}
+		n := 0
+		for p := range m {
+			for i := strings.LastIndex(p, "/"); i > 0; i = strings.LastIndex(p[:i], "/") {
+				if _, hit := set[p[:i]]; hit {
+					n++
+					break
+				}
+			}
+		}
+		s.mu.Unlock()
+		return n, nil
+	}
+	s.mu.Unlock()
+	n := 0
+	for _, d := range dirs {
+		// A range on the primary key, not LIKE (which SQLite cannot serve from
+		// that index): '0' is the byte after '/', so "d/" <= path < "d0" is
+		// exactly the rows beneath d.
+		var c int
+		if err := s.db.QueryRow(
+			`SELECT COUNT(*) FROM baseline WHERE account_id = ? AND pair_key = ? AND path >= ? AND path < ?`,
+			s.accountID, pairKey, d+"/", d+"0",
+		).Scan(&c); err != nil {
+			return 0, fmt.Errorf("count baseline under %q: %w", d, err)
+		}
+		n += c
+	}
+	return n, nil
+}
+
 // CloneStatus returns a pair's initial-clone state: "" (none yet), "started"
 // (clone in progress — resume it), or "done" (use the normal diff path).
 func (s *Store) CloneStatus(pairKey string) (string, error) {

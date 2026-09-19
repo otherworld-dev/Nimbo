@@ -1,0 +1,246 @@
+package agent
+
+// A server outage must never read as a deletion (Deck #691).
+//
+// 2026-09-19, live mode: the server was unreachable for 13 minutes. A local
+// change inside "To Sort" put the folder itself into a scoped SyncPaths batch;
+// the folder's Stat failed, the failure was taken for "not on the server", and
+// the whole folder (180,810 files) was deleted locally. These tests pin each
+// link of that chain.
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/otherworld/nimbo/internal/engine"
+)
+
+// seededFolderPair builds a settled pair holding one folder of n files, so the
+// damage guard is armed exactly as on a long-running install. A file beside the
+// folder keeps the root non-empty: an empty root trips a different guard.
+func seededFolderPair(t *testing.T, dir string, n int) (*fakeDAV, *Engine, Pair) {
+	t.Helper()
+	nodes := map[string]davNode{
+		"":         {isDir: true, etag: "e-root"},
+		dir:        {isDir: true, etag: "e-dir"},
+		"keep.txt": {etag: "e-keep", body: "k"},
+	}
+	for i := 0; i < n; i++ {
+		nodes[fmt.Sprintf("%s/f%03d.txt", dir, i)] = davNode{etag: fmt.Sprintf("e%03d", i), body: "v1"}
+	}
+	f := newFakeDAV(nodes)
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+	e, _ := newHookEngine(t, srv.URL)
+
+	p := Pair{LocalDir: t.TempDir()}
+	for _, pass := range []string{"seed", "settle"} {
+		if _, err := e.SyncOnce(context.Background(), p); err != nil {
+			t.Fatalf("%s sync: %v", pass, err)
+		}
+	}
+	return f, e, p
+}
+
+func assertLocalFiles(t *testing.T, p Pair, dir string, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		name := filepath.Join(p.LocalDir, dir, fmt.Sprintf("f%03d.txt", i))
+		if _, err := os.Stat(name); err != nil {
+			t.Fatalf("local file %s is gone: %v", name, err)
+		}
+	}
+}
+
+// The incident itself: the folder's Stat fails, and the folder must survive.
+func TestSyncPathsKeepsAFolderTheServerCouldNotBeAsked(t *testing.T) {
+	f, e, p := seededFolderPair(t, "To Sort", 3)
+	f.setFailPF("To Sort", http.StatusBadGateway)
+
+	// A file created in the folder: the watcher reports the folder too.
+	if err := os.WriteFile(filepath.Join(p.LocalDir, "To Sort", "new.txt"), []byte("n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.SyncPaths(context.Background(), p, []string{"To Sort", "To Sort/new.txt"})
+	if err == nil {
+		t.Fatal("a pass that could not ask the server about a path must fail, not guess")
+	}
+	assertLocalFiles(t, p, "To Sort", 3)
+	if d := f.deletePaths(); len(d) != 0 {
+		t.Fatalf("an unreachable server must not cause server deletions, got %v", d)
+	}
+}
+
+// A 404 is only an answer if Nextcloud gave it. A reverse proxy in front of a
+// stopped server can 404 every path — the pair's own root included, which a
+// real server never reports missing.
+func TestSyncPathsKeepsAFolderWhenEverythingIs404(t *testing.T) {
+	f, e, p := seededFolderPair(t, "To Sort", 3)
+	f.setFailPF("", http.StatusNotFound)
+	f.setFailPF("To Sort", http.StatusNotFound)
+
+	if _, err := e.SyncPaths(context.Background(), p, []string{"To Sort"}); err == nil {
+		t.Fatal("a 404 the server's own root shares is not a deletion; the pass must fail")
+	}
+	assertLocalFiles(t, p, "To Sort", 3)
+}
+
+// The checks above must not overcorrect: a folder the server really deleted is
+// still deleted here.
+func TestSyncPathsStillMirrorsARealServerDeletion(t *testing.T) {
+	f, e, p := seededFolderPair(t, "Small", 3)
+	for i := 0; i < 3; i++ {
+		f.delNode(fmt.Sprintf("Small/f%03d.txt", i))
+	}
+	f.delNode("Small")
+
+	if _, err := e.SyncPaths(context.Background(), p, []string{"Small"}); err != nil {
+		t.Fatalf("SyncPaths: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(p.LocalDir, "Small")); !os.IsNotExist(err) {
+		t.Fatalf("a folder the server deleted is still here locally (err=%v)", err)
+	}
+}
+
+// Only a TRACKED path, or a transient failure, must fail the pass. A refusal
+// (4xx) of a new file (say a name the server forbids) would otherwise fail
+// every batch that touches it, holding up the rest of the batch.
+func TestSyncPathsToleratesARefusedUntrackedPath(t *testing.T) {
+	f, e, p := seededFolderPair(t, "To Sort", 1)
+	for _, name := range []string{"refused.txt", "ok.txt"} {
+		if err := os.WriteFile(filepath.Join(p.LocalDir, "To Sort", name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.setFailPF("To Sort/refused.txt", http.StatusBadRequest)
+
+	if _, err := e.SyncPaths(context.Background(), p, []string{"To Sort/refused.txt", "To Sort/ok.txt"}); err != nil {
+		t.Fatalf("a refused untracked path failed the whole pass: %v", err)
+	}
+	if f.putBody("To Sort/ok.txt") != "ok.txt" {
+		t.Fatalf("the rest of the batch was not synced: %v", f.putPaths())
+	}
+}
+
+// An ignored path is not synced, so it is not asked about either: its Stat
+// failing must not fail the pass.
+func TestSyncPathsNeverAsksAboutAnIgnoredPath(t *testing.T) {
+	f, e, p := seededFolderPair(t, "To Sort", 1)
+	if err := os.WriteFile(filepath.Join(p.LocalDir, "To Sort", "x.tmp"), []byte("t"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.setFailPF("To Sort/x.tmp", http.StatusBadGateway)
+
+	if _, err := e.SyncPaths(context.Background(), p, []string{"To Sort/x.tmp"}); err != nil {
+		t.Fatalf("an ignored path failed the pass: %v", err)
+	}
+	if n := f.pfCount("To Sort/x.tmp"); n != 0 {
+		t.Fatalf("an ignored path was stat'd %d time(s)", n)
+	}
+}
+
+// The damage guard must weigh a folder delete by what it holds. The server
+// really deleting most of what this pair knows is the guard's whole job, but a
+// folder arriving as ONE action counted as one deletion and sailed under it.
+func TestGuardWeighsAFolderDeletedOnTheServer(t *testing.T) {
+	f, e, p := seededFolderPair(t, "Big", 60)
+	for i := 0; i < 60; i++ {
+		f.delNode(fmt.Sprintf("Big/f%03d.txt", i))
+	}
+	f.delNode("Big")
+
+	_, err := e.SyncPaths(context.Background(), p, []string{"Big"})
+	if err == nil || !strings.Contains(err.Error(), "paused") {
+		t.Fatalf("deleting a folder holding most of the pair must pause it, got err=%v", err)
+	}
+	assertLocalFiles(t, p, "Big", 60)
+}
+
+// The server-side bulk-delete guard, same flaw: a folder removed locally went
+// to the server as one DELETE, however many files it held.
+func TestBulkDeleteGuardWeighsAFolderDeletedLocally(t *testing.T) {
+	f, e, p := seededFolderPair(t, "Big", 60)
+	if err := os.RemoveAll(filepath.Join(p.LocalDir, "Big")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := e.SyncPaths(context.Background(), p, []string{"Big"})
+	if err == nil {
+		t.Fatal("deleting a folder holding most of the pair on the server must be refused")
+	}
+	if d := f.deletePaths(); len(d) != 0 {
+		t.Fatalf("the refused pass still deleted on the server: %v", d)
+	}
+}
+
+// Nimbo's own partial download is not a user file. A scoped pass tried to
+// upload it, and every write to it put its folder back into a batch.
+func TestSyncPathsNeverUploadsAPartialDownload(t *testing.T) {
+	f, e, p := seededFolderPair(t, "To Sort", 1)
+	part := filepath.Join(p.LocalDir, "To Sort", "OnlineArchive.pst.nimbo-part")
+	if err := os.WriteFile(part, []byte("half a download"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SyncPaths(context.Background(), p, []string{"To Sort/OnlineArchive.pst.nimbo-part"}); err != nil {
+		t.Fatalf("SyncPaths: %v", err)
+	}
+	// Asserted by name: the fixture's own files can be re-uploaded by the
+	// settle pass, since fakeDAV sends no Last-Modified (a pre-existing quirk).
+	for _, got := range f.putPaths() {
+		if strings.HasSuffix(got, ".nimbo-part") {
+			t.Fatalf("a partial download was uploaded: %s", got)
+		}
+	}
+}
+
+// deletionWeight is what the guards now count. A folder weighs what it holds;
+// a full scan, which already has one action per file, must weigh the same as
+// before (no double count); and "Big b" is a sibling of "Big", not inside it.
+func TestDeletionWeight(t *testing.T) {
+	st := maintTestStore(t)
+	const pk = "P"
+	for _, p := range []string{"Big", "Big/a", "Big/sub", "Big/sub/b", "Big b", "Big b/c", "file.txt"} {
+		if err := st.UpsertBaseline(pk, engine.BaselineState{Path: p}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	del := func(k engine.ActionKind, paths ...string) []engine.Action {
+		var out []engine.Action
+		for _, p := range paths {
+			out = append(out, engine.Action{Kind: k, Path: p})
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name    string
+		actions []engine.Action
+		want    int
+	}{
+		{"nothing", nil, 0},
+		{"one folder action", del(engine.ActDeleteLocal, "Big"), 4},
+		{"full-scan shape", del(engine.ActDeleteLocal, "Big", "Big/a", "Big/sub", "Big/sub/b"), 4},
+		{"siblings", del(engine.ActDeleteLocal, "Big", "Big b/c", "file.txt"), 6},
+		{"other kinds ignored", del(engine.ActDeleteRemote, "Big"), 0},
+		// A folder rename: rename coalescing pairs the FILES into moves and
+		// leaves the old folder's delete, so the moved rows are not deleted.
+		{"folder rename", append(del(engine.ActDeleteLocal, "Big"),
+			engine.Action{Kind: engine.ActMoveLocal, Path: "Big/a", Dest: "New/a"},
+			engine.Action{Kind: engine.ActMoveLocal, Path: "Big/sub/b", Dest: "New/sub/b"}), 2},
+		{"moves the other way do not count", append(del(engine.ActDeleteLocal, "Big"),
+			engine.Action{Kind: engine.ActMoveRemote, Path: "Big/a", Dest: "New/a"}), 4},
+	} {
+		got, err := deletionWeight(st, pk, tc.actions, engine.ActDeleteLocal)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: weight %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}

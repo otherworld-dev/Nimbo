@@ -456,3 +456,26 @@ func TestPropFindNotFoundIsFinal(t *testing.T) {
 		t.Errorf("Stat of a missing path = %v, %v; want false, nil", ok, serr)
 	}
 }
+
+// Stat's "absent" must mean the server said 404 and nothing else. It matched
+// the words "not found" in the error text, and the text carries the path, so
+// a refusal of a file NAMED like that read as "not on the server" — which a
+// sync pass acts on by deleting the local copy (Deck #691).
+func TestStatReportsAbsentOnlyForA404(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "gone") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "adam", "app-password")
+
+	if _, found, err := c.Stat(context.Background(), "gone.txt"); err != nil || found {
+		t.Fatalf("404: found=%v err=%v, want absent with no error", found, err)
+	}
+	if _, found, err := c.Stat(context.Background(), "Items not found.xlsx"); err == nil {
+		t.Fatalf("403 on a file named 'not found': found=%v, want an error, not absent", found)
+	}
+}
