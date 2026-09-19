@@ -98,3 +98,20 @@ func (e *Engine) awaitClosed(p Pair, abs string) {
 		}
 	}()
 }
+
+// movedAsideToast words the one notification a pass raises for everything it
+// moved next to the sync folder because the Recycle Bin couldn't take it (see
+// transfer.Executor.removeMirrored). One per pass: a folder deleted on the
+// server arrives file by file, and a toast each was thousands of toasts.
+func movedAsideToast(root string, rels []string) (title, msg string) {
+	clean := filepath.Clean(root)
+	aside := filepath.Join(filepath.Dir(clean), filepath.Base(clean)+" - removed on server")
+	if len(rels) == 1 {
+		name := filepath.Base(filepath.FromSlash(rels[0]))
+		return "Kept a copy of " + name, "\u201c" + name + "\u201d was deleted on the server and is too big for the Recycle Bin, " +
+			"so it was moved to " + aside + ". Delete it from there once you no longer need it."
+	}
+	return fmt.Sprintf("Kept %d items deleted on the server", len(rels)),
+		"They were deleted on the server and the Recycle Bin couldn't take them, so they were moved to " +
+			aside + ". Delete them from there once you no longer need them."
+}

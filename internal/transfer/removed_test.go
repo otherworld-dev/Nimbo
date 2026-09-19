@@ -126,3 +126,50 @@ func TestMirroredDeleteKeepsTheFolderWhenItCannotMoveIt(t *testing.T) {
 		t.Fatal("its baseline went although the folder stayed")
 	}
 }
+
+// A folder deleted on the server usually arrives as one delete per file (a
+// full or delta pass lists everything under it). Each file fits the bin on
+// its own, but the bin makes room by purging its oldest items, so recycling
+// them one by one lost most of a folder bigger than the bin just the same.
+// The bin takes files only until this pass has filled nine tenths of it.
+func TestAFolderDeletedFileByFileStopsRecyclingWhenTheBinWouldFill(t *testing.T) {
+	ex, root, recycled, moved := removedFixture(t, 300, nil) // 300-byte bin: 270 usable
+	for _, n := range []string{"b.txt", "c.txt", "d.txt", "e.txt"} {
+		if err := os.WriteFile(filepath.Join(root, "Big", n), make([]byte, 100), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var actions []engine.Action
+	for _, n := range []string{"a.txt", "b.txt", "c.txt", "d.txt", "e.txt"} {
+		actions = append(actions, engine.Action{Kind: engine.ActDeleteLocal, Path: "Big/" + n})
+	}
+	actions = append(actions, engine.Action{Kind: engine.ActDeleteLocal, Path: "Big"})
+	if _, err := ex.Run(context.Background(), actions); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var files int
+	for _, p := range *recycled {
+		if strings.HasSuffix(p, ".txt") {
+			files++
+		}
+	}
+	if files != 2 || len(*moved) != 3 {
+		t.Fatalf("recycled %d files and moved %d aside, want 2 and 3: recycled=%v moved=%v", files, len(*moved), *recycled, *moved)
+	}
+}
+
+// A drive with no Recycle Bin (a network or removable drive), or one whose bin
+// the user switched off, always deleted permanently, and still does: moving
+// every deletion aside there would pile up without end.
+func TestADriveWithNoBinDeletesAsBefore(t *testing.T) {
+	ex, root, recycled, moved := removedFixture(t, 0, nil) // capacity 0: no bin here
+	if err := deleteBig(t, ex); err != nil {
+		t.Fatalf("applyDelete: %v", err)
+	}
+	if len(*recycled) != 0 || len(*moved) != 0 {
+		t.Fatalf("recycled=%v moved=%v, want a plain delete", *recycled, *moved)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Big")); !os.IsNotExist(err) {
+		t.Fatalf("not deleted (err=%v)", err)
+	}
+}

@@ -46,6 +46,7 @@ type Executor struct {
 	// OnMovedAside, if set, is told when a folder or file the server deleted was
 	// too big for the Recycle Bin and was moved next to the sync folder instead.
 	OnMovedAside func(rel, dest string)
+	binUsed      map[string]int64 // bytes this run put in each drive's Recycle Bin
 
 	// Policy controls conflict handling. Under PolicyAsk, conflicts (other than
 	// identical content) are deferred into Pending instead of auto-resolved.
@@ -429,19 +430,34 @@ func (e *Executor) applyDelete(ctx context.Context, a engine.Action) error {
 // which is how 219 GB of "To Sort" was lost for good (Deck #691). Anything the
 // bin can't keep, or refuses, is moved next to the sync folder instead, and
 // OnMovedAside says where. Where even that fails, the item stays and the
-// action fails: never a delete nobody can undo. On a platform with no bin at
-// all it stays a plain delete, as before.
+// action fails: never a delete nobody can undo. Where there is no bin at all
+// (another platform, a network or removable drive, a bin switched off) it
+// stays a plain delete, as it always was.
 func (e *Executor) removeMirrored(rel string) error {
 	p := e.localPath(rel)
 	capacity, hasBins := binCapacity(p)
 	clearReadOnlyTree(p)
-	if !hasBins {
+	if !hasBins || capacity <= 0 {
+		// No bin on this drive (network, removable) or the user switched it
+		// off: deleting here was always for good, and still is.
 		return os.RemoveAll(p)
 	}
-	// Nine tenths: an item near the bin's whole size would also push out
-	// everything already in it.
-	if capacity > 0 && sizeWithin(p, capacity/10*9) {
+	// The bin takes items only until this pass has put nine tenths of its
+	// capacity in. It makes room by purging its oldest items, so a folder
+	// arriving file by file (a full or delta pass lists everything in it) would
+	// otherwise push its own first files out for good.
+	vol := strings.ToLower(filepath.VolumeName(p))
+	e.mu.Lock()
+	room := capacity/10*9 - e.binUsed[vol]
+	e.mu.Unlock()
+	if size, fits := sizeWithin(p, room); fits {
 		if err := recycleFn(p); err == nil {
+			e.mu.Lock()
+			if e.binUsed == nil {
+				e.binUsed = make(map[string]int64)
+			}
+			e.binUsed[vol] += size
+			e.mu.Unlock()
 			return nil
 		}
 	}
@@ -456,10 +472,13 @@ func (e *Executor) removeMirrored(rel string) error {
 	return nil
 }
 
-// sizeWithin reports whether everything at p adds up to no more than limit
-// bytes, stopping as soon as it doesn't.
-func sizeWithin(p string, limit int64) bool {
+// sizeWithin adds up everything at p and reports whether it comes to no more
+// than limit bytes, stopping as soon as it doesn't.
+func sizeWithin(p string, limit int64) (int64, bool) {
 	var total int64
+	if limit < 0 {
+		return 0, false
+	}
 	over := errors.New("over")
 	err := filepath.WalkDir(p, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -474,7 +493,7 @@ func sizeWithin(p string, limit int64) bool {
 		}
 		return nil
 	})
-	return err == nil
+	return total, err == nil
 }
 
 // moveAside moves rel out of the sync folder into a sibling named after it,

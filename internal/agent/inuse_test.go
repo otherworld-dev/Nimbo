@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -63,5 +65,21 @@ func TestAPutOffUploadIsNudgedOnceTheProgramLetsGo(t *testing.T) {
 	case got := <-nudge:
 		t.Fatalf("nudged twice (%q)", got)
 	case <-time.After(80 * time.Millisecond):
+	}
+}
+
+// A folder deleted on the server arrives file by file, so moving what the bin
+// can't take aside toasted once per file: thousands of toasts for one folder.
+// One pass gets one message.
+func TestMovedAsideIsOneMessagePerPass(t *testing.T) {
+	root := filepath.Join(`E:\`, "Nextcloud")
+	aside := `E:\Nextcloud - removed on server`
+	title, msg := movedAsideToast(root, []string{"To Sort/big.pst"})
+	if title != "Kept a copy of big.pst" || !strings.Contains(msg, aside) {
+		t.Errorf("one item: %q / %q", title, msg)
+	}
+	title, msg = movedAsideToast(root, []string{"To Sort/a", "To Sort/b", "To Sort/c"})
+	if title != "Kept 3 items deleted on the server" || !strings.Contains(msg, aside) {
+		t.Errorf("three items: %q / %q", title, msg)
 	}
 }

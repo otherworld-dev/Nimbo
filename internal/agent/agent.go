@@ -3754,6 +3754,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	var probMu sync.Mutex
 	var problems []string    // paths whose action failed — they poison dir-etag stamping
 	var busyUploads []string // uploads put off while another program has the file open
+	var movedAside []string  // server deletions the Recycle Bin couldn't take, moved beside the folder
 	ex := &transfer.Executor{
 		Client:     e.client,
 		State:      st,
@@ -3780,9 +3781,9 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			e.progBytes.Add(delta)
 		},
 		OnMovedAside: func(rel, dest string) {
-			name := filepath.Base(filepath.FromSlash(rel))
-			e.toast("Kept a copy of "+name, "“"+name+"” was deleted on the server and is too big for the Recycle Bin, "+
-				"so it was moved to "+dest+". Delete it from there once you no longer need it.", "")
+			probMu.Lock()
+			movedAside = append(movedAside, rel)
+			probMu.Unlock()
 		},
 		OnEvent: func(a engine.Action, aerr error) {
 			abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
@@ -3828,6 +3829,10 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		},
 	}
 	stats, err := ex.Run(ctx, actions)
+	if len(movedAside) > 0 {
+		title, msg := movedAsideToast(p.LocalDir, movedAside)
+		e.toast(title, msg, "")
+	}
 	// A cancelled pass (quit, pause, a restart) stops starting transfers but Run
 	// still reports no error, and what it never started is in no problem list.
 	// Treat it as the partway stop it is: stamping its folders as seen hid the
