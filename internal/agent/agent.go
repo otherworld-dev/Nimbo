@@ -3685,10 +3685,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	}
 	// A server copy that failed its checksum is not fetched again until it
 	// changes (Deck #691, see damaged.go).
-	actions, skippedDamaged, damagedConflicts := e.skipDamaged(pk, actions, remote)
-	for _, rel := range damagedConflicts {
-		e.keepEditAside(p, rel)
-	}
+	actions, skippedDamaged := e.skipDamaged(pk, actions, remote)
 
 	// Data-loss guard. If this plan would delete files on the SERVER while the
 	// local root has vanished (folder deleted, moved, unmounted, or empty), that is
