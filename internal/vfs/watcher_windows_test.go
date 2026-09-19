@@ -50,6 +50,7 @@ type fakeCf struct {
 	// directory is always populated and is answered from plain, not here.
 	populated     map[string]bool
 	notified      []string         // paths passed to the shell change-notify seam
+	createdNote   []string         // paths passed to the shell "item created" seam
 	settleChecked []string         // paths offered to the pin-settle seam
 	excluded      []string         // paths passed to the exclude-from-sync seam
 	reverted      []string         // paths passed to RevertPlaceholder (they become plain)
@@ -167,6 +168,13 @@ func installFakeCf(t *testing.T) *fakeCf {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.notified = append(f.notified, path)
+	}
+	osc := cfShellCreated
+	t.Cleanup(func() { cfShellCreated = osc })
+	cfShellCreated = func(path string, _ bool) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.createdNote = append(f.createdNote, path)
 	}
 	cfIsPlaceholder = func(_ os.FileInfo, full string) bool {
 		f.mu.Lock()

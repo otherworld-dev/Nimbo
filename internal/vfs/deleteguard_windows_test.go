@@ -82,6 +82,12 @@ func TestDeleteKeepsAFolderWhoseContentsWereNeverHere(t *testing.T) {
 	if fi, err := os.Stat(filepath.Join(root, "Lazy")); err != nil || !fi.IsDir() {
 		t.Fatalf("the folder is not back on disk: %v", err)
 	}
+	f.mu.Lock()
+	notes := append([]string(nil), f.createdNote...)
+	f.mu.Unlock()
+	if len(notes) != 1 || notes[0] != filepath.Join(root, "Lazy") {
+		t.Fatalf("Explorer was not told the folder is back (an open window shows it gone until F5); notes = %v", notes)
+	}
 	kept := rec.reportsOf("delete-kept")
 	if len(kept) != 1 || kept[0].path != "Lazy" || kept[0].err == nil {
 		t.Fatalf("want one delete-kept report for Lazy carrying the explanation, got %+v", kept)

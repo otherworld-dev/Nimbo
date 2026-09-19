@@ -39,6 +39,7 @@ var (
 	cfMarkInSync          = cfapi.MarkInSync
 	cfSetInSync           = cfapi.SetInSync
 	cfShellNotify         = cfapi.ShellNotifyUpdated
+	cfShellCreated        = cfapi.ShellNotifyCreated
 	cfSettlePin           = cfapi.SettlePin
 	cfExclude             = cfapi.ExcludeFromSync
 	cfPlaceholderIdentity = cfapi.PlaceholderIdentity
@@ -1955,7 +1956,13 @@ func (w *Watcher) restorePlaceholder(path string) error {
 	name := filepath.Base(path)
 	for _, k := range kids {
 		if strings.EqualFold(k.Name, name) {
-			return cfCreatePlaceholders(parent, []cfapi.PlaceholderInfo{k})
+			if err := cfCreatePlaceholders(parent, []cfapi.PlaceholderInfo{k}); err != nil {
+				return err
+			}
+			// The window the user deleted it from will not show it again on
+			// its own (measured: invisible until F5).
+			cfShellCreated(filepath.Join(parent, k.Name), k.IsDir)
+			return nil
 		}
 	}
 	return fmt.Errorf("%s is no longer in the server listing", name)
