@@ -686,21 +686,53 @@ func (s *Store) DeleteBaselineUnder(pairKey, prefix string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// A range, not LIKE: LIKE treats "_" and "%" as wildcards and ignores case,
-	// so clearing "a_b" also cleared "axb/..." and "A_B/..." (Deck #691). '0'
-	// is the byte after '/', so "p/" <= path < "p0" is exactly the rows beneath.
-	_, err := s.db.Exec(
-		`DELETE FROM baseline WHERE account_id = ? AND pair_key = ? AND (path = ? OR (path >= ? AND path < ?))`,
-		s.accountID, pairKey, prefix, prefix+"/", prefix+"0",
-	)
+	// This runs once per file of a mass delete, so every step must use the
+	// primary-key index (Deck #691): a range, not LIKE, which ignores case and
+	// treats "_" and "%" as wildcards (so clearing "a_b" also cleared "axb/..."
+	// and "A_B/..."); and the row and its subtree as two statements, since
+	// SQLite can't serve "path = ? OR range" from the index and scanned the
+	// pair's whole baseline for each file. '0' is the byte after '/', so
+	// "p/" <= path < "p0" is exactly the rows beneath.
+	lo, hi := prefix+"/", prefix+"0"
+	var beneath []string
+	if _, cached := s.cache[pairKey]; cached {
+		rows, err := s.db.Query(
+			`SELECT path FROM baseline WHERE account_id = ? AND pair_key = ? AND path >= ? AND path < ?`,
+			s.accountID, pairKey, lo, hi,
+		)
+		if err != nil {
+			return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+		}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				rows.Close()
+				return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+			}
+			beneath = append(beneath, p)
+		}
+		rows.Close()
+	}
+	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("delete baseline under %q: %w", prefix, err)
 	}
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	if _, err := tx.Exec(`DELETE FROM baseline WHERE account_id = ? AND pair_key = ? AND path = ?`,
+		s.accountID, pairKey, prefix); err != nil {
+		return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+	}
+	if _, err := tx.Exec(`DELETE FROM baseline WHERE account_id = ? AND pair_key = ? AND path >= ? AND path < ?`,
+		s.accountID, pairKey, lo, hi); err != nil {
+		return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+	}
 	if m, ok := s.cache[pairKey]; ok { // keep the resident copy current
-		for p := range m {
-			if p == prefix || strings.HasPrefix(p, prefix+"/") {
-				delete(m, p)
-			}
+		delete(m, prefix)
+		for _, p := range beneath {
+			delete(m, p)
 		}
 	}
 	return nil

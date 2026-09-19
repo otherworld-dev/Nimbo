@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/engine"
 )
@@ -281,5 +282,40 @@ func TestLoadBaselineScopedIsExact(t *testing.T) {
 	}
 	if len(got) != 1 || got["a_b/x"].Path == "" {
 		t.Fatalf("scoped to a_b, got %v", got)
+	}
+}
+
+// Clearing a deleted path's rows ran over the whole resident baseline on every
+// call, once per file of a mass delete: 208k deletes over a 370k-row cache is
+// tens of billions of steps with the store locked. A file has nothing beneath
+// it, and a folder's rows are found by the index.
+func TestDeleteBaselineUnderDoesNotWalkTheWholeCache(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"), "acct", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rows := make([]engine.BaselineState, 0, 200000)
+	for i := 0; i < 200000; i++ {
+		rows = append(rows, engine.BaselineState{Path: fmt.Sprintf("d%03d/f%06d", i%500, i)})
+	}
+	if err := st.UpsertBaselineBatch("P", rows); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.LoadBaseline("P"); err != nil { // fill the cache
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for i := 0; i < 2000; i++ {
+		if err := st.DeleteBaselineUnder("P", fmt.Sprintf("d%03d/f%06d", i%500, i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("2,000 file deletes over a 200,000-row cache took %v", d)
+	}
+	got, _ := st.LoadBaseline("P")
+	if len(got) != 198000 {
+		t.Fatalf("%d rows left, want 198000", len(got))
 	}
 }
