@@ -113,7 +113,7 @@ func TestDeleteJudgesTheWholeSubtree(t *testing.T) {
 		dirEntry("2026", "Photos/2026"),
 	}
 	rec.listing["Photos/2026"] = []cfapi.PlaceholderInfo{fileEntry("b.jpg", "Photos/2026/b.jpg")}
-	rec.baselines["Photos/a.jpg"] = "e-a"
+	rec.baselines["Photos/a.jpg"] = "e-a.jpg"
 	rec.baselines["Photos/2026"] = "e-2026"
 	w := bareWatcher(root, rec.ops())
 	defer w.cancel()
@@ -139,9 +139,8 @@ func TestDeleteSendsAFolderWhoseFilesWereAllHere(t *testing.T) {
 		dirEntry("Sub", "Opened/Sub"),
 	}
 	rec.listing["Opened/Sub"] = []cfapi.PlaceholderInfo{fileEntry("y.txt", "Opened/Sub/y.txt")}
-	rec.baselines["Opened/x.txt"] = "e-x"
-	rec.baselines["Opened/Sub/y.txt"] = "e-y"
-	rec.mountRoots = map[string]bool{} // wires Ops.Forget
+	rec.baselines["Opened/x.txt"] = "e-x.txt"
+	rec.baselines["Opened/Sub/y.txt"] = "e-y.txt"
 	w := bareWatcher(root, rec.ops())
 	defer w.cancel()
 
@@ -149,10 +148,6 @@ func TestDeleteSendsAFolderWhoseFilesWereAllHere(t *testing.T) {
 
 	if d := rec.deleteList(); len(d) != 1 || d[0] != "Opened" {
 		t.Fatalf("a folder the user had must be deleted on the server; deletes = %v", d)
-	}
-	// Left behind, its baselines would vouch for a later folder of the same name.
-	if got := rec.forgottenPaths(); len(got) != 1 || got[0] != "Opened" {
-		t.Fatalf("what was recorded under the deleted folder was not forgotten: %v", got)
 	}
 }
 
@@ -291,7 +286,8 @@ func TestDeleteOfAFolderWaitsForItsContentsDeletes(t *testing.T) {
 
 // A tool that removes empty folders bottom-up removes the parent right after
 // the child the guard kept: deleting the parent would take the kept child, so
-// the parent is kept too, even though its own listing looks harmless by then.
+// the parent is kept too. P's listing is deliberately empty here to isolate
+// that rule; with a real listing its own walk would find the file as well.
 func TestDeleteKeepsAFolderWhenSomethingInsideWasKept(t *testing.T) {
 	installFakeCf(t)
 	root := t.TempDir()
@@ -342,5 +338,160 @@ func TestDeleteKeepsATreeTooLargeToCheck(t *testing.T) {
 	}
 	if !rec.logged("too many to check") {
 		t.Fatalf("logs = %v", rec.logLines())
+	}
+}
+
+// An old baseline is not proof: the folder was deleted and re-created on the
+// server since this computer listed it, and the file of the same name is a new
+// version (a new ETag) that was never here.
+func TestDeleteKeepsWhenABaselineIsOutOfDate(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	rec := newRecorder()
+	rec.listing["Reports"] = []cfapi.PlaceholderInfo{fileEntry("q1.xlsx", "Reports/q1.xlsx")} // ETag e-q1.xlsx
+	rec.baselines["Reports/q1.xlsx"] = "e-old"
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.handleDelete(filepath.Join(root, "Reports"))
+
+	if d := rec.deleteList(); len(d) != 0 {
+		t.Fatalf("an out-of-date baseline vouched for a file never here: %v", d)
+	}
+}
+
+// Population never shows an end-to-end encrypted folder, so a folder holding
+// only one looks empty even after it is opened. Its contents were never here.
+func TestDeleteKeepsAFolderHoldingAnEncryptedFolder(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	rec := newRecorder()
+	rec.checkStrict = true
+	vault := dirEntry("Vault", "Documents/Vault")
+	vault.Encrypted = true
+	rec.listing["Documents"] = []cfapi.PlaceholderInfo{vault}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.handleDelete(filepath.Join(root, "Documents"))
+
+	if d := rec.deleteList(); len(d) != 0 {
+		t.Fatalf("deleted a folder holding an encrypted folder: %v", d)
+	}
+	if !rec.logged("end-to-end encrypted") {
+		t.Fatalf("logs = %v", rec.logLines())
+	}
+}
+
+// Under a non-empty remote root the guard must list the path the server knows
+// (relative to the sync root, not the full server path). The strict listing
+// answers "not found" for anything else, which would silently drop the delete.
+func TestDeleteGuardListsTheRightPathUnderARemoteRoot(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	rec := newRecorder()
+	rec.checkStrict = true
+	rec.listing["F"] = []cfapi.PlaceholderInfo{}
+	w := bareWatcher(root, rec.ops())
+	w.remoteRoot = "Sub"
+	defer w.cancel()
+
+	w.handleDelete(filepath.Join(root, "F"))
+
+	if d := rec.deleteList(); len(d) != 1 || d[0] != "Sub/F" {
+		t.Fatalf("deletes = %v, want [Sub/F]", d)
+	}
+}
+
+// The walk can take a while. If the path is back on disk by the time it
+// finishes (re-created, uploaded again), the DELETE must not go out.
+func TestDeleteRechecksThePathAfterTheWalk(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	rec := newRecorder()
+	ops := rec.ops()
+	ops.CheckList = func(rel string) ([]cfapi.PlaceholderInfo, error) {
+		// The user's editor writes the file again while the guard is asking.
+		_ = os.WriteFile(filepath.Join(root, "a.txt"), []byte("new"), 0o644)
+		return []cfapi.PlaceholderInfo{}, nil
+	}
+	w := bareWatcher(root, ops)
+	defer w.cancel()
+
+	w.handleDelete(filepath.Join(root, "a.txt"))
+
+	if d := rec.deleteList(); len(d) != 0 {
+		t.Fatalf("deleted a path that was back on disk: %v", d)
+	}
+}
+
+// Shutting down in the middle of the walk sends nothing.
+func TestDeleteSendsNothingWhenStoppedDuringTheWalk(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	rec := newRecorder()
+	ops := rec.ops()
+	var w *Watcher
+	ops.CheckList = func(rel string) ([]cfapi.PlaceholderInfo, error) {
+		w.cancel()
+		return []cfapi.PlaceholderInfo{}, nil
+	}
+	w = bareWatcher(root, ops)
+
+	w.handleDelete(filepath.Join(root, "a.txt"))
+
+	if d := rec.deleteList(); len(d) != 0 {
+		t.Fatalf("deleted during shutdown: %v", d)
+	}
+}
+
+// A MOVE onto the path (or a folder above it) that has not landed yet means the
+// server cannot answer what a delete would remove: wait for it.
+func TestDeleteWaitsForAMoveInFlight(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	rec := newRecorder()
+	rec.listing["P/a.txt"] = []cfapi.PlaceholderInfo{}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+	w.mu.Lock()
+	w.inMove[strings.ToLower(filepath.Join(root, "P"))] = true
+	w.mu.Unlock()
+
+	w.handleDelete(filepath.Join(root, "P", "a.txt"))
+	if d := rec.deleteList(); len(d) != 0 {
+		t.Fatalf("deleted while a move onto its folder was in flight: %v", d)
+	}
+
+	w.mu.Lock()
+	delete(w.inMove, strings.ToLower(filepath.Join(root, "P")))
+	w.mu.Unlock()
+	select {
+	case got := <-rec.deleted:
+		if got != "P/a.txt" {
+			t.Fatalf("deleted %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the delete was dropped instead of waiting for the move")
+	}
+}
+
+// Reconcile must not pull back a folder whose delete is still being checked:
+// the delete would then find it "came back" and drop it.
+func TestReconcileLeavesAPendingDeleteAlone(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	rec := newRecorder()
+	rec.listing[""] = []cfapi.PlaceholderInfo{ph("P", true, "etag-p", "")}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.scheduleDelete(filepath.Join(root, "P")) // gone here, delete pending
+	w.Reconcile()
+
+	for _, n := range f.createdNames() {
+		if n == "P" {
+			t.Fatal("reconcile pulled back a folder whose delete was pending")
+		}
 	}
 }

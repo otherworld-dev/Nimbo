@@ -705,6 +705,10 @@ type PlaceholderInfo struct {
 	// mount: the one entry whose later disappearance from a listing means
 	// "detached from this account", not "deleted" (Deck #557).
 	MountRoot bool
+	// Encrypted marks an end-to-end encrypted folder. Population never creates
+	// one; only the delete guard's complete listing reports them, so a folder
+	// holding one is never deleted on the strength of a listing that hid it.
+	Encrypted bool
 }
 
 // CF_FS_METADATA { FILE_BASIC_INFO BasicInfo; LARGE_INTEGER FileSize; }

@@ -142,7 +142,7 @@
        "delete-remote": "Deleted on server", "move-local": "Moved", "move-remote": "Moved",
        "mkdir-local": "New folder", "mkdir-remote": "New folder", conflict: "Conflict",
        unshared: "No longer shared with you — copy kept",
-       "delete-kept": "Removed here, kept on server",
+       "delete-kept": "Kept on server (not deleted)",
        "unshared-empty": "No longer shared with you — nothing was downloaded" } as Record<string, string>)[k] ?? k;
   refresh();
   Events.On("status", (e: any) => {

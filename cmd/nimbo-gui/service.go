@@ -1308,6 +1308,35 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		poll = 5 * time.Minute
 	}
 	up := a.uploadWithConflictFor(eng, etags)
+	// checkList is the delete guard's listing (vfs.Ops.CheckList): every child,
+	// end-to-end encrypted folders included, no side effects (listRemote
+	// records share roots and can raise lock toasts), and a time limit so a
+	// stalled response cannot hold one of the guard's few slots for ever.
+	checkList := func(rel string) ([]cfapi.PlaceholderInfo, error) {
+		ctx, cancel := context.WithTimeout(a.ctx, 2*time.Minute)
+		defer cancel()
+		remote := strings.Trim(root+"/"+rel, "/")
+		entries, err := eng.Browse(ctx, remote)
+		if err != nil {
+			return nil, err
+		}
+		items := []cfapi.PlaceholderInfo{}
+		for _, e := range entries {
+			p := strings.Trim(e.Path, "/")
+			if p == remote || p == "" {
+				continue // the directory itself
+			}
+			name := p
+			if i := strings.LastIndex(p, "/"); i >= 0 {
+				name = p[i+1:]
+			}
+			items = append(items, cfapi.PlaceholderInfo{
+				Name: name, IsDir: e.IsDir, Identity: []byte(p), ETag: e.ETag,
+				Encrypted: e.IsDir && e.IsEncrypted,
+			})
+		}
+		return items, nil
+	}
 	forgetUnder := func(remote string) {
 		etags.delUnder(remote)
 		fileids.delUnder(remote)
@@ -1315,11 +1344,12 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 	}
 	startWatcher := func() *vfs.Watcher {
 		w, werr := vfs.New(a.ctx, localDir, root, poll, vfs.Ops{
-			Upload: up,
-			Mkdir:  eng.MkdirRemote,
-			Delete: eng.DeleteRemote,
-			Move:   eng.MoveRemote,
-			List:   listRemote,
+			Upload:    up,
+			Mkdir:     eng.MkdirRemote,
+			Delete:    eng.DeleteRemote,
+			Move:      eng.MoveRemote,
+			List:      listRemote,
+			CheckList: checkList,
 			// Lost-MOVE detection: after a rename's MOVE "fails", the watcher
 			// asks whether the destination exists — the server may have applied
 			// the move and only the response was lost.
@@ -1447,10 +1477,11 @@ func (a *App) vfsErrorToast(kind, remotePath string, err error) {
 	}
 	if kind == "delete-kept" {
 		// Not a failure: a folder vanished here while the server still holds
-		// files in it that were never on this computer, so the watcher kept it
-		// on the server and put it back (vfs.judgeDelete). The log has the reason.
+		// things in it this computer never had (or could not check), so the
+		// watcher kept it on the server and put it back (vfs.judgeDelete).
+		// The log has the exact reason.
 		notify.Toast(brand.Current.Name+" — on-demand sync",
-			filepath.Base(remotePath)+" was removed from this PC but kept on the server, because some of what it holds was never on this PC. Delete it on the server if you meant to.", "")
+			filepath.Base(remotePath)+" wasn't deleted on the server, because it holds files this PC never had. It's back here as an online-only folder. To delete it everywhere, use the web page.", "")
 		return
 	}
 	verb := map[string]string{

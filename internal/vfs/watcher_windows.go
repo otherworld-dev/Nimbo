@@ -60,6 +60,13 @@ type Ops struct {
 	// listing is unknown (e.g. a network failure) and must NOT be treated as an
 	// empty directory.
 	List func(rel string) ([]cfapi.PlaceholderInfo, error)
+	// CheckList lists a server folder for the delete guard, sync-root-relative
+	// like List, but completely and quietly: end-to-end encrypted folders are
+	// included (Encrypted set) rather than skipped, nothing is recorded as a
+	// side effect, and a listing that cannot finish returns an error (a
+	// transport.ErrNotFound one when the folder is not there). Nil makes the
+	// guard use List.
+	CheckList func(rel string) ([]cfapi.PlaceholderInfo, error)
 	// Stat reports whether a RAW server path currently exists — used to tell a
 	// lost MOVE response (the server applied the rename) from a real failure.
 	// Nil disables that detection.
@@ -154,7 +161,7 @@ type Watcher struct {
 	// and kept the folders the delete guard kept on the server recently (both
 	// lower-cased); guardSem bounds how many guard listings run at once. All
 	// three are created on first use.
-	deleting   map[string]bool
+	deleting   map[string]int
 	kept       map[string]time.Time
 	guardSem   chan struct{}
 	mvAttempts map[string]int // consecutive MOVE failures per destination
@@ -768,11 +775,15 @@ func (w *Watcher) scheduleDelete(path string) {
 		return
 	}
 	w.delete[path] = time.AfterFunc(deleteDebounce, func() {
+		// Pending hands over to running under one lock, so a folder waiting
+		// on this path never sees it in neither state. handleDelete counts
+		// its own run; this mark covers only the gap and is released after.
 		w.mu.Lock()
 		delete(w.delete, path)
 		w.markDeletingLocked(strings.ToLower(path), true)
 		w.mu.Unlock()
 		w.handleDelete(path)
+		w.markDeleting(strings.ToLower(path), false)
 	})
 }
 
@@ -788,11 +799,15 @@ func (w *Watcher) scheduleDeleteAfter(path string, d time.Duration) {
 		return
 	}
 	w.delete[path] = time.AfterFunc(d, func() {
+		// Pending hands over to running under one lock, so a folder waiting
+		// on this path never sees it in neither state. handleDelete counts
+		// its own run; this mark covers only the gap and is released after.
 		w.mu.Lock()
 		delete(w.delete, path)
 		w.markDeletingLocked(strings.ToLower(path), true)
 		w.mu.Unlock()
 		w.handleDelete(path)
+		w.markDeleting(strings.ToLower(path), false)
 	})
 }
 
@@ -1828,6 +1843,12 @@ func (w *Watcher) handleDelete(path string) {
 		w.ops.Log("vfs delete %s skipped: it was moved, not deleted", w.remoteFor(path))
 		return
 	}
+	if w.moveInFlightOrAbove(path) {
+		// A MOVE onto this path, or one of its folders, has not landed yet:
+		// until it has, the server cannot answer what a delete would remove.
+		w.scheduleDeleteAfter(path, deleteDebounce)
+		return
+	}
 	// An upload still running (or queued) for this path is now moot — and left
 	// alone it would RECREATE the file on the server after our DELETE, which
 	// reconcile then resurrects locally.
@@ -1867,20 +1888,34 @@ func (w *Watcher) handleDelete(path string) {
 	case deleteGone:
 		// The server no longer has it: nothing to delete and nothing to retry.
 		w.clearDeleteState(key)
-		w.forget(server)
 		return
 	case deleteUnknown:
 		// Unknown is not empty: a network blip or a listing that timed out must
-		// neither delete blind nor drop the user's delete. Ask again later.
+		// neither delete blind nor drop the user's delete. Ask again later, and
+		// say so once it has failed a few times, as a failed DELETE would.
 		w.ops.Log("vfs delete %s: could not check the server copy first: %v", server, lerr)
 		w.mu.Lock()
 		w.delAttempts[key]++
 		n := w.delAttempts[key]
 		w.mu.Unlock()
+		if n == 3 {
+			w.report("delete-remote", remote, fmt.Errorf("could not check what the server holds under it: %w", lerr))
+		}
 		w.scheduleDeleteAfter(path, retryDelay(n))
 		return
 	case deleteKeep:
 		w.keepOnServer(path, remote, why)
+		return
+	}
+	// The walk can take a while (a guard slot, many listings). Whatever was
+	// true before it may not be now: the path re-created and uploaded, a late
+	// rename report, our own removal.
+	if _, err := os.Lstat(path); err == nil || w.isSuppressed(path) || w.recentlyMoved(path) {
+		w.clearDeleteState(key)
+		return
+	}
+	if w.moveInFlightOrAbove(path) {
+		w.scheduleDeleteAfter(path, deleteDebounce)
 		return
 	}
 	if err := w.ops.Delete(w.ctx, server); err != nil {
@@ -1898,9 +1933,6 @@ func (w *Watcher) handleDelete(path string) {
 		return
 	}
 	w.clearDeleteState(key)
-	// Whatever was recorded under it no longer applies: left behind, a stale
-	// baseline would vouch for a later folder of the same name.
-	w.forget(server)
 	w.ops.Log("vfs deleted %s", server)
 	w.report("delete-remote", remote, nil)
 }
@@ -1910,6 +1942,14 @@ func (w *Watcher) clearDeleteState(key string) {
 	delete(w.delAttempts, key)
 	delete(w.attempts, key)
 	delete(w.busyCount, key)
+	// A kept folder at or under a path that is now gone for good no longer
+	// needs to hold its ancestors back.
+	prefix := key + string(filepath.Separator)
+	for k := range w.kept {
+		if k == key || strings.HasPrefix(k, prefix) {
+			delete(w.kept, k)
+		}
+	}
 	w.mu.Unlock()
 }
 
@@ -1924,8 +1964,12 @@ func (w *Watcher) clearDeleteState(key string) {
 // server, none of it ever seen here (GitHub #7; reproduced on the test VM
 // 2026-09-19). The path is gone by the time we hear of it, so the guard judges
 // what a DELETE would remove: every file in the server subtree must have been
-// on this computer (a recorded baseline, which every placeholder, pull and
-// upload leaves), or the folder is kept on the server and put back here.
+// on this computer in the version the server holds now (a recorded baseline
+// equal to the listing's ETag, which every placeholder, pull and upload
+// leaves), or the folder is kept on the server and put back here. A baseline
+// alone is not enough: an old one outlives a folder deleted and re-created
+// elsewhere, and would vouch for a file of the same name this computer never
+// had.
 
 type deleteVerdict int
 
@@ -1939,7 +1983,7 @@ const (
 var (
 	// maxDeleteCheckListings bounds how many server folders the guard lists
 	// for one delete before it gives up and keeps the folder.
-	maxDeleteCheckListings = 200
+	maxDeleteCheckListings = 500
 	// deleteCheckConcurrency bounds guard listings across all deletes, so a
 	// bulk removal cannot turn into a PROPFIND storm (the 2026-07-03 server
 	// DoS was one).
@@ -1951,7 +1995,11 @@ var (
 
 // judgeDelete walks the server subtree a DELETE of server would remove.
 func (w *Watcher) judgeDelete(server string) (deleteVerdict, string, error) {
-	if w.ops.List == nil {
+	list := w.ops.CheckList
+	if list == nil {
+		list = w.ops.List
+	}
+	if list == nil {
 		return deleteSafe, "", nil // no listing wired (tests only; the app always has one)
 	}
 	sem := w.guardSlot()
@@ -1964,14 +2012,14 @@ func (w *Watcher) judgeDelete(server string) (deleteVerdict, string, error) {
 	queue := []string{w.listRel(server)}
 	for n := 0; len(queue) > 0; n++ {
 		if n >= maxDeleteCheckListings {
-			return deleteKeep, fmt.Sprintf("it holds more than %d folders on the server, too many to check", maxDeleteCheckListings), nil
+			return deleteKeep, fmt.Sprintf("it holds more than %d folders on the server, too many to check one by one", maxDeleteCheckListings), nil
 		}
 		if err := w.ctx.Err(); err != nil {
 			return deleteUnknown, "", err
 		}
 		dir := queue[0]
 		queue = queue[1:]
-		kids, err := w.ops.List(dir)
+		kids, err := list(dir)
 		if err != nil {
 			if errors.Is(err, transport.ErrNotFound) {
 				if n == 0 {
@@ -1982,11 +2030,14 @@ func (w *Watcher) judgeDelete(server string) (deleteVerdict, string, error) {
 			return deleteUnknown, "", err
 		}
 		for _, k := range kids {
+			if k.Encrypted {
+				return deleteKeep, "it holds an end-to-end encrypted folder, whose contents this computer cannot see", nil
+			}
 			if k.IsDir {
 				queue = append(queue, dir+"/"+k.Name)
 				continue
 			}
-			if _, seen := w.baselineFor(string(k.Identity)); !seen {
+			if base, ok := w.baselineFor(string(k.Identity)); !ok || base == "" || base != k.ETag {
 				return deleteKeep, "the server holds files in it that were never on this computer", nil
 			}
 		}
@@ -2019,14 +2070,18 @@ func (w *Watcher) markDeleting(key string, on bool) {
 	w.markDeletingLocked(key, on)
 }
 
+// markDeletingLocked counts runs, not paths: two overlapping runs for the
+// same path must not let the first to finish clear the second's mark.
 func (w *Watcher) markDeletingLocked(key string, on bool) {
 	if w.deleting == nil {
-		w.deleting = map[string]bool{}
+		w.deleting = map[string]int{}
 	}
 	if on {
-		w.deleting[key] = true
-	} else {
+		w.deleting[key]++
+	} else if w.deleting[key] <= 1 {
 		delete(w.deleting, key)
+	} else {
+		w.deleting[key]--
 	}
 }
 
@@ -2043,6 +2098,27 @@ func (w *Watcher) deletePendingBeneath(path string) bool {
 	}
 	for k := range w.deleting {
 		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// deletePendingAtOrBeneath reports whether a delete is waiting or running for
+// path itself or anything inside it. Reconcile must not pull such a path back
+// down: the delete would then find it "came back" and drop.
+func (w *Watcher) deletePendingAtOrBeneath(path string) bool {
+	key := strings.ToLower(path)
+	prefix := key + string(filepath.Separator)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for p := range w.delete {
+		if k := strings.ToLower(p); k == key || strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	for k := range w.deleting {
+		if k == key || strings.HasPrefix(k, prefix) {
 			return true
 		}
 	}
@@ -2084,8 +2160,8 @@ func (w *Watcher) keepOnServer(path, remote, why string) {
 	server := w.serverFor(path, true)
 	back := "it has been put back"
 	if err := w.restorePlaceholder(path, server); err != nil {
-		// The next full pass lists every folder and pulls it back.
-		w.lostEvents.Store(true)
+		// A full pass lists every folder and pulls it back; ask for one now.
+		w.noteEventLoss()
 		back = "it comes back on the next full check"
 		w.ops.Log("vfs keep %s: put back: %v", server, err)
 	}
@@ -2102,6 +2178,9 @@ func (w *Watcher) restorePlaceholder(path, server string) error {
 	}
 	info := cfapi.PlaceholderInfo{Name: filepath.Base(path), IsDir: true, ModTime: time.Now(), Identity: []byte(server)}
 	if err := cfCreatePlaceholders(parent, []cfapi.PlaceholderInfo{info}); err != nil {
+		if _, serr := os.Lstat(path); serr == nil {
+			return nil // reconcile got there first
+		}
 		return err
 	}
 	// The window it was deleted from will not show it again on its own
@@ -2915,6 +2994,13 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 	var toCreate []cfapi.PlaceholderInfo
 	for _, r := range remote {
 		if !skipName(r.Name) && !localByName[nameKey(r.Name)] && !consumed[nameKey(r.Name)] {
+			if w.deletePendingAtOrBeneath(filepath.Join(localDir, r.Name)) {
+				// Gone here because the user deleted it, and the delete is
+				// still being checked or sent. Pulling it back would make the
+				// delete read it as "came back" and drop it; look again later.
+				dirOK = false
+				continue
+			}
 			toCreate = append(toCreate, r)
 		}
 	}

@@ -28,6 +28,7 @@ type PlaceholderInfo struct {
 	ETag      string
 	FileID    string
 	MountRoot bool
+	Encrypted bool
 }
 
 // Debug is a diagnostic hook (used on Windows); unused here.
