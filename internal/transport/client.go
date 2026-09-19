@@ -161,7 +161,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		}
 		return resp, nil
 	}
-	return nil, fmt.Errorf("request failed after %d attempts: %w", maxAttempts, lastErr)
+	return nil, RetriesExhausted(maxAttempts, lastErr)
 }
 
 // retryAfter parses a Retry-After response header (delta-seconds form) into a

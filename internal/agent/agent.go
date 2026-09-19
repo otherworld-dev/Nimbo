@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -2119,15 +2121,22 @@ func (e *Engine) resetAuthLost() {
 // syncing (Deck #691).
 func syncErrKind(err error) string {
 	code := transport.StatusCode(err)
+	// Concrete network types, not the net.Error interface, which a plain
+	// Windows error code (inside "Access is denied") satisfies too.
+	var opErr *net.OpError
+	var dnsErr *net.DNSError
+	var urlErr *url.Error
 	switch {
 	case code == 401 || errors.Is(err, transport.ErrUnauthorized):
 		return "auth"
 	case code != 0:
 		return "error" // the server answered, so it is reachable
-	case errors.Is(err, context.DeadlineExceeded) || transport.Retryable(err):
-		return "offline" // a network failure, or retries that ran out
+	case errors.Is(err, transport.ErrRetriesExhausted) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &opErr) || errors.As(err, &dnsErr) ||
+		(errors.As(err, &urlErr) && urlErr.Timeout()):
+		return "offline" // the network, or a server down for every retry
 	default:
-		return "error"
+		return "error" // local trouble (a folder we may not read, the database), not the network
 	}
 }
 
@@ -4045,7 +4054,10 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 	if trackedAbsent {
 		root := strings.Trim(p.RemoteRoot, "/")
 		if _, ok, serr := e.client.Stat(ctx, root); serr != nil || !ok {
-			err := fmt.Errorf("the server reported a synced item missing but cannot see the sync folder %q either (found=%v, err=%v); not deleting anything on that answer", "/"+root, ok, serr)
+			err := fmt.Errorf("the server reported a synced item missing but cannot see the sync folder %q either; not deleting anything on that answer", "/"+root)
+			if serr != nil {
+				err = fmt.Errorf("%w: %w", err, serr) // keep the cause's type, so a 401 still reads as signed out
+			}
 			e.noteScanFailure(ctx, err)
 			return transfer.Stats{}, err
 		}

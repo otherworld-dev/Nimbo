@@ -40,6 +40,26 @@ var ErrNotFound = errors.New("not found on the server")
 // credentials, where no StatusError carries the 401 (the OCS API).
 var ErrUnauthorized = errors.New("unauthorized")
 
+// ErrRetriesExhausted marks a request that failed on every attempt: the server
+// or the network stayed down for the whole retry budget.
+var ErrRetriesExhausted = errors.New("retries exhausted")
+
+// RetriesExhausted is the error for a request that failed n times, the last
+// with last. It reads as it always has ("request failed after n attempts:
+// ...") and matches both ErrRetriesExhausted and last.
+func RetriesExhausted(n int, last error) error { return &exhaustedError{n: n, last: last} }
+
+type exhaustedError struct {
+	n    int
+	last error
+}
+
+func (e *exhaustedError) Error() string {
+	return fmt.Sprintf("request failed after %d attempts: %v", e.n, e.last)
+}
+
+func (e *exhaustedError) Unwrap() []error { return []error{ErrRetriesExhausted, e.last} }
+
 // Retryable reports whether err is worth another attempt: transient server
 // distress (5xx, 429) and network-level failures, but not deliberate refusals
 // (other 4xx — bad request, forbidden, locked, quota) or the caller giving up
