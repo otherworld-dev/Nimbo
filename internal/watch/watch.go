@@ -112,7 +112,8 @@ func runLoop(ctx context.Context, opts Options, sync SyncFunc, events <-chan str
 	}
 	// A sync of local changes keeps its own failure count. Fed into note(), a
 	// change that keeps failing (a path the server refuses) held pushes and
-	// polls back for hours with every retry (Deck #691).
+	// polls back for hours with every retry (Deck #691). A success still lifts
+	// the backoff: it shows the server is reachable again.
 	var changeFails int
 	runChange := func(changed []string) error {
 		slog.Info("sync triggered", "reason", "change")
@@ -120,6 +121,7 @@ func runLoop(ctx context.Context, opts Options, sync SyncFunc, events <-chan str
 		switch {
 		case err == nil:
 			changeFails = 0
+			note(nil) // it reached the server: lift any outage backoff, as before
 		case ctx.Err() == nil:
 			changeFails++
 			slog.Error("sync failed", "err", err)

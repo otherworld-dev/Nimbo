@@ -296,3 +296,56 @@ func TestFailingChangeRetriesDoNotHoldBackPushes(t *testing.T) {
 		}
 	}
 }
+
+// A change synced successfully proves the server is back, and lifts the
+// backoff an outage left on pushes and polls, as it always did. With change
+// syncs kept out of the failure streak, success stopped lifting it too, and
+// server changes waited up to an hour behind a working connection.
+func TestASuccessfulChangeSyncLiftsTheBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan string, 1)
+	ext := make(chan struct{}, 1)
+	var pushes atomic.Int32
+	onPush := func(context.Context) error {
+		if pushes.Add(1) == 1 {
+			return errors.New("server unreachable") // the outage: backs off for the poll interval
+		}
+		return nil
+	}
+	changed := make(chan struct{}, 1)
+	syncFn := func(_ context.Context, c []string) error {
+		if c != nil {
+			changed <- struct{}{}
+		}
+		return nil
+	}
+	go func() {
+		_ = runLoop(ctx, Options{Root: t.TempDir(), Debounce: 10 * time.Millisecond, PollInterval: time.Hour,
+			OnPush: onPush, External: ext}, syncFn, events)
+	}()
+	ext <- struct{}{} // first push fails: a one-hour hold
+	deadline := time.After(2 * time.Second)
+	for pushes.Load() < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("the first push never ran")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	events <- `C:\Sync\edited.txt` // the connection is back: this succeeds
+	select {
+	case <-changed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the change never synced")
+	}
+	ext <- struct{}{}
+	deadline = time.After(2 * time.Second)
+	for pushes.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("a push was still held back after a change synced fine")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
