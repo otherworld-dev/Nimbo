@@ -98,3 +98,20 @@ func TestIgnore_FilterMaps(t *testing.T) {
 		t.Errorf("expected 1 each, got local=%d remote=%d", len(local), len(remote))
 	}
 }
+
+// The full local walk and the filter applied to server listings must skip the
+// same names. Where only the walk skipped one (".Trash", ".~anything"), a server
+// item so named was downloaded, then missing from the next full walk, and read
+// as "deleted locally": a server deletion (Deck #691).
+func TestLocalWalkAndServerFilterSkipTheSameNames(t *testing.T) {
+	ig := NewIgnore(nil)
+	for _, name := range []string{
+		".Trash", ".Trashes", ".~budget.xlsx", ".~lock.report.docx#", "~$report.docx",
+		"x.tmp", "backup~", "a.nimbo-part", "Thumbs.db", ".DS_Store", "desktop.ini",
+		"report.docx", "notes.txt", "Trash", "a~b.txt",
+	} {
+		if walk, filter := isIgnoredName(name), ig.Match(name); walk != filter {
+			t.Errorf("%q: skipped by the local walk=%v, by the server filter=%v", name, walk, filter)
+		}
+	}
+}

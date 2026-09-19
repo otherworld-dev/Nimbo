@@ -16,8 +16,8 @@ import (
 // who accept the cost. (.git also deserves caution on its own merits: file-
 // syncing a live repo across machines can corrupt it.)
 var defaultIgnore = []string{
-	"*~", "~$*", ".~lock.*", "*.tmp", "*.part",
-	".DS_Store", "Thumbs.db", "desktop.ini",
+	"*~", "~$*", ".~*", "*.tmp", "*.part",
+	".DS_Store", "Thumbs.db", "desktop.ini", ".Trash", ".Trashes",
 	// official Nextcloud/ownCloud desktop client state (e.g. after a takeover):
 	".sync_*.db", ".sync_*.db-shm", ".sync_*.db-wal", "._sync_*.db",
 	".owncloudsync.log*", ".nextcloudsync.log*", "*.~syncpart",
