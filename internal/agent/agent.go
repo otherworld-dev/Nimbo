@@ -88,6 +88,8 @@ type Engine struct {
 	watchers     map[string]context.CancelFunc
 	triggers     map[string]chan struct{}
 	triggersFull map[string]chan struct{} // key -> force-a-full-local-pass trigger (name-rule changes)
+	nudges       map[string]chan string   // key -> paths to sync as if the watcher saw them (see inuse.go)
+	awaiting     map[string]bool          // absolute paths awaitClosed is watching
 	watchDone    map[string]chan struct{} // key -> closed when the watcher goroutine exits (for a synchronous, drained stop)
 
 	// Per-pair sync health (see pairhealth.go). Lazily created so a zero-value
@@ -3760,7 +3762,8 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 
 	e.status("Syncing…")
 	var probMu sync.Mutex
-	var problems []string // paths whose action failed — they poison dir-etag stamping
+	var problems []string    // paths whose action failed — they poison dir-etag stamping
+	var busyUploads []string // uploads put off while another program has the file open
 	ex := &transfer.Executor{
 		Client:     e.client,
 		State:      st,
@@ -3810,6 +3813,13 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			var damaged *transfer.ChecksumMismatchError
 			if (a.Kind == engine.ActDownload || a.Kind == engine.ActConflict) && errors.As(aerr, &damaged) {
 				e.noteDamaged(pk, a.Path, remote[a.Path].ETag)
+			}
+			var inUse *transfer.InUseError
+			if a.Kind == engine.ActUpload && errors.As(aerr, &inUse) {
+				probMu.Lock()
+				busyUploads = append(busyUploads, a.Path)
+				probMu.Unlock()
+				e.awaitClosed(p, abs) // see inuse.go
 			}
 			if aerr != nil {
 				probMu.Lock()
@@ -3884,7 +3894,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			e.toastError(err)
 		}
 	default:
-		e.status("Up to date")
+		e.status(waitingStatus(heldUploads, busyUploads))
 		e.resetAuthLost()
 	}
 	return stats, err
@@ -4388,6 +4398,7 @@ func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transf
 	e.watchers = make(map[string]context.CancelFunc)
 	e.triggers = make(map[string]chan struct{})
 	e.triggersFull = make(map[string]chan struct{})
+	e.nudges = make(map[string]chan string)
 	e.watchDone = make(map[string]chan struct{})
 	e.watchMu.Unlock()
 
@@ -4531,10 +4542,12 @@ func (e *Engine) startWatcher(p Pair) {
 	cctx, cancel := context.WithCancel(e.runCtx)
 	ext := make(chan struct{}, 1)
 	fullExt := make(chan struct{}, 1)
+	nudge := make(chan string, 16)
 	done := make(chan struct{})
 	e.watchers[key] = cancel
 	e.triggers[key] = ext
 	e.triggersFull[key] = fullExt
+	e.nudges[key] = nudge
 	e.watchDone[key] = done
 	e.watchMu.Unlock()
 
@@ -4589,6 +4602,7 @@ func (e *Engine) startWatcher(p Pair) {
 			Debounce:      500 * time.Millisecond, // snappy local→server; still coalesces a burst
 			External:      ext,
 			FullSync:      fullExt,
+			Nudge:         nudge,
 			OnPush:        pushFn,
 			FullSyncEvery: time.Hour, // most polls are fast remote-deltas; full walk hourly
 		}, syncFn)
@@ -4597,6 +4611,7 @@ func (e *Engine) startWatcher(p Pair) {
 		delete(e.watchers, key)
 		delete(e.triggers, key)
 		delete(e.triggersFull, key)
+		delete(e.nudges, key)
 		delete(e.watchDone, key)
 		e.watchMu.Unlock()
 	}()

@@ -34,6 +34,11 @@ type Options struct {
 	// changes that reclassify LOCAL files (name allow-list / escape-list), which a
 	// remote-delta trigger wouldn't pick up.
 	FullSync <-chan struct{}
+	// Nudge, if non-nil, carries absolute local paths to sync exactly as if the
+	// watcher had reported them: an upload put off while another program had
+	// the file open is nudged once that program lets go, since closing a file
+	// need not write to it and so need not raise a watcher event.
+	Nudge <-chan string
 }
 
 // SyncFunc performs one reconciliation. It is always called serially. changed
@@ -131,6 +136,10 @@ func runLoop(ctx context.Context, opts Options, sync SyncFunc, events <-chan str
 			} else {
 				changed[p] = struct{}{}
 			}
+			debounce = time.After(opts.Debounce)
+
+		case p := <-opts.Nudge:
+			changed[p] = struct{}{}
 			debounce = time.After(opts.Debounce)
 
 		case <-opts.External:

@@ -176,3 +176,31 @@ func TestOverflowForcesFullSync(t *testing.T) {
 		t.Fatalf("overflow must be a full local scan, not a remote-delta; pushCalls=%d", pushCalls)
 	}
 }
+
+// A nudged path is synced exactly like a local change the watcher saw: an
+// upload put off while a program had the file open is nudged once it closes,
+// since closing it may not write, and so may not raise a watcher event.
+func TestNudgedPathsSyncLikeLocalChanges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	nudge := make(chan string, 1)
+	got := make(chan []string, 4)
+	syncFn := func(_ context.Context, changed []string) error {
+		if changed != nil {
+			got <- changed
+		}
+		return nil
+	}
+	go func() {
+		_ = runLoop(ctx, Options{Root: t.TempDir(), Debounce: 20 * time.Millisecond, Nudge: nudge}, syncFn, make(chan string))
+	}()
+	nudge <- `C:\Sync\archive.pst`
+	select {
+	case changed := <-got:
+		if len(changed) != 1 || changed[0] != `C:\Sync\archive.pst` {
+			t.Fatalf("synced %v, want the nudged path", changed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a nudged path was never synced")
+	}
+}
