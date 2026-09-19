@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/otherworld/nimbo/internal/engine"
@@ -332,5 +333,59 @@ func TestSyncPathsKeepsTheShareRootFlagOfADirtiedFolder(t *testing.T) {
 	rows, _ := st.LoadBaseline(PairKey(p.LocalDir, p.RemoteRoot))
 	if !rows["Team"].MountRoot {
 		t.Fatalf("dirtying through SyncPaths cleared the share root flag: %+v", rows["Team"])
+	}
+}
+
+// A pass cancelled partway (quit, pause, a restart) left its remaining
+// transfers undone but still stamped their folders as seen at the server's
+// current version, so the next scan skipped those folders and the files it
+// never fetched stayed invisible until something else there changed. Folder A's
+// transfers are in flight when it stops, and fail, which keeps A rescanned; B's
+// never start, and nothing marks B unfinished.
+func TestACancelledPassLeavesItsUnfinishedFoldersToBeScannedAgain(t *testing.T) {
+	nodes := map[string]davNode{
+		"":         {isDir: true, etag: "e-root"},
+		"A":        {isDir: true, etag: "e-a"},
+		"B":        {isDir: true, etag: "e-b"},
+		"keep.txt": {etag: "k", body: "k"},
+	}
+	f := newFakeDAV(nodes)
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && strings.Contains(r.URL.Path, "/A/new") {
+			once.Do(cancel) // "quit" as soon as the first new file starts
+		}
+		f.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	e, _ := newHookEngine(t, srv.URL)
+	p := Pair{LocalDir: t.TempDir()}
+	for i := 0; i < 2; i++ {
+		if _, err := e.SyncOnce(context.Background(), p); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	const n = 8
+	for _, dir := range []string{"A", "B"} {
+		for i := 0; i < n; i++ {
+			f.setNode(fmt.Sprintf("%s/new%02d.txt", dir, i), davNode{etag: fmt.Sprintf("%s%02d", dir, i), body: "new"})
+		}
+		f.setNode(dir, davNode{isDir: true, etag: "e-" + dir + "2"})
+	}
+	f.setNode("", davNode{isDir: true, etag: "e-root2"})
+	_, _ = e.SyncOnce(ctx, p) // cancelled partway
+
+	if _, err := e.SyncOnce(context.Background(), p); err != nil {
+		t.Fatalf("the pass after: %v", err)
+	}
+	for _, dir := range []string{"A", "B"} {
+		for i := 0; i < n; i++ {
+			name := filepath.Join(p.LocalDir, dir, fmt.Sprintf("new%02d.txt", i))
+			if _, err := os.Stat(name); err != nil {
+				t.Fatalf("a file the cancelled pass never fetched stayed invisible: %v", err)
+			}
+		}
 	}
 }

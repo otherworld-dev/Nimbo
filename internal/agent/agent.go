@@ -3824,6 +3824,14 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		},
 	}
 	stats, err := ex.Run(ctx, actions)
+	// A cancelled pass (quit, pause, a restart) stops starting transfers but Run
+	// still reports no error, and what it never started is in no problem list.
+	// Treat it as the partway stop it is: stamping its folders as seen hid the
+	// files it never fetched from every later scan (Deck #691).
+	cancelled := err == nil && ctx.Err() != nil
+	if cancelled {
+		err = ctx.Err()
+	}
 	e.setConflicts(p, ex.Pending)
 	// Unresolved conflicts must keep their subtrees re-scanned (a pruned dir would
 	// reconstruct the conflicted file's remote state from the stale baseline and
@@ -3856,7 +3864,11 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		// but do dirty the chains of the failures that already happened.
 		maintainDirBaselines(st, pk, nil, remote, problems)
 	}
-	if err != nil {
+	switch {
+	case cancelled:
+		// Stopped from outside: not an error to tell anyone about, and not up
+		// to date either.
+	case err != nil:
 		switch syncErrKind(err) {
 		case "auth":
 			e.status("Sign in again")
@@ -3867,7 +3879,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			e.status("Error")
 			e.toastError(err)
 		}
-	} else {
+	default:
 		e.status("Up to date")
 		e.resetAuthLost()
 	}
