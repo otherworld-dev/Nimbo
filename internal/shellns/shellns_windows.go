@@ -38,7 +38,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -123,8 +126,8 @@ func desired(name, targetFolder, iconPath string) []regVal {
 // shown with iconPath. Idempotent; updates target/icon on each call.
 //
 // On a packaged build the write is handed to a scheduled task and this returns
-// as soon as the task is queued — a failure to *queue* it surfaces as an error,
-// but the entry appears a moment later, not by the time this returns.
+// once that task has run its script (a second or two), or with an error if it
+// did not run within outOfContainerTimeout.
 func Register(name, targetFolder, iconPath string) error {
 	if Packaged() {
 		return registerOutOfContainer(name, targetFolder, iconPath)
@@ -237,8 +240,23 @@ func unregisterScript() string {
 const notifyShellPS = "Add-Type -MemberDefinition '[DllImport(\"shell32.dll\")] public static extern void SHChangeNotify(int e, uint f, IntPtr a, IntPtr b);' -Name ShNs -Namespace NimboSidebar -ErrorAction SilentlyContinue\r\n" +
 	"try { [NimboSidebar.ShNs]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero) } catch {}\r\n"
 
+// outOfContainerMu serialises out-of-container runs. Each run holds it until
+// its script has finished, so two toggles in quick succession apply in order
+// instead of racing each other in the registry, and a caller that records the
+// preference after Register/Unregister returns is recording a change that has
+// really been made.
+var outOfContainerMu sync.Mutex
+
+// outOfContainerTimeout bounds the wait for the scheduled task to run its
+// script. Normally that takes a second or two; the bound only matters when the
+// Task Scheduler service is stopped or the task never starts, where the run is
+// reported as failed and its leftovers are cleared so the next attempt starts
+// clean.
+const outOfContainerTimeout = 30 * time.Second
+
 // runOutOfContainer writes body to a .ps1 and runs it via a one-shot scheduled
-// task, which executes outside our MSIX job so its HKCU writes are real.
+// task, which executes outside our MSIX job so its HKCU writes are real. It
+// returns once the script has run to its end.
 //
 // The script and its task definition go in the REAL user home, not %TEMP%: our
 // temp directory is the package-private AppContainer one and the task, running
@@ -246,7 +264,17 @@ const notifyShellPS = "Add-Type -MemberDefinition '[DllImport(\"shell32.dll\")] 
 // schtasks flags because schtasks defaults to "only on AC power", which leaves
 // the task Queued forever on a laptop on battery. Both are the same constraints
 // applyUpdate documents.
+//
+// Every run gets its own file names and runs alone (outOfContainerMu). With
+// shared names and no wait, a second toggle inside the first one's second or
+// so either replaced the first script before the scheduler had opened it (the
+// first request silently never ran) or had its own task XML deleted by the
+// first script's clean-up before schtasks read it ("schtasks create failed:
+// … The system cannot find the file specified").
 func runOutOfContainer(action, body string) error {
+	outOfContainerMu.Lock()
+	defer outOfContainerMu.Unlock()
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -256,11 +284,11 @@ func runOutOfContainer(action, body string) error {
 		pkg = "Nimbo"
 	}
 	taskName := pkg + "SidebarUpdate"
-	ps1 := filepath.Join(home, "nimbo-sidebar.ps1")
-	vbs := filepath.Join(home, "nimbo-sidebar.vbs")
-	taskXML := filepath.Join(home, "nimbo-sidebar-task.xml")
+	ps1, vbs, taskXML := scriptPaths(home)
 	logf := filepath.Join(home, "nimbo-sidebar.log")
 
+	// The script deletes itself last, so its disappearance is the signal that
+	// everything before it — the body included — has run.
 	script := fmt.Sprintf("\"$(Get-Date -Format s) sidebar %s\" | Out-File -FilePath %s -Append\r\n", action, psQuote(logf)) +
 		body +
 		fmt.Sprintf("\"$(Get-Date -Format s) sidebar %s done\" | Out-File -FilePath %s -Append\r\n", action, psQuote(logf)) +
@@ -308,17 +336,58 @@ func runOutOfContainer(action, body string) error {
 	if err := os.WriteFile(taskXML, utf16LEBOM(xml), 0o644); err != nil {
 		return err
 	}
-	mk := exec.Command("schtasks", "/create", "/tn", taskName, "/xml", taskXML, "/f")
-	mk.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	if out, err := mk.CombinedOutput(); err != nil {
+	if out, err := schtasks("/create", "/tn", taskName, "/xml", taskXML, "/f"); err != nil {
 		return fmt.Errorf("schtasks create failed: %v: %s", err, out)
 	}
-	run := exec.Command("schtasks", "/run", "/tn", taskName)
-	run.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	if out, err := run.CombinedOutput(); err != nil {
+	if out, err := schtasks("/run", "/tn", taskName); err != nil {
 		return fmt.Errorf("schtasks run failed: %v: %s", err, out)
 	}
+	if err := waitGone(ps1, outOfContainerTimeout); err != nil {
+		// It never ran (or is stuck): stop it and clear up, so the next attempt
+		// is not blocked by a task the scheduler still considers running.
+		_, _ = schtasks("/end", "/tn", taskName)
+		_, _ = schtasks("/delete", "/tn", taskName, "/f")
+		for _, f := range []string{taskXML, vbs, ps1} {
+			_ = os.Remove(f)
+		}
+		return fmt.Errorf("the Explorer change did not apply: %w", err)
+	}
 	return nil
+}
+
+// runSeq numbers this process's runs; the wall clock alone is too coarse on
+// Windows to tell two back-to-back runs apart.
+var runSeq atomic.Uint64
+
+// scriptPaths returns fresh names for one run's script, launcher and task
+// definition under home. They are unique per run because a finishing script
+// removes its own files, which with shared names took the next run's with them.
+func scriptPaths(home string) (ps1, vbs, taskXML string) {
+	stem := fmt.Sprintf("nimbo-sidebar-%d-%d-%d", os.Getpid(), time.Now().Unix(), runSeq.Add(1))
+	return filepath.Join(home, stem+".ps1"),
+		filepath.Join(home, stem+".vbs"),
+		filepath.Join(home, stem+"-task.xml")
+}
+
+// schtasks runs one schtasks.exe command with its console hidden.
+func schtasks(args ...string) ([]byte, error) {
+	c := exec.Command("schtasks", args...)
+	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return c.CombinedOutput()
+}
+
+// waitGone polls until path no longer exists, or fails once timeout has passed.
+func waitGone(path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for the scheduled task to run", timeout)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // psQuote renders s as a PowerShell single-quoted literal (no expansion, so a
