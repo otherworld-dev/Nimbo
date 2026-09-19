@@ -2,6 +2,7 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -202,5 +203,53 @@ func TestNudgedPathsSyncLikeLocalChanges(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("a nudged path was never synced")
+	}
+}
+
+// A quick sync of local changes that fails (the server unreachable, say) lost
+// its paths: nothing re-queued them, and the full pass that would have found
+// them again is itself held back by the failure backoff. They are retried.
+func TestAFailedChangeSyncIsRetried(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan string, 1)
+	var mu sync.Mutex
+	var changeCalls [][]string
+	syncFn := func(_ context.Context, changed []string) error {
+		if changed == nil {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		changeCalls = append(changeCalls, changed)
+		if len(changeCalls) == 1 {
+			return errors.New("server unreachable")
+		}
+		return nil
+	}
+	go func() {
+		_ = runLoop(ctx, Options{Root: t.TempDir(), Debounce: 20 * time.Millisecond, RetryChanges: 50 * time.Millisecond}, syncFn, events)
+	}()
+	events <- `C:\Sync\new.txt`
+	deadline := time.After(3 * time.Second)
+	for {
+		mu.Lock()
+		n := len(changeCalls)
+		var last []string
+		if n > 0 {
+			last = changeCalls[n-1]
+		}
+		mu.Unlock()
+		if n >= 2 {
+			if len(last) != 1 || last[0] != `C:\Sync\new.txt` {
+				t.Fatalf("retried %v, want the failed batch's path", last)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("a failed change sync was never retried (%d calls)", n)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }

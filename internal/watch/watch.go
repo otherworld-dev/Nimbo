@@ -39,6 +39,11 @@ type Options struct {
 	// the file open is nudged once that program lets go, since closing a file
 	// need not write to it and so need not raise a watcher event.
 	Nudge <-chan string
+	// RetryChanges is how long after a failed sync of local changes those paths
+	// are tried again, doubling with each failure in a row up to an hour. Zero
+	// means a minute. Without it the paths were dropped, and the full pass that
+	// would find them again is held back by the same failure (Deck #691).
+	RetryChanges time.Duration
 }
 
 // SyncFunc performs one reconciliation. It is always called serially. changed
@@ -63,6 +68,9 @@ func runLoop(ctx context.Context, opts Options, sync SyncFunc, events <-chan str
 	}
 	if opts.FullSyncEvery <= 0 {
 		opts.FullSyncEvery = time.Hour
+	}
+	if opts.RetryChanges <= 0 {
+		opts.RetryChanges = time.Minute
 	}
 	// Consecutive pass failures gate the poll/push retries with exponential
 	// backoff. Without it a failing pass is re-attempted at full poll cadence —
@@ -93,13 +101,14 @@ func runLoop(ctx context.Context, opts Options, sync SyncFunc, events <-chan str
 	}
 	holding := func() bool { return failStreak > 0 && time.Now().Before(holdUntil) }
 
-	runSync := func(reason string, changed []string) {
+	runSync := func(reason string, changed []string) error {
 		slog.Info("sync triggered", "reason", reason)
 		err := sync(ctx, changed)
 		if err != nil && ctx.Err() == nil {
 			slog.Error("sync failed", "err", err)
 		}
 		note(err)
+		return err
 	}
 	runPush := func(reason string) {
 		slog.Info("sync triggered", "reason", reason)
@@ -125,6 +134,8 @@ func runLoop(ctx context.Context, opts Options, sync SyncFunc, events <-chan str
 	changed := make(map[string]struct{}) // local paths touched since the last fire
 	pushed := false                      // a push (no path) is pending for this window
 	forceFull := false                   // watcher overflowed → recover with a full scan
+	var retry <-chan time.Time           // armed when a sync of local changes failed
+	retryPaths := make(map[string]struct{})
 	for {
 		select {
 		case <-ctx.Done():
@@ -140,6 +151,14 @@ func runLoop(ctx context.Context, opts Options, sync SyncFunc, events <-chan str
 
 		case p := <-opts.Nudge:
 			changed[p] = struct{}{}
+			debounce = time.After(opts.Debounce)
+
+		case <-retry:
+			retry = nil
+			for p := range retryPaths {
+				changed[p] = struct{}{}
+			}
+			retryPaths = make(map[string]struct{})
 			debounce = time.After(opts.Debounce)
 
 		case <-opts.External:
@@ -172,7 +191,16 @@ func runLoop(ctx context.Context, opts Options, sync SyncFunc, events <-chan str
 			// Local changes carry their paths (scoped/targeted reconcile). A push
 			// reconciles the remote delta separately — both can fire in one window.
 			if len(paths) > 0 {
-				runSync("change", paths)
+				if err := runSync("change", paths); err != nil && ctx.Err() == nil {
+					for _, p := range paths {
+						retryPaths[p] = struct{}{}
+					}
+					d := opts.RetryChanges << uint(min(failStreak-1, 12))
+					if d > time.Hour || d <= 0 {
+						d = time.Hour
+					}
+					retry = time.After(d)
+				}
 			}
 			if doPush {
 				if holding() {

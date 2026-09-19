@@ -436,3 +436,21 @@ func TestTheFirstSyncRecordsADamagedCopy(t *testing.T) {
 		t.Fatalf("the damaged copy was fetched %d times from the first sync on, want 1", n)
 	}
 }
+
+// A quick sync that can't reach the server says so, the way a full pass does.
+// It returned the error with the status line left on whatever it said before,
+// "Up to date" included.
+func TestAQuickSyncThatCannotReachTheServerSaysOffline(t *testing.T) {
+	f, e, p := seededFolderPair(t, "To Sort", 1)
+	e.status("Up to date")
+	f.setFailPF("To Sort", http.StatusBadGateway)
+	if _, err := e.SyncPaths(context.Background(), p, []string{"To Sort"}); err == nil {
+		t.Fatal("expected the pass to fail")
+	}
+	e.diagMu.Lock()
+	got := e.lastStatus
+	e.diagMu.Unlock()
+	if got != "Offline" {
+		t.Fatalf("status = %q, want Offline", got)
+	}
+}

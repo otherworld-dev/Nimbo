@@ -2939,20 +2939,7 @@ func (e *Engine) SyncOnce(ctx context.Context, p Pair) (transfer.Stats, error) {
 	e.status("Scanning…")
 	actions, remote, base, err := e.computePlan(ctx, st, p)
 	if err != nil {
-		// A failed scan must not leave the flyout stuck on "Scanning…". Classify it
-		// the way applyPlan does so the status reflects reality (skip on shutdown /
-		// watcher-restart cancellation, which isn't a real error).
-		if ctx.Err() == nil {
-			switch syncErrKind(err) {
-			case "auth":
-				e.status("Sign in again")
-				e.authLost()
-			case "offline":
-				e.status("Offline")
-			default:
-				e.status("Error")
-			}
-		}
+		e.noteScanFailure(ctx, err)
 		return transfer.Stats{}, err
 	}
 	planStats, err := e.applyPlan(ctx, st, p, actions, remote, base, true) // full reconcile
@@ -4019,7 +4006,9 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 			// reading as absent: at worst that plans an upload the server
 			// refuses again, where failing would stall every batch it is in.
 			if tracked || transport.Retryable(rerr) {
-				return transfer.Stats{}, fmt.Errorf("stat %q: %w", rel, rerr)
+				err := fmt.Errorf("stat %q: %w", rel, rerr)
+				e.noteScanFailure(ctx, err)
+				return transfer.Stats{}, err
 			}
 			continue
 		}
@@ -4034,8 +4023,10 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 	// own folder missing, so before planning a deletion from a 404, ask it once.
 	if trackedAbsent {
 		root := strings.Trim(p.RemoteRoot, "/")
-		if _, ok, err := e.client.Stat(ctx, root); err != nil || !ok {
-			return transfer.Stats{}, fmt.Errorf("the server reported a synced item missing but cannot see the sync folder %q either (found=%v, err=%v); not deleting anything on that answer", "/"+root, ok, err)
+		if _, ok, serr := e.client.Stat(ctx, root); serr != nil || !ok {
+			err := fmt.Errorf("the server reported a synced item missing but cannot see the sync folder %q either (found=%v, err=%v); not deleting anything on that answer", "/"+root, ok, serr)
+			e.noteScanFailure(ctx, err)
+			return transfer.Stats{}, err
 		}
 	}
 
@@ -4152,7 +4143,9 @@ func (e *Engine) syncRemoteDelta(ctx context.Context, p Pair) (transfer.Stats, e
 		e.markCheckpointDirty(pk)
 	}
 	if err != nil {
-		return transfer.Stats{}, fmt.Errorf("remote scan: %w", err)
+		err = fmt.Errorf("remote scan: %w", err)
+		e.noteScanFailure(ctx, err)
+		return transfer.Stats{}, err
 	}
 	remoteScan := time.Since(tScan)
 	tDelta := time.Now()
@@ -4277,6 +4270,26 @@ func parentDirOf(rel string) string {
 
 // toastError shows a sync-error toast, throttled to at most once every 5 minutes
 // so a flaky connection doesn't spam the desktop.
+// noteScanFailure puts a pass that failed before it could plan anything on the
+// status line: a failed scan must not leave the flyout on "Scanning…", or on
+// "Up to date" when a quick sync couldn't reach the server (Deck #691). It is
+// classified the way applyPlan does, without a toast, and skipped for a
+// cancellation (shutdown, watcher restart), which isn't a real error.
+func (e *Engine) noteScanFailure(ctx context.Context, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+	switch syncErrKind(err) {
+	case "auth":
+		e.status("Sign in again")
+		e.authLost()
+	case "offline":
+		e.status("Offline")
+	default:
+		e.status("Error")
+	}
+}
+
 func (e *Engine) toastError(err error) {
 	if e.onToast == nil {
 		return
