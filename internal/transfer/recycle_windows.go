@@ -4,8 +4,13 @@ package transfer
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 // recycle sends a path to the Windows Recycle Bin, silently.
@@ -59,3 +64,47 @@ var (
 	shell32              = syscall.NewLazyDLL("shell32.dll")
 	procSHFileOperationW = shell32.NewProc("SHFileOperationW")
 )
+
+// volumeBinCapacity reports the largest item the Recycle Bin on path's volume
+// will keep, in bytes: 0 when that volume has no bin (a network or removable
+// drive) or the bin is switched off, since Windows deletes outright there.
+// Explorer keeps each volume's setting under BitBucket\Volume\{GUID}; a volume
+// never configured has no key, and then a conservative 5% of the drive is
+// assumed, below the Windows default, so the guess errs towards moving aside.
+func volumeBinCapacity(path string) (int64, bool) {
+	root := filepath.VolumeName(filepath.Clean(path)) + `\`
+	rootp, err := windows.UTF16PtrFromString(root)
+	if err != nil {
+		return 0, true
+	}
+	if windows.GetDriveType(rootp) != windows.DRIVE_FIXED {
+		return 0, true
+	}
+	var total uint64
+	if err := windows.GetDiskFreeSpaceEx(rootp, nil, &total, nil); err != nil {
+		return 0, true
+	}
+	guess := int64(total / 20)
+	buf := make([]uint16, 64)
+	if err := windows.GetVolumeNameForVolumeMountPoint(rootp, &buf[0], uint32(len(buf))); err != nil {
+		return guess, true
+	}
+	vol := windows.UTF16ToString(buf) // \\?\Volume{GUID}\
+	i, j := strings.Index(vol, "{"), strings.Index(vol, "}")
+	if i < 0 || j < i {
+		return guess, true
+	}
+	k, err := registry.OpenKey(registry.CURRENT_USER,
+		`Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\`+vol[i:j+1], registry.QUERY_VALUE)
+	if err != nil {
+		return guess, true
+	}
+	defer k.Close()
+	if nuke, _, err := k.GetIntegerValue("NukeOnDelete"); err == nil && nuke != 0 {
+		return 0, true
+	}
+	if mb, _, err := k.GetIntegerValue("MaxCapacity"); err == nil && mb > 0 {
+		return int64(mb) << 20, true
+	}
+	return guess, true
+}

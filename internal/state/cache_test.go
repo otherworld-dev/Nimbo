@@ -217,3 +217,69 @@ func TestBaselineCountUnder(t *testing.T) {
 		})
 	}
 }
+
+// DeleteBaselineUnder must remove exactly a folder's own row and the rows
+// beneath it. It matched with LIKE, where "_" is a wildcard and case is
+// ignored, so clearing "a_b" also cleared "axb/..." and "A_B/..." (Deck #691).
+func TestDeleteBaselineUnderIsExact(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cached=%v", cached), func(t *testing.T) {
+			st, err := Open(filepath.Join(t.TempDir(), "state.db"), "acct", cached)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer st.Close()
+			paths := []string{"a_b", "a_b/x", "a_b/sub/y", "axb", "axb/z", "A_B/w", "a_b c/v", "a_bc"}
+			for _, p := range paths {
+				if err := st.UpsertBaseline("P", engine.BaselineState{Path: p}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if cached {
+				if _, err := st.LoadBaseline("P"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := st.DeleteBaselineUnder("P", "a_b"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := st.LoadBaseline("P")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, gone := range []string{"a_b", "a_b/x", "a_b/sub/y"} {
+				if _, ok := got[gone]; ok {
+					t.Errorf("%q survived", gone)
+				}
+			}
+			for _, kept := range []string{"axb", "axb/z", "A_B/w", "a_b c/v", "a_bc"} {
+				if _, ok := got[kept]; !ok {
+					t.Errorf("%q was removed with a_b", kept)
+				}
+			}
+		})
+	}
+}
+
+// A scoped load must return exactly the folder's subtree. LIKE ignores case,
+// so scoping to "a_b" also returned "A_B/...", which the scoped pass then
+// pruned as dead rows because neither side's scoped scan listed them.
+func TestLoadBaselineScopedIsExact(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"), "acct", false)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	for _, p := range []string{"a_b/x", "A_B/w", "axb/z", "a_b c/v"} {
+		if err := st.UpsertBaseline("P", engine.BaselineState{Path: p}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.LoadBaselineScoped("P", "a_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got["a_b/x"].Path == "" {
+		t.Fatalf("scoped to a_b, got %v", got)
+	}
+}

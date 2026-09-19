@@ -3,6 +3,8 @@ package transfer
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path"
@@ -41,6 +43,9 @@ type Executor struct {
 	// OnProgress, if set, is called with the bytes transferred for an action as
 	// they flow, for live progress display. Safe for concurrent use.
 	OnProgress func(a engine.Action, delta int64)
+	// OnMovedAside, if set, is told when a folder or file the server deleted was
+	// too big for the Recycle Bin and was moved next to the sync folder instead.
+	OnMovedAside func(rel, dest string)
 
 	// Policy controls conflict handling. Under PolicyAsk, conflicts (other than
 	// identical content) are deferred into Pending instead of auto-resolved.
@@ -406,7 +411,7 @@ func (e *Executor) applyDelete(ctx context.Context, a engine.Action) error {
 		// Recycle Bin first: a deletion mirrored FROM the server is the one
 		// this PC never chose, so it keeps an undo. Below the damage guard's
 		// thresholds this is the only safety net a server-side deletion has.
-		if err := RemoveToBin(e.localPath(a.Path)); err != nil {
+		if err := e.removeMirrored(a.Path); err != nil {
 			return err
 		}
 	} else {
@@ -416,6 +421,88 @@ func (e *Executor) applyDelete(ctx context.Context, a engine.Action) error {
 	}
 	slog.Info(a.Kind.String(), "path", a.Path)
 	return e.deleteBaseline(a.Path)
+}
+
+// removeMirrored removes rel for a deletion that came from the server. The
+// Recycle Bin keeps it where the bin can: an item bigger than the bin's
+// capacity is deleted outright by Windows, silently with confirmation off,
+// which is how 219 GB of "To Sort" was lost for good (Deck #691). Anything the
+// bin can't keep, or refuses, is moved next to the sync folder instead, and
+// OnMovedAside says where. Where even that fails, the item stays and the
+// action fails: never a delete nobody can undo. On a platform with no bin at
+// all it stays a plain delete, as before.
+func (e *Executor) removeMirrored(rel string) error {
+	p := e.localPath(rel)
+	capacity, hasBins := binCapacity(p)
+	clearReadOnlyTree(p)
+	if !hasBins {
+		return os.RemoveAll(p)
+	}
+	// Nine tenths: an item near the bin's whole size would also push out
+	// everything already in it.
+	if capacity > 0 && sizeWithin(p, capacity/10*9) {
+		if err := recycleFn(p); err == nil {
+			return nil
+		}
+	}
+	dest, err := e.moveAside(rel)
+	if err != nil {
+		return fmt.Errorf("too big for the Recycle Bin, and could not move it aside: %w", err)
+	}
+	slog.Warn("deleted on the server and too big for the Recycle Bin: moved aside", "path", rel, "to", dest)
+	if e.OnMovedAside != nil {
+		e.OnMovedAside(rel, dest)
+	}
+	return nil
+}
+
+// sizeWithin reports whether everything at p adds up to no more than limit
+// bytes, stopping as soon as it doesn't.
+func sizeWithin(p string, limit int64) bool {
+	var total int64
+	over := errors.New("over")
+	err := filepath.WalkDir(p, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if total += fi.Size(); total > limit {
+			return over
+		}
+		return nil
+	})
+	return err == nil
+}
+
+// moveAside moves rel out of the sync folder into a sibling named after it,
+// "<sync folder> - removed on server", keeping its relative path so it is
+// recognisable, and never over something already there.
+func (e *Executor) moveAside(rel string) (string, error) {
+	root := filepath.Clean(e.LocalRoot)
+	base := filepath.Base(root)
+	if base == "." || base == string(filepath.Separator) || base == filepath.VolumeName(root) {
+		return "", fmt.Errorf("the sync folder %s is a drive root, with no folder beside it", root)
+	}
+	dest := filepath.Join(filepath.Dir(root), base+" - removed on server", filepath.FromSlash(rel))
+	if _, err := os.Lstat(dest); err == nil {
+		for i := 2; ; i++ {
+			c := fmt.Sprintf("%s (%d)", dest, i)
+			if _, err := os.Lstat(c); err != nil {
+				dest = c
+				break
+			}
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.Rename(e.localPath(rel), dest); err != nil {
+		return "", err
+	}
+	return dest, nil
 }
 
 // RemoveToBin removes a local path the way a mirrored server deletion does:
@@ -506,10 +593,13 @@ func (e *Executor) saveDirBaseline(rel, etag, fileID string, mountRoot bool) err
 	})
 }
 
+// deleteBaseline drops rel's row and, when rel was a folder, the rows of
+// everything in it: those files went with it, and rows left behind would read
+// next time as deletions to send to the other side (Deck #691).
 func (e *Executor) deleteBaseline(rel string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.State.DeleteBaseline(e.PairKey, rel)
+	return e.State.DeleteBaselineUnder(e.PairKey, rel)
 }
 
 func sortByPathAsc(a []engine.Action) {
@@ -535,3 +625,8 @@ func sleepBackoff(ctx context.Context, attempt int) error {
 		return nil
 	}
 }
+
+var (
+	binCapacity = volumeBinCapacity
+	recycleFn   = recycle
+)

@@ -3782,6 +3782,11 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		OnProgress: func(a engine.Action, delta int64) {
 			e.progBytes.Add(delta)
 		},
+		OnMovedAside: func(rel, dest string) {
+			name := filepath.Base(filepath.FromSlash(rel))
+			e.toast("Kept a copy of "+name, "“"+name+"” was deleted on the server and is too big for the Recycle Bin, "+
+				"so it was moved to "+dest+". Delete it from there once you no longer need it.", "")
+		},
 		OnEvent: func(a engine.Action, aerr error) {
 			abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
 			e.markInflight(abs, false)

@@ -261,10 +261,12 @@ func (s *Store) LoadBaselineScoped(pairKey, scope string) (map[string]engine.Bas
 
 // queryBaselineScoped reads only a subtree's rows directly from the DB (no-cache).
 func (s *Store) queryBaselineScoped(pairKey, scope string) (map[string]engine.BaselineState, error) {
+	// A range, not LIKE, which ignores case: scoping to "a_b" also returned
+	// "A_B/...", and the scoped pass pruned those as dead rows (Deck #691).
 	rows, err := s.db.Query(
 		`SELECT path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1, mount_root
-		   FROM baseline WHERE account_id = ? AND pair_key = ? AND path LIKE ? ESCAPE '\'`,
-		s.accountID, pairKey, escapeLike(scope)+"/%",
+		   FROM baseline WHERE account_id = ? AND pair_key = ? AND path >= ? AND path < ?`,
+		s.accountID, pairKey, scope+"/", scope+"0",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query scoped baseline: %w", err)
@@ -282,12 +284,6 @@ func (s *Store) queryBaselineScoped(pairKey, scope string) (map[string]engine.Ba
 		out[b.Path] = b
 	}
 	return out, rows.Err()
-}
-
-// escapeLike escapes LIKE wildcards so a path with % or _ matches literally.
-func escapeLike(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return r.Replace(s)
 }
 
 // LoadBaselinePaths returns baseline rows for an explicit set of pair-relative
@@ -690,9 +686,12 @@ func (s *Store) DeleteBaselineUnder(pairKey, prefix string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A range, not LIKE: LIKE treats "_" and "%" as wildcards and ignores case,
+	// so clearing "a_b" also cleared "axb/..." and "A_B/..." (Deck #691). '0'
+	// is the byte after '/', so "p/" <= path < "p0" is exactly the rows beneath.
 	_, err := s.db.Exec(
-		`DELETE FROM baseline WHERE account_id = ? AND pair_key = ? AND (path = ? OR path LIKE ?)`,
-		s.accountID, pairKey, prefix, prefix+"/%",
+		`DELETE FROM baseline WHERE account_id = ? AND pair_key = ? AND (path = ? OR (path >= ? AND path < ?))`,
+		s.accountID, pairKey, prefix, prefix+"/", prefix+"0",
 	)
 	if err != nil {
 		return fmt.Errorf("delete baseline under %q: %w", prefix, err)
