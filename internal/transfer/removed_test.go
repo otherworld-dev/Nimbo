@@ -173,3 +173,19 @@ func TestADriveWithNoBinDeletesAsBefore(t *testing.T) {
 		t.Fatalf("not deleted (err=%v)", err)
 	}
 }
+
+// When the bin's capacity can't be read on a drive that has one, that is not
+// "no bin": it read as one, so the item was deleted for good. Unknown means
+// the safe choice, moving it aside.
+func TestAnUnknownBinCapacityMovesAside(t *testing.T) {
+	ex, root, recycled, moved := removedFixture(t, binUnknown, nil)
+	if err := deleteBig(t, ex); err != nil {
+		t.Fatalf("applyDelete: %v", err)
+	}
+	if len(*recycled) != 0 || len(*moved) != 1 {
+		t.Fatalf("recycled=%v moved=%v, want it moved aside", *recycled, *moved)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(root), "Sync - removed on server", "Big", "a.txt")); err != nil {
+		t.Fatalf("not moved aside: %v", err)
+	}
+}

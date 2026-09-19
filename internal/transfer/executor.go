@@ -437,10 +437,13 @@ func (e *Executor) removeMirrored(rel string) error {
 	p := e.localPath(rel)
 	capacity, hasBins := binCapacity(p)
 	clearReadOnlyTree(p)
-	if !hasBins || capacity <= 0 {
+	if !hasBins || capacity == 0 {
 		// No bin on this drive (network, removable) or the user switched it
 		// off: deleting here was always for good, and still is.
 		return os.RemoveAll(p)
+	}
+	if capacity == binUnknown {
+		return e.putAside(rel) // a bin whose size we couldn't read: don't gamble
 	}
 	// The bin takes items only until this pass has put nine tenths of its
 	// capacity in. It makes room by purging its oldest items, so a folder
@@ -461,6 +464,12 @@ func (e *Executor) removeMirrored(rel string) error {
 			return nil
 		}
 	}
+	return e.putAside(rel)
+}
+
+// putAside moves rel next to the sync folder for a deletion the Recycle Bin
+// can't keep, and says so.
+func (e *Executor) putAside(rel string) error {
 	dest, err := e.moveAside(rel)
 	if err != nil {
 		return fmt.Errorf("too big for the Recycle Bin, and could not move it aside: %w", err)
@@ -649,3 +658,7 @@ var (
 	binCapacity = volumeBinCapacity
 	recycleFn   = recycle
 )
+
+// binUnknown is the capacity reported for a drive that has a Recycle Bin whose
+// size couldn't be read.
+const binUnknown int64 = -1

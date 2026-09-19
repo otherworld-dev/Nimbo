@@ -711,7 +711,11 @@ func (s *Store) DeleteBaselineUnder(pairKey, prefix string) error {
 			}
 			beneath = append(beneath, p)
 		}
+		err = rows.Err()
 		rows.Close()
+		if err != nil { // a short list would leave rows in the cache the DB no longer has
+			return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+		}
 	}
 	tx, err := s.db.Begin()
 	if err != nil {

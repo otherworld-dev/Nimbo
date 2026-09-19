@@ -75,14 +75,14 @@ func volumeBinCapacity(path string) (int64, bool) {
 	root := filepath.VolumeName(filepath.Clean(path)) + `\`
 	rootp, err := windows.UTF16PtrFromString(root)
 	if err != nil {
-		return 0, true
+		return binUnknown, true
 	}
 	if windows.GetDriveType(rootp) != windows.DRIVE_FIXED {
 		return 0, true
 	}
 	var total uint64
 	if err := windows.GetDiskFreeSpaceEx(rootp, nil, &total, nil); err != nil {
-		return 0, true
+		return binUnknown, true // a fixed drive has a bin; we just can't size it
 	}
 	guess := int64(total / 20)
 	buf := make([]uint16, 64)
