@@ -32,6 +32,10 @@ func StatusCode(err error) int {
 	return 0
 }
 
+// ErrNotFound marks a listing of a path the server does not have (PROPFIND
+// 404). It is final, not transient: Retryable says no to it.
+var ErrNotFound = errors.New("not found on the server")
+
 // Retryable reports whether err is worth another attempt: transient server
 // distress (5xx, 429) and network-level failures, but not deliberate refusals
 // (other 4xx — bad request, forbidden, locked, quota) or the caller giving up
@@ -40,7 +44,7 @@ func Retryable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrNotFound) {
 		return false
 	}
 	if code := StatusCode(err); code != 0 {

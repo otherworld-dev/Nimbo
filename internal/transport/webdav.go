@@ -350,7 +350,7 @@ func (c *Client) propFind(ctx context.Context, remotePath, depth string) ([]Entr
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("path %q not found", remotePath)
+		return nil, fmt.Errorf("path %q not found: %w", remotePath, ErrNotFound)
 	}
 	if resp.StatusCode != http.StatusMultiStatus {
 		return nil, statusError("PROPFIND", remotePath, resp)

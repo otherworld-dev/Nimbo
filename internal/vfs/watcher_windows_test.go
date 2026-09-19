@@ -784,19 +784,6 @@ func (r *recorder) ops() Ops {
 			defer r.mu.Unlock()
 			delete(r.fileids, remote)
 		},
-		// Same contract as the real store (etagStore.knownBeneath): a
-		// baseline strictly beneath, never the path's own.
-		KnownBeneath: func(remote string) bool {
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			prefix := strings.Trim(remote, "/") + "/"
-			for k := range r.baselines {
-				if strings.HasPrefix(k, prefix) {
-					return true
-				}
-			}
-			return false
-		},
 	}
 }
 

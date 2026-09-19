@@ -1162,7 +1162,7 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			ev.Err = err.Error()
 		}
 		eng.Recorder().Add(ev)
-		if err != nil {
+		if err != nil || kind == "delete-kept" {
 			a.vfsErrorToast(kind, remotePath, err)
 		}
 	}
@@ -1333,7 +1333,6 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			RecordBaseline: func(remote, etag string) { etags.set(remote, etag) },
 			Baseline:       func(remote string) (string, bool) { e := etags.get(remote); return e, e != "" },
 			ForgetBaseline: func(remote string) { etags.del(remote) },
-			KnownBeneath:   func(remote string) bool { return etags.knownBeneath(remote) },
 			// Batch forms: each store write rewrites the whole JSON file, so a
 			// moved directory's carry and a directory's pull each have to be
 			// ONE write rather than one per item.
@@ -1447,11 +1446,11 @@ func (a *App) vfsErrorToast(kind, remotePath string, err error) {
 		return
 	}
 	if kind == "delete-kept" {
-		// Not a failure: a folder vanished here before its contents were ever
-		// downloaded, and the watcher refused to delete it on the server
-		// (vfs.unseenContents). The activity feed carries the full wording.
+		// Not a failure: a folder vanished here while the server still holds
+		// files in it that were never on this computer, so the watcher kept it
+		// on the server and put it back (vfs.judgeDelete). The log has the reason.
 		notify.Toast(brand.Current.Name+" — on-demand sync",
-			filepath.Base(remotePath)+" disappeared from this PC before its contents were downloaded, so it was kept on the server.", "")
+			filepath.Base(remotePath)+" was removed from this PC but kept on the server, because some of what it holds was never on this PC. Delete it on the server if you meant to.", "")
 		return
 	}
 	verb := map[string]string{
