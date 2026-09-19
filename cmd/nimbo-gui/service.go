@@ -1333,6 +1333,7 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			RecordBaseline: func(remote, etag string) { etags.set(remote, etag) },
 			Baseline:       func(remote string) (string, bool) { e := etags.get(remote); return e, e != "" },
 			ForgetBaseline: func(remote string) { etags.del(remote) },
+			KnownBeneath:   func(remote string) bool { return etags.knownBeneath(remote) },
 			// Batch forms: each store write rewrites the whole JSON file, so a
 			// moved directory's carry and a directory's pull each have to be
 			// ONE write rather than one per item.
@@ -1443,6 +1444,14 @@ func (a *App) vfsErrorToast(kind, remotePath string, err error) {
 		// a document, since the only one that has it is origin-only.
 		notify.Toast(brand.Current.Name+" — on-demand sync",
 			filepath.Base(remotePath)+" has corrupt cloud-file metadata (a Windows fault). Your server copy is safe; the activity feed shows how to clear it.", "")
+		return
+	}
+	if kind == "delete-kept" {
+		// Not a failure: a folder vanished here before its contents were ever
+		// downloaded, and the watcher refused to delete it on the server
+		// (vfs.unseenContents). The activity feed carries the full wording.
+		notify.Toast(brand.Current.Name+" — on-demand sync",
+			filepath.Base(remotePath)+" disappeared from this PC before its contents were downloaded, so it was kept on the server.", "")
 		return
 	}
 	verb := map[string]string{

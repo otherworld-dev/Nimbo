@@ -38,6 +38,36 @@ func TestKnownDir(t *testing.T) {
 	}
 }
 
+// knownBeneath backs the on-demand delete guard: it must answer "this computer
+// once listed what the folder held", so a folder's OWN baseline (recorded when
+// reconcile pulls a folder nobody has opened yet) must not count, and a sibling
+// that merely shares a name prefix must not vouch for it.
+func TestKnownBeneath(t *testing.T) {
+	s := newEtagStore(filepath.Join(t.TempDir(), "etags.json"))
+	s.setMany(map[string]string{
+		"Lazy":                 "e0",
+		"Documents/Report.doc": "e2",
+		"Photos2/cat.jpg":      "e3",
+	})
+
+	for _, tc := range []struct {
+		remote string
+		want   bool
+		why    string
+	}{
+		{"Lazy", false, "its own baseline proves nothing about its contents"},
+		{"Documents", true, "a file beneath it was listed here"},
+		{"/Documents/", true, "slashes are trimmed like every other accessor"},
+		{"Photos", false, "Photos2/... is a sibling, not beneath Photos"},
+		{"Documents/Report.doc", false, "nothing lives beneath a file"},
+		{"", false, "the root is never a delete target"},
+	} {
+		if got := s.knownBeneath(tc.remote); got != tc.want {
+			t.Errorf("knownBeneath(%q) = %v, want %v (%s)", tc.remote, got, tc.want, tc.why)
+		}
+	}
+}
+
 // moveMany is the store side of a moved subtree's baseline carry — one call,
 // one persist, because every write here marshals and rewrites the entire file.
 // (That there is exactly one call per move is pinned on the watcher side, in

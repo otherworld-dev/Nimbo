@@ -143,6 +143,27 @@ func (s *etagStore) moveMany(pairs [][2]string) {
 	_ = os.WriteFile(s.path, b, 0o644)
 }
 
+// knownBeneath reports whether any baseline is recorded strictly beneath
+// remote. Unlike knownDir it ignores remote's own entry: reconcile records a
+// baseline for a folder it pulls before anyone opens it, so a folder's own
+// entry proves nothing about whether its contents were ever listed here. The
+// on-demand delete guard relies on that difference.
+func (s *etagStore) knownBeneath(remote string) bool {
+	key := etagKey(remote)
+	if key == "" {
+		return false
+	}
+	prefix := key + "/"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k := range s.m {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // knownDir reports whether remote is a directory the server is known to have:
 // either it has a recorded baseline itself, or some recorded baseline lives
 // beneath it. Used by the state heal to decide a plain local directory inside a
