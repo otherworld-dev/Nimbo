@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"log/slog"
 	"path"
 
@@ -51,10 +52,17 @@ func (e *Engine) skipDamaged(pk string, actions []engine.Action, remote map[stri
 			if etag, ok := e.damaged[key]; ok {
 				if r, listed := remote[a.Path]; listed && r.ETag == etag {
 					skipped = append(skipped, a.Path)
+					if a.Kind == engine.ActConflict {
+						if e.heldDamaged == nil {
+							e.heldDamaged = make(map[string]string)
+						}
+						e.heldDamaged[key] = a.Path // a local edit waits on it
+					}
 					slog.Debug("skipping a download whose server copy is damaged", "path", a.Path, "etag", etag)
 					continue
 				}
 				delete(e.damaged, key) // the server's copy changed: try it
+				delete(e.heldDamaged, key)
 			}
 		}
 		kept = append(kept, a)
@@ -65,3 +73,21 @@ func (e *Engine) skipDamaged(pk string, actions []engine.Action, remote map[stri
 const damagedCopyMsg = "the copy on the server is damaged (its content doesn't match the checksum stored with it), " +
 	"so it wasn't downloaded. It will be tried again when it changes on the server. " +
 	"Restore an earlier version from the Nextcloud web page, or upload it again from the computer that has a good copy."
+
+// heldDamagedStatus is the status line while a local edit is held back by a
+// damaged server copy (a conflict can't be settled without the server's
+// bytes), or "" when none is. Holding it back silently let "Up to date" pass
+// an unsynced edit off as synced (Deck #691).
+func (e *Engine) heldDamagedStatus() string {
+	e.damagedMu.Lock()
+	defer e.damagedMu.Unlock()
+	switch len(e.heldDamaged) {
+	case 0:
+		return ""
+	case 1:
+		for _, rel := range e.heldDamaged {
+			return "Waiting \u2014 " + path.Base(rel) + ": the copy on the server is damaged"
+		}
+	}
+	return fmt.Sprintf("Waiting \u2014 %d files: the copies on the server are damaged", len(e.heldDamaged))
+}

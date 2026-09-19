@@ -415,6 +415,14 @@ func TestADamagedServerCopyInAConflictIsNotFetchedEveryPass(t *testing.T) {
 	if b, _ := os.ReadFile(local); string(b) != "local edit" {
 		t.Fatalf("the local edit was not left alone: %q", b)
 	}
+	// Held back, the edit must not be passed off as synced.
+	e.status("Up to date")
+	e.diagMu.Lock()
+	got := e.lastStatus
+	e.diagMu.Unlock()
+	if got != "Waiting — f000.txt: the copy on the server is damaged" {
+		t.Fatalf("status = %q while a local edit is held back", got)
+	}
 }
 
 // The first sync (the clone) didn't record a damaged copy either, so a new

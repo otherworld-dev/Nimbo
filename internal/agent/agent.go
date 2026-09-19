@@ -138,8 +138,9 @@ type Engine struct {
 	failMu   sync.Mutex
 	lastFail map[string]string // "<kind>\x00<path>" -> last human reason logged
 
-	damagedMu sync.Mutex
-	damaged   map[string]string // "<pairKey>\x00<path>" -> server etag of a copy that failed its checksum
+	damagedMu   sync.Mutex
+	damaged     map[string]string // "<pairKey>\x00<path>" -> server etag of a copy that failed its checksum
+	heldDamaged map[string]string // same keys -> path: conflicts (local edits) held back by such a copy
 
 	policy       transfer.ConflictPolicy
 	conflictMu   sync.Mutex
@@ -2380,6 +2381,8 @@ func (e *Engine) status(s string) {
 	if s == "Up to date" {
 		if w := e.busyStatus(); w != "" {
 			s = w // an upload is still waiting on a program (see inuse.go)
+		} else if w := e.heldDamagedStatus(); w != "" {
+			s = w // a local edit is held back by a damaged server copy (damaged.go)
 		}
 	}
 	e.diagMu.Lock()
