@@ -192,8 +192,8 @@ func TestSyncPathsNeverUploadsAPartialDownload(t *testing.T) {
 	if _, err := e.SyncPaths(context.Background(), p, []string{"To Sort/OnlineArchive.pst.nimbo-part"}); err != nil {
 		t.Fatalf("SyncPaths: %v", err)
 	}
-	// Asserted by name: the fixture's own files can be re-uploaded by the
-	// settle pass, since fakeDAV sends no Last-Modified (a pre-existing quirk).
+	// Asserted by name, so the test says what it is about: no partial file
+	// reaches the server, whatever else a pass uploads.
 	for _, got := range f.putPaths() {
 		if strings.HasSuffix(got, ".nimbo-part") {
 			t.Fatalf("a partial download was uploaded: %s", got)

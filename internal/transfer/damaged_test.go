@@ -113,3 +113,30 @@ func TestAResumedDownloadThatFailsItsChecksumStartsAgain(t *testing.T) {
 		t.Fatalf("downloaded %q", b)
 	}
 }
+
+// Without a Last-Modified header a download recorded "now" as the file's
+// modified time instead of the time the file really has, so the next pass saw
+// a changed file and uploaded it straight back.
+func TestADownloadRecordsTheFilesRealModifiedTime(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("content")) // no Last-Modified
+	}))
+	t.Cleanup(srv.Close)
+	// "Now" and the write often land in the same clock tick, so one try
+	// proves little: the old code failed about half of these.
+	dir := t.TempDir()
+	for i := 0; i < 50; i++ {
+		local := filepath.Join(dir, fmt.Sprintf("f%02d.txt", i))
+		res, err := Download(context.Background(), transport.New(srv.URL, "u", "p"), "f.txt", local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.MTimeNanos != fi.ModTime().UnixNano() {
+			t.Fatalf("try %d: recorded mtime %d, the file has %d", i, res.MTimeNanos, fi.ModTime().UnixNano())
+		}
+	}
+}

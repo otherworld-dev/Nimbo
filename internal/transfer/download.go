@@ -111,6 +111,12 @@ func DownloadProgress(ctx context.Context, c *transport.Client, remotePath, loca
 	if err != nil {
 		return FileResult{}, err
 	}
+	if _, perr := http.ParseTime(hdr.Get("Last-Modified")); perr != nil {
+		// No server time to set, so record the time the file really has: "now"
+		// differs from it, and the next pass took the file for edited here and
+		// uploaded it straight back.
+		mtime = fi.ModTime()
+	}
 	return FileResult{
 		ETag:        headerETag(hdr),
 		FileID:      hdr.Get("OC-FileId"),
