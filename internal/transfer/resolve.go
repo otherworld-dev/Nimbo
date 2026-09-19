@@ -290,9 +290,8 @@ func (e *Executor) resolveConflict(ctx context.Context, a engine.Action) (res re
 		return resIdentical, e.rebaselineFile(ctx, rel)
 	}
 
-	// Genuinely divergent: keep both.
-	_ = os.Remove(tmp)
-	return resKeptBoth, e.keepBoth(ctx, rel)
+	// Genuinely divergent: keep both, from the copy already fetched.
+	return resKeptBoth, e.keepBothFrom(ctx, rel, tmp, dres)
 }
 
 // resolveTypeConflict handles a file↔directory change by renaming the local item
@@ -312,20 +311,39 @@ func (e *Executor) resolveTypeConflict(rel string) error {
 
 // keepBoth preserves both versions: the local file is set aside as a "conflicted
 // copy" (kept on both sides) and the remote version takes the original name.
+// The server's version is fetched BEFORE the local file is touched: setting it
+// aside first left nothing under the original name whenever the download then
+// failed, a damaged server copy included (Deck #691).
 func (e *Executor) keepBoth(ctx context.Context, rel string) error {
+	tmp := e.localPath(rel) + ".ncremote.tmp"
+	dres, err := Download(ctx, e.Client, e.remotePath(rel), tmp)
+	if err != nil {
+		return err
+	}
+	return e.keepBothFrom(ctx, rel, tmp, dres)
+}
+
+// keepBothFrom is keepBoth with the server's version already downloaded to tmp.
+func (e *Executor) keepBothFrom(ctx context.Context, rel, tmp string, dres FileResult) error {
 	localP := e.localPath(rel)
 	confRel := conflictName(rel)
 	confLocal := e.localPath(confRel)
 
 	if err := os.MkdirAll(filepath.Dir(confLocal), 0o755); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(localP, confLocal); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	dres, err := Download(ctx, e.Client, e.remotePath(rel), localP)
-	if err != nil {
+	if err := os.Rename(tmp, localP); err != nil {
+		_ = os.Rename(confLocal, localP) // put the user's file back under its name
+		_ = os.Remove(tmp)
 		return err
+	}
+	if dres.FileID == "" {
+		dres.FileID = e.Remote[rel].FileID
 	}
 	if dres.FileID == "" {
 		if ent, ok, _ := e.Client.Stat(ctx, e.remotePath(rel)); ok {

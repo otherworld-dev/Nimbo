@@ -33,9 +33,11 @@ func (e *Engine) noteDamaged(pk, rel, etag string) {
 }
 
 // skipDamaged drops downloads of copies known to be damaged: the same path at
-// the same server etag. A copy that has changed since is downloaded again,
-// and its record goes. Skipped paths are returned so the pass treats them as
-// unfinished: their folders keep being re-listed rather than stamped clean.
+// the same server etag. A conflict on such a path is held back too, since
+// settling it starts by fetching the server's copy; the local edit stays as it
+// is meanwhile. A copy that has changed since is tried again, and its record
+// goes. Skipped paths are returned so the pass treats them as unfinished:
+// their folders keep being re-listed rather than stamped clean.
 func (e *Engine) skipDamaged(pk string, actions []engine.Action, remote map[string]engine.RemoteState) (kept []engine.Action, skipped []string) {
 	e.damagedMu.Lock()
 	defer e.damagedMu.Unlock()
@@ -44,7 +46,7 @@ func (e *Engine) skipDamaged(pk string, actions []engine.Action, remote map[stri
 	}
 	kept = actions[:0:0]
 	for _, a := range actions {
-		if a.Kind == engine.ActDownload {
+		if a.Kind == engine.ActDownload || a.Kind == engine.ActConflict {
 			key := damagedKey(pk, a.Path)
 			if etag, ok := e.damaged[key]; ok {
 				if r, listed := remote[a.Path]; listed && r.ETag == etag {

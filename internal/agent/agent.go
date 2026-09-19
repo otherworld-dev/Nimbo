@@ -3804,7 +3804,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 				e.progComplete()
 			}
 			var damaged *transfer.ChecksumMismatchError
-			if a.Kind == engine.ActDownload && errors.As(aerr, &damaged) {
+			if (a.Kind == engine.ActDownload || a.Kind == engine.ActConflict) && errors.As(aerr, &damaged) {
 				e.noteDamaged(pk, a.Path, remote[a.Path].ETag)
 			}
 			if aerr != nil {

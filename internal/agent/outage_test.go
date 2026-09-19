@@ -389,3 +389,30 @@ func TestACancelledPassLeavesItsUnfinishedFoldersToBeScannedAgain(t *testing.T) 
 		}
 	}
 }
+
+// A file changed on both sides is a conflict, not a download, and conflict
+// handling fetched the server's copy on its own, past the damaged-copy skip: a
+// damaged copy of a file also edited here (a .pst open in Outlook on two
+// computers) was fetched in full on every pass.
+func TestADamagedServerCopyInAConflictIsNotFetchedEveryPass(t *testing.T) {
+	f, e, p := seededFolderPair(t, "To Sort", 1)
+	const doc = "To Sort/f000.txt"
+	local := filepath.Join(p.LocalDir, filepath.FromSlash(doc))
+	if err := os.WriteFile(local, []byte("local edit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.setNode(doc, davNode{etag: "torn", body: "torn bytes", checksum: "4f663abde826ad82d8ff238365e1f9f3e2dd81af"})
+	f.setNode("To Sort", davNode{isDir: true, etag: "e-dir2"})
+	f.setNode("", davNode{isDir: true, etag: "e-root2"})
+	before := f.getCount(doc)
+
+	for pass := 0; pass < 3; pass++ {
+		_, _ = e.SyncOnce(context.Background(), p)
+	}
+	if n := f.getCount(doc) - before; n != 1 {
+		t.Fatalf("the damaged copy was fetched %d times over 3 passes, want 1", n)
+	}
+	if b, _ := os.ReadFile(local); string(b) != "local edit" {
+		t.Fatalf("the local edit was not left alone: %q", b)
+	}
+}
