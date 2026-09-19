@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/otherworld/nimbo/internal/engine"
+	"github.com/otherworld/nimbo/internal/state"
 )
 
 // seededFolderPair builds a settled pair holding one folder of n files, so the
@@ -275,5 +276,61 @@ func TestADamagedServerCopyIsNotDownloadedEveryPass(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(p.LocalDir, filepath.FromSlash(pst))); err != nil || string(b) != "good bytes" {
 		t.Fatalf("the clean copy was not downloaded: %q err=%v", b, err)
+	}
+}
+
+// shareRootPair seeds a pair holding a folder shared with the user ("Team") and a
+// file shared on its own ("Budget.xlsx"), so both are share roots.
+func shareRootPair(t *testing.T) (*fakeDAV, *Engine, *state.Store, Pair) {
+	t.Helper()
+	f := newFakeDAV(map[string]davNode{
+		"":            {isDir: true, etag: "e-root"},
+		"Team":        {isDir: true, etag: "e-team", perm: "SRGDNVCK"},
+		"Team/r.txt":  {etag: "r1", body: "v1", perm: "SRGDNVW"},
+		"Budget.xlsx": {etag: "b1", body: "b1", perm: "SRGDNVW"},
+		"keep.txt":    {etag: "k", body: "k"},
+	})
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+	e, st := newHookEngine(t, srv.URL)
+	p := Pair{LocalDir: t.TempDir()}
+	for i := 0; i < 2; i++ {
+		if _, err := e.SyncOnce(context.Background(), p); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	rows, _ := st.LoadBaseline(PairKey(p.LocalDir, p.RemoteRoot))
+	if !rows["Team"].MountRoot || !rows["Budget.xlsx"].MountRoot {
+		t.Fatalf("precondition: share roots not flagged: Team=%+v Budget=%+v", rows["Team"], rows["Budget.xlsx"])
+	}
+	return f, e, st, p
+}
+
+// A quick sync builds the server's state from a bare Stat, which can't tell a
+// share's root from anything inside it. Writing rows from that map dropped the
+// root flag, and an unshare then recycled the copy instead of keeping it (#557).
+func TestSyncPathsKeepsTheShareRootFlagOfAnEditedSharedFile(t *testing.T) {
+	_, e, st, p := shareRootPair(t)
+	if err := os.WriteFile(filepath.Join(p.LocalDir, "Budget.xlsx"), []byte("edited"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SyncPaths(context.Background(), p, []string{"Budget.xlsx"}); err != nil {
+		t.Fatalf("SyncPaths: %v", err)
+	}
+	rows, _ := st.LoadBaseline(PairKey(p.LocalDir, p.RemoteRoot))
+	if !rows["Budget.xlsx"].MountRoot {
+		t.Fatalf("an upload through SyncPaths cleared the share root flag: %+v", rows["Budget.xlsx"])
+	}
+}
+
+func TestSyncPathsKeepsTheShareRootFlagOfADirtiedFolder(t *testing.T) {
+	f, e, st, p := shareRootPair(t)
+	f.setNode("Team/r.txt", davNode{etag: "r2", body: "v2", perm: "SRGDNVW"})
+	f.setFailGET("Team/r.txt", http.StatusForbidden) // the download fails, so "Team" is dirtied
+	_, _ = e.SyncPaths(context.Background(), p, []string{"Team", "Team/r.txt"})
+
+	rows, _ := st.LoadBaseline(PairKey(p.LocalDir, p.RemoteRoot))
+	if !rows["Team"].MountRoot {
+		t.Fatalf("dirtying through SyncPaths cleared the share root flag: %+v", rows["Team"])
 	}
 }

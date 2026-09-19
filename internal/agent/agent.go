@@ -3998,7 +3998,7 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 			continue
 		}
 		if found {
-			remote[rel] = remoteStateFrom(rel, ent)
+			remote[rel] = remoteStateFrom(rel, ent, base[rel].MountRoot)
 		} else if tracked {
 			trackedAbsent = true
 		}
@@ -4030,7 +4030,13 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 // Note this is a Stat, not a listing: fields a depth-0 PROPFIND does not carry
 // meaningfully here (SHA1, ReadOnly, LastModified) are deliberately left unset,
 // as they were before.
-func remoteStateFrom(rel string, ent transport.Entry) engine.RemoteState {
+//
+// A share's root is told apart from anything inside it only by its PARENT's
+// permissions, which a Stat doesn't see. So the flag is kept from wasRoot, the
+// baseline row, while the Stat still shows it on a share or mount: leaving it
+// unset wrote rows that forgot a share root, and an unshare then recycled the
+// copy instead of keeping it (#557, Deck #691).
+func remoteStateFrom(rel string, ent transport.Entry, wasRoot bool) engine.RemoteState {
 	return engine.RemoteState{
 		Path:      rel,
 		IsDir:     ent.IsDir,
@@ -4039,6 +4045,7 @@ func remoteStateFrom(rel string, ent transport.Entry) engine.RemoteState {
 		Size:      ent.Size,
 		Lock:      ent.Lock,
 		LockKnown: true, // a Stat DID look, so its answer is authoritative
+		MountRoot: wasRoot && ent.OnMount(),
 	}
 }
 
