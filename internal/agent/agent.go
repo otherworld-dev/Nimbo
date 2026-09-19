@@ -90,6 +90,8 @@ type Engine struct {
 	triggersFull map[string]chan struct{} // key -> force-a-full-local-pass trigger (name-rule changes)
 	nudges       map[string]chan string   // key -> paths to sync as if the watcher saw them (see inuse.go)
 	awaiting     map[string]bool          // absolute paths awaitClosed is watching
+	busyMu       sync.Mutex
+	busy         map[string]string        // absolute path -> pair-relative: uploads waiting on a program (inuse.go)
 	watchDone    map[string]chan struct{} // key -> closed when the watcher goroutine exits (for a synchronous, drained stop)
 
 	// Per-pair sync health (see pairhealth.go). Lazily created so a zero-value
@@ -2375,6 +2377,11 @@ func (e *Engine) DeselectFolder(localDir, rel string, deleteLocal bool) error {
 func (e *Engine) SetStatusFunc(f func(string)) { e.onStatus = f }
 
 func (e *Engine) status(s string) {
+	if s == "Up to date" {
+		if w := e.busyStatus(); w != "" {
+			s = w // an upload is still waiting on a program (see inuse.go)
+		}
+	}
 	e.diagMu.Lock()
 	e.lastStatus = s
 	if s == "Up to date" {
@@ -3810,7 +3817,10 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 				probMu.Lock()
 				busyUploads = append(busyUploads, a.Path)
 				probMu.Unlock()
+				e.noteBusy(abs, a.Path)
 				e.awaitClosed(p, abs) // see inuse.go
+			} else if a.Kind == engine.ActUpload && aerr == nil {
+				e.clearBusy(abs)
 			}
 			if aerr != nil {
 				probMu.Lock()

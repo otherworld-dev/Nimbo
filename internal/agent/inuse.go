@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -80,6 +81,10 @@ func (e *Engine) awaitClosed(p Pair, abs string) {
 				return
 			case <-t.C:
 			}
+			if _, err := os.Stat(abs); os.IsNotExist(err) {
+				e.clearBusy(abs) // gone: nothing left to wait for
+				return
+			}
 			if !writerGone(abs) {
 				continue
 			}
@@ -114,4 +119,38 @@ func movedAsideToast(root string, rels []string) (title, msg string) {
 	return fmt.Sprintf("Kept %d items deleted on the server", len(rels)),
 		"They were deleted on the server and the Recycle Bin couldn't take them, so they were moved to " +
 			aside + ". Delete them from there once you no longer need them."
+}
+
+// noteBusy records an upload waiting on a program, so no pass claims "Up to
+// date" while it waits: the pass that met it set "Waiting", and the next quiet
+// pass overwrote it within minutes (Deck #691).
+func (e *Engine) noteBusy(abs, rel string) {
+	e.busyMu.Lock()
+	if e.busy == nil {
+		e.busy = make(map[string]string)
+	}
+	e.busy[abs] = rel
+	e.busyMu.Unlock()
+}
+
+// clearBusy drops abs once its upload has gone, or it no longer exists.
+func (e *Engine) clearBusy(abs string) {
+	e.busyMu.Lock()
+	delete(e.busy, abs)
+	e.busyMu.Unlock()
+}
+
+// busyStatus is the "Waiting" line for uploads still waiting on a program, or
+// "" when there are none.
+func (e *Engine) busyStatus() string {
+	e.busyMu.Lock()
+	defer e.busyMu.Unlock()
+	if len(e.busy) == 0 {
+		return ""
+	}
+	rels := make([]string, 0, len(e.busy))
+	for _, rel := range e.busy {
+		rels = append(rels, rel)
+	}
+	return waitingStatus(nil, rels)
 }

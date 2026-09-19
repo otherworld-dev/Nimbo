@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -44,7 +45,10 @@ func TestAPutOffUploadIsNudgedOnceTheProgramLetsGo(t *testing.T) {
 	closedCheckEvery = 10 * time.Millisecond
 	t.Cleanup(func() { writerGone, closedCheckEvery = ow, oe })
 
-	const abs = `C:\Sync\archive.pst`
+	abs := filepath.Join(p.LocalDir, "archive.pst")
+	if err := os.WriteFile(abs, []byte("pst"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	e.awaitClosed(p, abs)
 	e.awaitClosed(p, abs) // the next pass puts it off again: still one watch
 	select {
@@ -81,5 +85,54 @@ func TestMovedAsideIsOneMessagePerPass(t *testing.T) {
 	title, msg = movedAsideToast(root, []string{"To Sort/a", "To Sort/b", "To Sort/c"})
 	if title != "Kept 3 items deleted on the server" || !strings.Contains(msg, aside) {
 		t.Errorf("three items: %q / %q", title, msg)
+	}
+}
+
+// "Waiting" was set only by the pass that met the busy file; the next quiet
+// pass said "Up to date" within minutes while the file was still unsent.
+// While any upload is waiting on a program, nothing may claim up to date.
+func TestUpToDateWaitsForFilesOpenInAnotherProgram(t *testing.T) {
+	e := &Engine{}
+	e.noteBusy(`E:\Nextcloud\To Sort\archive.pst`, "To Sort/archive.pst")
+	e.status("Up to date")
+	if got := e.lastStatus; got != "Waiting — archive.pst is open in another program" {
+		t.Fatalf("status = %q while an upload waits", got)
+	}
+	e.clearBusy(`E:\Nextcloud\To Sort\archive.pst`)
+	e.status("Up to date")
+	if got := e.lastStatus; got != "Up to date" {
+		t.Fatalf("status = %q once nothing waits", got)
+	}
+}
+
+// A file deleted while its upload waited is not waited on for ever, nor left
+// holding the status on "Waiting".
+func TestAWaitingFileThatIsDeletedStopsTheWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := Pair{LocalDir: t.TempDir()}
+	nudge := make(chan string, 1)
+	e := &Engine{runCtx: ctx, nudges: map[string]chan string{PairKey(p.LocalDir, p.RemoteRoot): nudge}}
+	ow, oe := writerGone, closedCheckEvery
+	writerGone = func(string) bool { return false }
+	closedCheckEvery = 10 * time.Millisecond
+	t.Cleanup(func() { writerGone, closedCheckEvery = ow, oe })
+
+	abs := filepath.Join(p.LocalDir, "archive.pst")
+	if err := os.WriteFile(abs, []byte("pst"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.noteBusy(abs, "archive.pst")
+	e.awaitClosed(p, abs)
+	if err := os.Remove(abs); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(2 * time.Second)
+	for e.busyStatus() != "" {
+		select {
+		case <-deadline:
+			t.Fatal("a deleted file kept the status on Waiting")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
