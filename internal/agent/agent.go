@@ -3037,6 +3037,10 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 				if a.Kind == engine.ActDownload {
 					e.progComplete()
 				}
+				var damaged *transfer.ChecksumMismatchError
+				if a.Kind == engine.ActDownload && errors.As(aerr, &damaged) {
+					e.noteDamaged(pk, a.Path, remote[a.Path].ETag) // see damaged.go
+				}
 				ev := activity.Event{Local: p.LocalDir, Path: a.Path, Kind: a.Kind.String()}
 				ev.Err = e.recordActionResult(a, aerr) // humanised + deduped; "" on success
 				e.recorder.Add(ev)

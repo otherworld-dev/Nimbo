@@ -416,3 +416,23 @@ func TestADamagedServerCopyInAConflictIsNotFetchedEveryPass(t *testing.T) {
 		t.Fatalf("the local edit was not left alone: %q", b)
 	}
 }
+
+// The first sync (the clone) didn't record a damaged copy either, so a new
+// computer fetched it again on the very next pass.
+func TestTheFirstSyncRecordsADamagedCopy(t *testing.T) {
+	f := newFakeDAV(map[string]davNode{
+		"":            {isDir: true, etag: "e-root"},
+		"archive.pst": {etag: "torn", body: "torn bytes", checksum: "4f663abde826ad82d8ff238365e1f9f3e2dd81af"},
+		"ok.txt":      {etag: "ok", body: "ok"},
+	})
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+	e, _ := newHookEngine(t, srv.URL)
+	p := Pair{LocalDir: t.TempDir()}
+	for pass := 0; pass < 3; pass++ {
+		_, _ = e.SyncOnce(context.Background(), p)
+	}
+	if n := f.getCount("archive.pst"); n != 1 {
+		t.Fatalf("the damaged copy was fetched %d times from the first sync on, want 1", n)
+	}
+}
