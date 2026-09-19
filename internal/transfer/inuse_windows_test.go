@@ -139,3 +139,62 @@ func TestExecutorDoesNotRetryAFileInUse(t *testing.T) {
 		t.Fatalf("a file in use was retried within the pass (took %v)", d)
 	}
 }
+
+// Nimbo's reads must not block a safe save the way Word does one: move the
+// original aside, move the new file into its name, delete the original. Go's
+// os.Open doesn't share delete, so while an upload held the file open (minutes,
+// for a large one) the first step failed and the editor couldn't save.
+func TestASafeSaveDuringAnUploadIsNotBlocked(t *testing.T) {
+	smallChunks(t)
+	f, c, local := uploadFixture(t, 3*1024+100)
+	var saveErr error
+	saved := false
+	f.onChunkPut = func(name string) {
+		if name != "00002" || saved {
+			return
+		}
+		saved = true
+		tmp, old := local+".saving", local+".old"
+		if saveErr = os.WriteFile(tmp, make([]byte, 3*1024+100), 0o644); saveErr != nil {
+			return
+		}
+		if saveErr = os.Rename(local, old); saveErr != nil {
+			return
+		}
+		if saveErr = os.Rename(tmp, local); saveErr != nil {
+			return
+		}
+		saveErr = os.Remove(old)
+	}
+	if _, err := Upload(context.Background(), c, local, "docs/report.docx"); err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if saveErr != nil {
+		t.Fatalf("saving the file during the upload failed: %v", saveErr)
+	}
+}
+
+// A save that REPLACES the file while it is being hashed is an editor's atomic
+// save, not a program writing into the file, and must not mark the file as
+// written in place: that would hold every later upload of a Word document
+// back until Word closed it.
+func TestAReplacedFileIsNotTakenForAnInPlaceWriter(t *testing.T) {
+	smallChunks(t)
+	_, c, local := uploadFixture(t, 3*1024+100)
+	t.Cleanup(func() { clearBusyWriter(local) })
+	testHookBeforeSend = func() { // hashed; not yet opened to send
+		tmp := local + ".saving"
+		if err := os.WriteFile(tmp, make([]byte, 3*1024+100), 0o644); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Rename(tmp, local); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { testHookBeforeSend = nil })
+	_, _ = Upload(context.Background(), c, local, "docs/report.docx")
+	if isBusyWriter(local) {
+		t.Fatal("an atomic save marked the file as written in place")
+	}
+}

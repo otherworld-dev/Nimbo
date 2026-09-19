@@ -93,7 +93,7 @@ func UploadProgress(ctx context.Context, c *transport.Client, localPath, remoteP
 	res, err := uploadOnce(ctx, c, localPath, remotePath, prog)
 	var changed *ChangedError
 	switch {
-	case errors.As(err, &changed):
+	case errors.As(err, &changed) && changed.InPlace:
 		markBusyWriter(localPath)
 	case err == nil:
 		clearBusyWriter(localPath)
@@ -102,7 +102,7 @@ func UploadProgress(ctx context.Context, c *transport.Client, localPath, remoteP
 }
 
 func uploadOnce(ctx context.Context, c *transport.Client, localPath, remotePath string, prog func(int64)) (FileResult, error) {
-	fi, err := os.Stat(localPath)
+	fi, err := statShared(localPath)
 	if err != nil {
 		return FileResult{}, err
 	}
@@ -117,7 +117,7 @@ func uploadOnce(ctx context.Context, c *transport.Client, localPath, remotePath 
 	var sum string
 	if chunked {
 		sum, err = sha1File(localPath)
-	} else if data, err = os.ReadFile(localPath); err == nil {
+	} else if data, err = readShared(localPath); err == nil {
 		h := sha1.Sum(data)
 		sum = hex.EncodeToString(h[:])
 	}
@@ -132,7 +132,7 @@ func uploadOnce(ctx context.Context, c *transport.Client, localPath, remotePath 
 		return FileResult{}, err
 	}
 	if !chunked && int64(len(data)) != fi.Size() {
-		return FileResult{}, &ChangedError{Path: localPath}
+		return FileResult{}, &ChangedError{Path: localPath, InPlace: true}
 	}
 	checksum := ocChecksum(sum)
 	if testHookBeforeSend != nil {
@@ -143,7 +143,7 @@ func uploadOnce(ctx context.Context, c *transport.Client, localPath, remotePath 
 	if !chunked {
 		etag, fileID, err = uploadSingle(ctx, c, data, remotePath, checksum, prog)
 	} else {
-		etag, fileID, err = uploadChunked(ctx, c, localPath, remotePath, fi.Size(), fi.ModTime().UnixNano(), sum, prog)
+		etag, fileID, err = uploadChunked(ctx, c, localPath, remotePath, fi, sum, prog)
 	}
 	if err != nil {
 		return FileResult{}, err
@@ -180,16 +180,30 @@ func uploadOnce(ctx context.Context, c *transport.Client, localPath, remotePath 
 	}, nil
 }
 
-// statUnchanged verifies path still has the size and mtime captured in fi.
+// statUnchanged verifies path is still the file captured in fi, with the same
+// size and mtime. fi must come from statShared, so its identity is fixed.
 func statUnchanged(path string, fi os.FileInfo) error {
-	cur, err := os.Stat(path)
+	cur, err := statShared(path)
 	if err != nil {
 		return err
 	}
+	if !os.SameFile(fi, cur) {
+		return &ChangedError{Path: path} // replaced: an editor's atomic save
+	}
 	if cur.Size() != fi.Size() || !cur.ModTime().Equal(fi.ModTime()) {
-		return &ChangedError{Path: path}
+		return &ChangedError{Path: path, InPlace: true}
 	}
 	return nil
+}
+
+// readShared reads a whole file through openShared.
+func readShared(path string) ([]byte, error) {
+	f, err := openShared(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
 }
 
 // uploadSingle performs a one-shot PUT of data, riding out transient failures.
@@ -230,8 +244,9 @@ func uploadSingle(ctx context.Context, c *transport.Client, data []byte, remoteP
 // finds its previous session and skips the chunks already uploaded. That is
 // what makes a 300GB upload survivable on a connection that occasionally dies:
 // nothing short of the file itself changing restarts it from byte zero.
-func uploadChunked(ctx context.Context, c *transport.Client, localPath, remotePath string, size, mtimeNanos int64, sum string, prog func(int64)) (etag, fileID string, err error) {
-	uploadID := uploadIDFor(remotePath, size, mtimeNanos)
+func uploadChunked(ctx context.Context, c *transport.Client, localPath, remotePath string, orig os.FileInfo, sum string, prog func(int64)) (etag, fileID string, err error) {
+	size := orig.Size()
+	uploadID := uploadIDFor(remotePath, size, orig.ModTime().UnixNano())
 	if err := c.CreateUpload(ctx, uploadID); err != nil {
 		return "", "", err
 	}
@@ -246,7 +261,7 @@ func uploadChunked(ctx context.Context, c *transport.Client, localPath, remotePa
 		return "", "", err
 	}
 
-	f, err := os.Open(localPath)
+	f, err := openShared(localPath)
 	if err != nil {
 		return "", "", err
 	}
@@ -283,7 +298,13 @@ func uploadChunked(ctx context.Context, c *transport.Client, localPath, remotePa
 		// Torn: the file moved while it was being sent. Drop the chunks so a
 		// later resume can't assemble them either.
 		_ = c.DeleteUpload(ctx, uploadID)
-		return "", "", &ChangedError{Path: localPath}
+		// Written into (the handle is the file that was hashed), or saved over
+		// (a new file had replaced it by the time it was opened to send)?
+		inPlace := false
+		if sent, serr := f.Stat(); serr == nil {
+			inPlace = os.SameFile(orig, sent)
+		}
+		return "", "", &ChangedError{Path: localPath, InPlace: inPlace}
 	}
 
 	// A resumed session written under a different chunk layout (older app

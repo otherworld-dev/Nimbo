@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"os"
 	"strings"
 )
 
@@ -28,7 +27,7 @@ func sumHex(h interface{ Sum(b []byte) []byte }) string {
 
 // sha1File computes the SHA1 of a file's contents as a lowercase hex string.
 func sha1File(path string) (string, error) {
-	f, err := os.Open(path)
+	f, err := openShared(path)
 	if err != nil {
 		return "", err
 	}

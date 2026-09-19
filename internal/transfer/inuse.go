@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -25,8 +26,13 @@ func (e *InUseError) Error() string {
 func (e *InUseError) Unwrap() error { return e.Err }
 
 // ChangedError is an upload refused because the file changed while it was
-// being read for sending (Deck #691).
-type ChangedError struct{ Path string }
+// being read for sending (Deck #691). InPlace says a program wrote into the
+// file itself, as Outlook does to a .pst, rather than an editor saving a new
+// file over it: only the first marks the file as one to wait on.
+type ChangedError struct {
+	Path    string
+	InPlace bool
+}
 
 func (e *ChangedError) Error() string {
 	return fmt.Sprintf("%s changed while it was being read", filepath.Base(e.Path))
@@ -82,4 +88,16 @@ func UploadDeferred(localPath string) error {
 		return &InUseError{Path: localPath, Err: err}
 	}
 	return nil
+}
+
+// statShared stats path through an open handle. On Windows that fixes the
+// file's identity at the time of the call, where os.Stat looks it up from the
+// path only when compared, by which time a replaced file compares as itself.
+func statShared(path string) (os.FileInfo, error) {
+	f, err := openShared(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return f.Stat()
 }

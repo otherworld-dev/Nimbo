@@ -4,6 +4,7 @@ package transfer
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -44,4 +45,23 @@ func extendedPath(path string) string {
 		return `\?\UNC\` + path[2:]
 	}
 	return `\?\` + path
+}
+
+// openShared opens path to read the way os.Open does, but sharing delete as
+// well, so an editor's atomic save (a temp file renamed over this one) isn't
+// refused for as long as Nimbo reads the file: minutes, on a large upload.
+// The handle goes on reading the version it opened; the replacement is a new
+// file, which the next pass uploads.
+func openShared(path string) (*os.File, error) {
+	p, err := windows.UTF16PtrFromString(extendedPath(path))
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	h, err := windows.CreateFile(p, windows.GENERIC_READ,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	return os.NewFile(uintptr(h), path), nil
 }
