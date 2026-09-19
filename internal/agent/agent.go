@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/url"
@@ -3314,9 +3315,14 @@ func deletionWeight(st *state.Store, pk string, actions []engine.Action, kind en
 // reason for the log and the activity feed. The .Collectives case is the common
 // one: the Collectives app rejects directory creation there (a quirky 507), so
 // anything a user drops into that folder can't be uploaded.
+//
+// Reasons go by the error's status code and type, not words in its message,
+// which carries the file's path: a timeout uploading IMG_4012.jpg read as a
+// rejected sign-in, and one for Scans/20240409.pdf as a missing parent folder
+// (Deck #691).
 func humanActionErr(a engine.Action, err error) string {
 	s := err.Error()
-	low := strings.ToLower(s)
+	code := transport.StatusCode(err)
 	switch {
 	case strings.HasPrefix(a.Path, ".Collectives") || strings.Contains(s, ".Collectives"):
 		return "can't sync inside “.Collectives” — it's managed by the Collectives app and won't accept items created here; move this out of .Collectives to sync it"
@@ -3324,15 +3330,15 @@ func humanActionErr(a engine.Action, err error) string {
 		return "someone else has this file open — it's locked on the server"
 	case errors.As(err, new(*transfer.ChecksumMismatchError)):
 		return damagedCopyMsg
-	case strings.Contains(low, "insufficientstorage") || strings.Contains(s, "507"):
+	case code == 507:
 		return "the server wouldn't accept it (out of space, or the folder is read-only)"
-	case strings.Contains(low, "parent node does not exist") || strings.Contains(s, "409"):
+	case code == 409:
 		return "its parent folder couldn't be created on the server"
-	case strings.Contains(low, "forbidden") || strings.Contains(s, "403"):
+	case code == 403:
 		return "the server refused it (permission denied)"
-	case strings.Contains(low, "access is denied"):
+	case errors.Is(err, fs.ErrPermission):
 		return "Windows denied access to that path (it may be read-only or locked)"
-	case strings.Contains(low, "unauthorized") || strings.Contains(s, "401"):
+	case code == 401 || errors.Is(err, transport.ErrUnauthorized):
 		return "the server rejected our sign-in — you may need to log in again"
 	default:
 		return s

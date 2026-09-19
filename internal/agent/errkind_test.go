@@ -8,9 +8,11 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 
+	"github.com/otherworld/nimbo/internal/engine"
 	"github.com/otherworld/nimbo/internal/transport"
 )
 
@@ -59,5 +61,32 @@ func TestSyncErrKindKeepsOfflineForTheNetwork(t *testing.T) {
 		if got := syncErrKind(tc.err); got != tc.want {
 			t.Errorf("%s: syncErrKind = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// The activity feed's wording also went by words in the message, so a timeout
+// uploading IMG_4012.jpg read "the server rejected our sign-in" and one for
+// Scans/20240409.pdf "its parent folder couldn't be created".
+func TestActivityWordingGoesByType(t *testing.T) {
+	timeout := &url.Error{Op: "Put", URL: "https://example.org/x", Err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("i/o timeout")}}
+	for _, tc := range []struct {
+		path string
+		err  error
+		not  string
+	}{
+		{"Photos/IMG_4012.jpg", fmt.Errorf("upload %s: %w", "Photos/IMG_4012.jpg", timeout), "sign-in"},
+		{"Scans/20240409.pdf", fmt.Errorf("upload %s: %w", "Scans/20240409.pdf", timeout), "parent folder"},
+		{"Films/forbidden-planet.mkv", fmt.Errorf("upload %s: %w", "Films/forbidden-planet.mkv", timeout), "permission"},
+		{"Docs/5074.txt", fmt.Errorf("upload %s: %w", "Docs/5074.txt", timeout), "out of space"},
+	} {
+		got := humanActionErr(engine.Action{Kind: engine.ActUpload, Path: tc.path}, tc.err)
+		if strings.Contains(got, tc.not) {
+			t.Errorf("%s timing out reads %q", tc.path, got)
+		}
+	}
+	real := humanActionErr(engine.Action{Kind: engine.ActUpload, Path: "a.txt"},
+		&transport.StatusError{Op: "PUT", Path: "a.txt", Code: 403, Status: "403 Forbidden"})
+	if !strings.Contains(real, "permission") {
+		t.Errorf("a real 403 reads %q", real)
 	}
 }
