@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path"
@@ -362,7 +363,14 @@ func (e *Executor) applyTransfer(ctx context.Context, a engine.Action) error {
 		// have it for as long as they have it. Retrying just delays the message.
 		// The same goes for every other deliberate refusal (quota, forbidden,
 		// auth): re-hashing a huge file two more times won't change the answer.
-		if err == nil || ctx.Err() != nil || transport.IsLocked(err) || !transport.Retryable(err) {
+		// And for a file another program is writing: Outlook keeps an attached
+		// .pst open for hours, so it waits for the next pass. A checksum mismatch
+		// is the server's copy being damaged: fetching it again brings back the
+		// same bytes, and on a 24 GB file each try costs minutes.
+		var inUse *InUseError
+		var damaged *ChecksumMismatchError
+		if err == nil || ctx.Err() != nil || transport.IsLocked(err) || !transport.Retryable(err) ||
+			errors.As(err, &inUse) || errors.As(err, &damaged) {
 			break
 		}
 	}

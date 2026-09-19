@@ -134,6 +134,9 @@ type Engine struct {
 	failMu   sync.Mutex
 	lastFail map[string]string // "<kind>\x00<path>" -> last human reason logged
 
+	damagedMu sync.Mutex
+	damaged   map[string]string // "<pairKey>\x00<path>" -> server etag of a copy that failed its checksum
+
 	policy       transfer.ConflictPolicy
 	conflictMu   sync.Mutex
 	conflicts    map[string][]ConflictItem // key = pair LocalDir
@@ -3304,6 +3307,8 @@ func humanActionErr(a engine.Action, err error) string {
 		return "can't sync inside “.Collectives” — it's managed by the Collectives app and won't accept items created here; move this out of .Collectives to sync it"
 	case transport.IsLocked(err):
 		return "someone else has this file open — it's locked on the server"
+	case errors.As(err, new(*transfer.ChecksumMismatchError)):
+		return damagedCopyMsg
 	case strings.Contains(low, "insufficientstorage") || strings.Contains(s, "507"):
 		return "the server wouldn't accept it (out of space, or the folder is read-only)"
 	case strings.Contains(low, "parent node does not exist") || strings.Contains(s, "409"):
@@ -3675,6 +3680,9 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			slog.Info("holding an upload: someone else has the file open", "path", rel)
 		}
 	}
+	// A server copy that failed its checksum is not fetched again until it
+	// changes (Deck #691, see damaged.go).
+	actions, skippedDamaged := e.skipDamaged(pk, actions, remote)
 
 	// Data-loss guard. If this plan would delete files on the SERVER while the
 	// local root has vanished (folder deleted, moved, unmounted, or empty), that is
@@ -3716,8 +3724,8 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		// Nothing to do — but re-listed dirs still need their etags stamped, or
 		// they are re-listed on every future scan (this quiet case is the common
 		// steady state: our own transfers stale the ancestor dir etags).
-		maintainDirBaselines(st, pk, base, remote, heldUploads)
-		if base != nil {
+		maintainDirBaselines(st, pk, base, remote, append(append([]string(nil), heldUploads...), skippedDamaged...))
+		if base != nil && len(skippedDamaged) == 0 {
 			e.clearCheckpoint(st, pk) // clean pass — the crawl's rescue rows served their purpose
 		}
 		// A quiet pass must still clear "Scanning…" — nothing else will until the
@@ -3790,6 +3798,10 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
 				e.progComplete()
 			}
+			var damaged *transfer.ChecksumMismatchError
+			if a.Kind == engine.ActDownload && errors.As(aerr, &damaged) {
+				e.noteDamaged(pk, a.Path, remote[a.Path].ETag)
+			}
 			if aerr != nil {
 				probMu.Lock()
 				problems = append(problems, a.Path)
@@ -3816,6 +3828,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	// pending local change stops being re-detected until something else there
 	// changes.
 	problems = append(problems, heldUploads...)
+	problems = append(problems, skippedDamaged...)
 	for _, c := range ex.Pending {
 		problems = append(problems, c.Path)
 	}

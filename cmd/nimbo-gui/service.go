@@ -1519,6 +1519,13 @@ func (a *App) uploadWithConflictFor(eng *agent.Engine, etags *etagStore) func(ct
 			}
 		}
 
+		// A file still being written by the program caught changing it (Outlook
+		// with a .pst) won't upload yet. Ask before setting the server's copy
+		// aside, or that path would stay empty until the program closes.
+		if err := transfer.UploadDeferred(localPath); err != nil {
+			return err
+		}
+
 		base := etags.get(remotePath)
 		cur, curExists, statErr := eng.StatRemote(ctx, remotePath)
 		switch {

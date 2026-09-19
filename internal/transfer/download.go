@@ -82,7 +82,13 @@ func DownloadProgress(ctx context.Context, c *transport.Client, remotePath, loca
 	if want, ok := parseSHA1(hdr.Get("OC-Checksum")); ok {
 		if got := sumHex(hasher); got != want {
 			os.Remove(part)
-			return FileResult{}, fmt.Errorf("download %s: checksum mismatch (got %s, want %s)", remotePath, got, want)
+			if offset > 0 {
+				// A resume spliced the start of an older version onto this one
+				// (the file changed between attempts): our fault, not the
+				// server's. The part is gone, so the next try starts from zero.
+				return FileResult{}, fmt.Errorf("download %s: resumed copy did not match, starting again", remotePath)
+			}
+			return FileResult{}, &ChecksumMismatchError{Path: remotePath, Got: got, Want: want}
 		}
 	}
 
@@ -112,6 +118,18 @@ func DownloadProgress(ctx context.Context, c *transport.Client, remotePath, loca
 		MTimeNanos:  mtime.UnixNano(),
 		ContentSHA1: sumHex(hasher),
 	}, nil
+}
+
+// ChecksumMismatchError is a download whose bytes do not match the checksum the
+// server stores for the file. Over HTTPS the bytes cannot change on the way, so
+// the server really is serving these bytes: its copy is damaged, typically by
+// an upload of a file that was being written to at the time (Deck #691).
+type ChecksumMismatchError struct {
+	Path, Got, Want string
+}
+
+func (e *ChecksumMismatchError) Error() string {
+	return fmt.Sprintf("download %s: checksum mismatch (got %s, want %s)", e.Path, e.Got, e.Want)
 }
 
 // headerETag returns the response ETag, preferring Nextcloud's OC-ETag.

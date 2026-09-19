@@ -36,12 +36,16 @@ type fakeNC struct {
 	sessionDeletes  []string       // upload IDs DELETEd (whole session)
 	chunkDeletes    []string       // chunk names DELETEd individually
 	assembleAttempt int
+
+	onSinglePut func()            // runs as a single PUT arrives, while the upload is in flight
+	onChunkPut  func(name string) // runs as each chunk PUT arrives
+	declared    map[string]string // destination -> OC-Checksum a single PUT declared
 }
 
 func newFakeNC() *fakeNC {
 	return &fakeNC{
 		files: map[string][]byte{}, sessions: map[string]map[string][]byte{},
-		chunkFail: map[string]int{}, chunkPuts: map[string]int{},
+		chunkFail: map[string]int{}, chunkPuts: map[string]int{}, declared: map[string]string{},
 	}
 }
 
@@ -85,6 +89,9 @@ func (f *fakeNC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case http.MethodPut:
 			chunk := parts[1]
 			f.chunkPuts[chunk]++
+			if f.onChunkPut != nil {
+				f.onChunkPut(chunk)
+			}
 			if f.chunkFail[chunk] > 0 {
 				f.chunkFail[chunk]--
 				w.WriteHeader(f.chunkFailCode)
@@ -156,12 +163,16 @@ func (f *fakeNC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPut:
 			f.chunkPuts["single"]++
+			if f.onSinglePut != nil {
+				f.onSinglePut()
+			}
 			if f.chunkFail["single"] > 0 {
 				f.chunkFail["single"]--
 				w.WriteHeader(f.chunkFailCode)
 				return
 			}
 			f.files[dest] = readAll(r)
+			f.declared[dest] = r.Header.Get("OC-Checksum")
 			w.Header().Set("OC-ETag", `"etag-single"`)
 			w.Header().Set("OC-FileId", "fid-s")
 			w.WriteHeader(http.StatusCreated)

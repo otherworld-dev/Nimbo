@@ -244,3 +244,36 @@ func TestDeletionWeight(t *testing.T) {
 		}
 	}
 }
+
+// A server copy that fails its checksum (a torn upload from another computer)
+// was downloaded again on every pass: 24 GB every 20 minutes for days. It is
+// fetched once, then skipped until the server's copy changes, and fetched as
+// soon as it does.
+func TestADamagedServerCopyIsNotDownloadedEveryPass(t *testing.T) {
+	f, e, p := seededFolderPair(t, "To Sort", 1)
+	const pst = "To Sort/archive.pst"
+	f.setNode(pst, davNode{etag: "torn", body: "torn bytes", checksum: "4f663abde826ad82d8ff238365e1f9f3e2dd81af"})
+	f.setNode("To Sort", davNode{isDir: true, etag: "e-dir2"})
+	f.setNode("", davNode{isDir: true, etag: "e-root2"})
+
+	for pass := 0; pass < 3; pass++ {
+		_, _ = e.SyncOnce(context.Background(), p)
+	}
+	if n := f.getCount(pst); n != 1 {
+		t.Fatalf("the damaged copy was downloaded %d times over 3 passes, want 1", n)
+	}
+	if _, err := os.Stat(filepath.Join(p.LocalDir, filepath.FromSlash(pst))); !os.IsNotExist(err) {
+		t.Fatalf("a damaged copy landed locally (err=%v)", err)
+	}
+
+	// Uploaded again, cleanly: it must come down on the next pass.
+	f.setNode(pst, davNode{etag: "clean", body: "good bytes"})
+	f.setNode("To Sort", davNode{isDir: true, etag: "e-dir3"})
+	f.setNode("", davNode{isDir: true, etag: "e-root3"})
+	if _, err := e.SyncOnce(context.Background(), p); err != nil {
+		t.Fatalf("SyncOnce: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(p.LocalDir, filepath.FromSlash(pst))); err != nil || string(b) != "good bytes" {
+		t.Fatalf("the clean copy was not downloaded: %q err=%v", b, err)
+	}
+}

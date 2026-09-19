@@ -1,15 +1,20 @@
 package transfer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
+	"encoding"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,6 +28,10 @@ var (
 	// minChunkSize is the v2 minimum (except the final chunk).
 	minChunkSize int64 = 10 << 20 // 10 MiB (>= the 5 MiB protocol minimum)
 )
+
+// testHookBeforeSend runs after the file is hashed and checked, just before
+// its bytes are sent: the window a program writing to the file can land in.
+var testHookBeforeSend func()
 
 // maxChunks is the v2 cap on chunk count; chunk size scales to stay under it.
 const maxChunks = 10000
@@ -75,11 +84,43 @@ func Upload(ctx context.Context, c *transport.Client, localPath, remotePath stri
 // deltas: bytes reported for a chunk attempt that failed are withdrawn before
 // the chunk restarts, so the running total stays honest.
 func UploadProgress(ctx context.Context, c *transport.Client, localPath, remotePath string, prog func(int64)) (FileResult, error) {
+	// A file caught changing under an earlier upload is not read again while a
+	// program still has it open to write (Outlook and an attached .pst): each
+	// try would send the whole file only to find it torn again (Deck #691).
+	if err := UploadDeferred(localPath); err != nil {
+		return FileResult{}, err
+	}
+	res, err := uploadOnce(ctx, c, localPath, remotePath, prog)
+	var changed *ChangedError
+	switch {
+	case errors.As(err, &changed):
+		markBusyWriter(localPath)
+	case err == nil:
+		clearBusyWriter(localPath)
+	}
+	return res, err
+}
+
+func uploadOnce(ctx context.Context, c *transport.Client, localPath, remotePath string, prog func(int64)) (FileResult, error) {
 	fi, err := os.Stat(localPath)
 	if err != nil {
 		return FileResult{}, err
 	}
-	sum, err := sha1File(localPath)
+	// The checksum declared must be the checksum of the bytes that arrive.
+	// Hashing the file and then reading it again to send it let a program
+	// writing in between (Outlook, again) leave the server a torn copy under a
+	// checksum it did not match (Deck #691). So a small file is read once and
+	// those exact bytes are hashed and sent; a large one is hashed again as it
+	// is sent, and not assembled unless the two agree.
+	chunked := fi.Size() > chunkThreshold
+	var data []byte
+	var sum string
+	if chunked {
+		sum, err = sha1File(localPath)
+	} else if data, err = os.ReadFile(localPath); err == nil {
+		h := sha1.Sum(data)
+		sum = hex.EncodeToString(h[:])
+	}
 	if err != nil {
 		return FileResult{}, err
 	}
@@ -90,14 +131,19 @@ func UploadProgress(ctx context.Context, c *transport.Client, localPath, remoteP
 	if err := statUnchanged(localPath, fi); err != nil {
 		return FileResult{}, err
 	}
+	if !chunked && int64(len(data)) != fi.Size() {
+		return FileResult{}, &ChangedError{Path: localPath}
+	}
 	checksum := ocChecksum(sum)
+	if testHookBeforeSend != nil {
+		testHookBeforeSend()
+	}
 
 	var etag, fileID string
-	chunked := fi.Size() > chunkThreshold
 	if !chunked {
-		etag, fileID, err = uploadSingle(ctx, c, localPath, remotePath, fi.Size(), checksum, prog)
+		etag, fileID, err = uploadSingle(ctx, c, data, remotePath, checksum, prog)
 	} else {
-		etag, fileID, err = uploadChunked(ctx, c, localPath, remotePath, fi.Size(), fi.ModTime().UnixNano(), checksum, prog)
+		etag, fileID, err = uploadChunked(ctx, c, localPath, remotePath, fi.Size(), fi.ModTime().UnixNano(), sum, prog)
 	}
 	if err != nil {
 		return FileResult{}, err
@@ -141,41 +187,22 @@ func statUnchanged(path string, fi os.FileInfo) error {
 		return err
 	}
 	if cur.Size() != fi.Size() || !cur.ModTime().Equal(fi.ModTime()) {
-		return fmt.Errorf("%s changed while it was being read", filepath.Base(path))
+		return &ChangedError{Path: path}
 	}
 	return nil
 }
 
-// uploadSingle performs a one-shot PUT, riding out transient failures.
-func uploadSingle(ctx context.Context, c *transport.Client, localPath, remotePath string, size int64, checksum string, prog func(int64)) (etag, fileID string, err error) {
-	// Each attempt gets a FRESH file handle: net/http reads request bodies on
-	// its own goroutine, and a shared handle's seek offset would race a
-	// replayed body against a straggling reader from the failed attempt.
-	var cur *os.File
-	defer func() {
-		if cur != nil {
-			cur.Close()
-		}
-	}()
+// uploadSingle performs a one-shot PUT of data, riding out transient failures.
+// The bytes come from memory, so every attempt sends exactly what was hashed.
+func uploadSingle(ctx context.Context, c *transport.Client, data []byte, remotePath, checksum string, prog func(int64)) (etag, fileID string, err error) {
 	var sent atomic.Int64
 	newBody := func() (io.Reader, error) {
-		f, oerr := os.Open(localPath)
-		if oerr != nil {
-			return nil, oerr
-		}
-		if cur != nil {
-			cur.Close()
-		}
-		cur = f
 		if s := sent.Swap(0); s > 0 && prog != nil {
 			prog(-s)
 		}
-		// Never hand out f itself: it satisfies io.ReadCloser, and the HTTP
-		// client closes request bodies after each attempt — later reads from
-		// the retry path would then hit a closed file.
-		var r io.Reader = io.NopCloser(f)
+		var r io.Reader = bytes.NewReader(data)
 		if prog != nil {
-			r = &progReader{r: f, fn: func(d int64) { sent.Add(d); prog(d) }}
+			r = &progReader{r: r, fn: func(d int64) { sent.Add(d); prog(d) }}
 		}
 		return r, nil
 	}
@@ -188,7 +215,7 @@ func uploadSingle(ctx context.Context, c *transport.Client, localPath, remotePat
 				return "", "", err
 			}
 		}
-		etag, fileID, err = c.PutWithChecksum(ctx, remotePath, newBody, size, checksum)
+		etag, fileID, err = c.PutWithChecksum(ctx, remotePath, newBody, int64(len(data)), checksum)
 		if err == nil || ctx.Err() != nil {
 			return etag, fileID, err
 		}
@@ -203,7 +230,7 @@ func uploadSingle(ctx context.Context, c *transport.Client, localPath, remotePat
 // finds its previous session and skips the chunks already uploaded. That is
 // what makes a 300GB upload survivable on a connection that occasionally dies:
 // nothing short of the file itself changing restarts it from byte zero.
-func uploadChunked(ctx context.Context, c *transport.Client, localPath, remotePath string, size, mtimeNanos int64, checksum string, prog func(int64)) (etag, fileID string, err error) {
+func uploadChunked(ctx context.Context, c *transport.Client, localPath, remotePath string, size, mtimeNanos int64, sum string, prog func(int64)) (etag, fileID string, err error) {
 	uploadID := uploadIDFor(remotePath, size, mtimeNanos)
 	if err := c.CreateUpload(ctx, uploadID); err != nil {
 		return "", "", err
@@ -225,6 +252,10 @@ func uploadChunked(ctx context.Context, c *transport.Client, localPath, remotePa
 	}
 	defer f.Close()
 
+	// Hash what is actually sent, and for chunks a resumed session already
+	// holds, what the file holds there now: the file is only assembled if that
+	// is the file that was hashed (Deck #691).
+	var running hash.Hash = sha1.New()
 	var offset int64
 	last := 0
 	for i := 1; offset < size; i++ {
@@ -235,13 +266,24 @@ func uploadChunked(ctx context.Context, c *transport.Client, localPath, remotePa
 		}
 		name := fmt.Sprintf("%05d", i)
 		if got, ok := existing[name]; !ok || got != n {
-			if err := putChunkRetry(ctx, c, uploadID, name, f, offset, n, remotePath, prog); err != nil {
+			if running, err = putChunkRetry(ctx, c, uploadID, name, f, offset, n, remotePath, prog, running); err != nil {
 				return "", "", err
 			}
-		} else if prog != nil {
-			prog(n) // already-uploaded chunk counts toward progress
+		} else {
+			if _, err := io.Copy(running, io.NewSectionReader(f, offset, n)); err != nil {
+				return "", "", err
+			}
+			if prog != nil {
+				prog(n) // already-uploaded chunk counts toward progress
+			}
 		}
 		offset += n
+	}
+	if got := hex.EncodeToString(running.Sum(nil)); !strings.EqualFold(got, sum) {
+		// Torn: the file moved while it was being sent. Drop the chunks so a
+		// later resume can't assemble them either.
+		_ = c.DeleteUpload(ctx, uploadID)
+		return "", "", &ChangedError{Path: localPath}
 	}
 
 	// A resumed session written under a different chunk layout (older app
@@ -256,42 +298,79 @@ func uploadChunked(ctx context.Context, c *transport.Client, localPath, remotePa
 		}
 	}
 
-	return assembleRetry(ctx, c, uploadID, remotePath, size, checksum)
+	return assembleRetry(ctx, c, uploadID, remotePath, size, ocChecksum(sum))
 }
 
 // putChunkRetry uploads one chunk, retrying transient failures with backoff.
 // Bytes reported for a failed attempt are withdrawn (negative delta) before the
-// chunk restarts.
-func putChunkRetry(ctx context.Context, c *transport.Client, uploadID, name string, f *os.File, offset, n int64, destPath string, prog func(int64)) error {
+// chunk restarts. running is the hash of everything before this chunk; the hash
+// including this chunk's bytes, as the successful attempt read them, comes
+// back. Each attempt hashes into its own copy, so an abandoned attempt's body
+// still being read can't disturb the one that counts.
+func putChunkRetry(ctx context.Context, c *transport.Client, uploadID, name string, f *os.File, offset, n int64, destPath string, prog func(int64), running hash.Hash) (hash.Hash, error) {
+	before, err := running.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
 	var sent atomic.Int64
+	var mu sync.Mutex
+	var latest *lockedHash
 	newBody := func() (io.Reader, error) {
 		if s := sent.Swap(0); s > 0 && prog != nil {
 			prog(-s)
 		}
-		var r io.Reader = io.NewSectionReader(f, offset, n)
+		h := sha1.New()
+		if err := h.(encoding.BinaryUnmarshaler).UnmarshalBinary(before); err != nil {
+			return nil, err
+		}
+		lh := &lockedHash{h: h}
+		mu.Lock()
+		latest = lh
+		mu.Unlock()
+		var r io.Reader = io.TeeReader(io.NewSectionReader(f, offset, n), lh)
 		if prog != nil {
 			r = &progReader{r: r, fn: func(d int64) { sent.Add(d); prog(d) }}
 		}
 		return r, nil
 	}
-	var err error
 	for attempt := 0; attempt < chunkAttempts; attempt++ {
 		if attempt > 0 {
 			if !transport.Retryable(err) {
-				return err
+				return nil, err
 			}
 			if serr := sleepBackoff(ctx, attempt); serr != nil {
-				return err
+				return nil, err
 			}
 		}
 		if err = c.PutChunk(ctx, uploadID, name, newBody, n, destPath); err == nil {
-			return nil
+			mu.Lock()
+			lh := latest
+			mu.Unlock()
+			if lh == nil {
+				return nil, fmt.Errorf("chunk %s was sent without reading its body", name)
+			}
+			lh.mu.Lock()
+			defer lh.mu.Unlock()
+			return lh.h, nil
 		}
 		if ctx.Err() != nil {
-			return err
+			return nil, err
 		}
 	}
-	return err
+	return nil, err
+}
+
+// lockedHash is a hash safe to write from the HTTP client's body reader while
+// its result is read here.
+type lockedHash struct {
+	mu sync.Mutex
+	h  hash.Hash
+}
+
+func (l *lockedHash) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.h.Write(p)
 }
 
 // assembleRetry finalises the session with the MOVE of ".file", riding out
