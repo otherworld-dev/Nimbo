@@ -34,17 +34,17 @@ func writerPresent(path string) error {
 	return nil
 }
 
-// extendedPath gives CreateFile the \?\ form of a long absolute path, which
+// extendedPath gives CreateFile the \\?\ form of a long absolute path, which
 // the os package does for itself but a raw CreateFile call does not.
 func extendedPath(path string) string {
-	if len(path) < 248 || strings.HasPrefix(path, `\?\`) || strings.HasPrefix(path, `\.\`) || !filepath.IsAbs(path) {
+	if len(path) < 248 || strings.HasPrefix(path, `\\?\`) || strings.HasPrefix(path, `\\.\`) || !filepath.IsAbs(path) {
 		return path
 	}
 	path = filepath.Clean(path)
-	if strings.HasPrefix(path, `\`) {
-		return `\?\UNC\` + path[2:]
+	if strings.HasPrefix(path, `\\`) {
+		return `\\?\UNC\` + path[2:]
 	}
-	return `\?\` + path
+	return `\\?\` + path
 }
 
 // openShared opens path to read the way os.Open does, but sharing delete as

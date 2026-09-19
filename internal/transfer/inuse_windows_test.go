@@ -198,3 +198,33 @@ func TestAReplacedFileIsNotTakenForAnInPlaceWriter(t *testing.T) {
 		t.Fatal("an atomic save marked the file as written in place")
 	}
 }
+
+// Uploads and hashing open files through openShared, which must cope with a
+// path of 248 characters or more (Explorer makes those happily): a malformed
+// \?\ prefix made every such file fail to upload, and a rename into a deep
+// folder then went to the server as a delete with no upload.
+func TestALongPathHashesAndUploads(t *testing.T) {
+	f, c, _ := uploadFixture(t, 50)
+	dir := t.TempDir()
+	for len(dir) < 270 {
+		dir = filepath.Join(dir, "a-fairly-long-folder-name")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(dir, "report.docx")
+	if err := os.WriteFile(local, []byte("long path content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SHA1File(local); err != nil {
+		t.Fatalf("hashing a %d-character path: %v", len(local), err)
+	}
+	if _, err := Upload(context.Background(), c, local, "docs/report.docx"); err != nil {
+		t.Fatalf("uploading a %d-character path: %v", len(local), err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if string(f.files["docs/report.docx"]) != "long path content" {
+		t.Fatal("the long-path file was not uploaded")
+	}
+}

@@ -36,6 +36,10 @@ func StatusCode(err error) int {
 // 404). It is final, not transient: Retryable says no to it.
 var ErrNotFound = errors.New("not found on the server")
 
+// ErrUnauthorized marks a request the server refused for the account's
+// credentials, where no StatusError carries the 401 (the OCS API).
+var ErrUnauthorized = errors.New("unauthorized")
+
 // Retryable reports whether err is worth another attempt: transient server
 // distress (5xx, 429) and network-level failures, but not deliberate refusals
 // (other 4xx — bad request, forbidden, locked, quota) or the caller giving up

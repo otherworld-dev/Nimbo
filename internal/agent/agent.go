@@ -2109,17 +2109,20 @@ func (e *Engine) resetAuthLost() {
 
 // syncErrKind classifies a sync error so the UI can show a meaningful status:
 // "auth" (credentials rejected), "offline" (network unreachable), or "error".
+//
+// It goes by what the error IS, never by words in its message: the message
+// carries file paths and URLs, and a path with "401" in it (IMG_4012.jpg)
+// timing out read as a rejected password, which signs the user out and stops
+// syncing (Deck #691).
 func syncErrKind(err error) string {
-	s := strings.ToLower(err.Error())
+	code := transport.StatusCode(err)
 	switch {
-	case strings.Contains(s, "401") || strings.Contains(s, "unauthor") || strings.Contains(s, "app password"):
+	case code == 401 || errors.Is(err, transport.ErrUnauthorized):
 		return "auth"
-	case strings.Contains(s, "no such host") || strings.Contains(s, "dial ") ||
-		strings.Contains(s, "connection refused") || strings.Contains(s, "timeout") ||
-		strings.Contains(s, "deadline exceeded") || strings.Contains(s, "network is unreachable") ||
-		strings.Contains(s, "no route to host") || strings.Contains(s, "connection reset") ||
-		strings.Contains(s, "request failed after") || strings.Contains(s, "i/o timeout"):
-		return "offline"
+	case code != 0:
+		return "error" // the server answered, so it is reachable
+	case errors.Is(err, context.DeadlineExceeded) || transport.Retryable(err):
+		return "offline" // a network failure, or retries that ran out
 	default:
 		return "error"
 	}
