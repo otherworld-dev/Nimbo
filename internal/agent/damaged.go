@@ -2,9 +2,12 @@ package agent
 
 import (
 	"log/slog"
+	"os"
 	"path"
+	"path/filepath"
 
 	"github.com/otherworld/nimbo/internal/engine"
+	"github.com/otherworld/nimbo/internal/transfer"
 )
 
 // A server copy whose bytes do not match the checksum stored with it is
@@ -38,11 +41,11 @@ func (e *Engine) noteDamaged(pk, rel, etag string) {
 // is meanwhile. A copy that has changed since is tried again, and its record
 // goes. Skipped paths are returned so the pass treats them as unfinished:
 // their folders keep being re-listed rather than stamped clean.
-func (e *Engine) skipDamaged(pk string, actions []engine.Action, remote map[string]engine.RemoteState) (kept []engine.Action, skipped []string) {
+func (e *Engine) skipDamaged(pk string, actions []engine.Action, remote map[string]engine.RemoteState) (kept []engine.Action, skipped, conflicts []string) {
 	e.damagedMu.Lock()
 	defer e.damagedMu.Unlock()
 	if len(e.damaged) == 0 {
-		return actions, nil
+		return actions, nil, nil
 	}
 	kept = actions[:0:0]
 	for _, a := range actions {
@@ -51,6 +54,9 @@ func (e *Engine) skipDamaged(pk string, actions []engine.Action, remote map[stri
 			if etag, ok := e.damaged[key]; ok {
 				if r, listed := remote[a.Path]; listed && r.ETag == etag {
 					skipped = append(skipped, a.Path)
+					if a.Kind == engine.ActConflict {
+						conflicts = append(conflicts, a.Path)
+					}
 					slog.Debug("skipping a download whose server copy is damaged", "path", a.Path, "etag", etag)
 					continue
 				}
@@ -59,7 +65,27 @@ func (e *Engine) skipDamaged(pk string, actions []engine.Action, remote map[stri
 		}
 		kept = append(kept, a)
 	}
-	return kept, skipped
+	return kept, skipped, conflicts
+}
+
+// keepEditAside settles a conflict whose server copy is damaged without that
+// copy: the local edit is renamed to its conflicted-copy name, which the next
+// pass uploads as a new file, and the original name waits for a good server
+// copy. Holding the conflict back had held the edit back too, silently, for as
+// long as the damaged copy stayed. The original name now reads as "deleted
+// locally but changed on the server", a conflict still held back, never a
+// deletion to send.
+func (e *Engine) keepEditAside(p Pair, rel string) {
+	from := filepath.Join(p.LocalDir, filepath.FromSlash(rel))
+	if fi, err := os.Stat(from); err != nil || !fi.Mode().IsRegular() {
+		return // nothing edited here to keep, or not a plain file
+	}
+	to := filepath.Join(p.LocalDir, filepath.FromSlash(transfer.ConflictName(rel)))
+	if err := os.Rename(from, to); err != nil {
+		slog.Warn("could not keep a local edit beside a damaged server copy", "path", rel, "err", err)
+		return
+	}
+	slog.Warn("server copy damaged: local edit kept as a conflicted copy", "path", rel, "copy", to)
 }
 
 const damagedCopyMsg = "the copy on the server is damaged (its content doesn't match the checksum stored with it), " +

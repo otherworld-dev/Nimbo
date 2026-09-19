@@ -412,8 +412,21 @@ func TestADamagedServerCopyInAConflictIsNotFetchedEveryPass(t *testing.T) {
 	if n := f.getCount(doc) - before; n != 1 {
 		t.Fatalf("the damaged copy was fetched %d times over 3 passes, want 1", n)
 	}
-	if b, _ := os.ReadFile(local); string(b) != "local edit" {
-		t.Fatalf("the local edit was not left alone: %q", b)
+	// Holding the conflict back also held the local edit back, silently and for
+	// as long as the damaged copy stayed. It is kept both ways instead, without
+	// the server's bytes: the edit goes up as the conflicted copy, and the
+	// original name waits for a good server copy. Nothing is deleted.
+	var sent string
+	for _, put := range f.putPaths() {
+		if strings.HasPrefix(put, "To Sort/f000 (conflicted copy") {
+			sent = f.putBody(put)
+		}
+	}
+	if sent != "local edit" {
+		t.Fatalf("the local edit never reached the server (uploads: %v)", f.putPaths())
+	}
+	if d := f.deletePaths(); len(d) != 0 {
+		t.Fatalf("keeping both deleted on the server: %v", d)
 	}
 }
 
