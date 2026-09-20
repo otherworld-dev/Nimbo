@@ -4,9 +4,11 @@ package shellns
 
 import (
 	"encoding/base64"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // find returns the value written for key/name, or fails.
@@ -175,5 +177,34 @@ func TestUTF16LEBOM(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("byte %d = %#x, want %#x", i, got[i], want[i])
 		}
+	}
+}
+
+// A finishing script removes its own files; if two runs shared names, the first
+// run's clean-up took the second run's script with it.
+func TestScriptPathsAreUniquePerRun(t *testing.T) {
+	a1, b1, c1 := scriptPaths(`C:\Users\Adam`)
+	a2, b2, c2 := scriptPaths(`C:\Users\Adam`)
+	if a1 == a2 || b1 == b2 || c1 == c2 {
+		t.Errorf("two runs share a file name: %s %s %s / %s %s %s", a1, b1, c1, a2, b2, c2)
+	}
+	for _, p := range []string{a1, b1, c1} {
+		if filepath.Dir(p) != `C:\Users\Adam` {
+			t.Errorf("%s is not under the home dir", p)
+		}
+	}
+}
+
+func TestWaitGone(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "run.ps1")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitGone(p, 300*time.Millisecond); err == nil {
+		t.Error("reported gone while the file still exists")
+	}
+	go func() { time.Sleep(150 * time.Millisecond); _ = os.Remove(p) }()
+	if err := waitGone(p, 5*time.Second); err != nil {
+		t.Errorf("not seen going: %v", err)
 	}
 }

@@ -45,7 +45,9 @@
       </uap:VisualElements>
 
       <Extensions>
-        <!-- Run at login (replaces the registry autostart when packaged). -->
+        <!-- Run at login. Settings turns this on and off through the WinRT
+             StartupTask API (internal/autostart), so TaskId must stay in step
+             with startupTaskID there. -->
         <desktop:Extension Category="windows.startupTask" Executable="nimbo-gui.exe" EntryPoint="Windows.FullTrustApplication">
           <desktop:StartupTask TaskId="NimboAutostart" Enabled="true" DisplayName="Nimbo" />
         </desktop:Extension>

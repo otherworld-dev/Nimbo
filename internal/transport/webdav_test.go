@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -427,5 +428,54 @@ func TestEntryContentSHA1(t *testing.T) {
 		if got := (Entry{Checksums: c.in}).ContentSHA1(); got != c.want {
 			t.Errorf("ContentSHA1(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// A listing of a path the server does not have is final, not transient. The
+// on-demand delete guard lists a vanished path before deleting it; reading a
+// 404 as a network failure retried every such delete forever, and the error
+// text must still say "not found" for Stat, which matches on it.
+func TestPropFindNotFoundIsFinal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "adam", "app-password")
+	_, err := c.PropFind(context.Background(), "gone", 1)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("PROPFIND 404: err = %v, want ErrNotFound", err)
+	}
+	if Retryable(err) {
+		t.Error("a PROPFIND 404 is classed as worth retrying")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error text %q lost the \"not found\" Stat matches on", err)
+	}
+	_, ok, serr := c.Stat(context.Background(), "gone")
+	if serr != nil || ok {
+		t.Errorf("Stat of a missing path = %v, %v; want false, nil", ok, serr)
+	}
+}
+
+// Stat's "absent" must mean the server said 404 and nothing else. It matched
+// the words "not found" in the error text, and the text carries the path, so
+// a refusal of a file NAMED like that read as "not on the server" — which a
+// sync pass acts on by deleting the local copy (Deck #691).
+func TestStatReportsAbsentOnlyForA404(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "gone") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "adam", "app-password")
+
+	if _, found, err := c.Stat(context.Background(), "gone.txt"); err != nil || found {
+		t.Fatalf("404: found=%v err=%v, want absent with no error", found, err)
+	}
+	if _, found, err := c.Stat(context.Background(), "Items not found.xlsx"); err == nil {
+		t.Fatalf("403 on a file named 'not found': found=%v, want an error, not absent", found)
 	}
 }

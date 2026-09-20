@@ -136,12 +136,13 @@
   const kindIcon = (k: string) =>
     ({ download: "↓", upload: "↑", "delete-local": "🗑", "delete-remote": "🗑",
        "move-local": "↪", "move-remote": "↪", "mkdir-local": "📁", "mkdir-remote": "📁",
-       conflict: "⚠", unshared: "🔗" } as Record<string, string>)[k] ?? "•";
+       conflict: "⚠", unshared: "🔗", "delete-kept": "↺" } as Record<string, string>)[k] ?? "•";
   const kindLabel = (k: string) =>
     ({ download: "Downloaded", upload: "Uploaded", "delete-local": "Deleted locally",
        "delete-remote": "Deleted on server", "move-local": "Moved", "move-remote": "Moved",
        "mkdir-local": "New folder", "mkdir-remote": "New folder", conflict: "Conflict",
        unshared: "No longer shared with you — copy kept",
+       "delete-kept": "Kept on server (not deleted)",
        "unshared-empty": "No longer shared with you — nothing was downloaded" } as Record<string, string>)[k] ?? k;
   refresh();
   Events.On("status", (e: any) => {

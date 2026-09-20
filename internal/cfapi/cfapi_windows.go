@@ -78,6 +78,28 @@ func ShellNotifyUpdated(path string) {
 	_, _, _ = procSHChangeNotify.Call(shcneUpdateItem, shcnfPathW, uintptr(unsafe.Pointer(p)), 0)
 }
 
+// ShellNotifyCreated tells Explorer that a file or folder has appeared at path,
+// so an open window lists it straight away. An item the provider creates with
+// CfCreatePlaceholders is NOT picked up by a window that has just shown it
+// being deleted (measured on the test VM: a folder put back after a refused
+// delete stayed invisible until F5). Values from ShlObj_core.h, SDK 10.0.26100.
+func ShellNotifyCreated(path string, isDir bool) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return
+	}
+	const (
+		shcneCreate = 0x00000002
+		shcneMkdir  = 0x00000008
+		shcnfPathW  = 0x0005
+	)
+	ev := uintptr(shcneCreate)
+	if isDir {
+		ev = shcneMkdir
+	}
+	_, _, _ = procSHChangeNotify.Call(ev, shcnfPathW, uintptr(unsafe.Pointer(p)), 0)
+}
+
 // GOTCHA — placeholder DISGUISING (the #580 false alarm and the live-mode
 // 121k-failure bug): cfapi hides reparse points from every process that is not
 // a connected sync engine for the root or a %systemroot% binary — a MANIFEST
@@ -683,6 +705,10 @@ type PlaceholderInfo struct {
 	// mount: the one entry whose later disappearance from a listing means
 	// "detached from this account", not "deleted" (Deck #557).
 	MountRoot bool
+	// Encrypted marks an end-to-end encrypted folder. Population never creates
+	// one; only the delete guard's complete listing reports them, so a folder
+	// holding one is never deleted on the strength of a listing that hid it.
+	Encrypted bool
 }
 
 // CF_FS_METADATA { FILE_BASIC_INFO BasicInfo; LARGE_INTEGER FileSize; }

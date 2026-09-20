@@ -43,10 +43,11 @@ const davPrefix = "/remote.php/dav/files/alice"
 // overrides the oc:permissions served (default: a plain own dir/file), so a
 // test can present a folder shared with the user (S) or a mount (M).
 type davNode struct {
-	isDir bool
-	etag  string
-	body  string
-	perm  string
+	isDir    bool
+	etag     string
+	body     string
+	perm     string
+	checksum string // SHA1 hex sent as OC-Checksum on GET; need not match body
 }
 
 // fakeDAV serves just enough WebDAV for real sync passes: PROPFIND depth 1
@@ -64,6 +65,7 @@ type fakeDAV struct {
 	putN    map[string]int    // file -> PUTs accepted (a re-upload of identical bytes still counts)
 	mkcols  map[string]int    // dir -> MKCOLs seen
 	deletes []string          // paths DELETEd, in order
+	getN    map[string]int    // file -> GETs served, failures included
 }
 
 func newFakeDAV(nodes map[string]davNode) *fakeDAV {
@@ -75,6 +77,7 @@ func newFakeDAV(nodes map[string]davNode) *fakeDAV {
 		puts:    map[string]string{},
 		putN:    map[string]int{},
 		mkcols:  map[string]int{},
+		getN:    map[string]int{},
 	}
 }
 
@@ -107,6 +110,12 @@ func (f *fakeDAV) setFailGET(file string, code int) {
 	f.mu.Unlock()
 }
 func (f *fakeDAV) clearFailGET(file string) { f.mu.Lock(); delete(f.failGET, file); f.mu.Unlock() }
+
+func (f *fakeDAV) getCount(file string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getN[file]
+}
 
 func (f *fakeDAV) pfCount(dir string) int {
 	f.mu.Lock()
@@ -148,6 +157,7 @@ func (f *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMultiStatus)
 		_, _ = w.Write([]byte(f.multistatus(rel, r.Header.Get("Depth") == "infinity")))
 	case "GET":
+		f.getN[rel]++
 		if code, ok := f.failGET[rel]; ok {
 			w.WriteHeader(code)
 			return
@@ -156,6 +166,9 @@ func (f *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !ok || n.isDir {
 			w.WriteHeader(http.StatusNotFound)
 			return
+		}
+		if n.checksum != "" {
+			w.Header().Set("OC-Checksum", "SHA1:"+n.checksum)
 		}
 		_, _ = w.Write([]byte(n.body))
 	case "PUT":

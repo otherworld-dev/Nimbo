@@ -28,6 +28,7 @@ type PlaceholderInfo struct {
 	ETag      string
 	FileID    string
 	MountRoot bool
+	Encrypted bool
 }
 
 // Debug is a diagnostic hook (used on Windows); unused here.
@@ -105,6 +106,9 @@ func Disconnect(string, int64) {}
 
 // ShellNotifyUpdated is Windows-only (Explorer glyph refresh); no-op elsewhere.
 func ShellNotifyUpdated(string) {}
+
+// ShellNotifyCreated is Windows-only (Explorer change notification); no-op elsewhere.
+func ShellNotifyCreated(string, bool) {}
 
 // ExcludeFromSync is Windows-only (cloud-filter pin state); no-op elsewhere.
 func ExcludeFromSync(string) error { return nil }

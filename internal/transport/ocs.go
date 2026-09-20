@@ -65,7 +65,7 @@ func (c *Client) doOCS(ctx context.Context, method, fullURL string, body io.Read
 		return fmt.Errorf("read OCS response: %w", err)
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("OCS %s: unauthorized (app password rejected)", fullURL)
+		return fmt.Errorf("OCS %s: %w (app password rejected)", fullURL, ErrUnauthorized)
 	}
 
 	var env ocsEnvelope

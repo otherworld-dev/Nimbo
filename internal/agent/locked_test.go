@@ -17,7 +17,7 @@ func TestRemoteStateFromEntryCarriesLock(t *testing.T) {
 		Path: "Budget.xlsx", Size: 10, ETag: "e1", FileID: "42",
 		Lock: &transport.LockInfo{Owner: "bob", OwnerType: transport.LockOwnerApp},
 	}
-	got := remoteStateFrom("Budget.xlsx", ent)
+	got := remoteStateFrom("Budget.xlsx", ent, false)
 	if got.Lock == nil || got.Lock.Owner != "bob" || got.Lock.OwnerType != transport.LockOwnerApp {
 		t.Fatalf("Lock = %+v, want bob's app-owned lock", got.Lock)
 	}
@@ -28,7 +28,7 @@ func TestRemoteStateFromEntryCarriesLock(t *testing.T) {
 		t.Errorf("an existing field was lost in the conversion: %+v", got)
 	}
 
-	unlocked := remoteStateFrom("Free.xlsx", transport.Entry{Path: "Free.xlsx"})
+	unlocked := remoteStateFrom("Free.xlsx", transport.Entry{Path: "Free.xlsx"}, false)
 	if unlocked.Lock != nil {
 		t.Errorf("Lock = %+v, want nil", unlocked.Lock)
 	}

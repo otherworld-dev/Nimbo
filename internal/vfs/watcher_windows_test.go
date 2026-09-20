@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/otherworld/nimbo/internal/cfapi"
+	"github.com/otherworld/nimbo/internal/transport"
 )
 
 // --- test fakes -------------------------------------------------------------
@@ -50,6 +51,7 @@ type fakeCf struct {
 	// directory is always populated and is answered from plain, not here.
 	populated     map[string]bool
 	notified      []string         // paths passed to the shell change-notify seam
+	createdNote   []string         // paths passed to the shell "item created" seam
 	settleChecked []string         // paths offered to the pin-settle seam
 	excluded      []string         // paths passed to the exclude-from-sync seam
 	reverted      []string         // paths passed to RevertPlaceholder (they become plain)
@@ -167,6 +169,13 @@ func installFakeCf(t *testing.T) *fakeCf {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.notified = append(f.notified, path)
+	}
+	osc := cfShellCreated
+	t.Cleanup(func() { cfShellCreated = osc })
+	cfShellCreated = func(path string, _ bool) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.createdNote = append(f.createdNote, path)
 	}
 	cfIsPlaceholder = func(_ os.FileInfo, full string) bool {
 		f.mu.Lock()
@@ -503,9 +512,13 @@ type recorder struct {
 	listCalls map[string]int
 	listing   map[string][]cfapi.PlaceholderInfo
 	listErr   error
-	uploaded  chan string
-	deleted   chan string
-	moved     chan [2]string
+	// checkStrict wires Ops.CheckList, which answers ErrNotFound for any path
+	// the listing does not hold instead of an empty folder, so a guard that
+	// asks for the wrong path cannot pass by accident.
+	checkStrict bool
+	uploaded    chan string
+	deleted     chan string
+	moved       chan [2]string
 
 	uploadFails int           // fail this many uploads before succeeding…
 	uploadErr   error         // …with this error
@@ -709,6 +722,24 @@ func (r *recorder) ops() Ops {
 			}
 			return r.listing[rel], nil
 		},
+		CheckList: func() func(string) ([]cfapi.PlaceholderInfo, error) {
+			if !r.checkStrict {
+				return nil
+			}
+			return func(rel string) ([]cfapi.PlaceholderInfo, error) {
+				r.mu.Lock()
+				defer r.mu.Unlock()
+				r.listCalls[rel]++
+				if r.listErr != nil {
+					return nil, r.listErr
+				}
+				kids, ok := r.listing[rel]
+				if !ok {
+					return nil, fmt.Errorf("path %q not found: %w", rel, transport.ErrNotFound)
+				}
+				return kids, nil
+			}
+		}(),
 		RecordBaseline: func(remote, etag string) {
 			r.mu.Lock()
 			defer r.mu.Unlock()

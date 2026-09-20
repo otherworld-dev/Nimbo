@@ -1162,7 +1162,7 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			ev.Err = err.Error()
 		}
 		eng.Recorder().Add(ev)
-		if err != nil {
+		if err != nil || kind == "delete-kept" {
 			a.vfsErrorToast(kind, remotePath, err)
 		}
 	}
@@ -1308,6 +1308,35 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		poll = 5 * time.Minute
 	}
 	up := a.uploadWithConflictFor(eng, etags)
+	// checkList is the delete guard's listing (vfs.Ops.CheckList): every child,
+	// end-to-end encrypted folders included, no side effects (listRemote
+	// records share roots and can raise lock toasts), and a time limit so a
+	// stalled response cannot hold one of the guard's few slots for ever.
+	checkList := func(rel string) ([]cfapi.PlaceholderInfo, error) {
+		ctx, cancel := context.WithTimeout(a.ctx, 2*time.Minute)
+		defer cancel()
+		remote := strings.Trim(root+"/"+rel, "/")
+		entries, err := eng.Browse(ctx, remote)
+		if err != nil {
+			return nil, err
+		}
+		items := []cfapi.PlaceholderInfo{}
+		for _, e := range entries {
+			p := strings.Trim(e.Path, "/")
+			if p == remote || p == "" {
+				continue // the directory itself
+			}
+			name := p
+			if i := strings.LastIndex(p, "/"); i >= 0 {
+				name = p[i+1:]
+			}
+			items = append(items, cfapi.PlaceholderInfo{
+				Name: name, IsDir: e.IsDir, Identity: []byte(p), ETag: e.ETag,
+				Encrypted: e.IsDir && e.IsEncrypted,
+			})
+		}
+		return items, nil
+	}
 	forgetUnder := func(remote string) {
 		etags.delUnder(remote)
 		fileids.delUnder(remote)
@@ -1315,11 +1344,12 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 	}
 	startWatcher := func() *vfs.Watcher {
 		w, werr := vfs.New(a.ctx, localDir, root, poll, vfs.Ops{
-			Upload: up,
-			Mkdir:  eng.MkdirRemote,
-			Delete: eng.DeleteRemote,
-			Move:   eng.MoveRemote,
-			List:   listRemote,
+			Upload:    up,
+			Mkdir:     eng.MkdirRemote,
+			Delete:    eng.DeleteRemote,
+			Move:      eng.MoveRemote,
+			List:      listRemote,
+			CheckList: checkList,
 			// Lost-MOVE detection: after a rename's MOVE "fails", the watcher
 			// asks whether the destination exists — the server may have applied
 			// the move and only the response was lost.
@@ -1445,6 +1475,15 @@ func (a *App) vfsErrorToast(kind, remotePath string, err error) {
 			filepath.Base(remotePath)+" has corrupt cloud-file metadata (a Windows fault). Your server copy is safe; the activity feed shows how to clear it.", "")
 		return
 	}
+	if kind == "delete-kept" {
+		// Not a failure: a folder vanished here while the server still holds
+		// things in it this computer never had (or could not check), so the
+		// watcher kept it on the server and put it back (vfs.judgeDelete).
+		// The log has the exact reason.
+		notify.Toast(brand.Current.Name+" — on-demand sync",
+			filepath.Base(remotePath)+" wasn't deleted on the server, because it holds files this PC never had. It's back here as an online-only folder. To delete it everywhere, use the web page.", "")
+		return
+	}
 	verb := map[string]string{
 		"upload": "upload", "download": "download", "delete-remote": "delete",
 		"move": "move", "mkdir-remote": "create folder",
@@ -1478,6 +1517,13 @@ func (a *App) uploadWithConflictFor(eng *agent.Engine, etags *etagStore) func(ct
 				ent.Lock.HeldByOther(eng.Account.LoginName) {
 				return fmt.Errorf("%s: %w", remotePath, vfs.ErrHeldByLock)
 			}
+		}
+
+		// A file still being written by the program caught changing it (Outlook
+		// with a .pst) won't upload yet. Ask before setting the server's copy
+		// aside, or that path would stay empty until the program closes.
+		if err := transfer.UploadDeferred(localPath); err != nil {
+			return err
 		}
 
 		base := etags.get(remotePath)
@@ -3948,7 +3994,7 @@ func (a *App) syncSidebar() {
 		// package hive and skews positive -- so trusting our own record risks
 		// never retrying a removal that silently failed. The cost of getting it
 		// wrong that way is a permanent duplicate; the cost of retrying is one
-		// queued task per launch.
+		// task run per launch (a second or two, waited for).
 		if err := shellns.Unregister(); err != nil {
 			slog.Warn("could not drop the duplicate navigation-pane entry", "err", err)
 			return // leave the record alone so the next launch retries

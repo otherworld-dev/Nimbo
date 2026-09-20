@@ -2,6 +2,9 @@ package transfer
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path"
@@ -40,6 +43,10 @@ type Executor struct {
 	// OnProgress, if set, is called with the bytes transferred for an action as
 	// they flow, for live progress display. Safe for concurrent use.
 	OnProgress func(a engine.Action, delta int64)
+	// OnMovedAside, if set, is told when a folder or file the server deleted was
+	// too big for the Recycle Bin and was moved next to the sync folder instead.
+	OnMovedAside func(rel, dest string)
+	binUsed      map[string]int64 // bytes this run put in each drive's Recycle Bin
 
 	// Policy controls conflict handling. Under PolicyAsk, conflicts (other than
 	// identical content) are deferred into Pending instead of auto-resolved.
@@ -362,7 +369,14 @@ func (e *Executor) applyTransfer(ctx context.Context, a engine.Action) error {
 		// have it for as long as they have it. Retrying just delays the message.
 		// The same goes for every other deliberate refusal (quota, forbidden,
 		// auth): re-hashing a huge file two more times won't change the answer.
-		if err == nil || ctx.Err() != nil || transport.IsLocked(err) || !transport.Retryable(err) {
+		// And for a file another program is writing: Outlook keeps an attached
+		// .pst open for hours, so it waits for the next pass. A checksum mismatch
+		// is the server's copy being damaged: fetching it again brings back the
+		// same bytes, and on a 24 GB file each try costs minutes.
+		var inUse *InUseError
+		var damaged *ChecksumMismatchError
+		if err == nil || ctx.Err() != nil || transport.IsLocked(err) || !transport.Retryable(err) ||
+			errors.As(err, &inUse) || errors.As(err, &damaged) {
 			break
 		}
 	}
@@ -398,7 +412,7 @@ func (e *Executor) applyDelete(ctx context.Context, a engine.Action) error {
 		// Recycle Bin first: a deletion mirrored FROM the server is the one
 		// this PC never chose, so it keeps an undo. Below the damage guard's
 		// thresholds this is the only safety net a server-side deletion has.
-		if err := RemoveToBin(e.localPath(a.Path)); err != nil {
+		if err := e.removeMirrored(a.Path); err != nil {
 			return err
 		}
 	} else {
@@ -408,6 +422,115 @@ func (e *Executor) applyDelete(ctx context.Context, a engine.Action) error {
 	}
 	slog.Info(a.Kind.String(), "path", a.Path)
 	return e.deleteBaseline(a.Path)
+}
+
+// removeMirrored removes rel for a deletion that came from the server. The
+// Recycle Bin keeps it where the bin can: an item bigger than the bin's
+// capacity is deleted outright by Windows, silently with confirmation off,
+// which is how 219 GB of "To Sort" was lost for good (Deck #691). Anything the
+// bin can't keep, or refuses, is moved next to the sync folder instead, and
+// OnMovedAside says where. Where even that fails, the item stays and the
+// action fails: never a delete nobody can undo. Where there is no bin at all
+// (another platform, a network or removable drive, a bin switched off) it
+// stays a plain delete, as it always was.
+func (e *Executor) removeMirrored(rel string) error {
+	p := e.localPath(rel)
+	capacity, hasBins := binCapacity(p)
+	clearReadOnlyTree(p)
+	if !hasBins || capacity == 0 {
+		// No bin on this drive (network, removable) or the user switched it
+		// off: deleting here was always for good, and still is.
+		return os.RemoveAll(p)
+	}
+	if capacity == binUnknown {
+		return e.putAside(rel) // a bin whose size we couldn't read: don't gamble
+	}
+	// The bin takes items only until this pass has put nine tenths of its
+	// capacity in. It makes room by purging its oldest items, so a folder
+	// arriving file by file (a full or delta pass lists everything in it) would
+	// otherwise push its own first files out for good.
+	vol := strings.ToLower(filepath.VolumeName(p))
+	e.mu.Lock()
+	room := capacity/10*9 - e.binUsed[vol]
+	e.mu.Unlock()
+	if size, fits := sizeWithin(p, room); fits {
+		if err := recycleFn(p); err == nil {
+			e.mu.Lock()
+			if e.binUsed == nil {
+				e.binUsed = make(map[string]int64)
+			}
+			e.binUsed[vol] += size
+			e.mu.Unlock()
+			return nil
+		}
+	}
+	return e.putAside(rel)
+}
+
+// putAside moves rel next to the sync folder for a deletion the Recycle Bin
+// can't keep, and says so.
+func (e *Executor) putAside(rel string) error {
+	dest, err := e.moveAside(rel)
+	if err != nil {
+		return fmt.Errorf("too big for the Recycle Bin, and could not move it aside: %w", err)
+	}
+	slog.Warn("deleted on the server and too big for the Recycle Bin: moved aside", "path", rel, "to", dest)
+	if e.OnMovedAside != nil {
+		e.OnMovedAside(rel, dest)
+	}
+	return nil
+}
+
+// sizeWithin adds up everything at p and reports whether it comes to no more
+// than limit bytes, stopping as soon as it doesn't.
+func sizeWithin(p string, limit int64) (int64, bool) {
+	var total int64
+	if limit < 0 {
+		return 0, false
+	}
+	over := errors.New("over")
+	err := filepath.WalkDir(p, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if total += fi.Size(); total > limit {
+			return over
+		}
+		return nil
+	})
+	return total, err == nil
+}
+
+// moveAside moves rel out of the sync folder into a sibling named after it,
+// "<sync folder> - removed on server", keeping its relative path so it is
+// recognisable, and never over something already there.
+func (e *Executor) moveAside(rel string) (string, error) {
+	root := filepath.Clean(e.LocalRoot)
+	base := filepath.Base(root)
+	if base == "." || base == string(filepath.Separator) || base == filepath.VolumeName(root) {
+		return "", fmt.Errorf("the sync folder %s is a drive root, with no folder beside it", root)
+	}
+	dest := filepath.Join(filepath.Dir(root), base+" - removed on server", filepath.FromSlash(rel))
+	if _, err := os.Lstat(dest); err == nil {
+		for i := 2; ; i++ {
+			c := fmt.Sprintf("%s (%d)", dest, i)
+			if _, err := os.Lstat(c); err != nil {
+				dest = c
+				break
+			}
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.Rename(e.localPath(rel), dest); err != nil {
+		return "", err
+	}
+	return dest, nil
 }
 
 // RemoveToBin removes a local path the way a mirrored server deletion does:
@@ -498,10 +621,13 @@ func (e *Executor) saveDirBaseline(rel, etag, fileID string, mountRoot bool) err
 	})
 }
 
+// deleteBaseline drops rel's row and, when rel was a folder, the rows of
+// everything in it: those files went with it, and rows left behind would read
+// next time as deletions to send to the other side (Deck #691).
 func (e *Executor) deleteBaseline(rel string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.State.DeleteBaseline(e.PairKey, rel)
+	return e.State.DeleteBaselineUnder(e.PairKey, rel)
 }
 
 func sortByPathAsc(a []engine.Action) {
@@ -527,3 +653,12 @@ func sleepBackoff(ctx context.Context, attempt int) error {
 		return nil
 	}
 }
+
+var (
+	binCapacity = volumeBinCapacity
+	recycleFn   = recycle
+)
+
+// binUnknown is the capacity reported for a drive that has a Recycle Bin whose
+// size couldn't be read.
+const binUnknown int64 = -1
