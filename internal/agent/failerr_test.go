@@ -2,29 +2,40 @@ package agent
 
 import (
 	"errors"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/otherworld/nimbo/internal/engine"
+	"github.com/otherworld/nimbo/internal/transport"
 )
 
 // TestHumanActionErr checks the raw → human-readable mapping, especially the
 // .Collectives case (the one that prompted this).
 func TestHumanActionErr(t *testing.T) {
+	// The errors as the transport and the OS really produce them: HTTP failures
+	// are StatusErrors, local ones *os.PathError (see TestActivityWordingGoesByType
+	// for why the wording no longer reads the message).
+	status := func(op, path string, code int, st string) error {
+		return &transport.StatusError{Op: op, Path: path, Code: code, Status: st}
+	}
 	cases := []struct {
-		path, raw, wantSubstr string
+		path       string
+		err        error
+		wantSubstr string
 	}{
-		{".Collectives/Home Network", `MKCOL ".Collectives/Home Network": server returned 507 Insufficient Storage`, "Collectives"},
-		{"docs/x.txt", "server returned 403 Forbidden", "permission denied"},
-		{"a/b", `mkdir E:\Nextcloud\a: Access is denied.`, "Windows denied access"},
-		{"deep/file.md", "MKCOL: 409 Conflict: Parent node does not exist", "parent folder"},
-		{"Team/Budget.xlsx", `PUT "Team/Budget.xlsx": server returned 423 Locked`, "someone else"},
-		{"q/r", "some unrecognised transport error", "some unrecognised transport error"}, // falls back to raw
+		{".Collectives/Home Network", status("MKCOL", ".Collectives/Home Network", 507, "507 Insufficient Storage"), "Collectives"},
+		{"docs/x.txt", status("PUT", "docs/x.txt", 403, "403 Forbidden"), "permission denied"},
+		{"a/b", &os.PathError{Op: "mkdir", Path: `E:\Nextcloud\a`, Err: syscall.Errno(5)}, "Windows denied access"},
+		{"deep/file.md", status("MKCOL", "deep", 409, "409 Conflict"), "parent folder"},
+		{"Team/Budget.xlsx", status("PUT", "Team/Budget.xlsx", 423, "423 Locked"), "someone else"},
+		{"q/r", errors.New("some unrecognised transport error"), "some unrecognised transport error"}, // falls back to raw
 	}
 	for _, c := range cases {
-		got := humanActionErr(engine.Action{Path: c.path}, errors.New(c.raw))
+		got := humanActionErr(engine.Action{Path: c.path}, c.err)
 		if !strings.Contains(got, c.wantSubstr) {
-			t.Errorf("humanActionErr(%q, %q) = %q, want it to contain %q", c.path, c.raw, got, c.wantSubstr)
+			t.Errorf("humanActionErr(%q, %v) = %q, want it to contain %q", c.path, c.err, got, c.wantSubstr)
 		}
 	}
 }

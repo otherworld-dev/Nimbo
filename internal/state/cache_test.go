@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/engine"
 )
@@ -163,5 +164,158 @@ func TestBaselineCacheWriteThrough(t *testing.T) {
 	}
 	if empty, _ := st2.BaselineEmpty("P"); empty {
 		t.Fatal("BaselineEmpty should be false with rows present")
+	}
+}
+
+// BaselineCountUnder backs the damage guards' weighing of a directory delete.
+// Both read paths must agree, and "under" must mean strictly beneath: not the
+// directory's own row, and not a sibling whose name merely starts the same
+// ("dir b", "dir.txt", "dir0" all sort between "dir" and "dir/").
+func TestBaselineCountUnder(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cached=%v", cached), func(t *testing.T) {
+			st, err := Open(filepath.Join(t.TempDir(), "state.db"), "acct", cached)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer st.Close()
+			for _, p := range []string{
+				"dir", "dir/a.txt", "dir/sub", "dir/sub/b.txt",
+				"dir b", "dir b/c.txt", "dir.txt", "dir0/d.txt",
+				"other", "other/e.txt",
+			} {
+				if err := st.UpsertBaseline("P", engine.BaselineState{Path: p}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := st.UpsertBaseline("Q", engine.BaselineState{Path: "dir/not-this-pair"}); err != nil {
+				t.Fatal(err)
+			}
+			if cached {
+				if _, err := st.LoadBaseline("P"); err != nil { // fill the cache
+					t.Fatal(err)
+				}
+			}
+			for _, tc := range []struct {
+				dirs []string
+				want int
+			}{
+				{nil, 0},
+				{[]string{"dir"}, 3},
+				{[]string{"dir/sub"}, 1},
+				{[]string{"dir", "other"}, 4},
+				{[]string{"dir.txt"}, 0}, // a file: nothing beneath it
+				{[]string{"missing"}, 0},
+			} {
+				got, err := st.BaselineCountUnder("P", tc.dirs)
+				if err != nil {
+					t.Fatalf("BaselineCountUnder(%v): %v", tc.dirs, err)
+				}
+				if got != tc.want {
+					t.Errorf("BaselineCountUnder(%v) = %d, want %d", tc.dirs, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// DeleteBaselineUnder must remove exactly a folder's own row and the rows
+// beneath it. It matched with LIKE, where "_" is a wildcard and case is
+// ignored, so clearing "a_b" also cleared "axb/..." and "A_B/..." (Deck #691).
+func TestDeleteBaselineUnderIsExact(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cached=%v", cached), func(t *testing.T) {
+			st, err := Open(filepath.Join(t.TempDir(), "state.db"), "acct", cached)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer st.Close()
+			paths := []string{"a_b", "a_b/x", "a_b/sub/y", "axb", "axb/z", "A_B/w", "a_b c/v", "a_bc"}
+			for _, p := range paths {
+				if err := st.UpsertBaseline("P", engine.BaselineState{Path: p}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if cached {
+				if _, err := st.LoadBaseline("P"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := st.DeleteBaselineUnder("P", "a_b"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := st.LoadBaseline("P")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, gone := range []string{"a_b", "a_b/x", "a_b/sub/y"} {
+				if _, ok := got[gone]; ok {
+					t.Errorf("%q survived", gone)
+				}
+			}
+			for _, kept := range []string{"axb", "axb/z", "A_B/w", "a_b c/v", "a_bc"} {
+				if _, ok := got[kept]; !ok {
+					t.Errorf("%q was removed with a_b", kept)
+				}
+			}
+		})
+	}
+}
+
+// A scoped load must return exactly the folder's subtree. LIKE ignores case,
+// so scoping to "a_b" also returned "A_B/...", which the scoped pass then
+// pruned as dead rows because neither side's scoped scan listed them.
+func TestLoadBaselineScopedIsExact(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"), "acct", false)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	for _, p := range []string{"a_b/x", "A_B/w", "axb/z", "a_b c/v"} {
+		if err := st.UpsertBaseline("P", engine.BaselineState{Path: p}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.LoadBaselineScoped("P", "a_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got["a_b/x"].Path == "" {
+		t.Fatalf("scoped to a_b, got %v", got)
+	}
+}
+
+// Clearing a deleted path's rows ran over the whole resident baseline on every
+// call, once per file of a mass delete: 208k deletes over a 370k-row cache is
+// tens of billions of steps with the store locked. A file has nothing beneath
+// it, and a folder's rows are found by the index.
+func TestDeleteBaselineUnderDoesNotWalkTheWholeCache(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "state.db"), "acct", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rows := make([]engine.BaselineState, 0, 200000)
+	for i := 0; i < 200000; i++ {
+		rows = append(rows, engine.BaselineState{Path: fmt.Sprintf("d%03d/f%06d", i%500, i)})
+	}
+	if err := st.UpsertBaselineBatch("P", rows); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.LoadBaseline("P"); err != nil { // fill the cache
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for i := 0; i < 2000; i++ {
+		if err := st.DeleteBaselineUnder("P", fmt.Sprintf("d%03d/f%06d", i%500, i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("2,000 file deletes over a 200,000-row cache took %v", d)
+	}
+	got, _ := st.LoadBaseline("P")
+	if len(got) != 198000 {
+		t.Fatalf("%d rows left, want 198000", len(got))
 	}
 }

@@ -16,11 +16,14 @@ import (
 // who accept the cost. (.git also deserves caution on its own merits: file-
 // syncing a live repo across machines can corrupt it.)
 var defaultIgnore = []string{
-	"*~", "~$*", ".~lock.*", "*.tmp", "*.part",
-	".DS_Store", "Thumbs.db", "desktop.ini",
+	"*~", "~$*", ".~*", "*.tmp", "*.part",
+	".DS_Store", "Thumbs.db", "desktop.ini", ".Trash", ".Trashes",
 	// official Nextcloud/ownCloud desktop client state (e.g. after a takeover):
 	".sync_*.db", ".sync_*.db-shm", ".sync_*.db-wal", "._sync_*.db",
 	".owncloudsync.log*", ".nextcloudsync.log*", "*.~syncpart",
+	// Nimbo's own partial download. The full local walk always skipped it, but
+	// a scoped pass sees only this list, and tried to upload it (Deck #691).
+	"*.nimbo-part",
 	// Left behind by the retired one-way backup mode (beta v0.1.0.205 only):
 	// its attic held everything the backup removed or replaced. The entry
 	// stays so an install that still has one never uploads it — that would

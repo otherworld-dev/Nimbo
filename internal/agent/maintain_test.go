@@ -178,6 +178,46 @@ func TestMaintainDirBaselinesKeepsMountRoot(t *testing.T) {
 	}
 }
 
+// Dirtying rewrites an EXISTING row; it must never create one. A row says
+// "synced on both sides", so one written for a folder that is not there locally
+// reads next pass as a local deletion to send to the server. That is how a
+// folder deleted by a pass came back as a row and drew a DELETE (Deck #691).
+func TestMaintainDirBaselinesDirtyNeverCreatesARow(t *testing.T) {
+	st := maintTestStore(t)
+	const pk = "P"
+
+	// The stat-built route: no row exists for "gone".
+	maintainDirBaselines(st, pk, nil, map[string]engine.RemoteState{}, []string{"gone/file.part"})
+	got, _ := st.LoadBaseline(pk)
+	if b, ok := got["gone"]; ok {
+		t.Fatalf("dirtying created a row for a folder with none: %+v", b)
+	}
+
+	// The listing route: base still has the row (it predates the pass), but the
+	// pass deleted it, and the listing still shows the folder on the server.
+	base := map[string]engine.BaselineState{"gone": {Path: "gone", IsDir: true, RemoteETag: "old"}}
+	remote := map[string]engine.RemoteState{"gone": {Path: "gone", IsDir: true, ETag: "NEW"}}
+	maintainDirBaselines(st, pk, base, remote, []string{"gone/file.part"})
+	got, _ = st.LoadBaseline(pk)
+	if b, ok := got["gone"]; ok {
+		t.Fatalf("dirtying resurrected a row the pass deleted: %+v", b)
+	}
+}
+
+// A folder whose OWN action failed (say its local mkdir) has not reconciled.
+// Stamping it would write a row for a folder that may not exist locally, and
+// the next pass would read that as "deleted locally": a server deletion.
+func TestMaintainDirBaselinesNeverStampsAFailedDir(t *testing.T) {
+	st := maintTestStore(t)
+	const pk = "P"
+	remote := map[string]engine.RemoteState{"newdir": {Path: "newdir", IsDir: true, ETag: "N1"}}
+	maintainDirBaselines(st, pk, map[string]engine.BaselineState{}, remote, []string{"newdir"})
+	got, _ := st.LoadBaseline(pk)
+	if b, ok := got["newdir"]; ok {
+		t.Fatalf("a folder whose own action failed was stamped: %+v", b)
+	}
+}
+
 func TestDirParent(t *testing.T) {
 	for in, want := range map[string]string{
 		"a/b/c": "a/b", "a/b": "a", "a": "", "": "",

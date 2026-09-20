@@ -91,25 +91,18 @@ func LocalScanProgress(root, scope string, progress func(files int)) (map[string
 }
 
 // isIgnoredName reports whether a file/dir name should be excluded from sync.
-// This is intentionally small for now; per-folder ignore rules arrive in Phase 6.
+// It is the default ignore list itself, which the server side is filtered by
+// too: when the walk skipped names the server side didn't (".Trash", ".~x"), a
+// server item so named was downloaded, then missing from the next walk, and
+// read as a local deletion to send to the server (Deck #691).
+// Server-forbidden names (.htaccess etc.) are NOT skipped here: they are
+// detected against the server's rules and surfaced as "can't sync" with
+// rename/blacklist options (see engine.Forbidden / FilterBlocked).
 func isIgnoredName(name string) bool {
-	switch name {
-	case ".DS_Store", "Thumbs.db", "desktop.ini", ".Trash", ".Trashes":
-		return true
-	}
-	// Note: server-forbidden names (.htaccess etc.) are NOT skipped here — they
-	// are detected against the server's rules and surfaced as "can't sync" with
-	// rename/blacklist options (see engine.Forbidden / FilterBlocked).
-	// Editor/transfer temp files.
-	if strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, "~") {
-		return true
-	}
-	if strings.HasPrefix(name, "~$") || strings.HasPrefix(name, ".~") {
-		return true
-	}
-	// Nimbo's own partial-download temp files (see transfer layer).
-	if strings.HasSuffix(name, ".nimbo-part") {
-		return true
+	for _, p := range defaultIgnore {
+		if matchPattern(p, name, name) {
+			return true
+		}
 	}
 	return false
 }

@@ -450,7 +450,9 @@ func (c *Client) parseResponse(r davResponse) (Entry, bool, error) {
 func (c *Client) Stat(ctx context.Context, remotePath string) (Entry, bool, error) {
 	entries, err := c.PropFind(ctx, remotePath, 0)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		// Only a real 404. Matching "not found" in the text also matched paths
+		// named that way, and callers act on "absent" by deleting (Deck #691).
+		if errors.Is(err, ErrNotFound) {
 			return Entry{}, false, nil
 		}
 		return Entry{}, false, err

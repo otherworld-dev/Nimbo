@@ -2,7 +2,9 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -174,5 +176,176 @@ func TestOverflowForcesFullSync(t *testing.T) {
 	defer mu.Unlock()
 	if pushCalls != 0 {
 		t.Fatalf("overflow must be a full local scan, not a remote-delta; pushCalls=%d", pushCalls)
+	}
+}
+
+// A nudged path is synced exactly like a local change the watcher saw: an
+// upload put off while a program had the file open is nudged once it closes,
+// since closing it may not write, and so may not raise a watcher event.
+func TestNudgedPathsSyncLikeLocalChanges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	nudge := make(chan string, 1)
+	got := make(chan []string, 4)
+	syncFn := func(_ context.Context, changed []string) error {
+		if changed != nil {
+			got <- changed
+		}
+		return nil
+	}
+	go func() {
+		_ = runLoop(ctx, Options{Root: t.TempDir(), Debounce: 20 * time.Millisecond, Nudge: nudge}, syncFn, make(chan string))
+	}()
+	nudge <- `C:\Sync\archive.pst`
+	select {
+	case changed := <-got:
+		if len(changed) != 1 || changed[0] != `C:\Sync\archive.pst` {
+			t.Fatalf("synced %v, want the nudged path", changed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a nudged path was never synced")
+	}
+}
+
+// A quick sync of local changes that fails (the server unreachable, say) lost
+// its paths: nothing re-queued them, and the full pass that would have found
+// them again is itself held back by the failure backoff. They are retried.
+func TestAFailedChangeSyncIsRetried(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan string, 1)
+	var mu sync.Mutex
+	var changeCalls [][]string
+	syncFn := func(_ context.Context, changed []string) error {
+		if changed == nil {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		changeCalls = append(changeCalls, changed)
+		if len(changeCalls) == 1 {
+			return errors.New("server unreachable")
+		}
+		return nil
+	}
+	go func() {
+		_ = runLoop(ctx, Options{Root: t.TempDir(), Debounce: 20 * time.Millisecond, RetryChanges: 50 * time.Millisecond}, syncFn, events)
+	}()
+	events <- `C:\Sync\new.txt`
+	deadline := time.After(3 * time.Second)
+	for {
+		mu.Lock()
+		n := len(changeCalls)
+		var last []string
+		if n > 0 {
+			last = changeCalls[n-1]
+		}
+		mu.Unlock()
+		if n >= 2 {
+			if len(last) != 1 || last[0] != `C:\Sync\new.txt` {
+				t.Fatalf("retried %v, want the failed batch's path", last)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("a failed change sync was never retried (%d calls)", n)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// Retrying a change that keeps failing (a path the server refuses) must not
+// hold back syncing FROM the server: each retry fed the same failure streak
+// that pauses pushes and polls, so one bad path could keep them waiting for
+// hours. Change retries keep their own count.
+func TestFailingChangeRetriesDoNotHoldBackPushes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan string, 1)
+	ext := make(chan struct{}, 1)
+	var changes, pushes atomic.Int32
+	syncFn := func(_ context.Context, changed []string) error {
+		if changed == nil {
+			return nil
+		}
+		changes.Add(1)
+		return errors.New("the server refuses this path")
+	}
+	onPush := func(context.Context) error { pushes.Add(1); return nil }
+	go func() {
+		_ = runLoop(ctx, Options{Root: t.TempDir(), Debounce: 10 * time.Millisecond, PollInterval: time.Hour,
+			OnPush: onPush, External: ext, RetryChanges: 10 * time.Millisecond}, syncFn, events)
+	}()
+	events <- `C:\Sync\refused.txt`
+	deadline := time.After(2 * time.Second)
+	for changes.Load() < 3 {
+		select {
+		case <-deadline:
+			t.Fatalf("only %d change attempts", changes.Load())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	ext <- struct{}{}
+	deadline = time.After(2 * time.Second)
+	for pushes.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("a server push was held back by failing change retries")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// A change synced successfully proves the server is back, and lifts the
+// backoff an outage left on pushes and polls, as it always did. With change
+// syncs kept out of the failure streak, success stopped lifting it too, and
+// server changes waited up to an hour behind a working connection.
+func TestASuccessfulChangeSyncLiftsTheBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan string, 1)
+	ext := make(chan struct{}, 1)
+	var pushes atomic.Int32
+	onPush := func(context.Context) error {
+		if pushes.Add(1) == 1 {
+			return errors.New("server unreachable") // the outage: backs off for the poll interval
+		}
+		return nil
+	}
+	changed := make(chan struct{}, 1)
+	syncFn := func(_ context.Context, c []string) error {
+		if c != nil {
+			changed <- struct{}{}
+		}
+		return nil
+	}
+	go func() {
+		_ = runLoop(ctx, Options{Root: t.TempDir(), Debounce: 10 * time.Millisecond, PollInterval: time.Hour,
+			OnPush: onPush, External: ext}, syncFn, events)
+	}()
+	ext <- struct{}{} // first push fails: a one-hour hold
+	deadline := time.After(2 * time.Second)
+	for pushes.Load() < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("the first push never ran")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	events <- `C:\Sync\edited.txt` // the connection is back: this succeeds
+	select {
+	case <-changed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the change never synced")
+	}
+	ext <- struct{}{}
+	deadline = time.After(2 * time.Second)
+	for pushes.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("a push was still held back after a change synced fine")
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }

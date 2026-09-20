@@ -261,10 +261,12 @@ func (s *Store) LoadBaselineScoped(pairKey, scope string) (map[string]engine.Bas
 
 // queryBaselineScoped reads only a subtree's rows directly from the DB (no-cache).
 func (s *Store) queryBaselineScoped(pairKey, scope string) (map[string]engine.BaselineState, error) {
+	// A range, not LIKE, which ignores case: scoping to "a_b" also returned
+	// "A_B/...", and the scoped pass pruned those as dead rows (Deck #691).
 	rows, err := s.db.Query(
 		`SELECT path, is_dir, remote_etag, remote_fileid, local_size, local_mtime_nanos, content_sha1, mount_root
-		   FROM baseline WHERE account_id = ? AND pair_key = ? AND path LIKE ? ESCAPE '\'`,
-		s.accountID, pairKey, escapeLike(scope)+"/%",
+		   FROM baseline WHERE account_id = ? AND pair_key = ? AND path >= ? AND path < ?`,
+		s.accountID, pairKey, scope+"/", scope+"0",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query scoped baseline: %w", err)
@@ -282,12 +284,6 @@ func (s *Store) queryBaselineScoped(pairKey, scope string) (map[string]engine.Ba
 		out[b.Path] = b
 	}
 	return out, rows.Err()
-}
-
-// escapeLike escapes LIKE wildcards so a path with % or _ matches literally.
-func escapeLike(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return r.Replace(s)
 }
 
 // LoadBaselinePaths returns baseline rows for an explicit set of pair-relative
@@ -397,6 +393,49 @@ func (s *Store) BaselineCount(pairKey string) (int, error) {
 		s.accountID, pairKey,
 	).Scan(&n)
 	return n, err
+}
+
+// BaselineCountUnder counts the rows strictly beneath any of dirs, which must
+// not nest (a row under two of them would count twice). The damage guards need
+// it: deleting a directory is one action, but it removes everything beneath.
+func (s *Store) BaselineCountUnder(pairKey string, dirs []string) (int, error) {
+	if len(dirs) == 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	if m, ok := s.cache[pairKey]; ok {
+		set := make(map[string]struct{}, len(dirs))
+		for _, d := range dirs {
+			set[d] = struct{}{}
+		}
+		n := 0
+		for p := range m {
+			for i := strings.LastIndex(p, "/"); i > 0; i = strings.LastIndex(p[:i], "/") {
+				if _, hit := set[p[:i]]; hit {
+					n++
+					break
+				}
+			}
+		}
+		s.mu.Unlock()
+		return n, nil
+	}
+	s.mu.Unlock()
+	n := 0
+	for _, d := range dirs {
+		// A range on the primary key, not LIKE (which SQLite cannot serve from
+		// that index): '0' is the byte after '/', so "d/" <= path < "d0" is
+		// exactly the rows beneath d.
+		var c int
+		if err := s.db.QueryRow(
+			`SELECT COUNT(*) FROM baseline WHERE account_id = ? AND pair_key = ? AND path >= ? AND path < ?`,
+			s.accountID, pairKey, d+"/", d+"0",
+		).Scan(&c); err != nil {
+			return 0, fmt.Errorf("count baseline under %q: %w", d, err)
+		}
+		n += c
+	}
+	return n, nil
 }
 
 // CloneStatus returns a pair's initial-clone state: "" (none yet), "started"
@@ -647,18 +686,57 @@ func (s *Store) DeleteBaselineUnder(pairKey, prefix string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(
-		`DELETE FROM baseline WHERE account_id = ? AND pair_key = ? AND (path = ? OR path LIKE ?)`,
-		s.accountID, pairKey, prefix, prefix+"/%",
-	)
+	// This runs once per file of a mass delete, so every step must use the
+	// primary-key index (Deck #691): a range, not LIKE, which ignores case and
+	// treats "_" and "%" as wildcards (so clearing "a_b" also cleared "axb/..."
+	// and "A_B/..."); and the row and its subtree as two statements, since
+	// SQLite can't serve "path = ? OR range" from the index and scanned the
+	// pair's whole baseline for each file. '0' is the byte after '/', so
+	// "p/" <= path < "p0" is exactly the rows beneath.
+	lo, hi := prefix+"/", prefix+"0"
+	var beneath []string
+	if _, cached := s.cache[pairKey]; cached {
+		rows, err := s.db.Query(
+			`SELECT path FROM baseline WHERE account_id = ? AND pair_key = ? AND path >= ? AND path < ?`,
+			s.accountID, pairKey, lo, hi,
+		)
+		if err != nil {
+			return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+		}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				rows.Close()
+				return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+			}
+			beneath = append(beneath, p)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil { // a short list would leave rows in the cache the DB no longer has
+			return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+		}
+	}
+	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("delete baseline under %q: %w", prefix, err)
 	}
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	if _, err := tx.Exec(`DELETE FROM baseline WHERE account_id = ? AND pair_key = ? AND path = ?`,
+		s.accountID, pairKey, prefix); err != nil {
+		return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+	}
+	if _, err := tx.Exec(`DELETE FROM baseline WHERE account_id = ? AND pair_key = ? AND path >= ? AND path < ?`,
+		s.accountID, pairKey, lo, hi); err != nil {
+		return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("delete baseline under %q: %w", prefix, err)
+	}
 	if m, ok := s.cache[pairKey]; ok { // keep the resident copy current
-		for p := range m {
-			if p == prefix || strings.HasPrefix(p, prefix+"/") {
-				delete(m, p)
-			}
+		delete(m, prefix)
+		for _, p := range beneath {
+			delete(m, p)
 		}
 	}
 	return nil

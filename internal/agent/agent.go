@@ -12,7 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -88,6 +91,10 @@ type Engine struct {
 	watchers     map[string]context.CancelFunc
 	triggers     map[string]chan struct{}
 	triggersFull map[string]chan struct{} // key -> force-a-full-local-pass trigger (name-rule changes)
+	nudges       map[string]chan string   // key -> paths to sync as if the watcher saw them (see inuse.go)
+	awaiting     map[string]bool          // absolute paths awaitClosed is watching
+	busyMu       sync.Mutex
+	busy         map[string]string        // absolute path -> pair-relative: uploads waiting on a program (inuse.go)
 	watchDone    map[string]chan struct{} // key -> closed when the watcher goroutine exits (for a synchronous, drained stop)
 
 	// Per-pair sync health (see pairhealth.go). Lazily created so a zero-value
@@ -133,6 +140,10 @@ type Engine struct {
 	// once with a human-readable reason instead of spamming every sync pass.
 	failMu   sync.Mutex
 	lastFail map[string]string // "<kind>\x00<path>" -> last human reason logged
+
+	damagedMu   sync.Mutex
+	damaged     map[string]string // "<pairKey>\x00<path>" -> server etag of a copy that failed its checksum
+	heldDamaged map[string]string // same keys -> path: conflicts (local edits) held back by such a copy
 
 	policy       transfer.ConflictPolicy
 	conflictMu   sync.Mutex
@@ -2104,19 +2115,29 @@ func (e *Engine) resetAuthLost() {
 
 // syncErrKind classifies a sync error so the UI can show a meaningful status:
 // "auth" (credentials rejected), "offline" (network unreachable), or "error".
+//
+// It goes by what the error IS, never by words in its message: the message
+// carries file paths and URLs, and a path with "401" in it (IMG_4012.jpg)
+// timing out read as a rejected password, which signs the user out and stops
+// syncing (Deck #691).
 func syncErrKind(err error) string {
-	s := strings.ToLower(err.Error())
+	code := transport.StatusCode(err)
+	// Concrete network types, not the net.Error interface, which a plain
+	// Windows error code (inside "Access is denied") satisfies too.
+	var opErr *net.OpError
+	var dnsErr *net.DNSError
+	var urlErr *url.Error
 	switch {
-	case strings.Contains(s, "401") || strings.Contains(s, "unauthor") || strings.Contains(s, "app password"):
+	case code == 401 || errors.Is(err, transport.ErrUnauthorized):
 		return "auth"
-	case strings.Contains(s, "no such host") || strings.Contains(s, "dial ") ||
-		strings.Contains(s, "connection refused") || strings.Contains(s, "timeout") ||
-		strings.Contains(s, "deadline exceeded") || strings.Contains(s, "network is unreachable") ||
-		strings.Contains(s, "no route to host") || strings.Contains(s, "connection reset") ||
-		strings.Contains(s, "request failed after") || strings.Contains(s, "i/o timeout"):
-		return "offline"
+	case code != 0:
+		return "error" // the server answered, so it is reachable
+	case errors.Is(err, transport.ErrRetriesExhausted) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &opErr) || errors.As(err, &dnsErr) ||
+		(errors.As(err, &urlErr) && urlErr.Timeout()):
+		return "offline" // the network, or a server down for every retry
 	default:
-		return "error"
+		return "error" // local trouble (a folder we may not read, the database), not the network
 	}
 }
 
@@ -2367,6 +2388,13 @@ func (e *Engine) DeselectFolder(localDir, rel string, deleteLocal bool) error {
 func (e *Engine) SetStatusFunc(f func(string)) { e.onStatus = f }
 
 func (e *Engine) status(s string) {
+	if s == "Up to date" {
+		if w := e.busyStatus(); w != "" {
+			s = w // an upload is still waiting on a program (see inuse.go)
+		} else if w := e.heldDamagedStatus(); w != "" {
+			s = w // a local edit is held back by a damaged server copy (damaged.go)
+		}
+	}
 	e.diagMu.Lock()
 	e.lastStatus = s
 	if s == "Up to date" {
@@ -2934,20 +2962,7 @@ func (e *Engine) SyncOnce(ctx context.Context, p Pair) (transfer.Stats, error) {
 	e.status("Scanning…")
 	actions, remote, base, err := e.computePlan(ctx, st, p)
 	if err != nil {
-		// A failed scan must not leave the flyout stuck on "Scanning…". Classify it
-		// the way applyPlan does so the status reflects reality (skip on shutdown /
-		// watcher-restart cancellation, which isn't a real error).
-		if ctx.Err() == nil {
-			switch syncErrKind(err) {
-			case "auth":
-				e.status("Sign in again")
-				e.authLost()
-			case "offline":
-				e.status("Offline")
-			default:
-				e.status("Error")
-			}
-		}
+		e.noteScanFailure(ctx, err)
 		return transfer.Stats{}, err
 	}
 	planStats, err := e.applyPlan(ctx, st, p, actions, remote, base, true) // full reconcile
@@ -3033,6 +3048,10 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 				e.markInflight(filepath.Join(p.LocalDir, filepath.FromSlash(a.Path)), false)
 				if a.Kind == engine.ActDownload {
 					e.progComplete()
+				}
+				var damaged *transfer.ChecksumMismatchError
+				if a.Kind == engine.ActDownload && errors.As(aerr, &damaged) {
+					e.noteDamaged(pk, a.Path, remote[a.Path].ETag) // see damaged.go
 				}
 				ev := activity.Event{Local: p.LocalDir, Path: a.Path, Kind: a.Kind.String()}
 				ev.Err = e.recordActionResult(a, aerr) // humanised + deduped; "" on success
@@ -3244,27 +3263,82 @@ func bulkDeleteGuardTrips(deletes, total int) bool {
 	return deletes >= guardDeleteFloor && total >= guardDeleteFloor && deletes*100 >= total*guardDeletePct
 }
 
+// deletionWeight is how many known rows a plan's deletions of one kind remove:
+// each deleted path, plus every row beneath a deleted directory. Deleting a
+// directory is ONE action however much it holds, so counting actions let a
+// scoped pass delete a 180,810-file folder as "1", under both guards (Deck
+// #691). A path beneath another deleted path is already covered and is not
+// counted twice, which keeps a full scan (one action per file) at its old weight.
+// Files the same plan MOVES out first are not deleted either: rename coalescing
+// pairs files, so a folder rename is per-file moves plus the old folder's delete.
+func deletionWeight(st *state.Store, pk string, actions []engine.Action, kind engine.ActionKind) (int, error) {
+	move := engine.ActMoveLocal
+	if kind == engine.ActDeleteRemote {
+		move = engine.ActMoveRemote
+	}
+	deleted := make(map[string]struct{})
+	for _, a := range actions {
+		if a.Kind == kind {
+			deleted[a.Path] = struct{}{}
+		}
+	}
+	beneathDeleted := func(p string) bool {
+		for d := dirParent(p); d != ""; d = dirParent(d) {
+			if _, ok := deleted[d]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	var top []string
+	for p := range deleted {
+		if !beneathDeleted(p) {
+			top = append(top, p)
+		}
+	}
+	if len(top) == 0 {
+		return 0, nil
+	}
+	beneath, err := st.BaselineCountUnder(pk, top)
+	if err != nil {
+		return 0, err
+	}
+	for _, a := range actions {
+		if a.Kind == move && beneathDeleted(a.Path) {
+			beneath--
+		}
+	}
+	return len(top) + beneath, nil
+}
+
 // humanActionErr turns a raw transfer/WebDAV error into a short, human-readable
 // reason for the log and the activity feed. The .Collectives case is the common
 // one: the Collectives app rejects directory creation there (a quirky 507), so
 // anything a user drops into that folder can't be uploaded.
+//
+// Reasons go by the error's status code and type, not words in its message,
+// which carries the file's path: a timeout uploading IMG_4012.jpg read as a
+// rejected sign-in, and one for Scans/20240409.pdf as a missing parent folder
+// (Deck #691).
 func humanActionErr(a engine.Action, err error) string {
 	s := err.Error()
-	low := strings.ToLower(s)
+	code := transport.StatusCode(err)
 	switch {
 	case strings.HasPrefix(a.Path, ".Collectives") || strings.Contains(s, ".Collectives"):
 		return "can't sync inside “.Collectives” — it's managed by the Collectives app and won't accept items created here; move this out of .Collectives to sync it"
 	case transport.IsLocked(err):
 		return "someone else has this file open — it's locked on the server"
-	case strings.Contains(low, "insufficientstorage") || strings.Contains(s, "507"):
+	case errors.As(err, new(*transfer.ChecksumMismatchError)):
+		return damagedCopyMsg
+	case code == 507:
 		return "the server wouldn't accept it (out of space, or the folder is read-only)"
-	case strings.Contains(low, "parent node does not exist") || strings.Contains(s, "409"):
+	case code == 409:
 		return "its parent folder couldn't be created on the server"
-	case strings.Contains(low, "forbidden") || strings.Contains(s, "403"):
+	case code == 403:
 		return "the server refused it (permission denied)"
-	case strings.Contains(low, "access is denied"):
+	case errors.Is(err, fs.ErrPermission):
 		return "Windows denied access to that path (it may be read-only or locked)"
-	case strings.Contains(low, "unauthorized") || strings.Contains(s, "401"):
+	case code == 401 || errors.Is(err, transport.ErrUnauthorized):
 		return "the server rejected our sign-in — you may need to log in again"
 	default:
 		return s
@@ -3387,10 +3461,11 @@ func dirParent(rel string) string {
 // in the field: ~6,000 PROPFINDs ≈ 3 minutes per delta on a 95k-dir tree).
 //
 // After a pass, stamp the scan-time etag of every re-listed directory whose
-// subtree fully reconciled, and dirty (empty etag) the ancestor chains of every
-// path that failed or conflicted — a stamped ancestor must never hide unfinished
-// work (e.g. a freshly created dir whose child download failed would otherwise
-// be pruned over and the child never retried). Stamping the SCAN-time etag is
+// subtree fully reconciled, and dirty (empty etag) the existing rows on the
+// ancestor chains of every path that failed or conflicted — a stamped ancestor
+// must never hide unfinished work (e.g. a freshly created dir whose child
+// download failed would otherwise be pruned over and the child never retried).
+// Stamping the SCAN-time etag is
 // TOCTOU-safe: anything the server changed after the scan carries a newer etag,
 // so it still fails the prune next pass.
 //
@@ -3399,7 +3474,9 @@ func dirParent(rel string) string {
 // when it doesn't (SyncPaths' stat-built map) — then only dirtying runs.
 func maintainDirBaselines(st *state.Store, pk string, base map[string]engine.BaselineState, remote map[string]engine.RemoteState, problems []string) {
 	dirty := make(map[string]struct{})
+	failed := make(map[string]struct{}, len(problems))
 	for _, pth := range problems {
+		failed[pth] = struct{}{}
 		for d := dirParent(pth); d != ""; d = dirParent(d) {
 			dirty[d] = struct{}{}
 		}
@@ -3413,6 +3490,9 @@ func maintainDirBaselines(st *state.Store, pk string, base map[string]engine.Bas
 			if _, poisoned := dirty[pth]; poisoned {
 				continue
 			}
+			if _, bad := failed[pth]; bad {
+				continue // its own action failed (e.g. the local mkdir): not reconciled
+			}
 			if b, ok := base[pth]; ok && b.IsDir && b.RemoteETag == r.ETag {
 				continue // still fresh — was pruned or genuinely unchanged
 			}
@@ -3420,32 +3500,39 @@ func maintainDirBaselines(st *state.Store, pk string, base map[string]engine.Bas
 		}
 	}
 	healed := len(rows)
-	// Dirtying REWRITES the row, so the share/mount-root flag has to be carried
-	// over or the next unshare of that folder deletes it. The listing knows it
-	// for a dir it listed; otherwise the row that exists does — read those rows
-	// when the caller passed no baseline (the stat-built SyncPaths route).
-	known := base
-	if known == nil && len(dirty) > 0 {
+	// Dirtying REWRITES a row that exists now, after this pass's actions; it
+	// never creates one. A row says "synced on both sides", so one written for a
+	// folder this pass deleted, or never managed to create, reads next pass as a
+	// local deletion and is sent to the server (Deck #691). That is why the rows
+	// are read back from the store: base predates the pass and still holds any
+	// row the pass deleted. The same rows carry the share/mount-root flag over,
+	// or the next unshare of that folder deletes it.
+	var existing map[string]engine.BaselineState
+	if len(dirty) > 0 {
 		paths := make([]string, 0, len(dirty))
 		for d := range dirty {
 			paths = append(paths, d)
 		}
-		if rows, err := st.LoadBaselinePaths(pk, paths); err == nil {
-			known = rows
+		var err error
+		if existing, err = st.LoadBaselinePaths(pk, paths); err != nil {
+			slog.Warn("dir-baseline maintenance: cannot read rows to dirty", "err", err)
 		}
 	}
+	dirtied := 0
 	for d := range dirty {
-		row := engine.BaselineState{Path: d, IsDir: true} // empty etag = never prunes
+		b, ok := existing[d]
+		if !ok {
+			continue
+		}
+		row := engine.BaselineState{Path: d, IsDir: true, RemoteFileID: b.RemoteFileID, MountRoot: b.MountRoot} // empty etag = never prunes
 		if r, ok := remote[d]; ok {
 			// The listing is the authority: a folder the user re-created under a
 			// former share's name is NOT a root, whatever the old row said.
 			row.RemoteFileID = r.FileID
 			row.MountRoot = r.MountRoot
-		} else if b, ok := known[d]; ok {
-			row.RemoteFileID = b.RemoteFileID
-			row.MountRoot = b.MountRoot
 		}
 		rows = append(rows, row)
+		dirtied++
 	}
 	if len(rows) == 0 {
 		return
@@ -3454,7 +3541,7 @@ func maintainDirBaselines(st *state.Store, pk string, base map[string]engine.Bas
 		slog.Warn("dir-baseline maintenance failed", "err", err)
 		return
 	}
-	slog.Info("dir baselines maintained", "healed", healed, "dirtied", len(dirty))
+	slog.Info("dir baselines maintained", "healed", healed, "dirtied", dirtied)
 }
 
 // applyPlan filters, executes, and reports a reconciliation plan — shared by the
@@ -3555,6 +3642,11 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 					}
 				}
 				counts := syncguard.Count(actions, gbase)
+				// Count counts actions; a folder deleted here is one action for
+				// everything beneath it. Weigh it by what it holds.
+				if counts.Deletions, err = deletionWeight(st, pk, actions, engine.ActDeleteLocal); err != nil {
+					return transfer.Stats{}, fmt.Errorf("damage guard: cannot weigh deletions: %w", err)
+				}
 				if reason, trips := syncguard.Trips(counts, known, syncguard.DefaultFloor, syncguard.DefaultPct); trips {
 					return transfer.Stats{}, e.tripGuard(p, reason, counts, known)
 				}
@@ -3609,6 +3701,9 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			slog.Info("holding an upload: someone else has the file open", "path", rel)
 		}
 	}
+	// A server copy that failed its checksum is not fetched again until it
+	// changes (Deck #691, see damaged.go).
+	actions, skippedDamaged := e.skipDamaged(pk, actions, remote)
 
 	// Data-loss guard. If this plan would delete files on the SERVER while the
 	// local root has vanished (folder deleted, moved, unmounted, or empty), that is
@@ -3616,11 +3711,10 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	// the whole sync rather than propagate deletions that would wipe Nextcloud data.
 	// This is the logout-then-delete-the-folder footgun that previously emptied the
 	// server: a non-empty baseline + an absent local tree reads as "delete everything".
-	remoteDeletes := 0
-	for _, a := range actions {
-		if a.Kind == engine.ActDeleteRemote {
-			remoteDeletes++
-		}
+	// Weighed, not counted: one folder DELETE takes everything beneath it.
+	remoteDeletes, err := deletionWeight(st, pk, actions, engine.ActDeleteRemote)
+	if err != nil {
+		return transfer.Stats{}, fmt.Errorf("data-loss guard: cannot weigh deletions: %w", err)
 	}
 	if remoteDeletes > 0 && localRootVanished(p.LocalDir) {
 		slog.Error("data-loss guard: refusing to delete server files while the local folder is missing or empty",
@@ -3651,8 +3745,8 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		// Nothing to do — but re-listed dirs still need their etags stamped, or
 		// they are re-listed on every future scan (this quiet case is the common
 		// steady state: our own transfers stale the ancestor dir etags).
-		maintainDirBaselines(st, pk, base, remote, heldUploads)
-		if base != nil {
+		maintainDirBaselines(st, pk, base, remote, append(append([]string(nil), heldUploads...), skippedDamaged...))
+		if base != nil && len(skippedDamaged) == 0 {
 			e.clearCheckpoint(st, pk) // clean pass — the crawl's rescue rows served their purpose
 		}
 		// A quiet pass must still clear "Scanning…" — nothing else will until the
@@ -3683,7 +3777,9 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 
 	e.status("Syncing…")
 	var probMu sync.Mutex
-	var problems []string // paths whose action failed — they poison dir-etag stamping
+	var problems []string    // paths whose action failed — they poison dir-etag stamping
+	var busyUploads []string // uploads put off while another program has the file open
+	var movedAside []string  // server deletions the Recycle Bin couldn't take, moved beside the folder
 	ex := &transfer.Executor{
 		Client:     e.client,
 		State:      st,
@@ -3709,6 +3805,11 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		OnProgress: func(a engine.Action, delta int64) {
 			e.progBytes.Add(delta)
 		},
+		OnMovedAside: func(rel, dest string) {
+			probMu.Lock()
+			movedAside = append(movedAside, rel)
+			probMu.Unlock()
+		},
 		OnEvent: func(a engine.Action, aerr error) {
 			abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
 			e.markInflight(abs, false)
@@ -3724,6 +3825,20 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			}
 			if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
 				e.progComplete()
+			}
+			var damaged *transfer.ChecksumMismatchError
+			if (a.Kind == engine.ActDownload || a.Kind == engine.ActConflict) && errors.As(aerr, &damaged) {
+				e.noteDamaged(pk, a.Path, remote[a.Path].ETag)
+			}
+			var inUse *transfer.InUseError
+			if a.Kind == engine.ActUpload && errors.As(aerr, &inUse) {
+				probMu.Lock()
+				busyUploads = append(busyUploads, a.Path)
+				probMu.Unlock()
+				e.noteBusy(abs, a.Path)
+				e.awaitClosed(p, abs) // see inuse.go
+			} else if a.Kind == engine.ActUpload && aerr == nil {
+				e.clearBusy(abs)
 			}
 			if aerr != nil {
 				probMu.Lock()
@@ -3742,6 +3857,18 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		},
 	}
 	stats, err := ex.Run(ctx, actions)
+	if len(movedAside) > 0 {
+		title, msg := movedAsideToast(p.LocalDir, movedAside)
+		e.toast(title, msg, "")
+	}
+	// A cancelled pass (quit, pause, a restart) stops starting transfers but Run
+	// still reports no error, and what it never started is in no problem list.
+	// Treat it as the partway stop it is: stamping its folders as seen hid the
+	// files it never fetched from every later scan (Deck #691).
+	cancelled := err == nil && ctx.Err() != nil
+	if cancelled {
+		err = ctx.Err()
+	}
 	e.setConflicts(p, ex.Pending)
 	// Unresolved conflicts must keep their subtrees re-scanned (a pruned dir would
 	// reconstruct the conflicted file's remote state from the stale baseline and
@@ -3751,6 +3878,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	// pending local change stops being re-detected until something else there
 	// changes.
 	problems = append(problems, heldUploads...)
+	problems = append(problems, skippedDamaged...)
 	for _, c := range ex.Pending {
 		problems = append(problems, c.Path)
 	}
@@ -3773,7 +3901,11 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		// but do dirty the chains of the failures that already happened.
 		maintainDirBaselines(st, pk, nil, remote, problems)
 	}
-	if err != nil {
+	switch {
+	case cancelled:
+		// Stopped from outside: not an error to tell anyone about, and not up
+		// to date either.
+	case err != nil:
 		switch syncErrKind(err) {
 		case "auth":
 			e.status("Sign in again")
@@ -3784,8 +3916,8 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			e.status("Error")
 			e.toastError(err)
 		}
-	} else {
-		e.status("Up to date")
+	default:
+		e.status(waitingStatus(heldUploads, busyUploads))
 		e.resetAuthLost()
 	}
 	return stats, err
@@ -3881,9 +4013,15 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 		return transfer.Stats{}, err
 	}
 	esc := e.escaper.Load()
+	ig := e.ignoreFor(p)
 	local := make(map[string]engine.LocalState, len(relPaths))
 	remote := make(map[string]engine.RemoteState, len(relPaths))
+	trackedAbsent := false
 	for _, rel := range relPaths {
+		if ig.Match(rel) {
+			continue // not synced, so not asked about: its Stat can't fail the pass
+		}
+		_, tracked := base[rel]
 		if fi, serr := os.Stat(filepath.Join(p.LocalDir, filepath.FromSlash(rel))); serr == nil {
 			ls := engine.LocalState{Path: rel, IsDir: fi.IsDir(), MTime: fi.ModTime()}
 			if !fi.IsDir() {
@@ -3895,14 +4033,41 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 		// X<suffix>); a raw stat of X would 404 and misread it as "removed
 		// remotely", deleting the local file out from under a live server copy.
 		rp := strings.Trim(p.RemoteRoot+"/"+esc.Encode(rel), "/")
-		if ent, found, rerr := e.client.Stat(ctx, rp); rerr == nil && found {
-			remote[rel] = remoteStateFrom(rel, ent)
+		ent, found, rerr := e.client.Stat(ctx, rp)
+		if rerr != nil {
+			// A Stat that failed is NOT a path the server lacks. Read that way
+			// for a tracked path, an outage deleted a whole local folder (Deck
+			// #691); and a network or 5xx failure says nothing about any path.
+			// Either fails the pass. A refusal (4xx) of an untracked path keeps
+			// reading as absent: at worst that plans an upload the server
+			// refuses again, where failing would stall every batch it is in.
+			if tracked || transport.Retryable(rerr) {
+				err := fmt.Errorf("stat %q: %w", rel, rerr)
+				e.noteScanFailure(ctx, err)
+				return transfer.Stats{}, err
+			}
+			continue
+		}
+		if found {
+			remote[rel] = remoteStateFrom(rel, ent, base[rel].MountRoot)
+		} else if tracked {
+			trackedAbsent = true
 		}
 	}
-
-	ig := e.ignoreFor(p)
-	ig.FilterLocal(local)
-	ig.FilterRemote(remote)
+	// A 404 is only an answer if Nextcloud gave it: a proxy in front of a
+	// stopped server can 404 every path. A real server never reports the pair's
+	// own folder missing, so before planning a deletion from a 404, ask it once.
+	if trackedAbsent {
+		root := strings.Trim(p.RemoteRoot, "/")
+		if _, ok, serr := e.client.Stat(ctx, root); serr != nil || !ok {
+			err := fmt.Errorf("the server reported a synced item missing but cannot see the sync folder %q either; not deleting anything on that answer", "/"+root)
+			if serr != nil {
+				err = fmt.Errorf("%w: %w", err, serr) // keep the cause's type, so a 401 still reads as signed out
+			}
+			e.noteScanFailure(ctx, err)
+			return transfer.Stats{}, err
+		}
+	}
 
 	actions := planPaths(base, remote, local, func(rel string) (string, error) {
 		return transfer.SHA1File(filepath.Join(p.LocalDir, filepath.FromSlash(rel)))
@@ -3921,7 +4086,13 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 // Note this is a Stat, not a listing: fields a depth-0 PROPFIND does not carry
 // meaningfully here (SHA1, ReadOnly, LastModified) are deliberately left unset,
 // as they were before.
-func remoteStateFrom(rel string, ent transport.Entry) engine.RemoteState {
+//
+// A share's root is told apart from anything inside it only by its PARENT's
+// permissions, which a Stat doesn't see. So the flag is kept from wasRoot, the
+// baseline row, while the Stat still shows it on a share or mount: leaving it
+// unset wrote rows that forgot a share root, and an unshare then recycled the
+// copy instead of keeping it (#557, Deck #691).
+func remoteStateFrom(rel string, ent transport.Entry, wasRoot bool) engine.RemoteState {
 	return engine.RemoteState{
 		Path:      rel,
 		IsDir:     ent.IsDir,
@@ -3930,6 +4101,7 @@ func remoteStateFrom(rel string, ent transport.Entry) engine.RemoteState {
 		Size:      ent.Size,
 		Lock:      ent.Lock,
 		LockKnown: true, // a Stat DID look, so its answer is authoritative
+		MountRoot: wasRoot && ent.OnMount(),
 	}
 }
 
@@ -4010,7 +4182,9 @@ func (e *Engine) syncRemoteDelta(ctx context.Context, p Pair) (transfer.Stats, e
 		e.markCheckpointDirty(pk)
 	}
 	if err != nil {
-		return transfer.Stats{}, fmt.Errorf("remote scan: %w", err)
+		err = fmt.Errorf("remote scan: %w", err)
+		e.noteScanFailure(ctx, err)
+		return transfer.Stats{}, err
 	}
 	remoteScan := time.Since(tScan)
 	tDelta := time.Now()
@@ -4135,6 +4309,26 @@ func parentDirOf(rel string) string {
 
 // toastError shows a sync-error toast, throttled to at most once every 5 minutes
 // so a flaky connection doesn't spam the desktop.
+// noteScanFailure puts a pass that failed before it could plan anything on the
+// status line: a failed scan must not leave the flyout on "Scanning…", or on
+// "Up to date" when a quick sync couldn't reach the server (Deck #691). It is
+// classified the way applyPlan does, without a toast, and skipped for a
+// cancellation (shutdown, watcher restart), which isn't a real error.
+func (e *Engine) noteScanFailure(ctx context.Context, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+	switch syncErrKind(err) {
+	case "auth":
+		e.status("Sign in again")
+		e.authLost()
+	case "offline":
+		e.status("Offline")
+	default:
+		e.status("Error")
+	}
+}
+
 func (e *Engine) toastError(err error) {
 	if e.onToast == nil {
 		return
@@ -4256,6 +4450,7 @@ func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transf
 	e.watchers = make(map[string]context.CancelFunc)
 	e.triggers = make(map[string]chan struct{})
 	e.triggersFull = make(map[string]chan struct{})
+	e.nudges = make(map[string]chan string)
 	e.watchDone = make(map[string]chan struct{})
 	e.watchMu.Unlock()
 
@@ -4399,10 +4594,12 @@ func (e *Engine) startWatcher(p Pair) {
 	cctx, cancel := context.WithCancel(e.runCtx)
 	ext := make(chan struct{}, 1)
 	fullExt := make(chan struct{}, 1)
+	nudge := make(chan string, 16)
 	done := make(chan struct{})
 	e.watchers[key] = cancel
 	e.triggers[key] = ext
 	e.triggersFull[key] = fullExt
+	e.nudges[key] = nudge
 	e.watchDone[key] = done
 	e.watchMu.Unlock()
 
@@ -4457,6 +4654,7 @@ func (e *Engine) startWatcher(p Pair) {
 			Debounce:      500 * time.Millisecond, // snappy local→server; still coalesces a burst
 			External:      ext,
 			FullSync:      fullExt,
+			Nudge:         nudge,
 			OnPush:        pushFn,
 			FullSyncEvery: time.Hour, // most polls are fast remote-deltas; full walk hourly
 		}, syncFn)
@@ -4465,6 +4663,7 @@ func (e *Engine) startWatcher(p Pair) {
 		delete(e.watchers, key)
 		delete(e.triggers, key)
 		delete(e.triggersFull, key)
+		delete(e.nudges, key)
 		delete(e.watchDone, key)
 		e.watchMu.Unlock()
 	}()
