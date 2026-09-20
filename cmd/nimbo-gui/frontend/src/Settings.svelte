@@ -444,9 +444,12 @@
   (async () => { shellSupported = await App.ShellMenuSupported(); shellOn = await App.ShellMenuEnabled(); })();
   async function toggleShell() { shellOn = !shellOn; const err = await App.SetShellMenu(shellOn); if (err) { shellOn = !shellOn; alert(err); } }
 
-  let navSupported = $state(false), navOn = $state(false);
+  let navSupported = $state(false), navOn = $state(false), navBusy = $state(false);
   (async () => { navSupported = await App.SidebarSupported(); navOn = await App.SidebarEnabled(); })();
-  async function toggleNav() { navOn = !navOn; const err = await App.SetSidebar(navOn); if (err) { navOn = !navOn; alert(err); } }
+  // SetSidebar returns once Explorer has been updated (a second or two on a
+  // packaged build), so the box is held until then: a second click mid-way
+  // used to queue a second change on top of the first.
+  async function toggleNav() { if (navBusy) return; navBusy = true; navOn = !navOn; const err = await App.SetSidebar(navOn); navBusy = false; if (err) { navOn = !navOn; alert(err); } }
 
   let notifyOn = $state(true);
   (async () => { notifyOn = await App.NotificationsEnabled(); })();
@@ -1412,7 +1415,7 @@ SHA-256: {localTest.fingerprint}</pre>
         <label class="check"><input type="checkbox" checked={shellOn} onchange={toggleShell} /> Add “Share with {brandName}” to the Explorer right-click menu</label>
       {/if}
       {#if navSupported}
-        <label class="check"><input type="checkbox" checked={navOn} onchange={toggleNav} /> Show {brandName} in the Explorer sidebar (points at your default sync location)</label>
+        <label class="check"><input type="checkbox" checked={navOn} disabled={navBusy} onchange={toggleNav} /> Show {brandName} in the Explorer sidebar (points at your default sync location)</label>
       {/if}
 
       <h3>Troubleshooting</h3>

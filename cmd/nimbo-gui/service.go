@@ -3994,7 +3994,7 @@ func (a *App) syncSidebar() {
 		// package hive and skews positive -- so trusting our own record risks
 		// never retrying a removal that silently failed. The cost of getting it
 		// wrong that way is a permanent duplicate; the cost of retrying is one
-		// queued task per launch.
+		// task run per launch (a second or two, waited for).
 		if err := shellns.Unregister(); err != nil {
 			slog.Warn("could not drop the duplicate navigation-pane entry", "err", err)
 			return // leave the record alone so the next launch retries
