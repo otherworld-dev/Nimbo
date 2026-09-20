@@ -1,7 +1,9 @@
 package account
 
 import (
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -132,5 +134,63 @@ func TestDAVRoot(t *testing.T) {
 	want := "https://cloud.example.com/remote.php/dav/files/alice"
 	if a.DAVRoot() != want {
 		t.Errorf("DAVRoot() = %q, want %q", a.DAVRoot(), want)
+	}
+}
+
+// Every caller loads its own Store from the same file (the GUI service does so
+// at a dozen call sites, and so do the agent, the CLI and mobile), so two
+// savers of one accounts.json are ordinary rather than exotic. They used to
+// share a fixed "accounts.json.tmp": the first rename consumed the temp file
+// and the second found nothing left to rename, failing the save outright.
+// internal/config hit exactly this on Android in August 2026 and fixed it with
+// unique temp names; the account store never got the same fix.
+func TestConcurrentSavesDoNotCollide(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+
+	const n = 32
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			st, err := LoadStore(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if err := st.Upsert(Account{
+				ID:        fmt.Sprintf("acct-%d", i),
+				ServerURL: "https://cloud.example.com",
+				LoginName: fmt.Sprintf("user-%d", i),
+			}); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent save failed: %v", err)
+	}
+
+	// Whichever save landed last, what it left behind has to be a whole store,
+	// and no temp files may be left lying beside it.
+	st, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("reload after concurrent saves: %v", err)
+	}
+	if len(st.Accounts) == 0 {
+		t.Error("no accounts survived the concurrent saves")
+	}
+	names, err := filepath.Glob(filepath.Join(dir, "*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		if name != path {
+			t.Errorf("left behind %s, want only accounts.json", filepath.Base(name))
+		}
 	}
 }

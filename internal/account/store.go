@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/otherworld/nimbo/internal/atomicfile"
 )
 
 // Store is a small JSON-backed collection of account metadata persisted to a
@@ -36,19 +38,16 @@ func LoadStore(path string) (*Store, error) {
 	return s, nil
 }
 
-// save atomically writes the store to disk (temp file + rename) so a crash
-// mid-write cannot corrupt the existing store.
+// save writes the store to disk atomically, so a crash mid-write cannot
+// corrupt the existing store and two savers of one file cannot destroy each
+// other's temp file; see internal/atomicfile.
 func (s *Store) save() error {
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode account store: %w", err)
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("write account store: %w", err)
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("commit account store: %w", err)
+	if err := atomicfile.Write(s.path, data, 0o600); err != nil {
+		return fmt.Errorf("save account store: %w", err)
 	}
 	return nil
 }
