@@ -4382,7 +4382,7 @@ func (a *App) SwitchAccount(id string) string {
 	if cur, ok := st.Default(); ok && cur.ID == id {
 		return "" // already active
 	}
-	if err := st.SetDefault(id); err != nil {
+	if err := account.Update(d.AccountsFile(), func(s *account.Store) error { return s.SetDefault(id) }); err != nil {
 		return err.Error()
 	}
 	a.disconnectAllOnDemand()
@@ -4435,7 +4435,7 @@ func (a *App) RemoveAccount(id string) string {
 	delete(a.acctStatus, id)
 	a.acctMu.Unlock()
 	_ = account.DeleteSecret(id)
-	if err := st.Remove(id); err != nil {
+	if err := account.Update(d.AccountsFile(), func(s *account.Store) error { s.Remove(id); return nil }); err != nil {
 		return err.Error()
 	}
 	a.clearSyncData(d.WithAccount(id), id)
@@ -4462,14 +4462,15 @@ func (a *App) SignOut(clearData bool) string {
 	moreAccounts := false
 	if d, err := config.Resolve(); err == nil {
 		var accID string
-		if st, e := account.LoadStore(d.AccountsFile()); e == nil {
+		_ = account.Update(d.AccountsFile(), func(st *account.Store) error {
 			if acc, ok := st.Default(); ok {
 				accID = acc.ID
 				_ = account.DeleteSecret(acc.ID)
-				_ = st.Remove(acc.ID)
+				st.Remove(acc.ID)
 			}
 			moreAccounts = len(st.Accounts) > 0
-		}
+			return nil
+		})
 		if clearData {
 			a.clearSyncData(d.WithAccount(accID), accID)
 		}
@@ -4621,15 +4622,13 @@ func (a *App) SaveLocalAddress(addr, pin string) string {
 	if err != nil {
 		return err.Error()
 	}
-	acc, ok := st.Find(eng.Account.ID)
-	if !ok {
+	if _, ok := st.Find(eng.Account.ID); !ok {
 		return "Account not found."
 	}
 	ctx, cancel := context.WithTimeout(a.ctx, 25*time.Second)
 	defer cancel()
 	if strings.TrimSpace(addr) == "" {
-		acc.Local = nil
-		if err := st.Upsert(acc); err != nil {
+		if err := setLocalRoute(d.AccountsFile(), eng.Account.ID, nil); err != nil {
 			return err.Error()
 		}
 		if err := eng.ApplyLocalRoute(ctx, nil); err != nil {
@@ -4641,14 +4640,29 @@ func (a *App) SaveLocalAddress(addr, pin string) string {
 	if lr == nil {
 		return dto.Message
 	}
-	acc.Local = lr
-	if err := st.Upsert(acc); err != nil {
+	if err := setLocalRoute(d.AccountsFile(), eng.Account.ID, lr); err != nil {
 		return err.Error()
 	}
 	if err := eng.ApplyLocalRoute(ctx, lr); err != nil {
 		return err.Error()
 	}
 	return ""
+}
+
+// setLocalRoute records lr as the account's local network route (nil clears
+// it) and nothing else. The address test before it can run for 25 seconds, so
+// a copy of the store loaded ahead of the test is stale by the time it would
+// be saved: an account signed in meanwhile would vanish with it.
+func setLocalRoute(path, id string, lr *account.LocalRoute) error {
+	return account.Update(path, func(st *account.Store) error {
+		acc, ok := st.Find(id)
+		if !ok {
+			return fmt.Errorf("account %s is no longer configured", id)
+		}
+		acc.Local = lr
+		st.Upsert(acc)
+		return nil
+	})
 }
 
 // clearSyncData removes this device's sync setup (the pair list) and local sync
@@ -4790,10 +4804,7 @@ func (a *App) BeginLogin(server string) string {
 		}
 		d, cerr := config.Resolve()
 		if cerr == nil {
-			var st *account.Store
-			if st, cerr = account.LoadStore(d.AccountsFile()); cerr == nil {
-				_, cerr = account.Complete(st, creds)
-			}
+			_, cerr = account.Complete(d.AccountsFile(), creds)
 		}
 		if cerr != nil {
 			a.app.Event.Emit("login:error", cerr.Error())

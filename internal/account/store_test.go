@@ -1,7 +1,9 @@
 package account
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -27,6 +29,15 @@ func TestNewIDStableAndDistinct(t *testing.T) {
 	_ = b
 }
 
+// update is Update with a mutate that cannot fail, for tests that only care
+// about the resulting store.
+func update(t *testing.T, path string, mutate func(*Store)) {
+	t.Helper()
+	if err := Update(path, func(st *Store) error { mutate(st); return nil }); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+}
+
 func TestStoreRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "accounts.json")
 
@@ -39,9 +50,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 
 	acc := Account{ID: "id1", ServerURL: "https://cloud.example.com", LoginName: "alice"}
-	if err := st.Upsert(acc); err != nil {
-		t.Fatalf("Upsert: %v", err)
-	}
+	update(t, path, func(st *Store) { st.Upsert(acc) })
 
 	// Reload from disk and confirm persistence.
 	st2, err := LoadStore(path)
@@ -58,74 +67,78 @@ func TestStoreRoundTrip(t *testing.T) {
 
 	// Upsert with same ID replaces rather than duplicates.
 	acc.LoginName = "alice2"
-	if err := st2.Upsert(acc); err != nil {
-		t.Fatalf("Upsert replace: %v", err)
-	}
-	if len(st2.Accounts) != 1 {
-		t.Errorf("expected 1 account after replace, got %d", len(st2.Accounts))
+	update(t, path, func(st *Store) { st.Upsert(acc) })
+	st3, _ := LoadStore(path)
+	if len(st3.Accounts) != 1 || st3.Accounts[0] != acc {
+		t.Errorf("after replace: %+v, want just %+v", st3.Accounts, acc)
 	}
 
 	// Remove deletes it.
-	if err := st2.Remove("id1"); err != nil {
-		t.Fatalf("Remove: %v", err)
-	}
-	if _, ok := st2.Find("id1"); ok {
+	update(t, path, func(st *Store) { st.Remove("id1") })
+	st4, _ := LoadStore(path)
+	if _, ok := st4.Find("id1"); ok {
 		t.Error("account still present after Remove")
 	}
 }
 
 func TestMultiAccountDefault(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "accounts.json")
-	st, err := LoadStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
 	a := Account{ID: "ida", ServerURL: "https://a.example.com", LoginName: "alice"}
 	b := Account{ID: "idb", ServerURL: "https://b.example.com", LoginName: "bob"}
-	for _, acc := range []Account{a, b} {
-		if err := st.Upsert(acc); err != nil {
-			t.Fatal(err)
-		}
-	}
+	update(t, path, func(st *Store) {
+		st.Upsert(a)
+		st.Upsert(b)
+	})
 
 	// No DefaultID yet: first account wins (pre-multi-account behaviour).
+	st, _ := LoadStore(path)
 	if def, ok := st.Default(); !ok || def.ID != "ida" {
 		t.Fatalf("default = %+v, want first account", def)
 	}
 
-	if err := st.SetDefault("idb"); err != nil {
-		t.Fatalf("SetDefault: %v", err)
-	}
-	if def, _ := st.Default(); def.ID != "idb" {
-		t.Errorf("default after SetDefault = %s, want idb", def.ID)
-	}
-
 	// Persists across reload.
-	st2, err := LoadStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	update(t, path, func(st *Store) {
+		if err := st.SetDefault("idb"); err != nil {
+			t.Fatalf("SetDefault: %v", err)
+		}
+	})
+	st2, _ := LoadStore(path)
 	if def, _ := st2.Default(); def.ID != "idb" {
 		t.Errorf("default after reload = %s, want idb", def.ID)
 	}
 
-	// Unknown ID is rejected.
-	if err := st2.SetDefault("nope"); err == nil {
+	// Unknown ID is rejected, and the failed update leaves the file alone.
+	err := Update(path, func(st *Store) error { return st.SetDefault("nope") })
+	if err == nil {
 		t.Error("SetDefault(nope) succeeded")
+	}
+	st3, _ := LoadStore(path)
+	if def, _ := st3.Default(); def.ID != "idb" {
+		t.Errorf("default after a failed update = %s, want idb untouched", def.ID)
 	}
 
 	// Removing the default falls back to the remaining account.
-	if err := st2.Remove("idb"); err != nil {
-		t.Fatal(err)
-	}
-	if def, ok := st2.Default(); !ok || def.ID != "ida" {
+	update(t, path, func(st *Store) { st.Remove("idb") })
+	st4, _ := LoadStore(path)
+	if def, ok := st4.Default(); !ok || def.ID != "ida" {
 		t.Errorf("default after removing it = %+v, want fallback to ida", def)
 	}
 
 	// A stale DefaultID (e.g. hand-edited file) also falls back, not fails.
-	st2.DefaultID = "ghost"
-	if def, ok := st2.Default(); !ok || def.ID != "ida" {
+	st4.DefaultID = "ghost"
+	if def, ok := st4.Default(); !ok || def.ID != "ida" {
 		t.Errorf("stale DefaultID: default = %+v, want ida", def)
+	}
+}
+
+// An update that ends up changing nothing writes nothing: a sign-out with no
+// account left, or a switch to the account that is already active, must not
+// conjure up an accounts.json where there was none.
+func TestUpdateWithoutChangeWritesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	update(t, path, func(st *Store) { st.Remove("nobody") })
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a no-op update created the store (stat err: %v)", err)
 	}
 }
 
@@ -137,14 +150,17 @@ func TestDAVRoot(t *testing.T) {
 	}
 }
 
-// Every caller loads its own Store from the same file (the GUI service does so
-// at a dozen call sites, and so do the agent, the CLI and mobile), so two
-// savers of one accounts.json are ordinary rather than exotic. They used to
-// share a fixed "accounts.json.tmp": the first rename consumed the temp file
-// and the second found nothing left to rename, failing the save outright.
-// internal/config hit exactly this on Android in August 2026 and fixed it with
-// unique temp names; the account store never got the same fix.
-func TestConcurrentSavesDoNotCollide(t *testing.T) {
+// Deck #693: every caller used to load its own copy of accounts.json, edit it
+// and write the whole file back, so two callers overlapping both started from
+// the same copy and whichever saved second threw the other's change away. The
+// GUI does this to itself: add an account in the login window while the
+// settings window is saving a local route, and one of them silently vanishes.
+// Update holds the file's lock across the whole load-edit-save, so every
+// change lands. (Two savers of one file were already ordinary before this —
+// the fixed "accounts.json.tmp" they once shared made the second save fail
+// outright, which internal/atomicfile's unique temp names fixed — so this
+// also checks that nothing is left lying beside the store.)
+func TestUpdateKeepsEveryConcurrentChange(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "accounts.json")
 
@@ -155,34 +171,32 @@ func TestConcurrentSavesDoNotCollide(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			st, err := LoadStore(path)
-			if err != nil {
-				errs <- err
-				return
-			}
-			if err := st.Upsert(Account{
-				ID:        fmt.Sprintf("acct-%d", i),
-				ServerURL: "https://cloud.example.com",
-				LoginName: fmt.Sprintf("user-%d", i),
-			}); err != nil {
-				errs <- err
-			}
+			errs <- Update(path, func(st *Store) error {
+				st.Upsert(Account{
+					ID:        fmt.Sprintf("acct-%d", i),
+					ServerURL: "https://cloud.example.com",
+					LoginName: fmt.Sprintf("user-%d", i),
+				})
+				return nil
+			})
 		}(i)
 	}
 	wg.Wait()
 	close(errs)
 	for err := range errs {
-		t.Errorf("concurrent save failed: %v", err)
+		if err != nil {
+			t.Errorf("Update: %v", err)
+		}
 	}
 
-	// Whichever save landed last, what it left behind has to be a whole store,
-	// and no temp files may be left lying beside it.
 	st, err := LoadStore(path)
 	if err != nil {
-		t.Fatalf("reload after concurrent saves: %v", err)
+		t.Fatalf("reload: %v", err)
 	}
-	if len(st.Accounts) == 0 {
-		t.Error("no accounts survived the concurrent saves")
+	for i := 0; i < n; i++ {
+		if _, ok := st.Find(fmt.Sprintf("acct-%d", i)); !ok {
+			t.Errorf("acct-%d was lost: another Update overwrote it", i)
+		}
 	}
 	names, err := filepath.Glob(filepath.Join(dir, "*"))
 	if err != nil {

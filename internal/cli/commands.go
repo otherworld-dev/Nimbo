@@ -38,11 +38,11 @@ func cmdLogin(ctx context.Context, args []string) error {
 		return err
 	}
 
-	st, _, err := loadStore()
+	d, err := dirs()
 	if err != nil {
 		return err
 	}
-	acc, err := account.Complete(st, creds)
+	acc, err := account.Complete(d.AccountsFile(), creds)
 	if err != nil {
 		return err
 	}
@@ -85,7 +85,7 @@ func cmdAccounts(_ context.Context, _ []string) error {
 
 // cmdLogout removes an account and its keychain secret.
 func cmdLogout(_ context.Context, args []string) error {
-	st, _, err := loadStore()
+	st, d, err := loadStore()
 	if err != nil {
 		return err
 	}
@@ -102,7 +102,7 @@ func cmdLogout(_ context.Context, args []string) error {
 	if err := account.DeleteSecret(acc.ID); err != nil {
 		return err
 	}
-	if err := st.Remove(acc.ID); err != nil {
+	if err := account.Update(d.AccountsFile(), func(s *account.Store) error { s.Remove(acc.ID); return nil }); err != nil {
 		return err
 	}
 	fmt.Printf("Removed account %s (%s)\n", acc.LoginName, acc.ID)
