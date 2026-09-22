@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -304,5 +305,245 @@ func TestReconcileMatchesNamesCaseInsensitively(t *testing.T) {
 	// And the existing entries must survive, with their content intact.
 	if b, err := os.ReadFile(filepath.Join(root, "Notes.txt")); err != nil || string(b) != "keep me" {
 		t.Fatalf("Notes.txt was deleted or clobbered (err=%v, content=%q)", err, string(b))
+	}
+}
+
+// Live sync blocks a forbidden X when a genuine X.nimboesc is in the same plan
+// (engine.FilterBlocked's claimed set): escaping X would PUT over the genuine
+// file's server copy. The write-back watcher pushes one file at a time and had
+// no such check. Its "plan" is the folder on disk: a neighbour already wearing
+// the escaped name means X must not upload. The refusal is reported once, not
+// every time the reconcile rescue re-arms the dirty file, and no retry timer
+// is set: only the user's rename can clear it (Deck #554, item 1).
+func TestWriteBackRefusesAnEscapedNameAGenuineFileOccupies(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	disguised := filepath.Join(root, ".htaccess")
+	genuine := filepath.Join(root, ".htaccess.nimboesc")
+	for _, p := range []string{disguised, genuine} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.markDirty(disguised)
+
+	rec := newRecorder()
+	w := bareWatcher(root, escapingOps(rec))
+	defer w.cancel()
+
+	w.handleChange(disguised)
+	w.handleChange(disguised) // the reconcile rescue re-arms a dirty file every pass
+
+	if len(rec.uploads) != 0 {
+		t.Fatalf("uploaded %v: the genuine .htaccess.nimboesc's server copy would be overwritten", rec.uploads)
+	}
+	got := rec.reportsOf("upload")
+	if len(got) != 1 {
+		t.Fatalf("want exactly one upload report for the two refusals, got %+v", got)
+	}
+	if got[0].path != ".htaccess" || got[0].err == nil || !strings.Contains(got[0].err.Error(), ".htaccess.nimboesc") {
+		t.Fatalf("report = %+v, want an error on .htaccess that names .htaccess.nimboesc", got[0])
+	}
+	if _, ok := f.identityOf(disguised); ok {
+		t.Fatal("the refused file was marked in-sync")
+	}
+	w.mu.Lock()
+	_, armed := w.upload[disguised]
+	w.mu.Unlock()
+	if armed {
+		t.Fatal("a retry timer was armed for a refusal only the user can clear")
+	}
+}
+
+// Once the genuine file is out of the way the disguised one uploads as normal,
+// its success clears the sticky error, and a later collision is reported afresh.
+func TestWriteBackUploadsOnceTheEscapedNameIsFree(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	disguised := filepath.Join(root, ".htaccess")
+	genuine := filepath.Join(root, ".htaccess.nimboesc")
+	for _, p := range []string{disguised, genuine} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.markDirty(disguised)
+
+	rec := newRecorder()
+	w := bareWatcher(root, escapingOps(rec))
+	defer w.cancel()
+
+	w.handleChange(disguised) // refused
+	if err := os.Rename(genuine, filepath.Join(root, "config.txt")); err != nil {
+		t.Fatal(err)
+	}
+	w.handleChange(disguised) // free now
+
+	if len(rec.uploads) != 1 || rec.uploads[0] != ".htaccess.nimboesc" {
+		t.Fatalf("uploads = %v, want [.htaccess.nimboesc]", rec.uploads)
+	}
+	got := rec.reportsOf("upload")
+	if len(got) != 2 || got[1].path != ".htaccess" || got[1].err != nil {
+		t.Fatalf("reports = %+v, want the refusal then a success on .htaccess", got)
+	}
+
+	// The name is taken again: a fresh stretch, reported again.
+	if err := os.WriteFile(genuine, []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.markDirty(disguised)
+	w.handleChange(disguised)
+	if got := rec.reportsOf("upload"); len(got) != 3 || got[2].err == nil {
+		t.Fatalf("reports = %+v, want a third, failed report for the new collision", got)
+	}
+}
+
+// A rename INTO a disguised name is the same collision through the MOVE path:
+// notes.txt -> .htaccess would MOVE the server's notes.txt over the genuine
+// .htaccess.nimboesc. Refused before the MOVE, reported once, and the move
+// bookkeeping is released so reconcile can look again.
+func TestWriteBackRenameRefusesAnEscapedNameAGenuineFileOccupies(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	oldPath := filepath.Join(root, "notes.txt")
+	newPath := filepath.Join(root, ".htaccess")
+	genuine := filepath.Join(root, ".htaccess.nimboesc")
+	for _, p := range []string{newPath, genuine} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec := newRecorder()
+	w := bareWatcher(root, escapingOps(rec))
+	defer w.cancel()
+
+	w.handleRename(oldPath, newPath)
+	w.handleRename(oldPath, newPath)
+
+	if len(rec.moves) != 0 {
+		t.Fatalf("moved %v: the genuine .htaccess.nimboesc's server copy would be overwritten", rec.moves)
+	}
+	got := rec.reportsOf("move")
+	if len(got) != 1 || got[0].path != ".htaccess" || got[0].err == nil || !strings.Contains(got[0].err.Error(), ".htaccess.nimboesc") {
+		t.Fatalf("reports = %+v, want one error on .htaccess that names .htaccess.nimboesc", got)
+	}
+	w.mu.Lock()
+	inMove := len(w.inMove)
+	w.mu.Unlock()
+	if inMove != 0 {
+		t.Fatal("the refused move is still marked in flight")
+	}
+}
+
+// Down-sync reports carried the RAW server name while up-sync reports carry
+// the local one, so the activity feed showed ".htaccess.nimboesc" for a pull
+// and ".htaccess" for a push of the same file. Worse than cosmetic: the
+// recorder keys unresolved errors by path, so an error under one form could
+// never be cleared by a success under the other (Deck #554, item 2).
+func TestReconcileReportsAPulledDisguisedFileUnderItsLocalName(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+
+	rec := newRecorder()
+	rec.listing[""] = []cfapi.PlaceholderInfo{phAt(".htaccess.nimboesc", false, "e-ht", "f-ht")}
+	w := bareWatcher(root, escapingOps(rec))
+	defer w.cancel()
+
+	w.Reconcile()
+
+	got := rec.reportsOf("download")
+	if len(got) != 1 || got[0].path != ".htaccess" {
+		t.Fatalf("download reports = %+v, want one for .htaccess (the local name)", got)
+	}
+}
+
+// The same for a rename applied from the server side.
+func TestReconcileReportsAPulledRenameUnderItsLocalName(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "old.txt"), []byte("hydrated"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := newRecorder()
+	rec.fileids["old.txt"] = "fid-1"
+	rec.listing[""] = []cfapi.PlaceholderInfo{phAt(".htaccess.nimboesc", false, "e2", "fid-1")}
+	w := bareWatcher(root, escapingOps(rec))
+	defer w.cancel()
+
+	w.Reconcile()
+
+	got := rec.reportsOf("move")
+	if len(got) != 1 || got[0].path != ".htaccess" {
+		t.Fatalf("move reports = %+v, want one for .htaccess (the local name)", got)
+	}
+}
+
+// The once-per-stretch bookkeeping ends when the refused file goes away: a
+// file of the same name created later is a new collision and is reported.
+func TestWriteBackReportsACollisionAgainAfterTheFileWasDeleted(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	disguised := filepath.Join(root, ".htaccess")
+	genuine := filepath.Join(root, ".htaccess.nimboesc")
+	for _, p := range []string{disguised, genuine} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.markDirty(disguised)
+
+	rec := newRecorder()
+	w := bareWatcher(root, escapingOps(rec))
+	defer w.cancel()
+
+	w.handleChange(disguised) // refused
+	if err := os.Remove(disguised); err != nil {
+		t.Fatal(err)
+	}
+	w.handleDelete(disguised)
+	if err := os.WriteFile(disguised, []byte("again"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.markDirty(disguised)
+	w.handleChange(disguised) // a new file, the same collision
+
+	if got := rec.reportsOf("upload"); len(got) != 2 || got[1].err == nil {
+		t.Fatalf("reports = %+v, want the new file's collision reported as well", got)
+	}
+}
+
+// The same when the refused file is renamed away rather than deleted.
+func TestWriteBackReportsACollisionAgainAfterTheFileWasRenamedAway(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	disguised := filepath.Join(root, ".htaccess")
+	genuine := filepath.Join(root, ".htaccess.nimboesc")
+	for _, p := range []string{disguised, genuine} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.markDirty(disguised)
+
+	rec := newRecorder()
+	w := bareWatcher(root, escapingOps(rec))
+	defer w.cancel()
+
+	w.handleChange(disguised) // refused
+	moved := filepath.Join(root, "moved.txt")
+	if err := os.Rename(disguised, moved); err != nil {
+		t.Fatal(err)
+	}
+	w.handleRename(disguised, moved)
+	if err := os.WriteFile(disguised, []byte("again"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.markDirty(disguised)
+	w.handleChange(disguised) // a new file, the same collision
+
+	if got := rec.reportsOf("upload"); len(got) != 2 || got[1].err == nil {
+		t.Fatalf("reports = %+v, want the new file's collision reported as well", got)
 	}
 }

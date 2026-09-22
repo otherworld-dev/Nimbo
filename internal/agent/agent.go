@@ -3021,15 +3021,19 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 	ig := e.ignoreFor(p)
 
 	esc := e.escaper.Load()
-	relOf := func(full string) string {
+	relOf := func(full string, isDir bool) string {
 		rel := full
 		if root != "" {
 			rel = strings.TrimPrefix(full, root+"/")
 		}
 		// An escaped server name (X<suffix>) maps to its local decoded name X, so
 		// the clone downloads/adopts/baselines it under the name it lives as
-		// locally; the Executor re-encodes for the actual GET.
-		rel, _ = esc.Decode(rel)
+		// locally; the Executor re-encodes for the actual GET. Files only: a
+		// folder is never escaped, so its name is taken as it is (engine.RemoteScan
+		// does the same).
+		if !isDir {
+			rel, _ = esc.Decode(rel)
+		}
 		return rel
 	}
 	newExec := func(remote map[string]engine.RemoteState) *transfer.Executor {
@@ -3116,7 +3120,7 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 		if full == root {
 			continue
 		}
-		rel := relOf(full)
+		rel := relOf(full, en.IsDir)
 		rootRemote[rel] = cloneRemoteState(rel, en, rootOnMount, rootKnown)
 		if en.IsDir {
 			topDirs = append(topDirs, full)
@@ -3127,7 +3131,7 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 	// Folders that survived the ignore filter get recursed.
 	var dispatch []string
 	for _, td := range topDirs {
-		if _, kept := rootRemote[relOf(td)]; kept {
+		if _, kept := rootRemote[relOf(td, true)]; kept {
 			dispatch = append(dispatch, td)
 		}
 	}
@@ -3201,7 +3205,7 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 			}
 			for _, en := range entries {
 				full := strings.Trim(en.Path, "/")
-				rel := relOf(full)
+				rel := relOf(full, en.IsDir)
 				if rel == "" {
 					continue
 				}

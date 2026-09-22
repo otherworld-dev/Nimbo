@@ -155,3 +155,33 @@ func TestEscaperBrandSuffix(t *testing.T) {
 		t.Errorf("brand suffix: Decode = %q, %v", dec, was)
 	}
 }
+
+// Encode and Decode change the BASENAME and nothing else. The escape branch
+// used to path.Join its result, which cleaned the rest of the path on that
+// branch only ("a/b/../.htaccess" came back as "a/.htaccess.nimboesc" while
+// "a/b/../notes.md" came back untouched), and a trailing slash was read as
+// part of the name ("web/.htaccess/" became "web/.htaccess/.htaccess.nimboesc").
+// A path ending in "/" names a directory, and directories are never escaped.
+// Backslashes are not separators here: the whole string is the basename, and
+// it is simply not a forbidden name (Deck #554, item 6).
+func TestEscaperTouchesOnlyTheBasename(t *testing.T) {
+	e := newTestEscaper(".htaccess")
+	for _, c := range []struct{ in, want string }{
+		{"web/.htaccess/", "web/.htaccess/"},
+		{"a/b/../.htaccess", "a/b/../.htaccess.nimboesc"},
+		{`web\.htaccess`, `web\.htaccess`},
+	} {
+		if got := e.Encode(c.in); got != c.want {
+			t.Errorf("Encode(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	for _, c := range []struct{ in, want string }{
+		{"web/.htaccess.nimboesc/", "web/.htaccess.nimboesc/"},
+		{"a/b/../.htaccess.nimboesc", "a/b/../.htaccess"},
+		{`web\.htaccess.nimboesc`, `web\.htaccess.nimboesc`},
+	} {
+		if got, _ := e.Decode(c.in); got != c.want {
+			t.Errorf("Decode(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

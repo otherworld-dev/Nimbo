@@ -572,7 +572,7 @@ func (e *Executor) makeLocalDir(rel string) error {
 }
 
 func (e *Executor) makeRemoteDir(ctx context.Context, rel string) error {
-	remote := e.remotePath(rel)
+	remote := e.rawRemotePath(rel) // a folder is never escaped
 	if err := e.Client.Mkcol(ctx, remote); err != nil {
 		return err
 	}
@@ -584,9 +584,16 @@ func (e *Executor) makeRemoteDir(ctx context.Context, rel string) error {
 	return e.saveDirBaseline(rel, etag, fileID, false) // our own new folder: never a share root
 }
 
-// remotePath maps a pair-relative path to a files-root-relative path.
+// remotePath maps a pair-relative FILE path to a files-root-relative path,
+// encoding a forbidden name to its stored server name (no-op when inactive).
 func (e *Executor) remotePath(rel string) string {
-	rel = e.Escaper.Encode(rel) // encode a forbidden name to its stored server name; no-op when inactive
+	return e.rawRemotePath(e.Escaper.Encode(rel))
+}
+
+// rawRemotePath is remotePath without the encoding: for a directory, which is
+// never escaped (escaping renames a basename only, and a folder's children keep
+// their own path underneath it).
+func (e *Executor) rawRemotePath(rel string) string {
 	if e.RemoteRoot == "" {
 		return rel
 	}

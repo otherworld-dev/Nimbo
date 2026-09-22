@@ -191,8 +191,11 @@ func RemoteScan(ctx context.Context, c PropFinder, root string, opts ScanOpts) (
 			rel := relTo(full, root)
 			// Decode an escaped server name (X.nimboesc -> X) so the remote map is
 			// keyed by LOCAL names; the diff, baseline and ignore rules then all match
-			// on X as normal. No-op when escaping is inactive.
-			if esc != nil {
+			// on X as normal. No-op when escaping is inactive. Files only: a folder
+			// is never escaped, so its name is taken as it is (decoding one would
+			// give it a local name its children, listed under the raw one, never
+			// share).
+			if esc != nil && !e.IsDir {
 				rel, _ = esc.Decode(rel)
 			}
 			if skip != nil && skip(rel) {

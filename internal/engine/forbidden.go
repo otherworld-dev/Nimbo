@@ -83,8 +83,10 @@ func FilterBlocked(actions []Action, f *Forbidden, esc *Escaper, blacklisted fun
 	claimed := make(map[string]int)
 	for _, a := range actions {
 		switch a.Kind {
-		case ActUpload, ActCreateRemoteDir:
+		case ActUpload:
 			claimed[esc.Encode(a.Path)]++
+		case ActCreateRemoteDir:
+			claimed[a.Path]++ // a folder is never escaped: it claims its own name
 		case ActMoveRemote:
 			claimed[esc.Encode(a.Dest)]++
 		}
@@ -106,10 +108,15 @@ func FilterBlocked(actions []Action, f *Forbidden, esc *Escaper, blacklisted fun
 			continue // user-ignored: drop without flagging
 		}
 		if reason, bad := f.Check(path.Base(target)); bad {
-			// A forbidden name whose extension the user opted in is escaped by the
-			// executor (stored under a marker name) instead of blocked — unless that
-			// would collide with a real file already occupying the server name.
-			if esc.Escapes(path.Base(target)) && claimed[esc.Encode(target)] == 1 {
+			// A forbidden FILE name whose extension the user opted in is escaped by
+			// the executor (stored under a marker name) instead of blocked — unless
+			// that would collide with a real entry already occupying the server
+			// name. A folder is never escaped: escaping renames a basename only, so
+			// an escaped folder would be created as X<suffix> while everything
+			// inside it still went to X/, a folder the server does not have. It is
+			// blocked like any other forbidden name, and the user renames it. The
+			// on-demand mode has always worked this way, so the two modes agree.
+			if !isDir && esc.Escapes(path.Base(target)) && claimed[esc.Encode(target)] == 1 {
 				kept = append(kept, a)
 				continue
 			}
