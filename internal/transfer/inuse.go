@@ -76,12 +76,28 @@ func isBusyWriter(p string) bool {
 	return ok
 }
 
+// alwaysWaitForWriter reports whether localPath is an Outlook data file,
+// which never uploads while a program holds it open to write. Outlook writes
+// to an attached .pst in bursts, not constantly, so a burst landing BETWEEN
+// two uploads is never caught mid-read and the busy-writer mark below is never
+// set: every burst then sent the whole file again, gigabytes at a time, for as
+// long as Outlook stayed open (Deck #634). Nothing is lost by waiting: it
+// uploads once Outlook lets go, and awaitClosed notices that within 30s.
+func alwaysWaitForWriter(localPath string) bool {
+	switch strings.ToLower(filepath.Ext(localPath)) {
+	case ".pst", ".ost":
+		return true
+	}
+	return false
+}
+
 // UploadDeferred reports, as an InUseError, whether an upload of localPath
-// would be put off right now: the file was caught changing mid-upload and a
-// program still holds it open to write. Callers that change the server before
-// uploading (on-demand mode sets a conflicting server copy aside) ask first.
+// would be put off right now: a program holds it open to write, and it is
+// either an Outlook data file or was caught changing under an earlier upload.
+// Callers that change the server before uploading (on-demand mode sets a
+// conflicting server copy aside) ask first.
 func UploadDeferred(localPath string) error {
-	if !isBusyWriter(localPath) {
+	if !alwaysWaitForWriter(localPath) && !isBusyWriter(localPath) {
 		return nil
 	}
 	if err := writerPresent(localPath); err != nil {
