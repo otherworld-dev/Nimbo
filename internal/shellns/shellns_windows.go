@@ -153,6 +153,104 @@ func Unregister() error {
 	return nil
 }
 
+// --- the node Windows supplies for a cloud sync root ---
+//
+// A registered cloud sync root (on-demand mode) gets a navigation-pane node
+// from Windows itself: a delegate folder under HKCU\Software\Classes\CLSID of
+// the same shape as ours, created with the registration and recorded on the
+// root's SyncRootManager key as NamespaceCLSID (cfapi.ShellSyncRootNamespaceCLSID).
+// The sidebar toggle has to act on that node there — ours is stood down beside
+// a sync root so Explorer does not show two Nimbos — and the only handle on its
+// visibility is the pinned-to-tree flag, the value that also pins our own entry.
+// Verified on a real machine (2026-09-22): clearing it removes the node at once,
+// setting it brings the node back, and a restart of the app — which registers
+// the same root again — leaves it as set.
+
+// cloudRootPinnedValue is that flag, in Windows' own spelling on the nodes it
+// generates (ours writes it as "NameSpace"; registry value names are
+// case-insensitive, so either reaches it, but writing it as Windows does keeps
+// the key as Windows made it).
+const cloudRootPinnedValue = "System.IsPinnedToNamespaceTree"
+
+// cloudRootWait bounds how long a write waits for Windows to finish creating
+// the node, which can lag the registration call by a moment.
+const cloudRootWait = 10 * time.Second
+
+func cloudRootKey(clsid string) string { return `Software\Classes\CLSID\` + clsid }
+
+// CloudRootPinned reports whether the node clsid is pinned into the navigation
+// pane, and whether the node exists at all.
+//
+// Unlike Enabled, this read is trustworthy inside the MSIX container: the key
+// is only ever written outside it (by Windows at registration, or by our
+// scheduled task), so there is no private copy to shadow the real one.
+func CloudRootPinned(clsid string) (pinned, exists bool) {
+	k, err := registry.OpenKey(registry.CURRENT_USER, cloudRootKey(clsid), registry.QUERY_VALUE)
+	if err != nil {
+		return false, false
+	}
+	defer k.Close()
+	v, _, err := k.GetIntegerValue(cloudRootPinnedValue)
+	if err != nil {
+		return false, true
+	}
+	return v == 1, true
+}
+
+// SetCloudRootPinned shows (on) or hides the node Windows supplies for a cloud
+// sync root. The node is Windows' own: only its flag is written, never the key,
+// so a node that does not exist is an error rather than something to invent.
+// On a packaged build the write goes out of the container, like Register's.
+func SetCloudRootPinned(clsid string, on bool) error {
+	if Packaged() {
+		action := "hide-cloud-root"
+		if on {
+			action = "show-cloud-root"
+		}
+		return runOutOfContainer(action, cloudRootPinScript(clsid, on))
+	}
+	var v uint32
+	if on {
+		v = 1
+	}
+	var k registry.Key
+	var err error
+	for deadline := time.Now().Add(cloudRootWait); ; {
+		k, err = registry.OpenKey(registry.CURRENT_USER, cloudRootKey(clsid), registry.SET_VALUE)
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if err != nil {
+		return fmt.Errorf("navigation-pane node %s: %w", clsid, err)
+	}
+	defer k.Close()
+	if err := k.SetDWordValue(cloudRootPinnedValue, v); err != nil {
+		return err
+	}
+	refresh()
+	return nil
+}
+
+// cloudRootPinScript renders the out-of-container write: wait briefly for the
+// node, set its flag, tell Explorer. It never creates the key.
+func cloudRootPinScript(clsid string, on bool) string {
+	var v int
+	if on {
+		v = 1
+	}
+	var b strings.Builder
+	b.WriteString("$ErrorActionPreference = 'Continue'\r\n")
+	b.WriteString(fmt.Sprintf("$k = %s\r\n", psQuote(`HKCU:\`+cloudRootKey(clsid))))
+	b.WriteString(fmt.Sprintf("$deadline = (Get-Date).AddSeconds(%d)\r\n", int(cloudRootWait/time.Second)))
+	b.WriteString("while (-not (Test-Path -LiteralPath $k) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }\r\n")
+	b.WriteString(fmt.Sprintf("if (Test-Path -LiteralPath $k) { New-ItemProperty -LiteralPath $k -Name %s -Value %d -PropertyType DWord -Force | Out-Null }\r\n",
+		psQuote(cloudRootPinnedValue), v))
+	b.WriteString(notifyShellPS)
+	return b.String()
+}
+
 // --- out-of-container application (packaged builds) ---
 
 // stableIconPath is where a packaged build's sidebar icon lives: under

@@ -370,6 +370,38 @@ func ShellSyncRootRegistered(path string) bool {
 	return false
 }
 
+// ShellSyncRootNamespaceCLSID returns the CLSID of the navigation-pane node
+// Windows created for path's cloud sync root, or "" when path is not a
+// registered root or Windows gave it no node. The registration records it as
+// NamespaceCLSID on the root's SyncRootManager key (seen on Windows 11 26200;
+// the node itself is an HKCU\Software\Classes\CLSID delegate folder pinned
+// into the pane — the same shape as our own entry in internal/shellns).
+func ShellSyncRootNamespaceCLSID(path string) string {
+	id, err := shellRootID(path)
+	if err != nil {
+		return ""
+	}
+	for _, hive := range []registry.Key{registry.LOCAL_MACHINE, registry.CURRENT_USER} {
+		if s := namespaceCLSIDAt(hive, syncRootManager+`\`+id); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func namespaceCLSIDAt(hive registry.Key, keyPath string) string {
+	k, err := registry.OpenKey(hive, keyPath, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	s, _, err := k.GetStringValue("NamespaceCLSID")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(s)
+}
+
 func removeLegacyHKCUEntry(id string) {
 	base := syncRootManager + `\` + id
 	_ = registry.DeleteKey(registry.CURRENT_USER, base+`\UserSyncRoots`)

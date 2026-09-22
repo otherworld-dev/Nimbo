@@ -19,3 +19,9 @@ func Register(string, string, string) error { return nil }
 
 // Unregister is a no-op on non-Windows platforms.
 func Unregister() error { return nil }
+
+// CloudRootPinned never finds a node off Windows.
+func CloudRootPinned(string) (pinned, exists bool) { return false, false }
+
+// SetCloudRootPinned is a no-op on non-Windows platforms.
+func SetCloudRootPinned(string, bool) error { return nil }
