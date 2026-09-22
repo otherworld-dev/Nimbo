@@ -1157,13 +1157,19 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 	// report records a VFS operation in the activity feed (which auto-refreshes
 	// the flyout via the recorder subscription) and toasts on error.
 	report := func(kind, remotePath string, err error) {
-		ev := activity.Event{Local: localDir, Path: remotePath, Kind: kind}
+		// The watcher reports local names; hydration (below) reports the
+		// placeholder identity, which is the RAW server name. One decode here
+		// keeps the feed, the toasts and the recorder's error keys on the
+		// local name for both, so an error recorded by one can be cleared by
+		// the other (Deck #554).
+		shown := vfsDisplayPath(eng.Escaper(), remotePath)
+		ev := activity.Event{Local: localDir, Path: shown, Kind: kind}
 		if err != nil {
 			ev.Err = err.Error()
 		}
 		eng.Recorder().Add(ev)
 		if err != nil || kind == "delete-kept" {
-			a.vfsErrorToast(kind, remotePath, err)
+			a.vfsErrorToast(kind, shown, err)
 		}
 	}
 	hydrate := func(identity []byte, offset, length int64) ([]byte, error) {
@@ -3239,12 +3245,7 @@ func (a *App) BlockedList() []BlockedItem {
 	}
 	var out []BlockedItem
 	for _, b := range a.eng.BlockedFiles() {
-		base := filepath.Base(b.Path)
-		out = append(out, BlockedItem{
-			Abs: b.Abs, Path: b.Path, Reason: b.Reason,
-			Ext:       filepath.Ext(base),
-			Escapable: a.eng.CanEscape(base),
-		})
+		out = append(out, blockedItem(b, a.eng.CanEscape))
 	}
 	for _, ext := range a.eng.EscapedExtensions() {
 		out = append(out, BlockedItem{Path: ext, Ext: ext, Escaping: true,

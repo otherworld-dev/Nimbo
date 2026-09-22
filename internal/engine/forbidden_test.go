@@ -90,3 +90,33 @@ func TestFilterBlocked_Escaping(t *testing.T) {
 		t.Fatalf("collision kept = %+v, want the real .nimboesc file", kept)
 	}
 }
+
+// A directory is never escaped. Escaping renames a basename only, so an
+// escaped folder would be created as X.nimboesc while everything inside it
+// still uploaded under X/... into a folder the server does not have. A
+// forbidden folder name is blocked outright (the user renames it), which is
+// what the on-demand mode has always done, so the two modes now agree (Deck
+// #554, item 3). A folder claims its raw server name, so a file whose
+// escaped name is that folder is blocked too.
+func TestFilterBlocked_NeverEscapesADirectory(t *testing.T) {
+	f := NewForbidden(nil, nil, nil, nil, nil)
+	esc := NewEscaper(f, []string{".htaccess"}, "")
+
+	kept, blocked := FilterBlocked([]Action{
+		{Kind: ActCreateRemoteDir, Path: "web/.htaccess"},
+	}, f, esc, nil)
+	if len(kept) != 0 || len(blocked) != 1 || blocked[0].Path != "web/.htaccess" || !blocked[0].IsDir {
+		t.Fatalf("folder: kept=%+v blocked=%+v, want the folder blocked as a directory", kept, blocked)
+	}
+
+	kept, blocked = FilterBlocked([]Action{
+		{Kind: ActCreateRemoteDir, Path: "dir/.htaccess.nimboesc"},
+		{Kind: ActUpload, Path: "dir/.htaccess"},
+	}, f, esc, nil)
+	if len(blocked) != 1 || blocked[0].Path != "dir/.htaccess" || blocked[0].IsDir {
+		t.Fatalf("file whose escaped name is a folder: blocked=%+v, want the file", blocked)
+	}
+	if len(kept) != 1 || kept[0].Path != "dir/.htaccess.nimboesc" {
+		t.Fatalf("file whose escaped name is a folder: kept=%+v, want the folder", kept)
+	}
+}

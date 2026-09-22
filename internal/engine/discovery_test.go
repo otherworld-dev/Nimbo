@@ -502,3 +502,32 @@ func TestRemoteScanReportsProgress(t *testing.T) {
 		}
 	}
 }
+
+// Directories are never escaped, so a server folder whose name merely looks
+// escaped keeps that name locally. Decoding it the way files are decoded gave
+// the folder one local name and its children another: a child's own basename
+// never decodes, so "X.nimboesc/f" landed under "X.nimboesc/" while the folder
+// itself became "X/" (Deck #554, item 3).
+func TestRemoteScanLeavesAnEscapedLookingDirectoryAlone(t *testing.T) {
+	f := &fakeServer{
+		dirs: map[string][]transport.Entry{
+			"":                   {d("", "eroot"), d(".htaccess.nimboesc", "ed")},
+			".htaccess.nimboesc": {d(".htaccess.nimboesc", "ed"), fi(".htaccess.nimboesc/.htaccess.nimboesc", "ef", 1)},
+		},
+		fail: map[string]error{},
+	}
+	esc := NewEscaper(NewForbidden(nil, nil, nil, nil, nil), []string{".htaccess"}, "")
+	out, err := RemoteScan(context.Background(), f, "", ScanOpts{Esc: esc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := out[".htaccess.nimboesc"]; !ok || !r.IsDir {
+		t.Errorf("the folder was decoded away: %v", out)
+	}
+	if _, ok := out[".htaccess"]; ok {
+		t.Error("a folder named .htaccess was invented")
+	}
+	if r, ok := out[".htaccess.nimboesc/.htaccess"]; !ok || r.IsDir {
+		t.Errorf("the disguised FILE inside it was not decoded: %v", out)
+	}
+}

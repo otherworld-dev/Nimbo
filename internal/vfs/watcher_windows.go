@@ -137,12 +137,17 @@ type Ops struct {
 
 // Watcher monitors a mount root subtree and pushes user changes to the server.
 type Watcher struct {
-	root       string // local sync-root path
-	remoteRoot string // files-root-relative remote path ("" = account root)
-	ops        Ops
-	handle     windows.Handle
-	ctx        context.Context
-	cancel     context.CancelFunc
+	root string // local sync-root path
+	// blockedNames holds paths whose upload or move is refused because a
+	// neighbour already carries their escaped server name (escapeCollision),
+	// lower-cased; each is reported once, and forgotten when it syncs, is
+	// deleted or is renamed away.
+	blockedNames map[string]bool
+	remoteRoot   string // files-root-relative remote path ("" = account root)
+	ops          Ops
+	handle       windows.Handle
+	ctx          context.Context
+	cancel       context.CancelFunc
 
 	pollEvery time.Duration // safety-net reconcile interval
 
@@ -1299,7 +1304,7 @@ func (w *Watcher) pullRename(localDir, oldFull string, y cfapi.PlaceholderInfo, 
 	w.recordFileID(string(y.Identity), fileid)
 	w.dropFileID(oldRemote)
 	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(y.Identity))
-	w.report("move", string(y.Identity), nil)
+	w.report("move", w.localName(string(y.Identity)), nil) // user-visible name
 	return true
 }
 
@@ -1364,6 +1369,55 @@ func (w *Watcher) localName(remote string) string {
 		return remote
 	}
 	return w.ops.Decode(remote)
+}
+
+// escapeCollision reports the neighbour that already owns the server name a
+// disguised file would be stored under, or "" when there is none. A disguised
+// ".htaccess" is PUT as ".htaccess.nimboesc"; a genuine file called
+// ".htaccess.nimboesc" in the same folder holds that server path already, and
+// uploading or moving over it would replace its content with the other file's.
+// Live sync refuses this in engine.FilterBlocked (its claimed set); the
+// write-back watcher works one file at a time, so the folder on disk is its
+// plan. server is what serverFor gave for path.
+func (w *Watcher) escapeCollision(path, server string) string {
+	if server == "" || server == w.remoteFor(path) {
+		return "" // not disguised: nothing to collide with
+	}
+	neighbour := filepath.Join(filepath.Dir(path), filepath.Base(server))
+	if _, err := os.Lstat(neighbour); err != nil {
+		return ""
+	}
+	return neighbour
+}
+
+// collisionError is the activity-feed entry for a refused upload or move.
+func collisionError(neighbour string) error {
+	return fmt.Errorf("a file called %s is in the same folder, and that is the name the server stores this one under. Rename one of them", filepath.Base(neighbour))
+}
+
+// noteBlocked records that path is refused for a name collision and reports
+// whether that is news: the first refusal of a stretch. The reconcile rescue
+// re-arms a dirty file on every pass, and a report per pass would bury the
+// feed. A stretch ends with clearBlocked, when the path syncs, is deleted or
+// is renamed away.
+func (w *Watcher) noteBlocked(path string) bool {
+	key := strings.ToLower(path)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.blockedNames == nil {
+		w.blockedNames = map[string]bool{}
+	}
+	if w.blockedNames[key] {
+		return false
+	}
+	w.blockedNames[key] = true
+	return true
+}
+
+func (w *Watcher) clearBlocked(path string) {
+	w.mu.Lock()
+	delete(w.blockedNames, strings.ToLower(path))
+	w.mu.Unlock()
 }
 
 // forceChange arms path's Mkdir/Upload branch to run even though it is
@@ -1600,6 +1654,17 @@ func (w *Watcher) handleChange(path string) {
 		}
 		w.report("mkdir-remote", remote, nil)
 	} else {
+		if neighbour := w.escapeCollision(path, server); neighbour != "" {
+			// Refused, not failed: no retry timer (the reconcile rescue re-arms
+			// a dirty file every pass anyway), one report per stretch, and the
+			// file stays dirty so nothing dehydrates it. Only a rename of one
+			// of the two files ends this.
+			w.ops.Log("vfs upload %s refused: %s already holds the server name %s", remote, w.remoteFor(neighbour), server)
+			if w.noteBlocked(path) {
+				w.report("upload", remote, collisionError(neighbour))
+			}
+			return
+		}
 		if err := w.ops.Upload(uctx, path, server); err != nil {
 			switch {
 			case errors.Is(err, ErrHeldByLock):
@@ -1641,6 +1706,7 @@ func (w *Watcher) handleChange(path string) {
 		}
 		w.ops.Log("vfs uploaded %s (%d bytes)", server, info.Size())
 		w.report("upload", remote, nil)
+		w.clearBlocked(path)
 	}
 	w.mu.Lock()
 	delete(w.attempts, key)
@@ -1836,6 +1902,7 @@ func (w *Watcher) handleDelete(path string) {
 	if w.ctx.Err() != nil {
 		return
 	}
+	w.clearBlocked(path) // a name-collision refusal ends with the file; a new one under this name is news again
 	if w.isSuppressed(path) {
 		return // we removed this ourselves during down-sync; already gone server-side
 	}
@@ -2202,6 +2269,7 @@ func (w *Watcher) handleRename(oldPath, newPath string) {
 	if w.remoteFor(oldPath) == "" || w.remoteFor(newPath) == "" {
 		return
 	}
+	w.clearBlocked(oldPath) // a name-collision refusal ends with the name; a new file under it is news again
 	// A rename cannot change dir-ness, so the destination (which exists) settles
 	// it for both ends. Each end is encoded independently: renaming notes.txt to
 	// .htaccess is a MOVE from the raw name to the escaped one.
@@ -2262,6 +2330,18 @@ func (w *Watcher) moveServer(src, newPath string, isDir bool) moveOutcome {
 		return out
 	}
 	dst := w.serverFor(newPath, isDir)
+	if !isDir {
+		if neighbour := w.escapeCollision(newPath, dst); neighbour != "" {
+			// The MOVE would land on the neighbour's server copy. Refused
+			// before it is sent, reported once, and the move mark released so
+			// reconcile can look at the file again once the user has renamed.
+			w.ops.Log("vfs move %s -> %s refused: %s already holds that server name", src, dst, w.remoteFor(neighbour))
+			if w.noteBlocked(newPath) {
+				w.report("move", w.remoteFor(newPath), collisionError(neighbour))
+			}
+			return done(moveRetrying)
+		}
+	}
 	err := w.ops.Move(w.ctx, src, dst)
 	if err == nil {
 		w.finishRename(src, newPath, dst)
@@ -3028,7 +3108,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 				if !r.IsDir {
 					w.recordFileID(string(r.Identity), r.FileID) // enable rename detection later
 				}
-				w.report("download", string(r.Identity), nil) // surface new server files in the activity feed
+				w.report("download", w.localName(string(r.Identity)), nil) // new server files in the activity feed, by their user-visible name
 			}
 			w.recordBaselines(base)
 		}

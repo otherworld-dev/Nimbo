@@ -77,24 +77,27 @@ func (e *Escaper) WouldEscape(base string) bool {
 
 // Encode returns the server-side pair-relative path for a local one: a forbidden,
 // opted-in basename gets the marker suffix appended. Idempotent (an already-escaped
-// name isn't re-escaped). v1 escapes file names only; directory paths are untouched.
+// name isn't re-escaped). File names only: a path ending in "/" names a directory
+// and comes back untouched. Nothing before the basename is touched either (no
+// cleaning), so a caller gets its own path back with only the last element changed.
 func (e *Escaper) Encode(rel string) string {
-	if !e.Active() {
+	if !e.Active() || strings.HasSuffix(rel, "/") {
 		return rel
 	}
 	base := path.Base(rel)
 	if !e.Escapes(base) {
 		return rel
 	}
-	return path.Join(path.Dir(rel), base+e.suffix)
+	return rel[:len(rel)-len(base)] + base + e.suffix
 }
 
 // Decode reverses Encode for a server-side path: a basename ending in the marker
 // whose decoded name we would have escaped is un-suffixed. Returns the decoded path
 // and whether it changed. The "would have escaped" check (vs. a bare suffix strip)
-// leaves a genuine file that merely ends in the marker untouched.
+// leaves a genuine file that merely ends in the marker untouched. A directory
+// path (trailing "/") is never decoded: directories are never escaped.
 func (e *Escaper) Decode(rel string) (string, bool) {
-	if !e.Active() {
+	if !e.Active() || strings.HasSuffix(rel, "/") {
 		return rel, false
 	}
 	base := path.Base(rel)
@@ -105,5 +108,5 @@ func (e *Escaper) Decode(rel string) (string, bool) {
 	if decoded == "" || !e.Escapes(decoded) {
 		return rel, false
 	}
-	return path.Join(path.Dir(rel), decoded), true
+	return rel[:len(rel)-len(base)] + decoded, true
 }
