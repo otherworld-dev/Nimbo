@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -40,11 +41,12 @@ type fakeNC struct {
 	onSinglePut func()            // runs as a single PUT arrives, while the upload is in flight
 	onChunkPut  func(name string) // runs as each chunk PUT arrives
 	declared    map[string]string // destination -> OC-Checksum a single PUT declared
+	mtimes      map[string]string // destination -> X-OC-Mtime the PUT or assembly MOVE carried
 }
 
 func newFakeNC() *fakeNC {
 	return &fakeNC{
-		files: map[string][]byte{}, sessions: map[string]map[string][]byte{},
+		files: map[string][]byte{}, sessions: map[string]map[string][]byte{}, mtimes: map[string]string{},
 		chunkFail: map[string]int{}, chunkPuts: map[string]int{}, declared: map[string]string{},
 	}
 }
@@ -123,6 +125,7 @@ func (f *fakeNC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					content = append(content, sess[n]...)
 				}
 				f.files[dest] = content
+				f.mtimes[dest] = r.Header.Get("X-OC-Mtime")
 				delete(f.sessions, id) // the server consumes the session on assembly
 			}
 			if f.assembleFail > 0 {
@@ -173,6 +176,7 @@ func (f *fakeNC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			f.files[dest] = readAll(r)
 			f.declared[dest] = r.Header.Get("OC-Checksum")
+			f.mtimes[dest] = r.Header.Get("X-OC-Mtime")
 			w.Header().Set("OC-ETag", `"etag-single"`)
 			w.Header().Set("OC-FileId", "fid-s")
 			w.WriteHeader(http.StatusCreated)
@@ -637,5 +641,43 @@ func TestUploadRefusesFileChangedDuringRead(t *testing.T) {
 	}
 	if _, err := Upload(context.Background(), c, local, "docs/x.bin"); err != nil {
 		t.Fatalf("steady file refused: %v", err)
+	}
+}
+
+// Deck #500 (1). Every upload tells the server the file's own modified time,
+// as Nextcloud's desktop client does. Without it the server stamps the upload
+// time, every other device then downloads the file with that date, and an
+// adopt scan reads a file uploaded from this very folder as a conflict
+// (same size, but the server's time is the upload's).
+func TestUploadSendsTheFilesModifiedTime(t *testing.T) {
+	f, c, local := uploadFixture(t, 50)
+	when := time.Date(2019, 3, 14, 15, 9, 26, 0, time.UTC)
+	if err := os.Chtimes(local, when, when); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Upload(context.Background(), c, local, "docs/old.txt"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if got, want := f.mtimes["docs/old.txt"], strconv.FormatInt(when.Unix(), 10); got != want {
+		t.Fatalf("X-OC-Mtime = %q, want %q", got, want)
+	}
+}
+
+func TestChunkedUploadSendsTheFilesModifiedTime(t *testing.T) {
+	smallChunks(t)
+	f, c, local := uploadFixture(t, 3*1024+100)
+	when := time.Date(2019, 3, 14, 15, 9, 26, 0, time.UTC)
+	if err := os.Chtimes(local, when, when); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Upload(context.Background(), c, local, "docs/big.bin"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if got, want := f.mtimes["docs/big.bin"], strconv.FormatInt(when.Unix(), 10); got != want {
+		t.Fatalf("X-OC-Mtime on the assembly MOVE = %q, want %q", got, want)
 	}
 }

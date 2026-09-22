@@ -86,7 +86,7 @@ func (a *App) scanAdopt() string {
 	// The sync ignore rules apply to the adopt too: ignored trees are excluded
 	// from the crawl, the plan, and therefore the upload bucket.
 	skip := a.eng.GlobalIgnoreMatcher()
-	remote, err := a.eng.RemoteTree(ctx, "", skip, func(n int) { a.adoptScanDirs.Store(int64(n)) })
+	remote, err := a.eng.RemoteTree(ctx, dir, "", skip, func(n int) { a.adoptScanDirs.Store(int64(n)) })
 	if err != nil {
 		// Nothing has changed either way — cancelled or unreachable, the user
 		// simply stays on their current mode.

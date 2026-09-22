@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 // Chunked upload v2: large files are uploaded as numbered chunks into a
@@ -110,7 +111,7 @@ func (c *Client) newChunkRequest(ctx context.Context, uploadID, chunkName string
 // AssembleUpload finalises a chunked upload by MOVEing the assembly member to
 // destPath. OC-Total-Length lets the server check quota; an optional OC-Checksum
 // has the server verify the assembled file. Returns the new ETag and file ID.
-func (c *Client) AssembleUpload(ctx context.Context, uploadID, destPath string, totalLen int64, ocChecksum string) (etag, fileID string, err error) {
+func (c *Client) AssembleUpload(ctx context.Context, uploadID, destPath string, totalLen int64, ocChecksum string, mtime time.Time) (etag, fileID string, err error) {
 	req, err := c.NewRequest(ctx, "MOVE", c.uploadsURL("/"+uploadID+"/.file"), nil)
 	if err != nil {
 		return "", "", err
@@ -121,6 +122,7 @@ func (c *Client) AssembleUpload(ctx context.Context, uploadID, destPath string, 
 	if ocChecksum != "" {
 		req.Header.Set("OC-Checksum", ocChecksum)
 	}
+	setMtime(req, mtime) // on the assembly MOVE, where chunking v2 reads it
 	resp, err := c.DoOnce(req)
 	if err != nil {
 		return "", "", err

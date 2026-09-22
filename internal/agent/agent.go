@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -1310,7 +1311,9 @@ func (e *Engine) GlobalIgnoreMatcher() func(rel string) bool {
 // and adopt must classify in that same namespace: decoding here would mark a
 // local file in-sync under an identity reconcile can never find, which reads
 // as a server-side delete. An escaped-name file simply fails its upload (the
-// server forbids the raw name) and stays a plain local file — safe.
+// server forbids the raw name) and stays a plain local file — safe. (Entries
+// rebuilt from the live baseline, below, are keyed by the baseline's LOCAL
+// names; the caller decodes every key anyway, which leaves those as they are.)
 //
 // The crawl is checkpoint-backed: each directory listing is cached in the
 // state DB as it is fetched, so a cancelled or failed scan retried later only
@@ -1319,23 +1322,117 @@ func (e *Engine) GlobalIgnoreMatcher() func(rel string) bool {
 // deliberately NOT cleared on success: a crash mid-adopt is recovered by
 // re-scanning, which should stay warm. The 14-day age-out is the backstop.
 //
+// When localDir is live-synced to root, the live baseline prunes the crawl as
+// the delta scan does: a folder whose ETag it holds is known unchanged and is
+// rebuilt from it instead of listed (adoptBaseline says when it can be
+// trusted). Deck #500.
+//
 // skip (optional) is an ignore predicate (root-relative paths): matches are
 // omitted from the result AND not descended into server-side, so ignored trees
 // cost no PROPFINDs. progress (optional) receives the running count of
 // directories listed — the heartbeat a UI needs to distinguish a long crawl
 // from a hang.
-func (e *Engine) RemoteTree(ctx context.Context, root string, skip func(string) bool, progress func(int)) (map[string]engine.RemoteState, error) {
+func (e *Engine) RemoteTree(ctx context.Context, localDir, root string, skip func(string) bool, progress func(int)) (map[string]engine.RemoteState, error) {
 	opts := engine.ScanOpts{Skip: skip, Progress: progress}
 	var cp *scanCheckpoint
 	if st, err := e.getStore(); err == nil {
 		cp = newScanCheckpoint(st, "vfs-adopt:"+strings.Trim(root, "/"))
 		opts.Checkpoint = cp
+		opts.Base = e.adoptBaseline(st, localDir, root)
 	}
 	remote, err := engine.RemoteScan(ctx, e.client, root, opts)
 	if cp != nil {
 		cp.logSummary()
 	}
-	return remote, err
+	if err != nil {
+		return remote, err
+	}
+	if opts.Base != nil {
+		settleRebuilt(remote, opts.Base, skip)
+	}
+	return remote, nil
+}
+
+// adoptBaseline returns the live baseline the adopt scan may prune with, or
+// nil to crawl everything. It must be the baseline of a live pair for exactly
+// this folder and remote root, and it must be one that can vouch for its
+// files: a selective-sync pair's baseline says nothing about the folders left
+// out, and a row with no recorded modified time cannot say whether the local
+// copy has changed since (settleRebuilt needs that time). Anything short of
+// that is a full crawl, as before.
+func (e *Engine) adoptBaseline(st *state.Store, localDir, root string) map[string]engine.BaselineState {
+	if localDir == "" {
+		return nil
+	}
+	root = strings.Trim(root, "/")
+	pairs, err := e.Pairs()
+	if err != nil {
+		return nil
+	}
+	want := PairKey(localDir, root)
+	found := false
+	for _, p := range pairs {
+		if PairKey(p.LocalDir, strings.Trim(p.RemoteRoot, "/")) != want {
+			continue
+		}
+		if len(p.Excludes) > 0 {
+			return nil
+		}
+		found = true
+	}
+	if !found {
+		return nil
+	}
+	base, err := st.LoadBaseline(want)
+	if err != nil || len(base) == 0 {
+		return nil
+	}
+	for _, b := range base {
+		if !b.IsDir && b.LocalMTimeNanos == 0 {
+			slog.Info("adopt scan: the live baseline has rows without modified times, crawling everything")
+			return nil
+		}
+	}
+	return base
+}
+
+// settleRebuilt finishes the entries RemoteScan rebuilt from the baseline
+// rather than listed (LockKnown false marks them: only a listing sets it).
+//
+// A rebuilt file has no server modified time, and the adopt classifier
+// (engine.LocalMatchesRemote) cannot call a file in sync without one, so
+// every file under a pruned folder would have been offered as a conflict: the
+// shape of the 556k-conflict near-miss. It gets the modified time the
+// baseline recorded for the local copy at the last sync instead. That makes
+// the test "is the local file as it was when last in sync", and the server
+// side is known unchanged because the folder's ETag still matched.
+//
+// And the ignore filter only ever saw listed entries, so rebuilt ones under
+// an ignored path are dropped here.
+func settleRebuilt(remote map[string]engine.RemoteState, base map[string]engine.BaselineState, skip func(string) bool) {
+	for rel, r := range remote {
+		if r.LockKnown {
+			continue // listed, not rebuilt
+		}
+		if skip != nil && ignoredOrUnder(rel, skip) {
+			delete(remote, rel)
+			continue
+		}
+		if !r.IsDir {
+			r.LastModified = time.Unix(0, base[rel].LocalMTimeNanos)
+			remote[rel] = r
+		}
+	}
+}
+
+// ignoredOrUnder reports whether rel or any folder above it is ignored.
+func ignoredOrUnder(rel string, skip func(string) bool) bool {
+	for p := rel; p != "." && p != ""; p = path.Dir(p) {
+		if skip(p) {
+			return true
+		}
+	}
+	return false
 }
 
 // ListShares / CreatePublicLink / CreateUserShare / DeleteShare proxy the client.
