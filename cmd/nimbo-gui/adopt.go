@@ -19,11 +19,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/otherworld/nimbo/internal/atomicfile"
 	"github.com/otherworld/nimbo/internal/brand"
 	"github.com/otherworld/nimbo/internal/cfapi"
+	"github.com/otherworld/nimbo/internal/config"
 	"github.com/otherworld/nimbo/internal/engine"
 	"github.com/otherworld/nimbo/internal/notify"
 	"github.com/otherworld/nimbo/internal/vfs"
@@ -142,6 +145,9 @@ func (a *App) adoptAndSwitch() string {
 	}
 	pending := a.pendingAdopt
 	a.pendingAdopt = nil
+	// This switch was scanned afresh, so an older resume record describes a
+	// folder state that no longer exists; the new plan records its own.
+	clearAdoptResume(a.eng.Account.ID)
 	if pending != nil && pending.dir == a.GetBaseDir() && len(pending.plan.Entries) > 0 {
 		a.preMountAdopt = pending
 	}
@@ -150,27 +156,103 @@ func (a *App) adoptAndSwitch() string {
 	return msg
 }
 
+// adoptResume is what an interrupted conversion still owes, persisted so the
+// next mount of the same folder finishes it (Deck #500): the plan's Unfinished
+// entries, pinned to the folder and remote root they were computed for.
+type adoptResume struct {
+	Dir     string      `json:"dir"`
+	Root    string      `json:"root"`
+	Entries []vfs.Entry `json:"entries"`
+}
+
+func adoptResumeFile(accountID string) string {
+	d, err := config.Resolve()
+	if err != nil {
+		return ""
+	}
+	return d.WithAccount(accountID).VFSAdoptResumeFile()
+}
+
+// saveAdoptResume records the plan's unfinished part before Apply starts, so a
+// shutdown mid-conversion leaves it on disk. Best effort: without it the
+// conversion still runs, it just cannot be finished after a restart.
+func saveAdoptResume(accountID, dir, root string, plan vfs.Plan) {
+	path := adoptResumeFile(accountID)
+	if path == "" {
+		return
+	}
+	u := plan.Unfinished()
+	if len(u.Entries) == 0 {
+		clearAdoptResume(accountID)
+		return
+	}
+	b, err := json.Marshal(adoptResume{Dir: dir, Root: root, Entries: u.Entries})
+	if err == nil {
+		err = atomicfile.Write(path, b, 0o644)
+	}
+	if err != nil {
+		slog.Warn("adopt: couldn't record the conversion for resuming", "err", err)
+	}
+}
+
+// loadAdoptResume returns the entries owed to this folder, or nil. A record
+// for a different folder or root is stale (the account's folder was changed)
+// and is dropped: a plan must never be applied to a folder it did not describe.
+func loadAdoptResume(accountID, dir, root string) []vfs.Entry {
+	path := adoptResumeFile(accountID)
+	if path == "" {
+		return nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var r adoptResume
+	if err := json.Unmarshal(b, &r); err != nil ||
+		!strings.EqualFold(filepath.Clean(r.Dir), filepath.Clean(dir)) || r.Root != root {
+		clearAdoptResume(accountID)
+		return nil
+	}
+	return r.Entries
+}
+
+func clearAdoptResume(accountID string) {
+	if path := adoptResumeFile(accountID); path != "" {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			slog.Warn("adopt: couldn't clear the resume record", "err", err)
+		}
+	}
+}
+
 // runAdoptConvert is the background conversion: Apply (all local mutations,
 // with live progress via the adoptConvert atomics the Diagnostics DTO reports),
 // then — preserving the ordering constraint — the write-back watcher, then the
 // pending uploads. ctx is cancelled by unmount (mode switch away, shutdown):
 // conversion stops at the next file, converted files stay converted (they are
-// correct placeholders), the rest stay plain files a re-scan re-offers.
+// correct placeholders). Of the rest, reconcile heals the matching files and
+// uploads the local-only ones; the conflicts and dead stubs are persisted
+// (saveAdoptResume) and finished on the next mount, with resumed set.
 func (a *App) runAdoptConvert(ctx context.Context, m *odMount, plan vfs.Plan, dir, root string,
-	upload func(ctx context.Context, localPath, remotePath string) error, startWatcher func() *vfs.Watcher) {
+	upload func(ctx context.Context, localPath, remotePath string) error, startWatcher func() *vfs.Watcher, resumed bool) {
 	a.adoptConvertTotal.Store(int64(len(plan.Entries)))
 	a.adoptConvertDone.Store(0)
 	defer func() {
 		a.adoptConvertTotal.Store(0)
 		a.adoptConvertDone.Store(0)
 	}()
+	if !resumed {
+		saveAdoptResume(m.accountID, dir, root, plan)
+	}
 	res := plan.Apply(ctx, dir, root, func(done, _ int) { a.adoptConvertDone.Store(int64(done)) })
 	slog.Info("adopt applied", "kept", res.Kept, "stubsReplaced", res.Replaced,
 		"conflictsRenamed", res.Renamed, "skipped", res.Skipped, "failed", res.Failed,
-		"uploadsPending", len(res.Uploads), "cancelled", ctx.Err() != nil)
+		"uploadsPending", len(res.Uploads), "cancelled", ctx.Err() != nil, "resumed", resumed)
 	if ctx.Err() != nil {
-		return // unmounted / switched away mid-convert
+		return // unmounted / switched away mid-convert; the resume record stays
 	}
+	// Every local mutation is done. A conflicted copy whose upload is cut short
+	// below is a plain local-only file, which reconcile's rescue uploads.
+	clearAdoptResume(m.accountID)
 	w := startWatcher()
 	if ctx.Err() != nil {
 		// Unmount raced the watcher start — don't leave one running on a dead root.
@@ -188,8 +270,9 @@ func (a *App) runAdoptConvert(ctx context.Context, m *odMount, plan vfs.Plan, di
 		a.runAdoptUploads(upload, dir, root, res.Uploads, w)
 	}
 	// The switch is only DONE here, long after the click — say so explicitly
-	// (a silent finish reads as "did it even work?").
-	if a.NotificationsEnabled() {
+	// (a silent finish reads as "did it even work?"). A resume is not a switch
+	// the user just made, and its Kept count is always zero, so it stays quiet.
+	if !resumed && a.NotificationsEnabled() {
 		notify.Toast(brand.Current.Name, fmt.Sprintf(
 			"Virtual files ready — %s files kept in place. Click to restart File Explorer so the sync icons show.",
 			thousands(res.Kept)), "action=explorer-restart")

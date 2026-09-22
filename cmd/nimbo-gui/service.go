@@ -1455,7 +1455,20 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		m.convertCancel = cancel
 		slog.Info("adopt: converting existing files in the background",
 			"files", len(pending.plan.Entries), "dir", localDir)
-		go a.runAdoptConvert(cctx, m, pending.plan, localDir, root, up, startWatcher)
+		go a.runAdoptConvert(cctx, m, pending.plan, localDir, root, up, startWatcher, false)
+		return nil
+	}
+	// An adopt interrupted by a shutdown owes its conflicts and dead stubs
+	// (Deck #500): finish them now, under the same ordering constraint — a
+	// conflict rename or stub delete seen by the watcher would reach the server.
+	if entries := loadAdoptResume(eng.Account.ID, localDir, root); len(entries) > 0 {
+		cctx, cancel := context.WithCancel(a.ctx)
+		m.convertCancel = cancel
+		slog.Info("adopt: resuming an interrupted conversion", "entries", len(entries), "dir", localDir)
+		// The escaper is read per call, as the watcher's Encode is: the user can
+		// change disguised types between the scan and this resume.
+		plan := vfs.ResumePlan(entries, func(rel string) string { return eng.Escaper().Encode(rel) })
+		go a.runAdoptConvert(cctx, m, plan, localDir, root, up, startWatcher, true)
 		return nil
 	}
 	m.watcher = startWatcher()
@@ -1711,6 +1724,10 @@ func (a *App) unmountAllOnDemand() {
 			m.healCancel()
 		}
 		cfapi.Unmount(dir, m.connKey)
+		// Unregistering strips the cloud state from the whole tree, so an
+		// unfinished adopt has nothing left to resume into; a later switch back
+		// scans afresh.
+		clearAdoptResume(m.accountID)
 		delete(a.onDemandMounts, dir)
 	}
 	a.refreshOverlayRoots()

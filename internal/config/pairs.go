@@ -55,6 +55,16 @@ func (d Dirs) VFSMountRootsFile() string {
 	return filepath.Join(d.Config, "vfs-mountroots.json")
 }
 
+// VFSAdoptResumeFile holds the part of a confirmed adopt that an interrupted
+// conversion must finish on the next mount (conflicts and dead stubs, Deck
+// #500). Scoped like PairsFile; absent when nothing is owed.
+func (d Dirs) VFSAdoptResumeFile() string {
+	if d.acct != "" {
+		return filepath.Join(d.Config, "vfs-adopt-resume-"+d.acct+".json")
+	}
+	return filepath.Join(d.Config, "vfs-adopt-resume.json")
+}
+
 // MigratePairs adopts the legacy unscoped files into this account's scoped
 // ones — a one-time rename for installs that predate multi-account. It only
 // acts when the Dirs is account-bound, the scoped file doesn't exist yet, and
