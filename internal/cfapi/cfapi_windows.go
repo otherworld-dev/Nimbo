@@ -970,6 +970,37 @@ const cfTransferAlign = 4096
 // leaving a fast link's full 4 MiB pieces untouched.
 const cfPieceFlushAfter = 15 * time.Second
 
+// cfReadStallLimit is how long a hydration stream may deliver nothing at all
+// before the request is failed. The filter withdraws a request that goes ~60s
+// without progress, but only when another process is waiting on it; Nimbo's
+// own hydrations (keeping a pinned file on this device) are never withdrawn,
+// so a link that stayed up but stopped sending held the read, the request
+// and the pin for good. Longer than the filter's 60s on purpose, so that for
+// every other request its withdrawal still comes first and nothing changes.
+const cfReadStallLimit = 90 * time.Second
+
+// testReadStallLimit overrides cfReadStallLimit when non-zero. Set only by
+// tests.
+var testReadStallLimit time.Duration
+
+func readStallLimit() time.Duration {
+	if testReadStallLimit > 0 {
+		return testReadStallLimit
+	}
+	return cfReadStallLimit
+}
+
+// errReadStalled is the cause streamFetch cancels its stream with when the
+// watchdog fires.
+var errReadStalled = errors.New("the hydration stream delivered nothing for too long")
+
+// execTransfer and execTransferFail are the CfExecute calls streamFetch
+// makes, as variables so its tests can run without a sync root.
+var (
+	execTransfer     = cfTransfer
+	execTransferFail = cfTransferFail
+)
+
 // testPieceFlushAfter overrides cfPieceFlushAfter when non-zero. Set ONLY by
 // the slow-link test, which would otherwise have to run for a minute to
 // observe a timed flush at all.
@@ -1111,9 +1142,28 @@ func fetchDataCallback(info, params uintptr) uintptr {
 // Whatever happens, the request is COMPLETED: fully transferred, or failed for
 // the part that could not be served. Returning without doing either is the
 // defect this replaces — the caller's open then hangs on the filter's time-out.
+// The one exception is a request the filter WITHDREW (ctx cancelled from
+// outside): its transfer key is dead and there is nothing left to complete.
+//
+// A stream that delivers nothing for readStallLimit, opening included, is
+// cancelled here and the request failed (see cfReadStallLimit).
 func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, connKey, transferKey int64, idStr string, identity []byte, reqOffset, reqLength int64) {
+	ctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+	limit := readStallLimit()
+	watchdog := time.AfterFunc(limit, func() { stop(errReadStalled) })
+	defer watchdog.Stop()
+	// stalled tells the watchdog's cancel apart from a withdrawal: only the
+	// first leaves a live transfer key that must still be answered.
+	stalled := func() bool { return errors.Is(context.Cause(ctx), errReadStalled) }
+
 	rc, err := stream(ctx, identity, reqOffset, reqLength)
 	if err != nil {
+		if stalled() {
+			dbg("FETCH_DATA %q: the stream did not open within %v, failing the request", idStr, limit)
+			execTransferFail(connKey, transferKey, reqOffset, reqLength)
+			return
+		}
 		if ctx.Err() != nil {
 			// The request was withdrawn while the stream was being opened —
 			// err is that cancellation, not a download failure, and the
@@ -1122,7 +1172,7 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 			return
 		}
 		dbg("FETCH_DATA %q: open stream: %v", idStr, err)
-		cfTransferFail(connKey, transferKey, reqOffset, reqLength)
+		execTransferFail(connKey, transferKey, reqOffset, reqLength)
 		return
 	}
 	if rc == nil {
@@ -1130,7 +1180,7 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 		// request still has to be answered, and a nil-interface Close would
 		// panic on a callback goroutine and take the process with it.
 		dbg("FETCH_DATA %q: the stream func returned no reader and no error", idStr)
-		cfTransferFail(connKey, transferKey, reqOffset, reqLength)
+		execTransferFail(connKey, transferKey, reqOffset, reqLength)
 		return
 	}
 	defer rc.Close()
@@ -1140,8 +1190,8 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 	off, remaining := reqOffset, reqLength
 	held := 0 // bytes at the front of buf: a previous piece's unaligned tail
 	for remaining > 0 {
-		if ctx.Err() != nil {
-			// Cancelled: the transfer key is dead, so there is nothing to
+		if ctx.Err() != nil && !stalled() {
+			// Withdrawn: the transfer key is dead, so there is nothing to
 			// complete — the filter has already failed the caller's I/O.
 			dbg("FETCH_DATA %q: cancelled with %d bytes left", idStr, remaining)
 			return
@@ -1159,6 +1209,9 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 		var rerr error
 		for n < want {
 			rn, err := rc.Read(buf[n:want])
+			if rn > 0 {
+				watchdog.Reset(limit) // the limit is on silence, not on the whole download
+			}
 			n += rn
 			if n >= want {
 				break // piece full; any error travels with the next read
@@ -1179,9 +1232,12 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 			// deliberately DROPPED: they would buy the caller nothing, and a
 			// partial piece is the one shape that can land off a sector
 			// boundary.
-			if ctx.Err() == nil {
+			if stalled() {
+				dbg("FETCH_DATA %q: nothing received for %v with %d bytes left (%d in hand, dropped), failing the request", idStr, limit, remaining, n)
+				execTransferFail(connKey, transferKey, off, remaining)
+			} else if ctx.Err() == nil {
 				dbg("FETCH_DATA %q: stream ended %d bytes short (%d in hand, dropped): %v", idStr, remaining, n, rerr)
-				cfTransferFail(connKey, transferKey, off, remaining)
+				execTransferFail(connKey, transferKey, off, remaining)
 			} else {
 				dbg("FETCH_DATA %q: cancelled with %d bytes left", idStr, remaining)
 			}
@@ -1189,8 +1245,11 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 		}
 		// Re-check: reading is where a download waits, so this is the one
 		// place a cancel can land mid-piece. Without it, a withdrawn request
-		// still pushes a piece at a dead transfer key.
-		if ctx.Err() != nil {
+		// still pushes a piece at a dead transfer key. (A stall cannot land
+		// here with a full piece in hand: the read that filled it reset the
+		// watchdog, so the piece is still worth sending and the next read
+		// meets the stall.)
+		if ctx.Err() != nil && !stalled() {
 			dbg("FETCH_DATA %q: cancelled with %d bytes left", idStr, remaining)
 			return
 		}
@@ -1207,13 +1266,13 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 			// than spin on a piece that cannot grow or hand CfExecute an
 			// empty buffer (which would panic on a callback goroutine).
 			dbg("FETCH_DATA %q: nothing sendable from %d bytes with %d left", idStr, n, remaining)
-			cfTransferFail(connKey, transferKey, off, remaining)
+			execTransferFail(connKey, transferKey, off, remaining)
 			return
 		}
-		if !cfTransfer(connKey, transferKey, off, buf[:send]) {
+		if !execTransfer(connKey, transferKey, off, buf[:send]) {
 			// The filter refused the piece; fail the rest from here so it
 			// never waits for a gap we are not going to fill.
-			cfTransferFail(connKey, transferKey, off, remaining)
+			execTransferFail(connKey, transferKey, off, remaining)
 			return
 		}
 		off += int64(send)

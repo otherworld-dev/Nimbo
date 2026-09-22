@@ -1156,6 +1156,7 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 	root := strings.Trim(remoteRoot, "/")
 	// report records a VFS operation in the activity feed (which auto-refreshes
 	// the flyout via the recorder subscription) and toasts on error.
+	dedupe := newDownloadDedupe(30 * time.Second)
 	report := func(kind, remotePath string, err error) {
 		// The watcher reports local names; hydration (below) reports the
 		// placeholder identity, which is the RAW server name. One decode here
@@ -1163,6 +1164,11 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		// local name for both, so an error recorded by one can be cleared by
 		// the other (Deck #554).
 		shown := vfsDisplayPath(eng.Escaper(), remotePath)
+		// The same file's failed download arrives twice when it was pinned:
+		// once from the stream, once from the watcher (Deck #686).
+		if !dedupe.admit(kind, localDir, shown, err) {
+			return
+		}
 		ev := activity.Event{Local: localDir, Path: shown, Kind: kind}
 		if err != nil {
 			ev.Err = err.Error()
