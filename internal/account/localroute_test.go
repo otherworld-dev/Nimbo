@@ -43,16 +43,13 @@ func TestParseLocalAddress(t *testing.T) {
 
 func TestLocalRouteJSONRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "accounts.json")
-	st, _ := LoadStore(path)
 	with := Account{ID: "a", ServerURL: "https://cloud.example.com", LoginName: "alice",
 		Local: &LocalRoute{Address: "192.168.1.100", Pin: "ab12", RootID: "00000042ocabc"}}
 	without := Account{ID: "b", ServerURL: "https://other.example.com", LoginName: "bob"}
-	if err := st.Upsert(with); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.Upsert(without); err != nil {
-		t.Fatal(err)
-	}
+	update(t, path, func(st *Store) {
+		st.Upsert(with)
+		st.Upsert(without)
+	})
 	raw, _ := os.ReadFile(path)
 	if strings.Count(string(raw), `"local"`) != 1 {
 		t.Fatalf("an account without a local route must not write a local key:\n%s", raw)
@@ -94,22 +91,23 @@ func TestCompleteKeepsLocalRoute(t *testing.T) {
 	SetSecretStore(newFakeSecretStore())
 	defer SetSecretStore(keychainStore{})
 	path := filepath.Join(t.TempDir(), "accounts.json")
-	st, _ := LoadStore(path)
 	lr := &LocalRoute{Address: "192.168.1.100", RootID: "00000042ocabc"}
 	first := Account{ID: newID("https://cloud.example.com", "alice"),
 		ServerURL: "https://cloud.example.com", LoginName: "alice", Local: lr}
-	if err := st.Upsert(first); err != nil {
-		t.Fatal(err)
-	}
-	got, err := Complete(st, Credentials{Server: "https://cloud.example.com/", LoginName: "alice", AppPassword: "pw2"})
+	update(t, path, func(st *Store) { st.Upsert(first) })
+	got, err := Complete(path, Credentials{Server: "https://cloud.example.com/", LoginName: "alice", AppPassword: "pw2"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Local == nil || *got.Local != *lr {
 		t.Fatalf("Complete dropped the local route: %+v", got.Local)
 	}
+	st, _ := LoadStore(path)
 	stored, _ := st.Find(got.ID)
 	if stored.Local == nil || *stored.Local != *lr {
 		t.Fatalf("store lost the local route: %+v", stored.Local)
+	}
+	if len(st.Accounts) != 1 {
+		t.Fatalf("re-login duplicated the account: %d entries", len(st.Accounts))
 	}
 }

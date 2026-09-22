@@ -166,33 +166,35 @@ func (f *Flow) pollOnce(ctx context.Context) (creds Credentials, done bool, err 
 
 // Complete persists the credentials from a finished flow: it derives a stable
 // account ID, stores the app password in the OS keychain, and records the
-// account in the store. It returns the saved account.
-func Complete(store *Store, creds Credentials) (Account, error) {
+// account in the store at path as the active one. It returns the saved account.
+func Complete(path string, creds Credentials) (Account, error) {
 	server := strings.TrimRight(creds.Server, "/")
 	a := Account{
 		ID:        newID(server, creds.LoginName),
 		ServerURL: server,
 		LoginName: creds.LoginName,
 	}
-	// A re-login replaces the whole record (Upsert), so carry the local route
-	// over — it belongs to the server, not to this sign-in.
-	if prev, ok := store.Find(a.ID); ok {
-		a.Local = prev.Local
-	}
-	if err := store.ensureDir(); err != nil {
-		return Account{}, err
-	}
+	// The secret goes in first: an account record whose password is missing
+	// shows up as "sign in again", which is recoverable, whereas the reverse
+	// leaves the record with nothing to sign in with and nowhere to look.
 	if err := SaveSecret(a.ID, creds.AppPassword); err != nil {
 		return Account{}, err
 	}
-	if err := store.Upsert(a); err != nil {
+	err := Update(path, func(store *Store) error {
+		// A re-login replaces the whole record (Upsert), so carry the local
+		// route over — it belongs to the server, not to this sign-in.
+		if prev, ok := store.Find(a.ID); ok {
+			a.Local = prev.Local
+		}
+		store.Upsert(a)
+		// A fresh sign-in becomes the active account — both on first run and
+		// when adding a second account (the natural "switch to what I just
+		// added").
+		return store.SetDefault(a.ID)
+	})
+	if err != nil {
 		// Roll back the secret so we don't leave an orphan keychain entry.
 		_ = DeleteSecret(a.ID)
-		return Account{}, err
-	}
-	// A fresh sign-in becomes the active account — both on first run and when
-	// adding a second account (the natural "switch to what I just added").
-	if err := store.SetDefault(a.ID); err != nil {
 		return Account{}, err
 	}
 	return a, nil

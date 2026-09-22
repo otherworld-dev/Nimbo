@@ -200,11 +200,7 @@ func (l *LoginFlow) Poll() (*Account, error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := account.LoadStore(d.AccountsFile())
-	if err != nil {
-		return nil, err
-	}
-	acc, err := account.Complete(st, creds)
+	acc, err := account.Complete(d.AccountsFile(), creds)
 	if err != nil {
 		return nil, err
 	}
@@ -262,11 +258,10 @@ func (c *Client) Logout(accountID string) error {
 	if err != nil {
 		return err
 	}
-	st, err := account.LoadStore(d.AccountsFile())
-	if err != nil {
-		return err
-	}
-	if err := st.Remove(accountID); err != nil {
+	if err := account.Update(d.AccountsFile(), func(st *account.Store) error {
+		st.Remove(accountID)
+		return nil
+	}); err != nil {
 		return err
 	}
 	_ = account.DeleteSecret(accountID)

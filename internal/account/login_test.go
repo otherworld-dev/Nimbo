@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -125,5 +127,57 @@ func TestFlowPollHonoursCancelDuringTransient(t *testing.T) {
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
 	if _, err := f.Poll(ctx); err == nil {
 		t.Fatal("cancelled Poll must return an error")
+	}
+}
+
+// Complete owns the whole sign-in write: secret first, then the account into
+// the store as the new default, under the store's lock so a concurrent
+// account change is not thrown away (Deck #693).
+func TestCompleteRecordsAccountAsDefault(t *testing.T) {
+	fake := newFakeSecretStore()
+	SetSecretStore(fake)
+	defer SetSecretStore(keychainStore{})
+	path := filepath.Join(t.TempDir(), "accounts.json")
+
+	got, err := Complete(path, Credentials{Server: "https://cloud.example.com/", LoginName: "alice", AppPassword: "pw"})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if got.ServerURL != "https://cloud.example.com" || got.LoginName != "alice" {
+		t.Errorf("returned account = %+v", got)
+	}
+	if pw, _ := fake.Get(got.ID); pw != "pw" {
+		t.Errorf("secret for %s = %q, want \"pw\"", got.ID, pw)
+	}
+	st, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def, ok := st.Default(); !ok || def != got {
+		t.Errorf("stored default = %+v (ok=%v), want %+v", def, ok, got)
+	}
+}
+
+// If the store cannot be written the secret must not be left behind: an
+// orphan keychain entry with no account to own it is invisible and never
+// cleaned up.
+func TestCompleteRollsBackSecretWhenStoreFails(t *testing.T) {
+	fake := newFakeSecretStore()
+	SetSecretStore(fake)
+	defer SetSecretStore(keychainStore{})
+	// A regular file where the store's directory should be: neither reading
+	// nor creating accounts.json under it can succeed.
+	blocker := filepath.Join(t.TempDir(), "notadir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(blocker, "accounts.json")
+
+	_, err := Complete(path, Credentials{Server: "https://cloud.example.com", LoginName: "alice", AppPassword: "pw"})
+	if err == nil {
+		t.Fatal("Complete succeeded with an unwritable store")
+	}
+	if len(fake.m) != 0 {
+		t.Errorf("secret left behind after the store write failed: %v", fake.m)
 	}
 }

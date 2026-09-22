@@ -115,11 +115,11 @@ func TestLogoutRemovesAccountWhenSecretDeleteFails(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(d.AccountsFile()), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	st, err := account.LoadStore(d.AccountsFile())
+	err := account.Update(d.AccountsFile(), func(st *account.Store) error {
+		st.Upsert(account.Account{ID: "acct1", ServerURL: "https://x", LoginName: "adam"})
+		return nil
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.Upsert(account.Account{ID: "acct1", ServerURL: "https://x", LoginName: "adam"}); err != nil {
 		t.Fatal(err)
 	}
 
