@@ -98,6 +98,9 @@ func RegisterStatusRoot(string) error { return errors.New("cloud sync roots are 
 // ShellSyncRootRegistered is always false off Windows: there is no Explorer.
 func ShellSyncRootRegistered(string) bool { return false }
 
+// ShellSyncRootNamespaceCLSID is always empty off Windows.
+func ShellSyncRootNamespaceCLSID(string) string { return "" }
+
 // IsPlaceholder is always false off Windows.
 func IsPlaceholder(string) (bool, error) { return false, nil }
 

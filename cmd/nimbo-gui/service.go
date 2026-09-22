@@ -3884,24 +3884,43 @@ func errString(err error) string {
 // SidebarSupported reports whether the Explorer sidebar entry is available.
 func (a *App) SidebarSupported() bool { return shellns.Supported() }
 
-// SidebarEnabled reports whether the Nimbo sidebar root is registered.
+// SidebarEnabled reports whether the Nimbo entry is in the Explorer navigation
+// pane.
 //
 // Answered from our own recorded choice, not the registry: a packaged build
 // reads HKCU through the MSIX container, which returns the package's private
-// copy rather than the keys Explorer actually uses. The registry is consulted
-// only when nothing has been recorded yet — a fresh install (nothing there) or
-// an entry left by an older unpackaged build (which is real, and ours).
-func (a *App) SidebarEnabled() bool { return sidebarWanted() }
+// copy rather than the keys Explorer actually uses. With nothing recorded, a
+// cloud sync root (on-demand mode) answers "on": Windows puts the root's own
+// node in the pane when the root is registered and it stays until we hide it,
+// so that is what the user is looking at. Otherwise the registry is consulted
+// for an entry left by an older unpackaged build (which is real, and ours).
+func (a *App) SidebarEnabled() bool { return a.sidebarWanted() }
 
-// sidebarWanted resolves the stored sidebar preference, falling back to the
-// registry the first time.
-func sidebarWanted() bool {
+func (a *App) sidebarWanted() bool {
+	recorded, _ := sidebarChoice()
+	cloudRoot := a.GetSyncMode() == "ondemand" || cfapi.ShellSyncRootRegistered(a.GetBaseDir())
+	return sidebarWantedFrom(recorded, cloudRoot, shellns.Enabled())
+}
+
+// sidebarWantedFrom is the rule behind SidebarEnabled: a recorded choice wins;
+// otherwise a cloud sync root's node is shown (Windows' default), and without
+// one only an entry already in the registry counts.
+func sidebarWantedFrom(recorded *bool, cloudRoot, legacyEntry bool) bool {
+	if recorded != nil {
+		return *recorded
+	}
+	return cloudRoot || legacyEntry
+}
+
+// sidebarChoice returns the recorded preference (nil when never chosen) and
+// the folder it was applied for.
+func sidebarChoice() (*bool, string) {
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil && s.SidebarEnabled != nil {
-			return *s.SidebarEnabled
+		if s, e := d.LoadSettings(); e == nil {
+			return s.SidebarEnabled, s.SidebarTarget
 		}
 	}
-	return shellns.Enabled()
+	return nil, ""
 }
 
 // sidebarSyncRoot is recorded as the sidebar's target when we deliberately have
@@ -3922,9 +3941,42 @@ func rememberSidebar(on bool, target string) {
 	})
 }
 
-// SetSidebar adds or removes the Nimbo root in the Explorer navigation
-// pane, pointing at the default sync location.
+// SetSidebar shows or hides the Nimbo entry in the Explorer navigation pane.
+//
+// Which entry depends on the folder. A cloud sync root (on-demand mode, or a
+// live folder with a status root) is given a node by Windows itself when the
+// root is registered, and that node is what the user sees: the choice is
+// applied to it through its pinned-to-tree flag, and any delegate-folder entry
+// of ours is dropped so there is never a second, identical-looking Nimbo beside
+// it (#574). Otherwise the entry is our own delegate folder, pointing at the
+// default sync location, added or removed as asked.
+//
+// Until this distinction the toggle only ever touched our own entry, which
+// beside a sync root was already stood down, so in on-demand mode it changed
+// nothing on screen whichever way it was set (issue #7).
 func (a *App) SetSidebar(on bool) string {
+	target := a.GetBaseDir()
+	if a.GetSyncMode() == "ondemand" || cfapi.ShellSyncRootRegistered(target) {
+		if err := shellns.Unregister(); err != nil {
+			return err.Error()
+		}
+		node := cfapi.ShellSyncRootNamespaceCLSID(target)
+		if node == "" {
+			if !on {
+				return "Explorer has no entry for the cloud folder yet, so there is nothing to hide. Try again once the folder shows in Explorer."
+			}
+			// Preference on, target recorded as the sentinel: if the folder later
+			// stops being a sync root, syncSidebar sees an unapplied target and
+			// puts our own entry back.
+			rememberSidebar(true, sidebarSyncRoot)
+			return ""
+		}
+		if err := shellns.SetCloudRootPinned(node, on); err != nil {
+			return err.Error()
+		}
+		rememberSidebar(on, sidebarSyncRoot)
+		return ""
+	}
 	if !on {
 		if err := shellns.Unregister(); err != nil {
 			return err.Error()
@@ -3932,20 +3984,8 @@ func (a *App) SetSidebar(on bool) string {
 		rememberSidebar(false, "")
 		return ""
 	}
-	target := a.GetBaseDir()
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		return err.Error()
-	}
-	if cfapi.ShellSyncRootRegistered(target) {
-		// Explorer already lists this folder under its cloud provider name. A
-		// delegate-folder entry on top of that is a second, identical-looking
-		// Nimbo in the navigation pane.
-		_ = shellns.Unregister()
-		// Preference on, target recorded as the sentinel: if the folder later
-		// stops being a sync root, syncSidebar sees an unapplied target and puts
-		// our own entry back.
-		rememberSidebar(true, sidebarSyncRoot)
-		return ""
 	}
 	icon, err := navIconPath()
 	if err != nil {
@@ -3958,16 +3998,25 @@ func (a *App) SetSidebar(on bool) string {
 	return ""
 }
 
-// syncSidebar re-points the Explorer entry at the current base dir when the user
-// has it on and it isn't already there. Called on startup and after a move.
+// syncSidebar makes the navigation pane match the user's choice for the current
+// base dir. Called on startup (after the mount — see start), after a mode
+// switch (which restarts through start) and after a folder move.
 //
-// The "isn't already there" test is against our own record, not the registry:
-// see SidebarEnabled. That record is also what repairs a stale entry — a build
-// that pre-dates it has no SidebarTarget, so the first launch rewrites the keys
-// once and fixes whatever an old unpackaged install left pointing at a folder
-// that no longer exists.
+// Beside a cloud sync root the node is Windows' own, created pinned into the
+// pane with every fresh registration (a first mount, a mode switch, a move, a
+// sign-in after "start fresh"), so a recorded "off" has to be re-applied here
+// or the entry comes back. A plain restart registers the same root again and
+// leaves the flag alone (checked on a real machine). Our own entry is dropped
+// there regardless — see below.
+//
+// For a plain live folder the entry is ours, (re)written when the user has it
+// on and the record says it is not yet applied for this folder. That record,
+// not the registry, is the test — see SidebarEnabled — and it is also what
+// repairs a stale entry: a build that pre-dates it has no SidebarTarget, so the
+// first launch rewrites the keys once and fixes whatever an old unpackaged
+// install left pointing at a folder that no longer exists.
 func (a *App) syncSidebar() {
-	if !shellns.Supported() || !sidebarWanted() {
+	if !shellns.Supported() {
 		return
 	}
 	target := a.GetBaseDir()
@@ -4000,13 +4049,20 @@ func (a *App) syncSidebar() {
 			return // leave the record alone so the next launch retries
 		}
 		slog.Info("removed the duplicate navigation-pane entry; the cloud sync root provides it", "dir", target)
-		rememberSidebar(true, sidebarSyncRoot)
+		recorded, _ := sidebarChoice()
+		if recorded == nil {
+			// Never chosen: Windows shows the node, and SidebarEnabled says so.
+			rememberSidebar(true, sidebarSyncRoot)
+			return
+		}
+		a.applyCloudRootChoice(target, *recorded)
 		return
 	}
-	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil && s.SidebarEnabled != nil && s.SidebarTarget == target {
-			return // already applied for this folder
-		}
+	if !a.sidebarWanted() {
+		return
+	}
+	if recorded, applied := sidebarChoice(); recorded != nil && applied == target {
+		return // already applied for this folder
 	}
 	icon, err := navIconPath()
 	if err != nil {
@@ -4018,6 +4074,35 @@ func (a *App) syncSidebar() {
 		return
 	}
 	rememberSidebar(true, target)
+}
+
+// applyCloudRootChoice hides or shows the node Windows supplies for target's
+// cloud sync root so that it matches want, then records the choice. The
+// out-of-container round trip is skipped when the node already agrees: that
+// key is only ever written outside the container (by Windows, or by our task),
+// so unlike our own entry's keys a read of it from inside is not shadowed by a
+// private copy. The node can lag the registration by a moment, so it is given
+// a short while to appear before the choice is left for the next launch.
+func (a *App) applyCloudRootChoice(target string, want bool) {
+	node := cfapi.ShellSyncRootNamespaceCLSID(target)
+	for i := 0; node == "" && i < 8; i++ {
+		time.Sleep(250 * time.Millisecond)
+		node = cfapi.ShellSyncRootNamespaceCLSID(target)
+	}
+	if node == "" {
+		slog.Warn("cloud sync root has no navigation-pane node to apply the sidebar choice to", "dir", target, "shown", want)
+		return
+	}
+	if pinned, ok := shellns.CloudRootPinned(node); ok && pinned == want {
+		rememberSidebar(want, sidebarSyncRoot)
+		return
+	}
+	if err := shellns.SetCloudRootPinned(node, want); err != nil {
+		slog.Warn("could not apply the sidebar choice to the cloud folder's entry", "dir", target, "shown", want, "err", err)
+		return
+	}
+	slog.Info("applied the sidebar choice to the cloud folder's navigation-pane entry", "dir", target, "shown", want)
+	rememberSidebar(want, sidebarSyncRoot)
 }
 
 // navIconPath writes the embedded app icon to the config dir and returns its
