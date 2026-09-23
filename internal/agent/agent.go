@@ -832,7 +832,7 @@ func (e *Engine) runLockLifetime(ctx context.Context) {
 	if !e.LockingAvailable() {
 		return
 	}
-	if n, err := e.lockMgr.sweep(ctx); n > 0 || err != nil {
+	if n, err := e.lockMgr.sweep(ctx, e.lockingEnabled() && !e.guardStateUnavailable()); n > 0 || err != nil {
 		slog.Info("swept locks left by a previous run", "released", n, "err", err)
 	}
 	if e.lockWarn != nil {
@@ -842,24 +842,44 @@ func (e *Engine) runLockLifetime(ctx context.Context) {
 	}
 	t := time.NewTicker(lockHeartbeat)
 	defer t.Stop()
+	tick := time.NewTicker(lockTick)
+	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			// Best effort on the way out, on a fresh context: ctx is already dead,
 			// and a lock we fail to release here lasts forever.
-			if e.lockWarn != nil {
-				e.lockWarn.closeAll() // never leave a user unable to edit their own file
-			}
 			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-			if n, err := e.lockMgr.releaseAll(rctx); n > 0 || err != nil {
+			if n, err := e.ReleaseLocksForExit(rctx); n > 0 || err != nil {
 				slog.Info("released locks on shutdown", "released", n, "err", err)
 			}
 			cancel()
 			return
 		case <-t.C:
 			e.lockMgr.heartbeat(ctx)
+		case <-tick.C:
+			e.lockMgr.tick(ctx)
 		}
 	}
+}
+
+// ReleaseLocksForExit gives back everything this account holds, for a process
+// about to exit: the lockout lets go of colleagues' files (handles and owner
+// files) and every lock we took is UNLOCKed. It returns how many locks went.
+//
+// The GUI calls it when app.Run returns — the tray Quit, an in-app update and
+// Windows ending the session all come through there, and none of them cancel
+// the engine, so before this nothing was released until the next start, and a
+// default Nextcloud never expires a lock (Deck #722). Whatever misses ctx's
+// deadline stays recorded for the startup sweep.
+func (e *Engine) ReleaseLocksForExit(ctx context.Context) (int, error) {
+	if e.lockWarn != nil {
+		e.lockWarn.closeAll() // never leave a user unable to edit their own file
+	}
+	if e.lockMgr == nil {
+		return 0, nil
+	}
+	return e.lockMgr.releaseAllForExit(ctx)
 }
 
 // heldStatus is the flyout line for a pass that finished with nothing to do.

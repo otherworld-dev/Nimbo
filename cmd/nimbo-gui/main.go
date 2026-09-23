@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -234,6 +235,8 @@ func main() {
 	// session). A log that stops without this line died another way: see
 	// crash.log, or it was killed.
 	slog.Info("exiting", "err", err)
+	// Give back file locks first: nothing on the server would ever expire them.
+	svc.releaseLocksOnExit(5 * time.Second)
 	// Disconnect WITHOUT unregistering: unregistering makes Windows strip the
 	// cloud state from the whole tree, which is how every app update used to
 	// flatten the mount (placeholders reverted to plain files on each restart).

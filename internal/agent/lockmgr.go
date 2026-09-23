@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -37,14 +39,25 @@ type lockMgr struct {
 
 	mu   sync.Mutex
 	held map[string]config.HeldLock // remote path -> our lock
-	now  func() time.Time           // injectable for tests
+	// releasing marks a held path whose UNLOCK failed: the document was
+	// closed, so the heartbeat must not LOCK it again, and tick retries the
+	// UNLOCK (Deck #722). In memory only; the record on disk is what the
+	// startup sweep uses if the process dies first.
+	releasing map[string]bool
+	// notes are locks given back at exit while their document was still
+	// open (config.HeldLock.Released): persisted so the next start can lock
+	// them again. Never refreshed or released; the sweep consumes them.
+	notes map[string]config.HeldLock
+	now   func() time.Time // injectable for tests
 }
 
 func newLockMgr(cl locker, dirs config.Dirs, account string) *lockMgr {
 	return &lockMgr{
 		cl: cl, dirs: dirs, account: account,
-		held: map[string]config.HeldLock{},
-		now:  time.Now,
+		held:      map[string]config.HeldLock{},
+		releasing: map[string]bool{},
+		notes:     map[string]config.HeldLock{},
+		now:       time.Now,
 	}
 }
 
@@ -61,6 +74,11 @@ func (m *lockMgr) persistLocked() {
 	for _, l := range m.held {
 		out = append(out, l)
 	}
+	for p, l := range m.notes {
+		if _, held := m.held[p]; !held {
+			out = append(out, l)
+		}
+	}
 	if err := m.dirs.SaveHeldLocks(out); err != nil {
 		// Not fatal: the lock is still real and we still hold it in memory, so
 		// this run will release it normally. Only a crash would now strand it.
@@ -75,13 +93,22 @@ func (m *lockMgr) persistLocked() {
 // answers 412 — harmless. The other order would leave a real lock with no
 // record, which nothing could ever clean up.
 func (m *lockMgr) take(ctx context.Context, remotePath string) error {
+	return m.takeFor(ctx, remotePath, "")
+}
+
+// takeFor is take, recording the editor lock file whose appearing caused it
+// (empty for a lock taken any other way), so tick can release the lock once
+// that file is gone even if the close event never arrived.
+func (m *lockMgr) takeFor(ctx context.Context, remotePath, lockFile string) error {
 	m.mu.Lock()
 	if _, already := m.held[remotePath]; already {
+		// Opened again: a release still pending from the last close is off.
+		delete(m.releasing, remotePath)
 		m.mu.Unlock()
 		return m.refreshOne(ctx, remotePath)
 	}
 	m.held[remotePath] = config.HeldLock{
-		Account: m.account, RemotePath: remotePath, Taken: m.now(),
+		Account: m.account, RemotePath: remotePath, Taken: m.now(), LockFile: lockFile,
 	}
 	m.persistLocked()
 	m.mu.Unlock()
@@ -133,10 +160,17 @@ func (m *lockMgr) release(ctx context.Context, remotePath string) error {
 		return nil
 	}
 	if err := m.cl.Unlock(ctx, remotePath); err != nil {
-		slog.Warn("could not release a lock; will retry on the next sweep", "path", remotePath, "err", err)
+		// Keep the record, but as one being released: the heartbeat must not
+		// LOCK it again, and tick retries (Deck #722). The startup sweep
+		// still covers a process that dies first.
+		m.mu.Lock()
+		m.releasing[remotePath] = true
+		m.mu.Unlock()
+		slog.Warn("could not release a lock; retrying shortly", "path", remotePath, "err", err)
 		return err
 	}
 	m.mu.Lock()
+	delete(m.releasing, remotePath)
 	delete(m.held, remotePath)
 	m.persistLocked()
 	m.mu.Unlock()
@@ -175,7 +209,9 @@ func (m *lockMgr) heartbeat(ctx context.Context) {
 	m.mu.Lock()
 	paths := make([]string, 0, len(m.held))
 	for p := range m.held {
-		paths = append(paths, p)
+		if !m.releasing[p] { // closed; tick is releasing it, never re-lock
+			paths = append(paths, p)
+		}
 	}
 	m.mu.Unlock()
 
@@ -190,11 +226,48 @@ func (m *lockMgr) heartbeat(ctx context.Context) {
 				slog.Warn("a lock we held is now someone else's; forgetting it", "path", p)
 				m.mu.Lock()
 				delete(m.held, p)
+				delete(m.releasing, p)
 				m.persistLocked()
 				m.mu.Unlock()
 				continue
 			}
 			slog.Warn("lock heartbeat failed", "path", p, "err", err)
+		}
+	}
+}
+
+// lockTick is how often tick runs: retries a failed UNLOCK, and notices a
+// document closed without the event reaching us. Far shorter than the
+// heartbeat, because a colleague is waiting on exactly these.
+const lockTick = 30 * time.Second
+
+// tick releases every held lock that should no longer be held (Deck #722):
+// one whose UNLOCK failed earlier, and one whose editor lock file has gone,
+// which means the document was closed even if that event was lost (a watcher
+// overflow drops a batch's paths; the guard-state gate returns before the
+// release). A lock with no recorded lock file was taken some other way and is
+// left alone.
+func (m *lockMgr) tick(ctx context.Context) {
+	m.mu.Lock()
+	var due []string
+	for p, l := range m.held {
+		if m.releasing[p] {
+			due = append(due, p)
+			continue
+		}
+		if l.LockFile != "" {
+			if _, err := os.Lstat(l.LockFile); errors.Is(err, fs.ErrNotExist) {
+				due = append(due, p)
+			}
+		}
+	}
+	m.mu.Unlock()
+	for _, p := range due {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := m.release(ctx, p); err == nil {
+			slog.Info("released a lock whose document is closed", "path", p)
 		}
 	}
 }
@@ -205,7 +278,54 @@ func (m *lockMgr) heartbeat(ctx context.Context) {
 // to other accounts are left untouched. A 412 from the server means the lock is
 // already gone, which Unlock treats as success — so re-sweeping is silent rather
 // than logging a failure on every boot.
-func (m *lockMgr) sweep(ctx context.Context) (int, error) {
+// releaseAllForExit is releaseAll for a process about to exit, leaving a note
+// for each lock whose document is still open (its editor lock file is still
+// there), so the next start can lock it again: an in-app update or a quit
+// with a document open must not leave it free for good (Deck #722).
+func (m *lockMgr) releaseAllForExit(ctx context.Context) (int, error) {
+	m.mu.Lock()
+	var open []config.HeldLock
+	for _, l := range m.held {
+		if editorFileOpen(l.LockFile) {
+			open = append(open, l)
+		}
+	}
+	m.mu.Unlock()
+	n, err := m.releaseAll(ctx)
+	m.mu.Lock()
+	for _, l := range open {
+		if _, still := m.held[l.RemotePath]; still {
+			continue // not released; its record already covers the next start
+		}
+		l.Released, l.Token = true, ""
+		m.notes[l.RemotePath] = l
+	}
+	if len(open) > 0 {
+		m.persistLocked()
+	}
+	m.mu.Unlock()
+	return n, err
+}
+
+// editorFileOpen reports whether an editor lock file is still there, i.e. its
+// document is still open. "" (a lock taken without one) is never open.
+func editorFileOpen(lockFile string) bool {
+	if lockFile == "" {
+		return false
+	}
+	_, err := os.Lstat(lockFile)
+	return err == nil
+}
+
+// sweep deals with what a PREVIOUS run left in the registry, at startup.
+//
+// A lock whose document is still open is wanted, when reacquire allows locking
+// (the setting is on and the guard state is readable): a note left at exit is
+// locked again, and a crashed run's lock, still on the server, is simply kept
+// for the heartbeat to refresh. Anything else is let go: a note is dropped
+// (its lock was already released) and a leftover lock is UNLOCKed; one that
+// cannot be is marked releasing, for tick to retry, never re-locked.
+func (m *lockMgr) sweep(ctx context.Context, reacquire bool) (int, error) {
 	onDisk, _ := m.dirs.LoadHeldLocks()
 	var mine, others []config.HeldLock
 	for _, l := range onDisk {
@@ -221,8 +341,19 @@ func (m *lockMgr) sweep(ctx context.Context) (int, error) {
 
 	n := 0
 	var firstErr error
-	var stuck []config.HeldLock
+	var stuck, keep, relock []config.HeldLock
 	for _, l := range mine {
+		if reacquire && editorFileOpen(l.LockFile) {
+			if l.Released {
+				relock = append(relock, l)
+			} else {
+				keep = append(keep, l)
+			}
+			continue
+		}
+		if l.Released {
+			continue // the lock went at exit and the document has closed since
+		}
 		if err := m.cl.Unlock(ctx, l.RemotePath); err != nil {
 			slog.Warn("could not release a lock left by a previous run",
 				"path", l.RemotePath, "err", err)
@@ -241,10 +372,23 @@ func (m *lockMgr) sweep(ctx context.Context) (int, error) {
 	m.mu.Lock()
 	for _, l := range stuck {
 		m.held[l.RemotePath] = l
+		m.releasing[l.RemotePath] = true // tick retries; the heartbeat must not re-lock
+	}
+	for _, l := range keep {
+		m.held[l.RemotePath] = l
+		slog.Info("kept a lock from a previous run: its document is still open", "path", l.RemotePath)
 	}
 	_ = others // preserved by persistLocked, which re-reads the file
 	m.persistLocked()
 	m.mu.Unlock()
+
+	for _, l := range relock {
+		if err := m.takeFor(ctx, l.RemotePath, l.LockFile); err != nil {
+			slog.Warn("could not lock again a document still open from before", "path", l.RemotePath, "err", err)
+			continue
+		}
+		slog.Info("locked again a document still open from before", "path", l.RemotePath)
+	}
 	return n, firstErr
 }
 
@@ -331,7 +475,7 @@ func (e *Engine) handleEditorLockFiles(ctx context.Context, p Pair, changed []st
 			if e.lockMgr.holds(remote) {
 				continue
 			}
-			if err := e.TakeLock(ctx, remote); err != nil {
+			if err := e.lockMgr.takeFor(ctx, remote, abs); err != nil {
 				if transport.IsLocked(err) {
 					// Somebody got there first. Entirely normal contention — the
 					// warning half of the feature has already told the user.
