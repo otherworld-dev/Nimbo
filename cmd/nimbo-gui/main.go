@@ -182,9 +182,9 @@ func main() {
 	})
 	tray := app.SystemTray.New()
 	tray.SetIcon(trayIcon("idle", 0, false))
-	// The icon had no tooltip, so hovering it showed nothing. The name in the
-	// taskbar settings comes from the exe's version resource (versioninfo.rc,
-	// GitHub #9).
+	// The icon had no tooltip, so hovering it showed nothing. Every later icon
+	// change has to put it back (setTrayIcon). The name in the taskbar settings
+	// comes from the exe's version resource instead (versioninfo.rc, GitHub #9).
 	tray.SetTooltip(brand.Current.Name)
 	tray.AttachWindow(flyout)
 	svc.tray = tray

@@ -2068,14 +2068,24 @@ func (a *App) animateTray() {
 			}
 			if state == "sync" {
 				frame++
-				a.tray.SetIcon(trayIcon("sync", frame, badge))
+				a.setTrayIcon(trayIcon("sync", frame, badge))
 				last = key
 			} else if key != last {
-				a.tray.SetIcon(trayIcon(state, 0, badge))
+				a.setTrayIcon(trayIcon(state, 0, badge))
 				last = key
 			}
 		}
 	}
+}
+
+// setTrayIcon changes the tray icon and puts its tooltip back. Wails changes
+// the icon with a NIM_MODIFY carrying only NIF_ICON, and under
+// NOTIFYICON_VERSION_4 an update without NIF_SHOWTIP hides the standard
+// tooltip again, so the name set at startup was gone the first time the icon
+// changed, a moment after launch (GitHub #9).
+func (a *App) setTrayIcon(icon []byte) {
+	a.tray.SetIcon(icon)
+	a.tray.SetTooltip(brand.Current.Name)
 }
 
 // busyStatusWords are the status-text fragments that mean "the engine is
