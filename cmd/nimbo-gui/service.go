@@ -87,6 +87,9 @@ type App struct {
 	// between registering the sync root and starting the write-back watcher —
 	// the watcher must never see adopt's local mutations as user actions.
 	pendingAdopt  *adoptPending
+	// mountRefused is why the last account-folder mount was refused (it overlaps
+	// another account's folder), so a mode switch can say so; "" otherwise.
+	mountRefused string
 	preMountAdopt *adoptPending
 	// adoptScanDirs is the live directory count of an in-flight adopt scan
 	// (0 = none), surfaced via Diagnostics so the scanning overlay has a moving
@@ -410,17 +413,30 @@ func (a *App) mountSecondaryOnDemand(eng *agent.Engine) {
 			}
 		}
 	}
-	others := foldersOtherThan(eng.Account.ID)
-	if root == "" {
-		root = eng.StoredBaseDir()
+	// Its own folder, but only one it has already mounted: in "choose" mode the
+	// account folder is the PARENT of its live folders, and mounting that would
+	// lay placeholders over them.
+	if stored := eng.StoredBaseDir(); root == "" && stored != "" && cfapi.ShellSyncRootRegistered(stored) {
+		root = stored
 	}
 	if root == "" {
-		root = suggestAccountFolder(filepath.Dir(a.GetBaseDir()), eng.Account.LoginName, others)
+		// A fresh folder, never one that already holds files: nobody chose it,
+		// and whatever is in it would be taken for this account's own files.
+		home, _ := os.UserHomeDir()
+		var claimed []accountFolder
+		if d, st, ok := accountsAndDirs(); ok {
+			claimed = otherAccountFolders(d, st, eng.Account.ID)
+		}
+		root = suggestAccountFolder(home, eng.Account.LoginName, claimed, missingOrEmpty)
+		if root == "" {
+			a.warnNoFolder(eng)
+			return
+		}
 		if err := eng.AddSyncPair(root, ""); err != nil {
 			slog.Warn("secondary on-demand: could not record account root", "account", eng.Account.LoginName, "err", err)
 		}
 	}
-	if msg := folderClash(root, others); msg != "" {
+	if msg := a.syncClashFor(eng.Account.ID, root); msg != "" {
 		a.warnFolderClash(eng, root, msg)
 		return
 	}
@@ -926,6 +942,9 @@ func (a *App) SetSyncMode(mode string) string {
 			return "Virtual files aren't supported on this system."
 		}
 		if _, ok := a.onDemandMounts[a.GetBaseDir()]; !ok {
+			if a.mountRefused != "" {
+				return a.mountRefused
+			}
 			return "Couldn't take over the folder for virtual files. If another sync app (like the official Nextcloud client or OneDrive) is still syncing this folder, sign out of it or uninstall it first, then switch again."
 		}
 	}
@@ -1015,7 +1034,7 @@ func (a *App) clearLivePairs() {
 	// Remember what we're clearing so switching back to live restores the
 	// user's folder setup instead of silently forgetting it (bit Adam twice).
 	if len(pairs) > 0 {
-		if err := a.eng.SetRememberedPairs(pairs); err != nil {
+		if err := a.eng.ParkPairs(pairs); err != nil {
 			slog.Warn("could not remember the live folder setup", "err", err)
 		}
 	}
@@ -1066,9 +1085,26 @@ func (a *App) mountAccountOnDemand() {
 	if _, already := a.onDemandMounts[dir]; already {
 		return
 	}
-	// Never mount a folder another account uses: both would then own one
-	// sync root and see each other's files as their own (GitHub #11).
-	if msg := a.folderClashFor(dir); msg != "" {
+	a.mountRefused = ""
+	if a.eng.StoredBaseDir() == "" {
+		// No folder chosen yet (a legacy account, or one not set up): only a
+		// fresh, empty folder is mounted without the user choosing it.
+		home, _ := os.UserHomeDir()
+		var claimed []accountFolder
+		if d, st, ok := accountsAndDirs(); ok {
+			claimed = otherAccountFolders(d, st, a.eng.Account.ID)
+		}
+		dir = suggestAccountFolder(home, a.eng.Account.LoginName, claimed, missingOrEmpty)
+		if dir == "" {
+			a.mountRefused = "There is no free, empty folder to use for this account. Choose a folder for it in Settings."
+			a.warnNoFolder(a.eng)
+			return
+		}
+	}
+	// Never mount a folder another account is syncing: both would then own
+	// one folder and see each other's files as their own (GitHub #11).
+	if msg := a.syncClashFor(a.eng.Account.ID, dir); msg != "" {
+		a.mountRefused = msg
 		a.warnFolderClash(a.eng, dir, msg)
 		return
 	}
@@ -4578,6 +4614,17 @@ func (a *App) RemoveAccount(id string) string {
 		return err.Error()
 	}
 	a.clearSyncData(d.WithAccount(id), id)
+	// Folders held back because the removed account used them too can sync
+	// again: re-ask the gate now rather than at the next start. Live mode only;
+	// in on-demand mode an account's pairs must never get live watchers.
+	if a.GetSyncMode() != "ondemand" {
+		if a.eng != nil {
+			_ = a.eng.ReloadPairs()
+		}
+		for _, se := range a.secondaries {
+			_ = se.eng.ReloadPairs()
+		}
+	}
 	a.emit("account")
 	return ""
 }
@@ -5221,6 +5268,9 @@ type PairDTO struct {
 	FreezeReason string `json:"freezeReason,omitempty"`
 	// FreezeSample is a few affected paths, so the user can judge the trip.
 	FreezeSample []string `json:"freezeSample,omitempty"`
+	// HeldReason says why this folder is not syncing because another account
+	// uses it (GitHub #11); "" when it syncs normally.
+	HeldReason string `json:"heldReason,omitempty"`
 }
 
 // GetPairs returns configured sync pairs.
@@ -5232,7 +5282,7 @@ func (a *App) GetPairs() []PairDTO {
 	views := a.eng.FrozenViews()
 	out := make([]PairDTO, 0, len(pairs))
 	for _, p := range pairs {
-		d := PairDTO{LocalDir: p.LocalDir, RemoteRoot: p.RemoteRoot, Excludes: p.Excludes}
+		d := PairDTO{LocalDir: p.LocalDir, RemoteRoot: p.RemoteRoot, Excludes: p.Excludes, HeldReason: a.eng.HeldReason(p.LocalDir)}
 		if v, ok := views[p.LocalDir]; ok {
 			d.Frozen = v.Frozen
 			d.FreezeReason = v.FreezeReason

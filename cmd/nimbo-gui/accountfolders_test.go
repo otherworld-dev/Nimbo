@@ -70,17 +70,76 @@ func TestOtherAccountFoldersReadsEveryOtherAccount(t *testing.T) {
 // A new account is offered a folder of its own, never one another account uses.
 func TestSuggestAccountFolderAvoidsOtherAccounts(t *testing.T) {
 	home := `C:\Users\x`
-	if got := suggestAccountFolder(home, "bob", nil); got != filepath.Join(home, "Nextcloud") {
+	if got := suggestAccountFolder(home, "bob", nil, nil); got != filepath.Join(home, "Nextcloud") {
 		t.Fatalf("first account: %q", got)
 	}
 	others := []accountFolder{{Account: "amy", Dir: filepath.Join(home, "Nextcloud")}}
 	want := filepath.Join(home, brand.Current.Name+" - bob")
-	if got := suggestAccountFolder(home, "bob", others); got != want {
+	if got := suggestAccountFolder(home, "bob", others, nil); got != want {
 		t.Fatalf("second account: %q, want %q", got, want)
 	}
 	others = append(others, accountFolder{Account: "old bob", Dir: want})
-	if got := suggestAccountFolder(home, "bob", others); got != want+" (2)" {
+	if got := suggestAccountFolder(home, "bob", others, nil); got != want+" (2)" {
 		t.Fatalf("both taken: %q", got)
+	}
+}
+
+// When another account's folder contains the home folder (a drive root, the
+// home folder itself) nothing under it is free. The search must give up rather
+// than loop forever, which hung start-up.
+func TestSuggestAccountFolderGivesUpWhenNothingIsFree(t *testing.T) {
+	for _, taken := range []string{`C:\Users\x`, `C:\`} {
+		others := []accountFolder{{Account: "amy", Dir: taken}}
+		if got := suggestAccountFolder(`C:\Users\x`, "bob", others, nil); got != "" {
+			t.Fatalf("%s taken: got %q, want no suggestion", taken, got)
+		}
+	}
+}
+
+// A folder that will be mounted without the user choosing it must be missing
+// or empty, never a folder that already holds someone's files.
+func TestSuggestAccountFolderSkipsUnusableCandidates(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "Nextcloud", "old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := suggestAccountFolder(home, "bob", nil, missingOrEmpty)
+	if want := filepath.Join(home, brand.Current.Name+" - bob"); got != want {
+		t.Fatalf("got %q, want %q (Nextcloud holds files)", got, want)
+	}
+}
+
+// What another account is actually SYNCING is what can collide at run time:
+// its live pairs in live mode, its mounted root in on-demand mode. Parked pairs
+// and a "choose"-mode parent folder sync nothing and must not hold anything back
+// (they did, and two accounts then blocked each other for good).
+func TestActiveAccountFoldersCountsOnlyWhatSyncs(t *testing.T) {
+	d := config.Dirs{Config: t.TempDir(), Data: t.TempDir()}
+	st := account.Store{Accounts: []account.Account{
+		{ID: "a", ServerURL: "https://one.example.com", LoginName: "amy"},
+		{ID: "b", ServerURL: "https://two.example.com", LoginName: "bob"},
+	}}
+	b := d.WithAccount("b")
+	_ = b.SavePairs([]config.SyncPair{{LocalDir: `C:\B\Photos`, RemoteRoot: "Photos"}})
+	_ = b.UpdateAccountState(func(s *config.AccountState) {
+		s.BaseDir = `C:\B`
+		s.RememberedPairs = []config.SyncPair{{LocalDir: `C:\Parked`, RemoteRoot: "P"}}
+	})
+
+	dirs := func(fs []accountFolder) map[string]bool {
+		m := map[string]bool{}
+		for _, f := range fs {
+			m[f.Dir] = true
+		}
+		return m
+	}
+	live := dirs(activeAccountFolders(d, st, "a", "live"))
+	if !live[`C:\B\Photos`] || live[`C:\B`] || live[`C:\Parked`] {
+		t.Fatalf("live mode: %v", live)
+	}
+	od := dirs(activeAccountFolders(d, st, "a", "ondemand"))
+	if !od[`C:\B`] || od[`C:\B\Photos`] || od[`C:\Parked`] {
+		t.Fatalf("on-demand mode: %v", od)
 	}
 }
 

@@ -1,12 +1,12 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/otherworld/nimbo/internal/account"
 	"github.com/otherworld/nimbo/internal/agent"
@@ -18,8 +18,22 @@ import (
 // Each account needs a folder of its own. GitHub #11: a second account was
 // offered the first account's folder, and nothing stopped two accounts syncing
 // the same folder against two servers, where each would upload the other's
-// files. Every place that sets an account's folder checks it against the
-// folders of all the other accounts first.
+// files.
+//
+// Two different questions are asked, against two different lists:
+//
+//   - Choosing a folder (setup, adding, moving, changing the account folder)
+//     is checked against everything another account has CLAIMED: its account
+//     folder, its sync folders and the ones parked while on-demand mode is on,
+//     so a choice can't collide with a folder that will come back later.
+//   - Syncing a folder is checked only against what another account is
+//     actually SYNCING at the time: its live folders in live mode, its mounted
+//     root in on-demand mode. A parked folder or a "choose"-mode parent syncs
+//     nothing, and counting those let two accounts block each other for good.
+//
+// A folder that fails the second check is not moved or parked: it is gated in
+// the engine (Engine.SetPairGate), stays in the account's setup, and resumes
+// by itself once the other account has moved away.
 
 // accountFolder is a folder in use by an account, labelled for messages.
 type accountFolder struct {
@@ -36,23 +50,32 @@ func accountLabel(acc account.Account) string {
 	return acc.LoginName + " on " + host
 }
 
-// otherAccountFolders lists every folder used by an account other than
+// folderList collects labelled folders without repeats.
+type folderList struct {
+	out  []accountFolder
+	seen map[string]bool
+}
+
+func (l *folderList) add(label, dir string) {
+	if dir == "" {
+		return
+	}
+	dir = filepath.Clean(dir)
+	if l.seen == nil {
+		l.seen = map[string]bool{}
+	}
+	if l.seen[label+"\x00"+dir] {
+		return
+	}
+	l.seen[label+"\x00"+dir] = true
+	l.out = append(l.out, accountFolder{Account: label, Dir: dir})
+}
+
+// otherAccountFolders lists every folder CLAIMED by an account other than
 // exclude: its account folder, its sync pairs, and the pairs parked while
 // on-demand mode is on (they come back when it is switched off).
 func otherAccountFolders(d config.Dirs, st account.Store, exclude string) []accountFolder {
-	var out []accountFolder
-	seen := map[string]bool{}
-	add := func(label, dir string) {
-		if dir == "" {
-			return
-		}
-		dir = filepath.Clean(dir)
-		if seen[label+"\x00"+dir] {
-			return
-		}
-		seen[label+"\x00"+dir] = true
-		out = append(out, accountFolder{Account: label, Dir: dir})
-	}
+	var l folderList
 	for _, acc := range st.Accounts {
 		if acc.ID == exclude {
 			continue
@@ -60,18 +83,53 @@ func otherAccountFolders(d config.Dirs, st account.Store, exclude string) []acco
 		ad := d.WithAccount(acc.ID)
 		label := accountLabel(acc)
 		if s, err := ad.LoadAccountState(); err == nil {
-			add(label, s.BaseDir)
+			l.add(label, s.BaseDir)
 			for _, p := range s.RememberedPairs {
-				add(label, p.LocalDir)
+				l.add(label, p.LocalDir)
 			}
 		}
 		if pairs, err := ad.LoadPairs(); err == nil {
 			for _, p := range pairs {
-				add(label, p.LocalDir)
+				l.add(label, p.LocalDir)
 			}
 		}
 	}
-	return out
+	return l.out
+}
+
+// activeAccountFolders lists the folders accounts other than exclude are
+// SYNCING in the given mode: their live pairs in live mode; in on-demand mode
+// the root each mounts (its whole-account pair, else its account folder).
+func activeAccountFolders(d config.Dirs, st account.Store, exclude, mode string) []accountFolder {
+	var l folderList
+	for _, acc := range st.Accounts {
+		if acc.ID == exclude {
+			continue
+		}
+		ad := d.WithAccount(acc.ID)
+		label := accountLabel(acc)
+		pairs, _ := ad.LoadPairs()
+		if mode != "ondemand" {
+			for _, p := range pairs {
+				l.add(label, p.LocalDir)
+			}
+			continue
+		}
+		root := ""
+		for _, p := range pairs {
+			if strings.Trim(p.RemoteRoot, "/") == "" {
+				root = p.LocalDir
+				break
+			}
+		}
+		if root == "" {
+			if s, err := ad.LoadAccountState(); err == nil {
+				root = s.BaseDir
+			}
+		}
+		l.add(label, root)
+	}
+	return l.out
 }
 
 // folderClash returns a message if dir is, sits inside, or contains a folder
@@ -87,23 +145,59 @@ func folderClash(dir string, others []accountFolder) string {
 	return ""
 }
 
+// suggestAttempts bounds the numbered candidates suggestAccountFolder tries.
+// When another account's folder contains home, every candidate clashes, and an
+// unbounded search hung start-up.
+const suggestAttempts = 50
+
 // suggestAccountFolder picks a default folder for an account: ~/Nextcloud when
-// no other account uses it, otherwise "<brand> - <login>" in the home folder,
-// numbered if that is taken too.
-func suggestAccountFolder(home, login string, others []accountFolder) string {
-	free := func(dir string) bool { return folderClash(dir, others) == "" }
-	if dir := filepath.Join(home, "Nextcloud"); free(dir) {
+// no other account uses it, otherwise "<brand> - <login>" in home, numbered if
+// that is taken too. usable (nil = any) can reject a candidate, e.g. one that
+// already holds files when the folder will be mounted without the user
+// choosing it. Returns "" when nothing suitable is found.
+func suggestAccountFolder(home, login string, others []accountFolder, usable func(string) bool) string {
+	ok := func(dir string) bool {
+		return folderClash(dir, others) == "" && (usable == nil || usable(dir))
+	}
+	if dir := filepath.Join(home, "Nextcloud"); ok(dir) {
 		return dir
 	}
-	base := filepath.Join(home, brand.Current.Name+" - "+login)
-	if free(base) {
+	name := brand.Current.Name
+	if login != "" {
+		name += " - " + login
+	}
+	base := filepath.Join(home, name)
+	if ok(base) {
 		return base
 	}
-	for n := 2; ; n++ {
-		if dir := fmt.Sprintf("%s (%d)", base, n); free(dir) {
+	for n := 2; n < suggestAttempts; n++ {
+		if dir := fmt.Sprintf("%s (%d)", base, n); ok(dir) {
 			return dir
 		}
 	}
+	return ""
+}
+
+// missingOrEmpty accepts a folder that doesn't exist yet or holds nothing.
+func missingOrEmpty(dir string) bool {
+	fi, err := os.Stat(dir)
+	if os.IsNotExist(err) {
+		return true
+	}
+	return err == nil && fi.IsDir() && folderEmpty(dir)
+}
+
+// accountsAndDirs loads the account store and config dirs, or reports false.
+func accountsAndDirs() (config.Dirs, account.Store, bool) {
+	d, err := config.Resolve()
+	if err != nil {
+		return config.Dirs{}, account.Store{}, false
+	}
+	st, err := account.LoadStore(d.AccountsFile())
+	if err != nil {
+		return config.Dirs{}, account.Store{}, false
+	}
+	return d, *st, true
 }
 
 // activeAccountID is the account whose folder is being set: the running
@@ -118,76 +212,88 @@ func (a *App) activeAccountID(st account.Store) string {
 	return ""
 }
 
-// otherFolders lists the folders used by every account except the active one.
-func (a *App) otherFolders() []accountFolder {
-	d, err := config.Resolve()
-	if err != nil {
-		return nil
-	}
-	st, err := account.LoadStore(d.AccountsFile())
-	if err != nil {
-		return nil
-	}
-	return otherAccountFolders(d, *st, a.activeAccountID(*st))
-}
-
-// folderClashFor checks dir against every other account's folders.
+// folderClashFor checks a folder the user is CHOOSING for the active account
+// against everything the other accounts have claimed.
 func (a *App) folderClashFor(dir string) string {
-	return folderClash(dir, a.otherFolders())
+	d, st, ok := accountsAndDirs()
+	if !ok {
+		return ""
+	}
+	return folderClash(dir, otherAccountFolders(d, st, a.activeAccountID(st)))
 }
 
-// foldersOtherThan lists the folders used by every account except accountID.
-func foldersOtherThan(accountID string) []accountFolder {
-	d, err := config.Resolve()
-	if err != nil {
-		return nil
+// syncClashFor checks a folder an account is about to SYNC or mount against
+// what the other accounts are syncing right now.
+func (a *App) syncClashFor(accountID, dir string) string {
+	d, st, ok := accountsAndDirs()
+	if !ok {
+		return ""
 	}
-	st, err := account.LoadStore(d.AccountsFile())
-	if err != nil {
-		return nil
-	}
-	return otherAccountFolders(d, *st, accountID)
+	return folderClash(dir, activeAccountFolders(d, st, accountID, a.GetSyncMode()))
 }
 
 // prepareLivePairs readies an account's live sync pairs before its engine
-// runs. A pair that overlaps another account's folder is parked rather than
-// synced: an install already in the #11 state has two accounts on one folder,
-// and each would upload the other's files. Parked pairs that no longer overlap
-// come back. The user is told once per start what was held back and why.
+// runs: pairs parked by an earlier on-demand spell come back, and a folder
+// another account is syncing is gated rather than synced (the #11 state, where
+// each account would upload the other's files). The gate is asked again
+// whenever watchers start, so a held folder resumes once the other account has
+// moved away. Returns the pairs to run.
 func (a *App) prepareLivePairs(eng *agent.Engine) []config.SyncPair {
-	others := foldersOtherThan(eng.Account.ID)
-	held := eng.HoldBackPairs(func(dir string) bool { return folderClash(dir, others) != "" })
-	eng.RestoreRememberedPairs(func(dir string) error {
-		if msg := folderClash(dir, others); msg != "" {
-			return errors.New(msg)
-		}
-		return nil
-	})
-	if len(held) > 0 {
-		a.warnFolderClash(eng, held[0].LocalDir, folderClash(held[0].LocalDir, others))
-	}
+	id := eng.Account.ID
+	eng.SetPairGate(func(dir string) string { return a.syncClashFor(id, dir) })
+	eng.RestoreRememberedPairs()
 	pairs, _ := eng.Pairs()
-	return pairs
+	var run []config.SyncPair
+	for _, p := range pairs {
+		if why := eng.HeldReason(p.LocalDir); why != "" {
+			a.warnFolderClash(eng, p.LocalDir, why)
+			continue
+		}
+		run = append(run, p)
+	}
+	return run
 }
 
-// warnFolderClash reports a folder that was not synced or mounted because
-// another account uses it: in the log always, and as a toast.
+// warnFolderClash reports a folder that is not synced or mounted because
+// another account uses it. It runs on every start while the clash lasts, so
+// the user is not left with a folder that has silently stopped.
 func (a *App) warnFolderClash(eng *agent.Engine, dir, why string) {
 	slog.Warn("not syncing a folder another account uses", "account", eng.Account.LoginName, "dir", dir, "why", why)
+	a.toastAccount(fmt.Sprintf(
+		"Not syncing %s for %s: another account uses the same folder. Choose a different folder for one of them in Settings.",
+		dir, accountLabel(eng.Account)))
+}
+
+// warnNoFolder reports an account that could not be given a folder to mount
+// because no free, empty one was found.
+func (a *App) warnNoFolder(eng *agent.Engine) {
+	slog.Warn("no free, empty folder to mount for an account", "account", eng.Account.LoginName)
+	a.toastAccount(fmt.Sprintf("%s has no folder yet. Choose a folder for it in Settings.", accountLabel(eng.Account)))
+}
+
+func (a *App) toastAccount(msg string) {
 	if a.NotificationsEnabled() {
-		notify.Toast(brand.Current.Name, fmt.Sprintf(
-			"Not syncing %s for %s: another account uses the same folder. Choose a different folder for one of them in Settings.",
-			dir, accountLabel(eng.Account)), "")
+		notify.Toast(brand.Current.Name, msg, "")
 	}
 }
 
-// suggestedFolder is the default folder to offer the active account when it
-// has none of its own yet.
+// suggestedFolder is the default folder to show the active account when it
+// has none of its own yet. It never returns "", so the UI always has a path to
+// show; if nothing is free it falls back to ~/Nextcloud, which every place that
+// actually uses a folder checks before doing so.
 func (a *App) suggestedFolder() string {
 	home, _ := os.UserHomeDir()
 	login := ""
 	if a.eng != nil {
 		login = a.eng.Account.LoginName
 	}
-	return suggestAccountFolder(home, login, a.otherFolders())
+	d, st, ok := accountsAndDirs()
+	var others []accountFolder
+	if ok {
+		others = otherAccountFolders(d, st, a.activeAccountID(st))
+	}
+	if dir := suggestAccountFolder(home, login, others, nil); dir != "" {
+		return dir
+	}
+	return filepath.Join(home, "Nextcloud")
 }

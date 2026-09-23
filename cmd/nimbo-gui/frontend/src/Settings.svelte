@@ -26,6 +26,7 @@
     localDir: string; remoteRoot: string; excludes: string[];
     frozen?: boolean;
     freezeReason?: string; freezeSample?: string[];
+    heldReason?: string; // not syncing: another account uses this folder (#11)
   };
 
   type SettingsTab = "folders" | "sync" | "exclusions" | "appearance" | "general";
@@ -262,7 +263,14 @@
     clearTimeout(savedTimer);
     savedTimer = setTimeout(() => (savedFlash = ""), 1500);
   }
-  const saveBase = () => { App.SetBaseDir(baseDir.trim()); flashSaved("base"); };
+  // SetBaseDir refuses (with its own dialog) a folder another account uses, so
+  // read the folder back rather than assuming it was saved.
+  const saveBase = async () => {
+    const want = baseDir.trim();
+    await App.SetBaseDir(want);
+    baseDir = await App.GetBaseDir();
+    if (baseDir === want) flashSaved("base");
+  };
 
   // Bandwidth
   let up_ = $state(0), down_ = $state(0);
@@ -1020,6 +1028,19 @@
           <p class="empty">No folders synced yet. Click “Add folder” to choose one.</p>
         {:else}
           {#each pairs as p}
+            {#if p.heldReason}
+              <!-- Another account syncs this folder too (GitHub #11). It is
+                   held back so neither account uploads the other's files, and
+                   resumes once one of them uses a different folder. -->
+              <div class="freeze">
+                <div class="freezehead">⚠ Not syncing — another account uses this folder</div>
+                <p class="freezewhy">{p.heldReason}</p>
+                <p class="freezewhat">
+                  Nothing in <b>{localName(p.localDir)}</b> was changed. Give one of the accounts a
+                  different folder (remove this one and add it again elsewhere) and syncing resumes.
+                </p>
+              </div>
+            {/if}
             {#if p.frozen}
               <!-- The damage guard stopped this folder: a pass looked like the
                    server losing files rather than the user changing them.

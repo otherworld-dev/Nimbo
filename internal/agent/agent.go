@@ -68,6 +68,8 @@ type Engine struct {
 	// means the state could not be READ — distinct from an empty set, which
 	// means "nothing is frozen". See guardStateUnavailable.
 	guard atomic.Pointer[config.GuardStates]
+	// pairGate holds folders back from syncing (see SetPairGate).
+	pairGate atomic.Pointer[func(localDir string) string]
 
 	mu            sync.Mutex
 	paused        bool          // indefinite manual pause
@@ -277,7 +279,13 @@ func NewEngineFor(ctx context.Context, accountID string) (*Engine, error) {
 	// The account folder used to be global and was always written by the active
 	// account, so on upgrade it belongs to the default one (GitHub #11).
 	if def, ok := st.Default(); ok && def.ID == acc.ID {
-		d.MigrateAccountFolder()
+		var others []string
+		for _, o := range st.Accounts {
+			if o.ID != acc.ID {
+				others = append(others, o.ID)
+			}
+		}
+		d.MigrateAccountFolder(others)
 	}
 	secret, err := account.LoadSecret(acc.ID)
 	if err != nil {
@@ -1559,10 +1567,22 @@ func (e *Engine) SetBaseDir(dir string) error {
 	return e.dirs.UpdateAccountState(func(s *config.AccountState) { s.BaseDir = dir })
 }
 
-// SetRememberedPairs parks this account's live sync pairs while on-demand mode
-// is on, so switching back to live can restore them.
-func (e *Engine) SetRememberedPairs(pairs []config.SyncPair) error {
-	return e.dirs.UpdateAccountState(func(s *config.AccountState) { s.RememberedPairs = pairs })
+// ParkPairs adds pairs to this account's parked list (live pairs set aside
+// while on-demand mode is on), merged with what is already parked so nothing
+// parked earlier is lost. A pair already parked is not added twice.
+func (e *Engine) ParkPairs(pairs []config.SyncPair) error {
+	return e.dirs.UpdateAccountState(func(s *config.AccountState) {
+		have := make(map[string]bool, len(s.RememberedPairs))
+		for _, p := range s.RememberedPairs {
+			have[PairKey(p.LocalDir, p.RemoteRoot)] = true
+		}
+		for _, p := range pairs {
+			if k := PairKey(p.LocalDir, p.RemoteRoot); !have[k] {
+				have[k] = true
+				s.RememberedPairs = append(s.RememberedPairs, p)
+			}
+		}
+	})
 }
 
 // TakeRememberedPairs returns this account's parked pairs and clears them in
@@ -1576,34 +1596,28 @@ func (e *Engine) TakeRememberedPairs() []config.SyncPair {
 }
 
 // RestoreRememberedPairs turns this account's parked pairs back into live
-// pairs and returns the ones restored. allow (nil = allow all) can refuse a
-// pair, which then stays parked: a parked folder that overlaps another
-// account's must not come back, but its setup must not be lost either. A
-// whole-account pair also becomes the account folder. Safe before Run:
-// watchers start with it.
-func (e *Engine) RestoreRememberedPairs(allow func(localDir string) error) []config.SyncPair {
-	var restored, refused []config.SyncPair
-	defer func() {
-		if len(refused) == 0 {
-			return
-		}
-		if err := e.dirs.UpdateAccountState(func(s *config.AccountState) {
-			s.RememberedPairs = append(s.RememberedPairs, refused...)
-		}); err != nil {
-			slog.Warn("could not keep the refused sync folders parked", "err", err)
-		}
-	}()
+// pairs, excludes included, and returns the ones restored. A whole-account pair
+// also becomes the account folder. A pair that can't be added right now (its
+// folder can't be created, the state store is busy) stays parked rather than
+// being lost; one whose remote or local folder another pair already syncs is
+// obsolete and is dropped. Safe before Run: watchers start with it.
+func (e *Engine) RestoreRememberedPairs() []config.SyncPair {
+	var restored, keep []config.SyncPair
 	for _, p := range e.TakeRememberedPairs() {
-		if allow != nil {
-			if err := allow(p.LocalDir); err != nil {
-				slog.Warn("keeping a parked sync folder parked", "local", p.LocalDir, "err", err)
-				refused = append(refused, p)
-				continue
-			}
-		}
 		if err := e.AddSyncPair(p.LocalDir, p.RemoteRoot); err != nil {
-			slog.Warn("could not restore a parked sync folder", "local", p.LocalDir, "err", err)
+			if errors.Is(err, errRemoteSynced) || errors.Is(err, errLocalUsed) {
+				slog.Info("dropping a parked sync folder that is already synced", "local", p.LocalDir, "err", err)
+			} else {
+				slog.Warn("could not restore a parked sync folder, keeping it parked", "local", p.LocalDir, "err", err)
+				keep = append(keep, p)
+			}
 			continue
+		}
+		if len(p.Excludes) > 0 {
+			ex := append([]string(nil), p.Excludes...)
+			if err := e.editPairExcludes(filepath.Clean(p.LocalDir), func([]string) []string { return ex }); err != nil {
+				slog.Warn("could not restore a parked folder's excluded subfolders", "local", p.LocalDir, "err", err)
+			}
 		}
 		if strings.Trim(p.RemoteRoot, "/") == "" {
 			if err := e.SetBaseDir(p.LocalDir); err != nil {
@@ -1613,38 +1627,40 @@ func (e *Engine) RestoreRememberedPairs(allow func(localDir string) error) []con
 		slog.Info("restored a parked sync folder", "local", p.LocalDir)
 		restored = append(restored, p)
 	}
+	if len(keep) > 0 {
+		if err := e.ParkPairs(keep); err != nil {
+			slog.Warn("could not keep the unrestored sync folders parked", "err", err)
+		}
+	}
 	return restored
 }
 
-// HoldBackPairs parks every pair whose local folder hold selects: the pair
-// stops syncing (its files are kept) and joins the parked list, so the setup
-// comes back through RestoreRememberedPairs once hold no longer selects it.
-// Used for a folder that overlaps another account's (GitHub #11), where
-// syncing it would upload that account's files. Returns the pairs parked.
-func (e *Engine) HoldBackPairs(hold func(localDir string) bool) []config.SyncPair {
-	pairs, err := e.dirs.LoadPairs()
-	if err != nil {
-		return nil
+// SetPairGate installs a check that can hold a folder back from syncing: it
+// returns why the folder must not sync, or "". The app uses it for a folder
+// another account also uses (GitHub #11), where each account would upload the
+// other's files. It is asked whenever watchers start (Run, ReloadPairs), so a
+// held folder resumes by itself once the reason is gone.
+func (e *Engine) SetPairGate(gate func(localDir string) string) { e.pairGate.Store(&gate) }
+
+// HeldReason returns why localDir is being held back from syncing, or "".
+func (e *Engine) HeldReason(localDir string) string {
+	if g := e.pairGate.Load(); g != nil && *g != nil {
+		return (*g)(localDir)
 	}
-	var held []config.SyncPair
+	return ""
+}
+
+// syncablePairs drops the pairs the gate holds back, logging each one.
+func (e *Engine) syncablePairs(pairs []Pair) []Pair {
+	out := make([]Pair, 0, len(pairs))
 	for _, p := range pairs {
-		if !hold(p.LocalDir) {
+		if why := e.HeldReason(p.LocalDir); why != "" {
+			slog.Warn("sync folder held back", "dir", p.LocalDir, "why", why)
 			continue
 		}
-		if err := e.RemoveSyncFolder(p.RemoteRoot, false); err != nil {
-			slog.Warn("could not hold back an overlapping sync folder", "local", p.LocalDir, "err", err)
-			continue
-		}
-		held = append(held, p)
+		out = append(out, p)
 	}
-	if len(held) > 0 {
-		if err := e.dirs.UpdateAccountState(func(s *config.AccountState) {
-			s.RememberedPairs = append(s.RememberedPairs, held...)
-		}); err != nil {
-			slog.Warn("could not park the held-back sync folders", "err", err)
-		}
-	}
-	return held
+	return out
 }
 
 // RememberedPairs returns this account's parked pairs without clearing them.
@@ -1689,6 +1705,13 @@ func (e *Engine) AddSyncFolder(remoteRoot string) error {
 	return e.ReloadPairs()
 }
 
+// AddSyncPair's refusals when another pair already syncs that remote or local
+// folder (a restore treats either as "this parked pair is obsolete").
+var (
+	errRemoteSynced = errors.New("that remote folder is already synced")
+	errLocalUsed    = errors.New("that local folder is already used by another sync")
+)
+
 // AddSyncPair starts syncing a remote folder to an explicit local directory
 // (rather than the default <BaseDir>/<path>), enabling multiple sync
 // connections that target different locations. The local directory is created
@@ -1712,10 +1735,10 @@ func (e *Engine) AddSyncPair(localDir, remoteRoot string) error {
 			return nil
 		}
 		if strings.Trim(p.RemoteRoot, "/") == remoteRoot {
-			return fmt.Errorf("that remote folder is already synced")
+			return errRemoteSynced
 		}
 		if filepath.Clean(p.LocalDir) == localDir {
-			return fmt.Errorf("that local folder is already used by another sync")
+			return errLocalUsed
 		}
 	}
 	if err := os.MkdirAll(localDir, 0o755); err != nil {
@@ -4760,7 +4783,7 @@ func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transf
 	}
 	e.status("Up to date")
 
-	for _, p := range pairs {
+	for _, p := range e.syncablePairs(pairs) {
 		e.startWatcher(p)
 	}
 	go e.watchPause(ctx)      // resume/pause at timed expiry and schedule boundaries
@@ -4846,6 +4869,14 @@ func (e *Engine) ReloadPairs() error {
 	desired := make(map[string]Pair, len(pairs))
 	for _, p := range pairs {
 		desired[PairKey(p.LocalDir, p.RemoteRoot)] = Pair{LocalDir: p.LocalDir, RemoteRoot: p.RemoteRoot, Excludes: p.Excludes}
+	}
+	// A held-back folder gets no watcher, and loses one it already has (the
+	// gate may have started holding it since Run).
+	for key, p := range desired {
+		if why := e.HeldReason(p.LocalDir); why != "" {
+			slog.Warn("sync folder held back", "dir", p.LocalDir, "why", why)
+			delete(desired, key)
+		}
 	}
 
 	e.watchMu.Lock()

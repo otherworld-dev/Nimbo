@@ -31,6 +31,11 @@ func (a *App) MoveSyncFolder(oldLocal, newLocal string) string {
 	if msg := a.folderClashFor(newLocal); msg != "" {
 		return msg
 	}
+	// Moving a folder another account also uses would carry that account's
+	// files away with it (GitHub #11). Re-adding it elsewhere is safe.
+	if msg := a.folderClashFor(oldLocal); msg != "" {
+		return "This folder is also used by another account, so moving it would take that account's files with it. Remove it here and add it again in a new folder instead."
+	}
 	// v1: on-demand (virtual files) folders need cloud-files sync-root
 	// re-registration, which isn't handled yet.
 	if _, ok := a.onDemandMountFor(oldLocal); ok {

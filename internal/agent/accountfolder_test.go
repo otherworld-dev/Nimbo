@@ -1,7 +1,7 @@
 package agent
 
 import (
-	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -38,7 +38,7 @@ func TestRememberedPairsArePerAccountAndTakenOnce(t *testing.T) {
 	b := &Engine{dirs: root.WithAccount("b")}
 	parked := []config.SyncPair{{LocalDir: `C:\Users\x\Nextcloud`, RemoteRoot: ""}}
 
-	if err := a.SetRememberedPairs(parked); err != nil {
+	if err := a.ParkPairs(parked); err != nil {
 		t.Fatal(err)
 	}
 	if got := b.TakeRememberedPairs(); len(got) != 0 {
@@ -52,68 +52,91 @@ func TestRememberedPairsArePerAccountAndTakenOnce(t *testing.T) {
 	}
 }
 
-// Parked pairs come back as real pairs, a whole-account one sets the account
-// folder, and a pair the caller refuses (it would overlap another account's
-// folder) stays parked rather than recreating the overlap or being lost.
+// Parking merges with what is already parked (a pair parked earlier must not
+// be lost when more are parked), without duplicating a pair.
+func TestParkPairsMergesWithoutDuplicates(t *testing.T) {
+	root := config.Dirs{Config: t.TempDir(), Data: t.TempDir()}
+	e := &Engine{dirs: root.WithAccount("a")}
+	x := config.SyncPair{LocalDir: `C:\X`, RemoteRoot: "X"}
+	y := config.SyncPair{LocalDir: `C:\Y`, RemoteRoot: "Y"}
+
+	if err := e.ParkPairs([]config.SyncPair{x}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ParkPairs([]config.SyncPair{y, x}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.RememberedPairs(); len(got) != 2 {
+		t.Fatalf("parked = %v, want x and y once each", got)
+	}
+}
+
+// Parked pairs come back as real pairs with their excludes, and a whole-account
+// one sets the account folder. A pair that can't be added right now (its
+// folder can't be created) stays parked instead of being lost; one whose remote
+// folder is already synced elsewhere is obsolete and is dropped.
 func TestRestoreRememberedPairsBringsBackTheParkedSetup(t *testing.T) {
 	e, _ := newHookEngine(t, "http://127.0.0.1:1")
 	whole := config.SyncPair{LocalDir: filepath.Join(t.TempDir(), "acct"), RemoteRoot: ""}
-	docs := config.SyncPair{LocalDir: filepath.Join(t.TempDir(), "docs"), RemoteRoot: "Docs"}
-	clash := config.SyncPair{LocalDir: filepath.Join(t.TempDir(), "clash"), RemoteRoot: "Clash"}
-	if err := e.SetRememberedPairs([]config.SyncPair{whole, docs, clash}); err != nil {
+	docs := config.SyncPair{LocalDir: filepath.Join(t.TempDir(), "docs"), RemoteRoot: "Docs", Excludes: []string{"Docs/Old"}}
+	blocker := filepath.Join(t.TempDir(), "a-file")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stuck := config.SyncPair{LocalDir: filepath.Join(blocker, "sub"), RemoteRoot: "Stuck"}
+	dupe := config.SyncPair{LocalDir: filepath.Join(t.TempDir(), "dupe"), RemoteRoot: "Docs"}
+	if err := e.ParkPairs([]config.SyncPair{whole, docs, stuck, dupe}); err != nil {
 		t.Fatal(err)
 	}
 
-	got := e.RestoreRememberedPairs(func(local string) error {
-		if local == clash.LocalDir {
-			return errors.New("used by another account")
-		}
-		return nil
-	})
+	got := e.RestoreRememberedPairs()
 
 	if len(got) != 2 {
-		t.Fatalf("restored %v, want the two allowed pairs", got)
+		t.Fatalf("restored %v, want whole and docs", got)
 	}
 	pairs, err := e.Pairs()
 	if err != nil {
 		t.Fatal(err)
 	}
-	have := map[string]bool{}
-	for _, p := range pairs {
-		have[p.LocalDir] = true
+	var docsNow *config.SyncPair
+	for i := range pairs {
+		if pairs[i].LocalDir == docs.LocalDir {
+			docsNow = &pairs[i]
+		}
 	}
-	if !have[whole.LocalDir] || !have[docs.LocalDir] || have[clash.LocalDir] {
-		t.Fatalf("pairs after restore = %v", pairs)
+	if docsNow == nil || len(docsNow.Excludes) != 1 || docsNow.Excludes[0] != "Docs/Old" {
+		t.Fatalf("docs restored without its excludes: %+v", pairs)
 	}
 	if e.StoredBaseDir() != whole.LocalDir {
 		t.Fatalf("account folder = %q, want the whole-account pair %q", e.StoredBaseDir(), whole.LocalDir)
 	}
-	if left := e.TakeRememberedPairs(); len(left) != 1 || left[0].LocalDir != clash.LocalDir {
-		t.Fatalf("parked after restore = %v, want only the refused pair", left)
+	left := e.RememberedPairs()
+	if len(left) != 1 || left[0].LocalDir != stuck.LocalDir {
+		t.Fatalf("parked after restore = %v, want only the pair that couldn't be added", left)
 	}
 }
 
-// An install already in the #11 state has a pair overlapping another account's
-// folder. It is parked (not synced, setup kept) until the overlap is gone.
-func TestHoldBackPairsParksTheOverlappingFolders(t *testing.T) {
-	e, _ := newHookEngine(t, "http://127.0.0.1:1")
-	shared := config.SyncPair{LocalDir: filepath.Join(t.TempDir(), "shared"), RemoteRoot: ""}
-	mine := config.SyncPair{LocalDir: filepath.Join(t.TempDir(), "mine"), RemoteRoot: "Mine"}
-	if err := e.dirs.SavePairs([]config.SyncPair{shared, mine}); err != nil {
-		t.Fatal(err)
+// A folder another account also uses must not sync (each account would upload
+// the other's files). The gate decides per folder, at the time, so the folder
+// resumes on its own once the other account has moved away.
+func TestPairGateHoldsBackGatedFolders(t *testing.T) {
+	e := &Engine{}
+	pairs := []Pair{{LocalDir: `C:\Shared`}, {LocalDir: `C:\Mine`, RemoteRoot: "Mine"}}
+	if got := e.syncablePairs(pairs); len(got) != 2 {
+		t.Fatalf("no gate set: %v", got)
 	}
-
-	held := e.HoldBackPairs(func(local string) bool { return local == shared.LocalDir })
-
-	if len(held) != 1 || held[0].LocalDir != shared.LocalDir {
-		t.Fatalf("held = %v", held)
+	e.SetPairGate(func(dir string) string {
+		if dir == `C:\Shared` {
+			return "used by another account"
+		}
+		return ""
+	})
+	got := e.syncablePairs(pairs)
+	if len(got) != 1 || got[0].LocalDir != `C:\Mine` {
+		t.Fatalf("gated = %v", got)
 	}
-	pairs, _ := e.Pairs()
-	if len(pairs) != 1 || pairs[0].LocalDir != mine.LocalDir {
-		t.Fatalf("pairs left = %v", pairs)
-	}
-	if parked := e.RememberedPairs(); len(parked) != 1 || parked[0].LocalDir != shared.LocalDir {
-		t.Fatalf("parked = %v", parked)
+	if why := e.HeldReason(`C:\Shared`); why != "used by another account" {
+		t.Fatalf("HeldReason = %q", why)
 	}
 }
 
@@ -129,7 +152,7 @@ func TestGuardSweepKeepsThisAccountsParkedFolder(t *testing.T) {
 	if err := e.dirs.SavePairs([]config.SyncPair{live}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.SetRememberedPairs([]config.SyncPair{parked}); err != nil {
+	if err := e.ParkPairs([]config.SyncPair{parked}); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.dirs.UpdateGuardState(func(g config.GuardStates) {

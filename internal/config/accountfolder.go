@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // AccountState is the folder setup that belongs to ONE account: where its
@@ -73,10 +74,13 @@ func (d Dirs) UpdateAccountState(mutate func(*AccountState)) error {
 
 // MigrateAccountFolder moves the folder setup out of the global settings file
 // into this account's own, then clears the global copy so no other account can
-// inherit it. Call it for the DEFAULT account only: the global value was always
-// written by whichever account was active, so on upgrade it belongs to that one.
+// inherit it. Call it for the DEFAULT account only, with the IDs of the other
+// accounts: the global value was written by whichever account last ran setup,
+// usually but not always the default one. A folder that holds another
+// account's sync folders and none of this account's belongs to that other
+// account, so it is not claimed here (this account then picks a folder later).
 // An account that already has its own folder keeps it. A no-op when unscoped.
-func (d Dirs) MigrateAccountFolder() {
+func (d Dirs) MigrateAccountFolder(others []string) {
 	if d.acct == "" {
 		return
 	}
@@ -84,9 +88,13 @@ func (d Dirs) MigrateAccountFolder() {
 		if g.BaseDir == "" && len(g.RememberedPairs) == 0 {
 			return
 		}
+		base := g.BaseDir
+		if base != "" && !d.ownsFolder(base) && anyOverlaps(base, others, d) {
+			base = ""
+		}
 		err := d.UpdateAccountState(func(s *AccountState) {
 			if s.BaseDir == "" {
-				s.BaseDir = g.BaseDir
+				s.BaseDir = base
 			}
 			if len(s.RememberedPairs) == 0 {
 				s.RememberedPairs = g.RememberedPairs
@@ -98,4 +106,64 @@ func (d Dirs) MigrateAccountFolder() {
 		g.BaseDir = ""
 		g.RememberedPairs = nil
 	})
+}
+
+// ownsFolder reports whether any of this account's sync folders (live or,
+// from the legacy global list, parked) is dir or overlaps it.
+func (d Dirs) ownsFolder(dir string) bool {
+	for _, p := range d.pairDirs(true) {
+		if overlaps(dir, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyOverlaps reports whether dir overlaps a sync folder of one of the given
+// accounts (their live and parked pairs).
+func anyOverlaps(dir string, accounts []string, d Dirs) bool {
+	for _, id := range accounts {
+		for _, p := range d.WithAccount(id).pairDirs(false) {
+			if overlaps(dir, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// pairDirs lists this account's live and parked pair folders; withLegacy also
+// counts the legacy global parked list, which the default account inherits.
+func (d Dirs) pairDirs(withLegacy bool) []string {
+	var out []string
+	if pairs, err := d.LoadPairs(); err == nil {
+		for _, p := range pairs {
+			out = append(out, p.LocalDir)
+		}
+	}
+	if s, err := d.LoadAccountState(); err == nil {
+		for _, p := range s.RememberedPairs {
+			out = append(out, p.LocalDir)
+		}
+	}
+	if withLegacy {
+		if g, err := d.LoadSettings(); err == nil {
+			for _, p := range g.RememberedPairs {
+				out = append(out, p.LocalDir)
+			}
+		}
+	}
+	return out
+}
+
+// overlaps reports whether a and b are the same folder or one is inside the
+// other (case-insensitive on Windows, as filepath.Rel is).
+func overlaps(a, b string) bool { return within(a, b) || within(b, a) }
+
+func within(p, dir string) bool {
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(p))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }

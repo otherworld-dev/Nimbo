@@ -62,8 +62,8 @@ func TestMigrateAccountFolderMovesTheGlobalFolderOnce(t *testing.T) {
 	}
 	a, b := root.WithAccount("a"), root.WithAccount("b")
 
-	a.MigrateAccountFolder()
-	b.MigrateAccountFolder() // nothing left to take
+	a.MigrateAccountFolder([]string{"b"})
+	b.MigrateAccountFolder([]string{"a"}) // nothing left to take
 
 	sa, _ := a.LoadAccountState()
 	sb, _ := b.LoadAccountState()
@@ -90,7 +90,7 @@ func TestMigrateAccountFolderKeepsAnExistingAccountFolder(t *testing.T) {
 	_ = a.UpdateAccountState(func(s *AccountState) { s.BaseDir = `D:\Mine` })
 	_ = root.SaveSettings(Settings{BaseDir: `C:\Users\x\Nextcloud`})
 
-	a.MigrateAccountFolder()
+	a.MigrateAccountFolder(nil)
 
 	sa, _ := a.LoadAccountState()
 	if sa.BaseDir != `D:\Mine` {
@@ -98,5 +98,42 @@ func TestMigrateAccountFolderKeepsAnExistingAccountFolder(t *testing.T) {
 	}
 	if g, _ := root.LoadSettings(); g.BaseDir != "" {
 		t.Fatalf("global folder not cleared: %q", g.BaseDir)
+	}
+}
+
+// The global folder was written by whichever account last ran setup, which is
+// not always the default one. A folder holding another account's sync folders
+// (and none of the default account's) belongs to that other account, so the
+// default account must not claim it; it gets no folder and picks one later.
+func TestMigrateAccountFolderSkipsAnotherAccountsFolder(t *testing.T) {
+	root := Dirs{Config: t.TempDir(), Data: t.TempDir()}
+	_ = root.SaveSettings(Settings{BaseDir: `D:\B`})
+	a, b := root.WithAccount("a"), root.WithAccount("b")
+	_ = a.SavePairs([]SyncPair{{LocalDir: `C:\Users\x\Nextcloud\Photos`, RemoteRoot: "Photos"}})
+	_ = b.SavePairs([]SyncPair{{LocalDir: `D:\B\Work`, RemoteRoot: "Work"}})
+
+	a.MigrateAccountFolder([]string{"b"})
+
+	if sa, _ := a.LoadAccountState(); sa.BaseDir != "" {
+		t.Fatalf("default account claimed another account's folder: %q", sa.BaseDir)
+	}
+	if g, _ := root.LoadSettings(); g.BaseDir != "" {
+		t.Fatalf("global folder not cleared: %q", g.BaseDir)
+	}
+}
+
+// The default account's own folder still migrates when the other accounts'
+// folders are elsewhere.
+func TestMigrateAccountFolderKeepsTheDefaultsOwnFolder(t *testing.T) {
+	root := Dirs{Config: t.TempDir(), Data: t.TempDir()}
+	_ = root.SaveSettings(Settings{BaseDir: `C:\Users\x\Nextcloud`})
+	a, b := root.WithAccount("a"), root.WithAccount("b")
+	_ = a.SavePairs([]SyncPair{{LocalDir: `C:\Users\x\Nextcloud`, RemoteRoot: ""}})
+	_ = b.SavePairs([]SyncPair{{LocalDir: `D:\B`, RemoteRoot: ""}})
+
+	a.MigrateAccountFolder([]string{"b"})
+
+	if sa, _ := a.LoadAccountState(); sa.BaseDir != `C:\Users\x\Nextcloud` {
+		t.Fatalf("default account lost its folder: %q", sa.BaseDir)
 	}
 }
