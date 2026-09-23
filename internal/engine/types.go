@@ -27,6 +27,7 @@ type RemoteState struct {
 	Size         int64
 	SHA1         string    // content SHA1 from oc:checksums, when the server provides it
 	LastModified time.Time // server mtime; populated where needed (e.g. takeover adoption)
+	UploadTime   int64     // nc:upload_time (unix seconds), 0 = not reported; see ContentKey
 	ReadOnly     bool      // server marks this not-writable (oc:permissions) -> mirror as a local read-only attribute
 	// MountRoot marks the top of a share received from someone else, or of an
 	// external-storage / group-folder mount: the one node whose disappearance
@@ -65,7 +66,20 @@ type BaselineState struct {
 	LocalSize       int64
 	LocalMTimeNanos int64
 	ContentSHA1     string // SHA1 of the content at last sync; enables move detection
-	MountRoot       bool   // it was the root of a received share or a mount (see RemoteState.MountRoot)
+	// ContentKey is the server version's content key at last sync
+	// (transport.ContentKey), "" when unknown. It lets the diff tell a
+	// files_lock ETag bump from an edit on files with no checksum.
+	ContentKey string
+	MountRoot  bool // it was the root of a received share or a mount (see RemoteState.MountRoot)
+}
+
+// ContentKey is the listed version's content key ("" for a directory or when
+// the server did not report an upload time); see transport.ContentKey.
+func (r RemoteState) ContentKey() string {
+	if r.IsDir {
+		return ""
+	}
+	return transport.ContentKey(r.Size, r.LastModified, r.UploadTime)
 }
 
 // ActionKind enumerates the reconciliation operations the diff can emit.

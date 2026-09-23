@@ -214,6 +214,7 @@ func RemoteScan(ctx context.Context, c PropFinder, root string, opts ScanOpts) (
 				FileID:       e.FileID,
 				Size:         e.Size,
 				LastModified: e.LastModified,
+				UploadTime:   e.UploadTime,
 				SHA1:         parseChecksumSHA1(e.Checksums),
 				ReadOnly:     e.ServerReadOnly(),
 				MountRoot:    e.OnMount() && it.onMountKnown && !it.onMount,

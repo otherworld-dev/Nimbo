@@ -20,15 +20,16 @@ func IsDehydrated(os.FileInfo) bool { return false }
 // PlaceholderInfo mirrors the Windows type so cross-platform code referencing it
 // (e.g. the vfs stub) compiles.
 type PlaceholderInfo struct {
-	Name      string
-	Size      int64
-	IsDir     bool
-	ModTime   time.Time
-	Identity  []byte
-	ETag      string
-	FileID    string
-	MountRoot bool
-	Encrypted bool
+	Name       string
+	Size       int64
+	IsDir      bool
+	ModTime    time.Time
+	Identity   []byte
+	ETag       string
+	UploadTime int64
+	FileID     string
+	MountRoot  bool
+	Encrypted  bool
 }
 
 // Debug is a diagnostic hook (used on Windows); unused here.

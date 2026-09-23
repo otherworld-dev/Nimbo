@@ -83,6 +83,16 @@ type Ops struct {
 	// Down-sync uses it to detect server-side edits reliably (any content change
 	// alters the ETag), rather than relying only on the size/mtime heuristic.
 	Baseline func(remotePath string) (string, bool)
+	// RecordContent / Content keep the content-version key
+	// (transport.ContentKey) of the server version a placeholder mirrors,
+	// alongside its ETag baseline. A new ETag with the same key is a
+	// metadata-only bump — files_lock changes the ETag on every lock and
+	// unlock — not an edit. "" = unknown, and then the ETag alone decides.
+	// RecordContent takes a batch (one store write per directory, like
+	// RecordBaselines); an empty key clears that path's entry, so a key never
+	// outlives the version it was recorded for. Nil disables it.
+	RecordContent func(keyByRemotePath map[string]string)
+	Content       func(remotePath string) string
 	// ForgetBaseline drops the recorded ETag for a remote path the server no
 	// longer holds under that name (the source of a MOVE). Nil disables it.
 	ForgetBaseline func(remotePath string)
@@ -1184,6 +1194,45 @@ func (w *Watcher) recordBaseline(remotePath, etag string) {
 	}
 }
 
+// contentKey is r's content-version key: "" for a directory, or when the
+// server did not report an upload time (transport.ContentKey).
+func contentKey(r cfapi.PlaceholderInfo) string {
+	if r.IsDir {
+		return ""
+	}
+	return transport.ContentKey(r.Size, r.ModTime, r.UploadTime)
+}
+
+// recordContents notes the content-version key of the server version each
+// placeholder now mirrors, in one write; "" clears a path's key.
+func (w *Watcher) recordContents(rs ...cfapi.PlaceholderInfo) {
+	if w.ops.RecordContent == nil || len(rs) == 0 {
+		return
+	}
+	m := make(map[string]string, len(rs))
+	for _, r := range rs {
+		if !r.IsDir && len(r.Identity) > 0 {
+			m[string(r.Identity)] = contentKey(r)
+		}
+	}
+	if len(m) > 0 {
+		w.ops.RecordContent(m)
+	}
+}
+
+// sameVersionAsBaseline reports whether the server still holds the very
+// version the placeholder was last synced to, although its ETag moved on: the
+// recorded content key matches the listing's. That is a metadata-only bump —
+// files_lock changes the ETag on every lock and unlock (GitHub #7) — and must
+// not be treated as an edit. False whenever either key is unknown.
+func (w *Watcher) sameVersionAsBaseline(r cfapi.PlaceholderInfo) bool {
+	if w.ops.Content == nil {
+		return false
+	}
+	k := contentKey(r)
+	return k != "" && k == w.ops.Content(string(r.Identity))
+}
+
 // baselineFor returns the recorded ETag for a remote path (used for both file
 // change detection and the directory-subtree skip).
 func (w *Watcher) baselineFor(remotePath string) (string, bool) {
@@ -1249,6 +1298,10 @@ func (w *Watcher) moveBaseline(srcRemote, dstRemote string) {
 	if base, ok := w.baselineFor(srcRemote); ok && base != "" {
 		w.recordBaseline(dstRemote, base)
 	}
+	// The content key travels too (an empty one clears whatever dst had).
+	if w.ops.Content != nil && w.ops.RecordContent != nil {
+		w.ops.RecordContent(map[string]string{dstRemote: w.ops.Content(srcRemote), srcRemote: ""})
+	}
 	if w.ops.ForgetBaseline != nil {
 		w.ops.ForgetBaseline(srcRemote)
 	}
@@ -1302,6 +1355,7 @@ func (w *Watcher) pullRename(localDir, oldFull string, y cfapi.PlaceholderInfo, 
 		}
 	}
 	w.recordBaseline(string(y.Identity), y.ETag)
+	w.recordContents(y)
 	w.recordFileID(string(y.Identity), fileid)
 	w.dropFileID(oldRemote)
 	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(y.Identity))
@@ -2915,6 +2969,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 												}
 											}
 											w.recordBaselines(kbase)
+											w.recordContents(remoteKids...)
 										}
 									}
 									if merr := cfMarkInSync(full, r.Identity); merr != nil {
@@ -3043,9 +3098,16 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		// in-sync (clean), refresh it so a previously-downloaded file isn't stale.
 		// (A dirty local copy is a pending upload / potential conflict — left alone.)
 		if w.remoteChanged(r, fi, string(r.Identity)) {
-			// Same inspect as the rescue above (it is a metadata OPEN now for
-			// anything not in sync, so it is not re-run per branch).
-			if ierr == nil && !ch.NeedsUpload {
+			if w.sameVersionAsBaseline(r) {
+				// Only the ETag moved (a colleague's lock, a tag): keep the
+				// local copy and follow the new ETag. (An edited file never
+				// gets here; its upload makes the same check, see
+				// serverEditedSince.)
+				w.recordBaseline(string(r.Identity), r.ETag)
+				w.ops.Log("vfs %s: server ETag changed but not its content (a lock or other metadata); kept the local copy", w.remoteFor(full))
+			} else if ierr == nil && !ch.NeedsUpload {
+				// Same inspect as the rescue above (it is a metadata OPEN now for
+				// anything not in sync, so it is not re-run per branch).
 				// VERIFY_IN_SYNC closes the race between that inspect and the
 				// refresh: an edit landing in between fails the update (and we
 				// skip) instead of being dehydrated away.
@@ -3058,6 +3120,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 					w.ops.Log("vfs refreshed %s (server changed)", w.remoteFor(full))
 					w.report("download", w.remoteFor(full), nil)
 					w.recordBaseline(string(r.Identity), r.ETag) // now mirrors the new server version
+					w.recordContents(r)
 				}
 			}
 		}
@@ -3119,6 +3182,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 				w.report("download", w.localName(string(r.Identity)), nil) // new server files in the activity feed, by their user-visible name
 			}
 			w.recordBaselines(base)
+			w.recordContents(toCreate...)
 		}
 	}
 
@@ -3163,6 +3227,7 @@ func (w *Watcher) healPlainFile(full string, fi os.FileInfo, r cfapi.Placeholder
 	w.ops.Log("vfs healed plain file %s (matches server)", remote)
 	cfShellNotify(full) // or Explorer keeps the stale pending glyph until F5
 	w.recordBaseline(remote, r.ETag)
+	w.recordContents(r)
 	if r.FileID != "" {
 		w.recordFileID(remote, r.FileID)
 	}

@@ -30,6 +30,37 @@ type Entry struct {
 	IsEncrypted  bool      // nc:is-encrypted — an end-to-end encrypted folder (contents are opaque to clients without E2EE keys)
 	Permissions  string    // oc:permissions, e.g. "RGDNVW" (file) / "RMGCK" (dir); empty = unknown
 	Lock         *LockInfo // files_lock state; nil = unlocked OR the server didn't say (see LockInfo)
+	// UploadTime is nc:upload_time (unix seconds): when this version's content
+	// was uploaded. 0 = the server did not say. Unlike the ETag it is left
+	// alone by metadata-only changes — see ContentKey.
+	UploadTime int64
+}
+
+// ContentKey identifies the CONTENT version of a file, for telling a real
+// server edit from a metadata-only ETag bump.
+//
+// Nextcloud changes a file's ETag when files_lock takes or releases a lock (and
+// for tags, comments and favourites) while the bytes stay the same. Measured on
+// a live server, 2026-09-23: a lock and an unlock each changed the ETag and
+// nothing else, while a PUT of new content with the same size changed
+// nc:upload_time. So two listings with the same key hold the same version.
+//
+// "" when the upload time is unknown: then there is nothing to vouch for the
+// content and the caller must go by the ETag alone, as before. mtime is
+// compared in whole seconds, the server's own resolution.
+func ContentKey(size int64, mtime time.Time, uploadTime int64) string {
+	if uploadTime <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d:%d:%d", size, mtime.Unix(), uploadTime)
+}
+
+// ContentKey is the entry's content version key (see the package function).
+func (e Entry) ContentKey() string {
+	if e.IsDir {
+		return ""
+	}
+	return ContentKey(e.Size, e.LastModified, e.UploadTime)
 }
 
 // LockOwnerType identifies who took a lock, from nc:lock-owner-type.
@@ -198,6 +229,7 @@ const entryProps = `    <d:getetag/>
     <nc:lock-time/>
     <nc:lock-timeout/>
     <nc:lock-token/>
+    <nc:upload_time/>
 `
 
 // propfindBody requests exactly the properties Entry exposes.
@@ -253,6 +285,7 @@ type davProp struct {
 	LockTime         string `xml:"lock-time"`
 	LockTimeout      string `xml:"lock-timeout"`
 	LockToken        string `xml:"lock-token"`
+	UploadTime       string `xml:"upload_time"`
 	// Trashbin properties (nc namespace; only populated for trashbin PROPFINDs).
 	TrashFilename string `xml:"trashbin-filename"`
 	TrashOrigLoc  string `xml:"trashbin-original-location"`
@@ -415,6 +448,9 @@ func (c *Client) parseResponse(r davResponse) (Entry, bool, error) {
 	}
 	if t, err := http.ParseTime(prop.GetLastModified); err == nil {
 		e.LastModified = t
+	}
+	if n, err := strconv.ParseInt(strings.TrimSpace(prop.UploadTime), 10, 64); err == nil && n > 0 {
+		e.UploadTime = n
 	}
 	// files_lock. Only a positive nc:lock yields a record: an unlocked file
 	// reports it as an EMPTY string, and a server without the app omits it
