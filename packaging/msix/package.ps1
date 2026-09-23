@@ -172,9 +172,43 @@ if ($Store -or $StoreChannel) {
         Write-Host "-StoreChannel: building an installable package that behaves as the Store build (self-update disabled)" -ForegroundColor Yellow
     }
 }
-& go build -ldflags $ldflags -o (Join-Path $stage "nimbo-gui.exe") ./cmd/nimbo-gui
-if ($LASTEXITCODE -ne 0) { Pop-Location; throw "go build failed" }
-Pop-Location
+# The exe's version resource carries the brand's name, which is what Windows
+# shows for the tray icon in the taskbar settings (GitHub #9), and this build's
+# version. Stamp it into versioninfo.rc, rebuild the resource object go build
+# links, and put both committed files back afterwards whatever happens.
+$guiDir = Join-Path $repo "cmd\nimbo-gui"
+$verRc  = Join-Path $guiDir "versioninfo.rc"
+$syso   = Join-Path $guiDir "rsrc_windows_amd64.syso"
+$keepRc = [System.IO.File]::ReadAllBytes($verRc)
+$keepSyso = [System.IO.File]::ReadAllBytes($syso)
+try {
+    $brand = Get-Content (Join-Path $repo "internal\brand\brand.json") -Raw | ConvertFrom-Json
+    # rc strings double a quote; a -replace replacement doubles a dollar.
+    $esc = { param($s) (($s -replace '"', '""') -replace '\$', '$$$$') }
+    $name = & $esc $brand.name
+    $company = & $esc $brand.company
+    $verCommas = ($pkgVersion -split '\.') -join ','
+    $rc = [System.IO.File]::ReadAllText($verRc)
+    $rc = $rc -replace '(FILEVERSION|PRODUCTVERSION) 0,0,0,0', "`$1 $verCommas"
+    $rc = $rc -replace '("(?:FileVersion|ProductVersion)", )"0\.0\.0\.0"', "`$1`"$pkgVersion`""
+    $rc = $rc -replace '("(?:FileDescription|ProductName)", )"Nimbo"', "`$1`"$name`""
+    $rc = $rc -replace '("CompanyName", )"[^"]*"', "`$1`"$company`""
+    [System.IO.File]::WriteAllText($verRc, $rc, (New-Object System.Text.UTF8Encoding $false))
+    Push-Location $guiDir
+    try {
+        & windres -c 65001 app.rc -O coff -o rsrc_windows_amd64.syso
+        if ($LASTEXITCODE -ne 0) { throw "windres failed" }
+    } finally { Pop-Location }
+
+    & go build -ldflags $ldflags -o (Join-Path $stage "nimbo-gui.exe") ./cmd/nimbo-gui
+    if ($LASTEXITCODE -ne 0) { throw "go build failed" }
+} finally {
+    [System.IO.File]::WriteAllBytes($verRc, $keepRc)
+    [System.IO.File]::WriteAllBytes($syso, $keepSyso)
+    Pop-Location
+}
+$vi = (Get-Item (Join-Path $stage "nimbo-gui.exe")).VersionInfo
+Write-Host "nimbo-gui.exe: $($vi.FileDescription) $($vi.FileVersion)"
 
 # --- build the context-menu DLL ---
 Write-Host "Building context-menu DLL..."

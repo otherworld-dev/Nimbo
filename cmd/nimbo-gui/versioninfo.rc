@@ -1,0 +1,35 @@
+// Version resource for nimbo-gui.exe, included by app.rc.
+//
+// Windows names a tray icon in Settings > Personalization > Taskbar > Other
+// system tray icons from the exe's FileDescription. Without this resource the
+// entry had no name, so it could not be told apart or set to always show
+// (GitHub #9). Explorer's Details tab reads it too.
+//
+// These are the defaults a plain `go build` gets. packaging/msix/package.ps1
+// writes this file with the brand's name and company (internal/brand/brand.json)
+// and the build's version, rebuilds rsrc_windows_amd64.syso, and puts both back
+// once the exe is built.
+1 VERSIONINFO
+FILEVERSION 0,0,0,0
+PRODUCTVERSION 0,0,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080904B0"
+    BEGIN
+      VALUE "CompanyName", "Otherworld Dev Ltd"
+      VALUE "FileDescription", "Nimbo"
+      VALUE "FileVersion", "0.0.0.0"
+      VALUE "InternalName", "nimbo-gui"
+      VALUE "OriginalFilename", "nimbo-gui.exe"
+      VALUE "ProductName", "Nimbo"
+      VALUE "ProductVersion", "0.0.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0809, 1200
+  END
+END
