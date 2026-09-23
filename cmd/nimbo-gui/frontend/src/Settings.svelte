@@ -380,7 +380,28 @@
   let accounts = $state<{ id: string; user: string; server: string; active: boolean; status: string }[]>([]);
   let acctBusy = $state(false);
   async function loadAccounts() { accounts = (await App.ListAccounts()) ?? []; }
-  loadAccounts();
+
+  // The folder settings belong to the ACTIVE account, so switching account must
+  // reload them; before this the page kept showing the previous account's
+  // folders (GitHub #11). Background accounts emit "account" on every status
+  // change too, so the list (with those statuses) refreshes each time but the
+  // account's views only reset when the active account really changed, which
+  // keeps an add-folder flow from being thrown away mid-way.
+  let activeId = "";
+  const activeOf = () => accounts.find(a => a.active)?.id ?? "";
+  loadAccounts().then(() => { activeId = activeOf(); });
+  Events.On("account", async () => {
+    await loadAccounts();
+    const now = activeOf();
+    if (now === activeId) return;
+    activeId = now;
+    exitAdding();
+    managing = false; managePair = null; pending = null;
+    account = await App.AccountInfo();
+    await loadFolders();
+    offCur = "";
+    await loadOffline();
+  });
 
   // Local network route (spec 2026-09-13). Test → (Trust) → Use this address.
   // The saved address comes from AccountInfo; live route state rides the 3 s

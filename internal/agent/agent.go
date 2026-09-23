@@ -274,6 +274,11 @@ func NewEngineFor(ctx context.Context, accountID string) (*Engine, error) {
 	// single-account files on first run after the multi-account change.
 	d = d.WithAccount(acc.ID)
 	d.MigratePairs()
+	// The account folder used to be global and was always written by the active
+	// account, so on upgrade it belongs to the default one (GitHub #11).
+	if def, ok := st.Default(); ok && def.ID == acc.ID {
+		d.MigrateAccountFolder()
+	}
 	secret, err := account.LoadSecret(acc.ID)
 	if err != nil {
 		return nil, err
@@ -1530,20 +1535,122 @@ func (e *Engine) SetLimits(up, down int) error {
 	return nil
 }
 
-// BaseDir returns the local root for newly-synced account folders, defaulting to
-// ~/Nextcloud if unset.
+// BaseDir returns this account's local root for newly-synced folders,
+// defaulting to ~/Nextcloud if the account has none yet. The folder is per
+// account (config.AccountState): a shared one let two accounts sync into the
+// same folder (GitHub #11).
 func (e *Engine) BaseDir() string {
-	s, _ := e.dirs.LoadSettings()
-	if s.BaseDir != "" {
-		return s.BaseDir
+	if dir := e.StoredBaseDir(); dir != "" {
+		return dir
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, "Nextcloud")
 }
 
-// SetBaseDir persists the local base directory.
+// StoredBaseDir returns the folder this account has chosen, or "" when it has
+// none yet (BaseDir then falls back to a default that may suit another account).
+func (e *Engine) StoredBaseDir() string {
+	s, _ := e.dirs.LoadAccountState()
+	return s.BaseDir
+}
+
+// SetBaseDir persists this account's local base directory.
 func (e *Engine) SetBaseDir(dir string) error {
-	return e.dirs.UpdateSettings(func(s *config.Settings) { s.BaseDir = dir })
+	return e.dirs.UpdateAccountState(func(s *config.AccountState) { s.BaseDir = dir })
+}
+
+// SetRememberedPairs parks this account's live sync pairs while on-demand mode
+// is on, so switching back to live can restore them.
+func (e *Engine) SetRememberedPairs(pairs []config.SyncPair) error {
+	return e.dirs.UpdateAccountState(func(s *config.AccountState) { s.RememberedPairs = pairs })
+}
+
+// TakeRememberedPairs returns this account's parked pairs and clears them in
+// the same locked step, so they can't be restored twice.
+func (e *Engine) TakeRememberedPairs() []config.SyncPair {
+	var taken []config.SyncPair
+	_ = e.dirs.UpdateAccountState(func(s *config.AccountState) {
+		taken, s.RememberedPairs = s.RememberedPairs, nil
+	})
+	return taken
+}
+
+// RestoreRememberedPairs turns this account's parked pairs back into live
+// pairs and returns the ones restored. allow (nil = allow all) can refuse a
+// pair, which then stays parked: a parked folder that overlaps another
+// account's must not come back, but its setup must not be lost either. A
+// whole-account pair also becomes the account folder. Safe before Run:
+// watchers start with it.
+func (e *Engine) RestoreRememberedPairs(allow func(localDir string) error) []config.SyncPair {
+	var restored, refused []config.SyncPair
+	defer func() {
+		if len(refused) == 0 {
+			return
+		}
+		if err := e.dirs.UpdateAccountState(func(s *config.AccountState) {
+			s.RememberedPairs = append(s.RememberedPairs, refused...)
+		}); err != nil {
+			slog.Warn("could not keep the refused sync folders parked", "err", err)
+		}
+	}()
+	for _, p := range e.TakeRememberedPairs() {
+		if allow != nil {
+			if err := allow(p.LocalDir); err != nil {
+				slog.Warn("keeping a parked sync folder parked", "local", p.LocalDir, "err", err)
+				refused = append(refused, p)
+				continue
+			}
+		}
+		if err := e.AddSyncPair(p.LocalDir, p.RemoteRoot); err != nil {
+			slog.Warn("could not restore a parked sync folder", "local", p.LocalDir, "err", err)
+			continue
+		}
+		if strings.Trim(p.RemoteRoot, "/") == "" {
+			if err := e.SetBaseDir(p.LocalDir); err != nil {
+				slog.Warn("could not record the restored account folder", "local", p.LocalDir, "err", err)
+			}
+		}
+		slog.Info("restored a parked sync folder", "local", p.LocalDir)
+		restored = append(restored, p)
+	}
+	return restored
+}
+
+// HoldBackPairs parks every pair whose local folder hold selects: the pair
+// stops syncing (its files are kept) and joins the parked list, so the setup
+// comes back through RestoreRememberedPairs once hold no longer selects it.
+// Used for a folder that overlaps another account's (GitHub #11), where
+// syncing it would upload that account's files. Returns the pairs parked.
+func (e *Engine) HoldBackPairs(hold func(localDir string) bool) []config.SyncPair {
+	pairs, err := e.dirs.LoadPairs()
+	if err != nil {
+		return nil
+	}
+	var held []config.SyncPair
+	for _, p := range pairs {
+		if !hold(p.LocalDir) {
+			continue
+		}
+		if err := e.RemoveSyncFolder(p.RemoteRoot, false); err != nil {
+			slog.Warn("could not hold back an overlapping sync folder", "local", p.LocalDir, "err", err)
+			continue
+		}
+		held = append(held, p)
+	}
+	if len(held) > 0 {
+		if err := e.dirs.UpdateAccountState(func(s *config.AccountState) {
+			s.RememberedPairs = append(s.RememberedPairs, held...)
+		}); err != nil {
+			slog.Warn("could not park the held-back sync folders", "err", err)
+		}
+	}
+	return held
+}
+
+// RememberedPairs returns this account's parked pairs without clearing them.
+func (e *Engine) RememberedPairs() []config.SyncPair {
+	s, _ := e.dirs.LoadAccountState()
+	return s.RememberedPairs
 }
 
 // SyncedRemotes returns the set of remote folder paths currently configured as

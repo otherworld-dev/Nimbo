@@ -28,6 +28,9 @@ func (a *App) MoveSyncFolder(oldLocal, newLocal string) string {
 	if strings.EqualFold(oldLocal, newLocal) {
 		return "" // same place — nothing to do
 	}
+	if msg := a.folderClashFor(newLocal); msg != "" {
+		return msg
+	}
 	// v1: on-demand (virtual files) folders need cloud-files sync-root
 	// re-registration, which isn't handled yet.
 	if _, ok := a.onDemandMountFor(oldLocal); ok {
