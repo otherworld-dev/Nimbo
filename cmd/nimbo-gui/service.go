@@ -751,7 +751,7 @@ func (a *App) ApplyUpdate() string {
 	// "Updating…" before the window goes.
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
-		a.Quit()
+		a.quit("installing update")
 	}()
 	return ""
 }
@@ -1536,6 +1536,11 @@ func (a *App) uploadWithConflictFor(eng *agent.Engine, etags *etagStore) func(ct
 		// aside, or that path would stay empty until the program closes.
 		if err := transfer.UploadDeferred(localPath); err != nil {
 			return err
+		}
+		// Likewise while it is already being uploaded: the upload would be
+		// refused after the server's copy had been moved (Deck #714).
+		if transfer.Uploading(localPath) {
+			return fmt.Errorf("%s: %w", remotePath, transfer.ErrUploadInProgress)
 		}
 
 		base := etags.get(remotePath)
@@ -2488,7 +2493,12 @@ func (a *App) absURL(href string) string {
 }
 
 // Quit exits the application.
-func (a *App) Quit() {
+func (a *App) Quit() { a.quit("asked by the app window") }
+
+// quit exits, logging why: without the reason a log that ends looks the same
+// whether the user quit, an update did, or the process died (Deck #714).
+func (a *App) quit(reason string) {
+	slog.Info("quitting", "reason", reason)
 	if a.app != nil {
 		a.app.Quit()
 	}
@@ -2533,7 +2543,7 @@ func (a *App) buildTrayMenu() *application.Menu {
 	m.Add("Sync status").OnClick(func(*application.Context) { a.OpenStatus() })
 	m.Add("Settings").OnClick(func(*application.Context) { a.OpenSettings() })
 	m.AddSeparator()
-	m.Add("Quit Nimbo").OnClick(func(*application.Context) { a.Quit() })
+	m.Add("Quit Nimbo").OnClick(func(*application.Context) { a.quit("tray menu") })
 	return m
 }
 
@@ -3081,9 +3091,9 @@ func humanAgo(d time.Duration) string {
 }
 
 // ResolveConflict settles a conflict: choice is "local", "remote", or "both".
-func (a *App) ResolveConflict(localDir, path, choice string) {
+func (a *App) ResolveConflict(localDir, path, choice string) string {
 	if a.eng == nil {
-		return
+		return "not signed in"
 	}
 	var c transfer.Choice
 	switch choice {
@@ -3097,11 +3107,14 @@ func (a *App) ResolveConflict(localDir, path, choice string) {
 	for _, it := range a.eng.PendingConflicts() {
 		if it.LocalDir == localDir && it.Path == path {
 			if err := a.eng.ResolveConflict(context.Background(), it, c); err != nil {
-				slog.Warn("resolve conflict failed", "err", err)
+				slog.Warn("resolve conflict failed", "path", path, "choice", choice, "err", err)
+				return err.Error()
 			}
-			return
+			slog.Info("conflict resolved", "path", path, "choice", choice)
+			return ""
 		}
 	}
+	return "" // already settled: a pass or an earlier click got there first
 }
 
 // DetachedDTO is a folder that stopped being shared with the user (or whose
@@ -4162,6 +4175,11 @@ func (a *App) TailLog() string {
 		if i := strings.IndexByte(s, '\n'); i >= 0 {
 			s = s[i+1:]
 		}
+	}
+	// A crash report goes to crash.log, not here: show it too, so Copy
+	// carries it (Deck #714).
+	if c := crashReportTail(filepath.Join(filepath.Dir(p), "crash.log")); c != "" {
+		s += "\n===== crash.log =====\n" + c
 	}
 	return s
 }

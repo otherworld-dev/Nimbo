@@ -84,6 +84,11 @@ func Upload(ctx context.Context, c *transport.Client, localPath, remotePath stri
 // deltas: bytes reported for a chunk attempt that failed are withdrawn before
 // the chunk restarts, so the running total stays honest.
 func UploadProgress(ctx context.Context, c *transport.Client, localPath, remotePath string, prog func(int64)) (FileResult, error) {
+	// One upload of a file at a time: two share its chunk session and tear it.
+	if err := beginUpload(localPath); err != nil {
+		return FileResult{}, err
+	}
+	defer endUpload(localPath)
 	// A file caught changing under an earlier upload is not read again while a
 	// program still has it open to write (Outlook and an attached .pst): each
 	// try would send the whole file only to find it torn again (Deck #691).

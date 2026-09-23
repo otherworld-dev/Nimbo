@@ -951,7 +951,7 @@ export function ReportProblem() {
  * @param {string} localDir
  * @param {string} path
  * @param {string} choice
- * @returns {$CancellablePromise<void>}
+ * @returns {$CancellablePromise<string>}
  */
 export function ResolveConflict(localDir, path, choice) {
     return $Call.ByID(1946249505, localDir, path, choice);
@@ -1150,9 +1150,10 @@ export function SetNotifications(on) {
 }
 
 /**
- * SetOfflinePin pins (always keep on this device — fully downloads and stays
- * current) or unpins (back to online-only preference) a folder subtree in the
- * shown account's virtual root.
+ * SetOfflinePin pins (always keep on this device — the watcher downloads any
+ * online-only content once it hears the attribute change or meets it during
+ * reconcile, and keeps it current) or unpins (back to online-only preference)
+ * a folder subtree in the shown account's virtual root.
  * @param {string} rel
  * @param {boolean} pinned
  * @returns {$CancellablePromise<string>}
@@ -1202,8 +1203,19 @@ export function SetShowSearch(on) {
 }
 
 /**
- * SetSidebar adds or removes the Nimbo root in the Explorer navigation
- * pane, pointing at the default sync location.
+ * SetSidebar shows or hides the Nimbo entry in the Explorer navigation pane.
+ * 
+ * Which entry depends on the folder. A cloud sync root (on-demand mode, or a
+ * live folder with a status root) is given a node by Windows itself when the
+ * root is registered, and that node is what the user sees: the choice is
+ * applied to it through its pinned-to-tree flag, and any delegate-folder entry
+ * of ours is dropped so there is never a second, identical-looking Nimbo beside
+ * it (#574). Otherwise the entry is our own delegate folder, pointing at the
+ * default sync location, added or removed as asked.
+ * 
+ * Until this distinction the toggle only ever touched our own entry, which
+ * beside a sync root was already stood down, so in on-demand mode it changed
+ * nothing on screen whichever way it was set (issue #7).
  * @param {boolean} on
  * @returns {$CancellablePromise<string>}
  */
@@ -1312,13 +1324,16 @@ export function ShowSearch() {
 }
 
 /**
- * SidebarEnabled reports whether the Nimbo sidebar root is registered.
+ * SidebarEnabled reports whether the Nimbo entry is in the Explorer navigation
+ * pane.
  * 
  * Answered from our own recorded choice, not the registry: a packaged build
  * reads HKCU through the MSIX container, which returns the package's private
- * copy rather than the keys Explorer actually uses. The registry is consulted
- * only when nothing has been recorded yet — a fresh install (nothing there) or
- * an entry left by an older unpackaged build (which is real, and ours).
+ * copy rather than the keys Explorer actually uses. With nothing recorded, a
+ * cloud sync root (on-demand mode) answers "on": Windows puts the root's own
+ * node in the pane when the root is registered and it stays until we hide it,
+ * so that is what the user is looking at. Otherwise the registry is consulted
+ * for an entry left by an older unpackaged build (which is real, and ours).
  * @returns {$CancellablePromise<boolean>}
  */
 export function SidebarEnabled() {

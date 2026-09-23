@@ -180,7 +180,12 @@ func (e *Executor) Run(ctx context.Context, actions []engine.Action) (Stats, err
 			info, merged, err := e.classifyConflict(ctx, a)
 			if err != nil {
 				e.report(a, err)
-				slog.Error("conflict classification failed", "path", a.Path, "err", err)
+				var inUse *InUseError
+				if errors.As(err, &inUse) {
+					slog.Info("conflict check waits: the file is in use", "path", a.Path)
+				} else {
+					slog.Error("conflict classification failed", "path", a.Path, "err", err)
+				}
 				stats.Failed++
 				continue
 			}
@@ -262,6 +267,13 @@ func (e *Executor) runTransfers(ctx context.Context, transfers []engine.Action, 
 			}
 			err := e.applyTransfer(ctx, a)
 			e.report(a, err)
+			if errors.Is(err, ErrUploadInProgress) {
+				// Another pass is sending this file right now and reports the
+				// outcome itself; if it fails, the file is still changed and the
+				// next pass sends it. Neither a failure nor an upload here.
+				slog.Debug("upload left to the one already running", "path", a.Path)
+				return
+			}
 			if err != nil {
 				slog.Debug("transfer failed", "kind", a.Kind, "path", a.Path, "err", err) // see recordActionResult for the user-facing log
 				e.mu.Lock()
@@ -375,8 +387,9 @@ func (e *Executor) applyTransfer(ctx context.Context, a engine.Action) error {
 		// same bytes, and on a 24 GB file each try costs minutes.
 		var inUse *InUseError
 		var damaged *ChecksumMismatchError
+		// Another upload of this file running is the same: it is not ours to retry.
 		if err == nil || ctx.Err() != nil || transport.IsLocked(err) || !transport.Retryable(err) ||
-			errors.As(err, &inUse) || errors.As(err, &damaged) {
+			errors.As(err, &inUse) || errors.As(err, &damaged) || errors.Is(err, ErrUploadInProgress) {
 			break
 		}
 	}
