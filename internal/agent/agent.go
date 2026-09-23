@@ -3685,6 +3685,79 @@ func maintainDirBaselines(st *state.Store, pk string, base map[string]engine.Bas
 	slog.Info("dir baselines maintained", "healed", healed, "dirtied", dirtied)
 }
 
+// beginAction marks a file transfer as started: the syncing icon, our own
+// deny-write handle let go for the transfer (it would refuse our own
+// download), and the flyout's current file. Shared by a pass's executor and
+// the long-transfer lane (lanejobs.go).
+func (e *Engine) beginAction(p Pair, a engine.Action) {
+	abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
+	e.markInflight(abs, true)
+	if e.lockWarn != nil {
+		e.lockWarn.release(abs)
+	}
+	if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
+		e.progCurrent(filepath.Base(a.Path))
+	}
+}
+
+// finishAction does the bookkeeping for a finished action: icon, deny-write
+// handle, progress, a damaged server copy, a file held open by a program, and
+// the activity row. It returns the paths the pass must count unfinished (their
+// folders are not stamped settled) and whether the file now waits on a
+// program. Shared by a pass's executor and the long-transfer lane.
+func (e *Engine) finishAction(p Pair, pk string, remote map[string]engine.RemoteState, a engine.Action, aerr error) (problems []string, busy bool) {
+	if errors.Is(aerr, transfer.ErrUploadInProgress) {
+		// Another pass is uploading this very file (Deck #714). It owns
+		// the icon, the activity entry and the outcome; this pass only
+		// must not count the folder as settled while that runs.
+		return []string{a.Path}, false
+	}
+	abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
+	e.markInflight(abs, false)
+	if e.lockWarn != nil {
+		e.lockWarn.retake(abs) // no-op unless it is still locked by someone else
+	}
+	if aerr == nil && (a.Kind == engine.ActDownload || a.Kind == engine.ActUpload || a.Kind == engine.ActConflict) {
+		// ActConflict included: keep-both leaves the server's fresh copy
+		// at a.Path (downloaded) and uploads the conflicted twin - both
+		// synced, but neither is a plain Download/Upload action, so the
+		// icon stayed on the pending spinner until the next restart.
+		e.statusIcons.notifySynced(p.LocalDir, a.Path)
+	}
+	if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
+		e.progComplete()
+	}
+	var damaged *transfer.ChecksumMismatchError
+	if (a.Kind == engine.ActDownload || a.Kind == engine.ActConflict) && errors.As(aerr, &damaged) {
+		e.noteDamaged(pk, a.Path, remote[a.Path].ETag)
+	}
+	// A conflict check that could not read the file (Outlook has the
+	// .pst) waits the same way an upload of it does (Deck #714).
+	var inUse *transfer.InUseError
+	if (a.Kind == engine.ActUpload || a.Kind == engine.ActConflict) && errors.As(aerr, &inUse) {
+		// Held, not failed: one neutral "waiting" activity row per wait
+		// instead of a red "failed" one every pass (see noteWaiting).
+		e.noteWaiting(p.LocalDir, abs, a.Path)
+		e.awaitClosed(p, abs) // see inuse.go
+		return []string{a.Path}, true // still unsent: the folder isn't settled
+	} else if a.Kind == engine.ActUpload && aerr == nil {
+		e.clearBusy(abs)
+	}
+	if aerr != nil {
+		problems = append(problems, a.Path)
+		if a.Dest != "" {
+			problems = append(problems, a.Dest)
+		}
+	}
+	ev := activity.Event{Local: p.LocalDir, Path: a.Path, Kind: a.Kind.String()}
+	if a.Dest != "" {
+		ev.Path = a.Path + " → " + a.Dest
+	}
+	ev.Err = e.recordActionResult(a, aerr) // humanised + deduped; "" on success
+	e.recorder.Add(ev)
+	return problems, false
+}
+
 // applyPlan filters, executes, and reports a reconciliation plan — shared by the
 // full SyncOnce and the scoped SyncScope, so both behave identically once a plan
 // exists. actions/remote are keyed relative to the pair root regardless of scope.
@@ -3931,18 +4004,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		Escaper:    e.escaper.Load(),
 		Workers:    4,
 		Policy:     e.policy,
-		OnBegin: func(a engine.Action) {
-			abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
-			e.markInflight(abs, true)
-			// Our own deny-write handle would refuse our own download. Let go for
-			// the duration of the transfer and re-take it afterwards.
-			if e.lockWarn != nil {
-				e.lockWarn.release(abs)
-			}
-			if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
-				e.progCurrent(filepath.Base(a.Path))
-			}
-		},
+		OnBegin: func(a engine.Action) { e.beginAction(p, a) },
 		OnProgress: func(a engine.Action, delta int64) {
 			e.progBytes.Add(delta)
 		},
@@ -3952,64 +4014,16 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			probMu.Unlock()
 		},
 		OnEvent: func(a engine.Action, aerr error) {
-			if errors.Is(aerr, transfer.ErrUploadInProgress) {
-				// Another pass is uploading this very file (Deck #714). It owns
-				// the icon, the activity entry and the outcome; this pass only
-				// must not count the folder as settled while that runs.
-				probMu.Lock()
-				problems = append(problems, a.Path)
-				probMu.Unlock()
+			probs, busy := e.finishAction(p, pk, remote, a, aerr)
+			if len(probs) == 0 {
 				return
 			}
-			abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
-			e.markInflight(abs, false)
-			if e.lockWarn != nil {
-				e.lockWarn.retake(abs) // no-op unless it is still locked by someone else
+			probMu.Lock()
+			problems = append(problems, probs...)
+			if busy {
+				busyUploads = append(busyUploads, a.Path) // uploads put off while a program has the file open
 			}
-			if aerr == nil && (a.Kind == engine.ActDownload || a.Kind == engine.ActUpload || a.Kind == engine.ActConflict) {
-				// ActConflict included: keep-both leaves the server's fresh copy
-				// at a.Path (downloaded) and uploads the conflicted twin - both
-				// synced, but neither is a plain Download/Upload action, so the
-				// icon stayed on the pending spinner until the next restart.
-				e.statusIcons.notifySynced(p.LocalDir, a.Path)
-			}
-			if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
-				e.progComplete()
-			}
-			var damaged *transfer.ChecksumMismatchError
-			if (a.Kind == engine.ActDownload || a.Kind == engine.ActConflict) && errors.As(aerr, &damaged) {
-				e.noteDamaged(pk, a.Path, remote[a.Path].ETag)
-			}
-			// A conflict check that could not read the file (Outlook has the
-			// .pst) waits the same way an upload of it does (Deck #714).
-			var inUse *transfer.InUseError
-			if (a.Kind == engine.ActUpload || a.Kind == engine.ActConflict) && errors.As(aerr, &inUse) {
-				// Held, not failed: one neutral "waiting" activity row per wait
-				// instead of a red "failed" one every pass (see noteWaiting).
-				probMu.Lock()
-				busyUploads = append(busyUploads, a.Path)
-				problems = append(problems, a.Path) // still unsent: the folder isn't settled
-				probMu.Unlock()
-				e.noteWaiting(p.LocalDir, abs, a.Path)
-				e.awaitClosed(p, abs) // see inuse.go
-				return
-			} else if a.Kind == engine.ActUpload && aerr == nil {
-				e.clearBusy(abs)
-			}
-			if aerr != nil {
-				probMu.Lock()
-				problems = append(problems, a.Path)
-				if a.Dest != "" {
-					problems = append(problems, a.Dest)
-				}
-				probMu.Unlock()
-			}
-			ev := activity.Event{Local: p.LocalDir, Path: a.Path, Kind: a.Kind.String()}
-			if a.Dest != "" {
-				ev.Path = a.Path + " → " + a.Dest
-			}
-			ev.Err = e.recordActionResult(a, aerr) // humanised + deduped; "" on success
-			e.recorder.Add(ev)
+			probMu.Unlock()
 		},
 	}
 	stats, err := ex.Run(ctx, actions)
