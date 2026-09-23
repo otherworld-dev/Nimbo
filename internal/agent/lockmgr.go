@@ -112,6 +112,14 @@ func (m *lockMgr) refreshOne(ctx context.Context, remotePath string) error {
 	return err
 }
 
+// holds reports whether we hold remotePath's lock (or are taking it).
+func (m *lockMgr) holds(remotePath string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.held[remotePath]
+	return ok
+}
+
 // release unlocks a path and forgets it. The UNLOCK comes first: if it fails we
 // keep the record, so a later sweep can try again. Forgetting first would strand
 // a real lock on a transient error.
@@ -275,6 +283,8 @@ func (e *Engine) handleEditorLockFiles(ctx context.Context, p Pair, changed []st
 	if e.guardStateUnavailable() {
 		return
 	}
+	e.editorLockMu.Lock()
+	defer e.editorLockMu.Unlock()
 	esc := e.escaper.Load()
 	for _, abs := range changed {
 		base := filepath.Base(abs)
@@ -314,6 +324,13 @@ func (e *Engine) handleEditorLockFiles(ctx context.Context, p Pair, changed []st
 		remote := strings.Trim(p.RemoteRoot+"/"+esc.Encode(rel), "/")
 
 		if _, statErr := os.Lstat(abs); statErr == nil {
+			// Already ours: one open is one LOCK. Word's owner file changes
+			// more than once while it opens, and on the live server repeated
+			// LOCKs in quick succession left a lock behind that the UNLOCK at
+			// close did not clear (VM, 2026-09-23). The heartbeat refreshes it.
+			if e.lockMgr.holds(remote) {
+				continue
+			}
 			if err := e.TakeLock(ctx, remote); err != nil {
 				if transport.IsLocked(err) {
 					// Somebody got there first. Entirely normal contention — the

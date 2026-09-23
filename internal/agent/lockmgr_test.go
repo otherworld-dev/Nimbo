@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 
 type fakeLocker struct {
 	locked    map[string]bool
+	mu        sync.Mutex
 	lockErr   map[string]error
 	unlockErr map[string]error
 	unlocked  []string
@@ -27,6 +29,8 @@ func newFakeLocker() *fakeLocker {
 }
 
 func (f *fakeLocker) Lock(_ context.Context, p string) (transport.LockResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.lockCalls = append(f.lockCalls, p)
 	if err := f.lockErr[p]; err != nil {
 		return transport.LockResult{}, err
@@ -36,6 +40,8 @@ func (f *fakeLocker) Lock(_ context.Context, p string) (transport.LockResult, er
 }
 
 func (f *fakeLocker) Unlock(_ context.Context, p string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if err := f.unlockErr[p]; err != nil {
 		return err
 	}
@@ -561,5 +567,40 @@ func TestReleaseLockoutHandleLetsWritersIn(t *testing.T) {
 	f.Close()
 	if _, err := os.Stat(filepath.Join(mount, "~$Budget.xlsx")); err != nil {
 		t.Errorf("the warning went with the handle: %v", err)
+	}
+}
+
+// Word writes its owner file in more than one step, and each change batch
+// reached the engine on its own goroutine: one document open sent four LOCKs,
+// two of them in the same millisecond, and on the live server the one UNLOCK
+// at close left a lock behind that only a second UNLOCK cleared (VM,
+// 2026-09-23). One open must mean one LOCK: batches are handled one at a time,
+// and a document we already hold is not locked again (the heartbeat keeps it).
+func TestEditorLockFilesLockOncePerOpen(t *testing.T) {
+	e, f := newEditorLockEngine(t)
+	mount := t.TempDir()
+	doc := filepath.Join(mount, "Report.docx")
+	owner := filepath.Join(mount, "~$Report.docx")
+	for _, p := range []string{doc, owner} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.NoteEditorLockFiles(context.Background(), mount, "", []string{owner})
+		}()
+	}
+	wg.Wait()
+	e.NoteEditorLockFiles(context.Background(), mount, "", []string{owner})
+
+	f.mu.Lock()
+	n := len(f.lockCalls)
+	f.mu.Unlock()
+	if n != 1 {
+		t.Errorf("%d LOCK requests for one open, want 1", n)
 	}
 }
