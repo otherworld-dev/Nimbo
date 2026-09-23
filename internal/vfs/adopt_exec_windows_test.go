@@ -4,6 +4,7 @@ package vfs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -296,5 +297,87 @@ func TestAdoptApplyProgressAndCancel(t *testing.T) {
 	}
 	if len(*marked) != 2 {
 		t.Errorf("cancelled run marked %d files, want 2: %v", len(*marked), *marked)
+	}
+}
+
+// An interrupted conversion leaves two kinds of entry that nothing else will
+// ever finish (Deck #500 item 2): an unrenamed conflict is a plain file that
+// differs from the server, which reconcile's heal rightly declines, and a
+// foreign dead stub is not ours to refresh. Matching files and uploads are NOT
+// carried: reconcile's plain-file heal and local-only rescue already finish
+// those, against the server's CURRENT state rather than a scan that may be
+// days old. The resumed plan survives a JSON round trip (it is persisted
+// across the restart) and replays safely over the half-done work: an entry the
+// first run already handled is skipped, never renamed or deleted twice.
+func TestAdoptResumeFinishesConflictsAndStubs(t *testing.T) {
+	dir := adoptTree(t,
+		"c1.txt:99:0",        // conflict, renamed before the interruption
+		"c2.txt:99:0",        // conflict, not reached
+		"keep.txt:10:0",      // matches: left to reconcile's heal
+		"stub.txt:10:0:stub", // foreign dead stub, not reached
+		"up.txt:4:0",         // local-only: left to reconcile's rescue
+	)
+	remote := map[string]engine.RemoteState{
+		"c1.txt":   remoteFile(10, 0),
+		"c2.txt":   remoteFile(10, 0),
+		"keep.txt": remoteFile(10, 0),
+		"stub.txt": remoteFile(10, 0),
+	}
+	plan, err := Scan(dir, remote, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unfinished := plan.Unfinished()
+	var rels []string
+	for _, e := range unfinished.Entries {
+		rels = append(rels, e.Rel)
+	}
+	if strings.Join(rels, ",") != "c1.txt,c2.txt,stub.txt" {
+		t.Fatalf("Unfinished = %v, want [c1.txt c2.txt stub.txt]", rels)
+	}
+	b, err := json.Marshal(unfinished.Entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First run, interrupted after the first entry (c1.txt).
+	marked := recordMarks(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	first := plan.Apply(ctx, dir, "", func(done, _ int) {
+		if done == 1 {
+			cancel()
+		}
+	})
+	if first.Renamed != 1 {
+		t.Fatalf("interrupted run renamed %d, want 1", first.Renamed)
+	}
+
+	// Next start: replay what was persisted.
+	var entries []Entry
+	if err := json.Unmarshal(b, &entries); err != nil {
+		t.Fatal(err)
+	}
+	*marked = (*marked)[:0]
+	res := ResumePlan(entries, nil).Apply(context.Background(), dir, "", nil)
+	if res.Renamed != 1 || res.Replaced != 1 || res.Skipped != 1 {
+		t.Errorf("resume: renamed=%d replaced=%d skipped=%d, want 1/1/1", res.Renamed, res.Replaced, res.Skipped)
+	}
+	if len(res.Uploads) != 1 || !strings.HasPrefix(res.Uploads[0].Rel, "c2") || !strings.Contains(res.Uploads[0].Rel, "conflicted copy") {
+		t.Errorf("resume uploads = %v, want one conflicted copy of c2.txt", res.Uploads)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "stub.txt")); !os.IsNotExist(err) {
+		t.Errorf("dead stub still present after resume (stat err = %v)", err)
+	}
+	copies, _ := filepath.Glob(filepath.Join(dir, "*conflicted copy*"))
+	if len(copies) != 2 {
+		t.Errorf("conflicted copies = %v, want exactly 2 (one each for c1 and c2)", copies)
+	}
+	if len(*marked) != 0 {
+		t.Errorf("resume marked %v, want nothing (Keep and Upload are not carried)", *marked)
+	}
+	for _, rel := range []string{"keep.txt", "up.txt"} {
+		if _, err := os.Stat(filepath.Join(dir, rel)); err != nil {
+			t.Errorf("%s disturbed by the resume: %v", rel, err)
+		}
 	}
 }

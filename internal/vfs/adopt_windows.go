@@ -129,14 +129,44 @@ func (p Plan) UploadBytes() int64 {
 	return n
 }
 
+// Unfinished is the part of the plan an interrupted conversion leaves for
+// nobody else to finish: conflicts and foreign dead stubs. A plain file that
+// differs from the server is declined by reconcile's plain-file heal (rightly:
+// it cannot tell a conflict from an edit), and a dead stub is another client's
+// placeholder with an identity we cannot serve. Keep and Upload entries are
+// deliberately left out: reconcile's heal and local-only rescue finish those
+// against the server's current state, which a persisted plan cannot know.
+// It is also small (conflicts and stubs are the rare buckets), which is what
+// makes it cheap to persist across a restart.
+func (p Plan) Unfinished() Plan {
+	out := Plan{remoteName: p.remoteName}
+	for _, e := range p.Entries {
+		if e.Action == ActionConflict || e.Action == ActionReplace {
+			out.Entries = append(out.Entries, e)
+		}
+	}
+	return out
+}
+
+// ResumePlan rebuilds a persisted plan (Unfinished's entries) for Apply.
+// remoteName is the escaper's Encode, which cannot be persisted with it.
+// Replaying is safe over half-done work because Apply re-verifies every entry
+// against the disk: a conflict already renamed, or a stub already deleted, no
+// longer stats as it did and is skipped.
+func ResumePlan(entries []Entry, remoteName func(rel string) string) Plan {
+	return Plan{Entries: entries, remoteName: remoteName}
+}
+
 // Scan classifies every file under localDir against remote (keyed by
 // sync-root-relative path, as engine.RemoteScan returns).
 //
 // It is pure: no cfapi calls, nothing mutated. That is what lets it run BEFORE
 // the folder is mounted, so the user can be shown a summary and cancel for free.
 // Directories are not classified — they are implied by their contents, and an
-// empty one is recreated by reconcile from the server listing. (Known gap: an
-// empty LOCAL-only directory is never adopted; it stays a plain dir.)
+// empty one is recreated by reconcile from the server listing. An empty
+// LOCAL-only directory is left out too: it stays a plain dir, which the
+// watcher's reconcile reads as needing a MKCOL and creates on the server
+// (TestReconcileCreatesEmptyLocalOnlyDir).
 //
 // skip (optional) is the sync ignore predicate (same rules live mode uses,
 // root-relative forward-slash paths): matches are excluded from the plan

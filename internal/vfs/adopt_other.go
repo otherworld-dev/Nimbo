@@ -66,6 +66,12 @@ type AdoptOps struct {
 	Log    func(format string, args ...any)
 }
 
+// Unfinished returns an empty plan off Windows.
+func (p Plan) Unfinished() Plan { return Plan{} }
+
+// ResumePlan rebuilds a persisted plan (a no-op to apply off Windows).
+func ResumePlan(entries []Entry, _ func(rel string) string) Plan { return Plan{Entries: entries} }
+
 // Scan returns an empty plan off Windows; callers are gated by cfapi.Supported.
 func Scan(string, map[string]engine.RemoteState, func(rel string) bool, func(rel string) string) (Plan, error) {
 	return Plan{}, nil

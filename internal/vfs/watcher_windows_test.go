@@ -2251,6 +2251,54 @@ func TestReconcileReschedulesDirtyLocalOnlyFile(t *testing.T) {
 	}
 }
 
+// An EMPTY local-only folder must reach the server too. Adopt only classifies
+// files, so a folder with nothing in it is left out of the plan (Deck #500 item
+// 4); nothing else fires for it either, since it existed before the watcher
+// started. Reconcile's local-only rescue is what creates it: a plain folder
+// needs upload, and a folder's upload is a MKCOL. It must never be read as a
+// server-side delete and removed.
+func TestReconcileCreatesEmptyLocalOnlyDir(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "Empty")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.markPlain(dir)
+	rec := newRecorder()
+	rec.listing[""] = nil // server doesn't have it
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rec.mu.Lock()
+		mkdirs := append([]string(nil), rec.mkdirs...)
+		rec.mu.Unlock()
+		if len(mkdirs) > 0 {
+			if len(mkdirs) != 1 || mkdirs[0] != "Empty" {
+				t.Fatalf("MKCOLs = %v, want exactly [Empty]", mkdirs)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("empty local-only folder never created on the server")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("empty local-only folder removed locally: %v", err)
+	}
+	rec.mu.Lock()
+	dels := len(rec.deletes)
+	rec.mu.Unlock()
+	if dels != 0 {
+		t.Fatalf("server deletes = %d, want none", dels)
+	}
+}
+
 // The first reconcile pass after start must also rescue a dirty file that
 // exists on BOTH sides (an edit whose upload failed before a restart).
 func TestReconcileFirstPassRescuesDirtyInBothFile(t *testing.T) {

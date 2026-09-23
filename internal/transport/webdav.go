@@ -589,7 +589,7 @@ func (c *Client) Put(ctx context.Context, remotePath string, body io.Reader, siz
 // newBody must return a fresh reader of the whole content each call — it backs
 // the request's GetBody so the transport can replay the PUT after a
 // connection-level failure (HTTP/2 GOAWAY, stale reused connection).
-func (c *Client) PutWithChecksum(ctx context.Context, remotePath string, newBody func() (io.Reader, error), size int64, ocChecksum string) (etag, fileID string, err error) {
+func (c *Client) PutWithChecksum(ctx context.Context, remotePath string, newBody func() (io.Reader, error), size int64, ocChecksum string, mtime time.Time) (etag, fileID string, err error) {
 	body, err := newBody()
 	if err != nil {
 		return "", "", err
@@ -616,6 +616,7 @@ func (c *Client) PutWithChecksum(ctx context.Context, remotePath string, newBody
 	if ocChecksum != "" {
 		req.Header.Set("OC-Checksum", ocChecksum)
 	}
+	setMtime(req, mtime)
 	resp, err := c.DoOnce(req)
 	if err != nil {
 		return "", "", err
@@ -626,6 +627,17 @@ func (c *Client) PutWithChecksum(ctx context.Context, remotePath string, newBody
 	}
 	etag, fileID = revisionHeaders(resp.Header)
 	return etag, fileID, nil
+}
+
+// setMtime tells the server the file's own modified time (X-OC-Mtime, whole
+// seconds since the epoch), as Nextcloud's desktop client does on every
+// upload. Without it the server stamps the time the upload arrived, and every
+// other device downloads the file with that date. A zero or pre-1970 time is
+// left out and the server keeps its default.
+func setMtime(req *http.Request, mtime time.Time) {
+	if !mtime.IsZero() && mtime.Unix() > 0 {
+		req.Header.Set("X-OC-Mtime", strconv.FormatInt(mtime.Unix(), 10))
+	}
 }
 
 // revisionHeaders extracts the ETag and OC-FileId from a write response,

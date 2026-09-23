@@ -146,7 +146,7 @@ func uploadOnce(ctx context.Context, c *transport.Client, localPath, remotePath 
 
 	var etag, fileID string
 	if !chunked {
-		etag, fileID, err = uploadSingle(ctx, c, data, remotePath, checksum, prog)
+		etag, fileID, err = uploadSingle(ctx, c, data, remotePath, checksum, fi.ModTime(), prog)
 	} else {
 		etag, fileID, err = uploadChunked(ctx, c, localPath, remotePath, fi, sum, prog)
 	}
@@ -213,7 +213,7 @@ func readShared(path string) ([]byte, error) {
 
 // uploadSingle performs a one-shot PUT of data, riding out transient failures.
 // The bytes come from memory, so every attempt sends exactly what was hashed.
-func uploadSingle(ctx context.Context, c *transport.Client, data []byte, remotePath, checksum string, prog func(int64)) (etag, fileID string, err error) {
+func uploadSingle(ctx context.Context, c *transport.Client, data []byte, remotePath, checksum string, mtime time.Time, prog func(int64)) (etag, fileID string, err error) {
 	var sent atomic.Int64
 	newBody := func() (io.Reader, error) {
 		if s := sent.Swap(0); s > 0 && prog != nil {
@@ -234,7 +234,7 @@ func uploadSingle(ctx context.Context, c *transport.Client, data []byte, remoteP
 				return "", "", err
 			}
 		}
-		etag, fileID, err = c.PutWithChecksum(ctx, remotePath, newBody, int64(len(data)), checksum)
+		etag, fileID, err = c.PutWithChecksum(ctx, remotePath, newBody, int64(len(data)), checksum, mtime)
 		if err == nil || ctx.Err() != nil {
 			return etag, fileID, err
 		}
@@ -324,7 +324,7 @@ func uploadChunked(ctx context.Context, c *transport.Client, localPath, remotePa
 		}
 	}
 
-	return assembleRetry(ctx, c, uploadID, remotePath, size, ocChecksum(sum))
+	return assembleRetry(ctx, c, uploadID, remotePath, size, ocChecksum(sum), orig.ModTime())
 }
 
 // putChunkRetry uploads one chunk, retrying transient failures with backoff.
@@ -412,7 +412,7 @@ func (l *lockedHash) Write(p []byte) (int, error) {
 // other failure — a 423 lock on the destination, quota, auth blips, a WAF
 // tantrum — keeps the session intact so the caller's retry RESUMES instead of
 // re-uploading hundreds of gigabytes.
-func assembleRetry(ctx context.Context, c *transport.Client, uploadID, remotePath string, size int64, checksum string) (etag, fileID string, err error) {
+func assembleRetry(ctx context.Context, c *transport.Client, uploadID, remotePath string, size int64, checksum string, mtime time.Time) (etag, fileID string, err error) {
 	// The pre-assembly baseline: without a KNOWN prior state of the
 	// destination, polling can mistake an old same-size file for our upload —
 	// so if this Stat fails, destination polling is disabled entirely.
@@ -429,7 +429,7 @@ func assembleRetry(ctx context.Context, c *transport.Client, uploadID, remotePat
 				return "", "", err
 			}
 		}
-		etag, fileID, err = c.AssembleUpload(ctx, uploadID, remotePath, size, checksum)
+		etag, fileID, err = c.AssembleUpload(ctx, uploadID, remotePath, size, checksum, mtime)
 		if err == nil {
 			return etag, fileID, nil
 		}
