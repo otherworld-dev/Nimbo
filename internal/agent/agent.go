@@ -1293,7 +1293,7 @@ func (e *Engine) setConflicts(p Pair, infos []transfer.ConflictInfo) {
 		}
 		for _, c := range items {
 			if !seen[c.Path] {
-				e.toast("Sync conflict", filepath.Base(c.Path)+" needs your decision", "")
+				e.toast("Sync conflict", filepath.Base(c.Path)+" needs your decision", "action=conflicts")
 			}
 		}
 	}
@@ -3887,11 +3887,15 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			// .pst) waits the same way an upload of it does (Deck #714).
 			var inUse *transfer.InUseError
 			if (a.Kind == engine.ActUpload || a.Kind == engine.ActConflict) && errors.As(aerr, &inUse) {
+				// Held, not failed: one neutral "waiting" activity row per wait
+				// instead of a red "failed" one every pass (see noteWaiting).
 				probMu.Lock()
 				busyUploads = append(busyUploads, a.Path)
+				problems = append(problems, a.Path) // still unsent: the folder isn't settled
 				probMu.Unlock()
-				e.noteBusy(abs, a.Path)
+				e.noteWaiting(p.LocalDir, abs, a.Path)
 				e.awaitClosed(p, abs) // see inuse.go
+				return
 			} else if a.Kind == engine.ActUpload && aerr == nil {
 				e.clearBusy(abs)
 			}

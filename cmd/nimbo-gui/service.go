@@ -3649,6 +3649,9 @@ func (a *App) dispatchToastActivation(args string) {
 				notify.Toast("Folder badges", msg, "")
 			}
 		}()
+	case "conflicts":
+		// A "Sync conflict" toast: straight to the choice it is asking for.
+		application.InvokeAsync(func() { a.openStatus("conflicts") })
 	case "inuse":
 		// A "File in use" toast: show WHO has WHAT open, in context.
 		application.InvokeAsync(func() { a.openStatus("inuse") })
