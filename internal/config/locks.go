@@ -25,6 +25,10 @@ type HeldLock struct {
 	// other way. Its disappearance releases the lock even when the close
 	// event itself was missed (Deck #722).
 	LockFile string `json:"lockFile,omitempty"`
+	// Released marks a note, not a lock: the lock was given back when Nimbo
+	// exited while its document was still open, so the next start locks it
+	// again if LockFile is still there, and otherwise forgets it.
+	Released bool `json:"released,omitempty"`
 }
 
 // LocksFile is the path to the registry of locks we hold. It lives in Config,

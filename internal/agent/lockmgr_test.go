@@ -144,7 +144,7 @@ func TestSweepReleasesStrandedLocks(t *testing.T) {
 		{Account: "adam", RemotePath: "stranded.xlsx", Token: "files_lock/x"},
 	})
 
-	n, err := m.sweep(context.Background())
+	n, err := m.sweep(context.Background(), true)
 	if err != nil || n != 1 {
 		t.Fatalf("sweep = %d, %v; want 1, nil", n, err)
 	}
@@ -163,7 +163,7 @@ func TestSweepIgnoresOtherAccounts(t *testing.T) {
 		{Account: "someone-else", RemotePath: "theirs.xlsx", Token: "files_lock/y"},
 	})
 
-	n, err := m.sweep(context.Background())
+	n, err := m.sweep(context.Background(), true)
 	if err != nil || n != 0 {
 		t.Fatalf("sweep = %d, %v; want 0, nil", n, err)
 	}
@@ -182,7 +182,7 @@ func TestSweepForgetsLocksNowHeldByOthers(t *testing.T) {
 	_ = d.SaveHeldLocks([]config.HeldLock{{Account: "adam", RemotePath: "taken.xlsx"}})
 	f.unlockErr["taken.xlsx"] = errors.New(`UNLOCK "taken.xlsx": server returned 423 Locked: `)
 
-	if _, err := m.sweep(context.Background()); err == nil {
+	if _, err := m.sweep(context.Background(), true); err == nil {
 		t.Fatal("sweep() hid a 423")
 	}
 	if held, _ := d.LoadHeldLocks(); len(held) != 0 {
@@ -197,7 +197,7 @@ func TestSweepKeepsTransientFailures(t *testing.T) {
 	_ = d.SaveHeldLocks([]config.HeldLock{{Account: "adam", RemotePath: "flaky.xlsx"}})
 	f.unlockErr["flaky.xlsx"] = errors.New("connection refused")
 
-	if _, err := m.sweep(context.Background()); err == nil {
+	if _, err := m.sweep(context.Background(), true); err == nil {
 		t.Fatal("sweep() hid a failure")
 	}
 	if held, _ := d.LoadHeldLocks(); len(held) != 1 {
@@ -742,5 +742,127 @@ func TestReleaseLocksForExit(t *testing.T) {
 		t.Errorf("lockout handle still held: %v", err)
 	} else {
 		fh.Close()
+	}
+}
+
+// writeOpenFile creates an editor lock file standing for a document still open.
+func writeOpenFile(t *testing.T, name string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// Quitting (or an in-app update) releases every lock, but a document still
+// open then has to be locked again when Nimbo comes back, or colleagues see it
+// free while the user is still in it. The exit release therefore leaves a note
+// for each lock whose editor file is still there, and only for those.
+func TestExitReleaseNotesDocumentsStillOpen(t *testing.T) {
+	m, f, d := newTestMgr(t)
+	ctx := context.Background()
+	open := writeOpenFile(t, "~$Open.docx")
+	closed := writeOpenFile(t, "~$Closed.docx")
+	_ = m.takeFor(ctx, "Open.docx", open)
+	_ = m.takeFor(ctx, "Closed.docx", closed)
+	_ = os.Remove(closed)
+
+	n, err := m.releaseAllForExit(ctx)
+	if err != nil || n != 2 || len(f.unlocked) != 2 {
+		t.Fatalf("released %d (err %v, unlocked %q), want both", n, err, f.unlocked)
+	}
+	onDisk, _ := d.LoadHeldLocks()
+	if len(onDisk) != 1 || onDisk[0].RemotePath != "Open.docx" || !onDisk[0].Released || onDisk[0].LockFile != open {
+		t.Errorf("registry after exit = %+v, want one released note for Open.docx", onDisk)
+	}
+}
+
+// At the next start the note becomes a lock again while the document is still
+// open, and is simply dropped once it has been closed.
+func TestSweepRelocksADocumentStillOpen(t *testing.T) {
+	m, f, d := newTestMgr(t)
+	open := writeOpenFile(t, "~$Open.docx")
+	_ = d.SaveHeldLocks([]config.HeldLock{
+		{Account: "adam", RemotePath: "Open.docx", LockFile: open, Released: true},
+		{Account: "adam", RemotePath: "Gone.docx", LockFile: filepath.Join(t.TempDir(), "~$Gone.docx"), Released: true},
+	})
+
+	if _, err := m.sweep(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.lockCalls) != 1 || f.lockCalls[0] != "Open.docx" {
+		t.Errorf("LOCKs = %q, want just the still-open document", f.lockCalls)
+	}
+	if len(f.unlocked) != 0 {
+		t.Errorf("a released note was UNLOCKed again: %q", f.unlocked)
+	}
+	held := m.list()
+	if len(held) != 1 || held[0].RemotePath != "Open.docx" || held[0].Released || held[0].LockFile != open {
+		t.Errorf("held = %+v, want Open.docx held again with its lock file", held)
+	}
+	onDisk, _ := d.LoadHeldLocks()
+	for _, l := range onDisk {
+		if l.Released {
+			t.Errorf("a released note outlived the sweep: %+v", l)
+		}
+	}
+}
+
+// After a crash the lock is still on the server. If its document is still open
+// it is kept as it is (no UNLOCK, and no round trip needed: the heartbeat
+// refreshes it), rather than released under the user's feet.
+func TestSweepKeepsACrashedRunsLockWhileItsDocumentIsOpen(t *testing.T) {
+	m, f, d := newTestMgr(t)
+	open := writeOpenFile(t, "~$Crash.docx")
+	_ = d.SaveHeldLocks([]config.HeldLock{{Account: "adam", RemotePath: "Crash.docx", LockFile: open}})
+
+	_, _ = m.sweep(context.Background(), true)
+	if len(f.unlocked) != 0 {
+		t.Errorf("a lock on a document still open was released: %q", f.unlocked)
+	}
+	if held := m.list(); len(held) != 1 || held[0].RemotePath != "Crash.docx" {
+		t.Errorf("held = %+v, want Crash.docx kept", held)
+	}
+}
+
+// With locking switched off (or the guard state unreadable) nothing is taken
+// at startup: a note is dropped and a crashed run's lock is released as before.
+func TestSweepWithoutLockingReleasesInsteadOfRelocking(t *testing.T) {
+	m, f, d := newTestMgr(t)
+	open := writeOpenFile(t, "~$A.docx")
+	_ = d.SaveHeldLocks([]config.HeldLock{
+		{Account: "adam", RemotePath: "Noted.docx", LockFile: open, Released: true},
+		{Account: "adam", RemotePath: "Crash.docx", LockFile: open},
+	})
+	_, _ = m.sweep(context.Background(), false)
+	if len(f.lockCalls) != 0 {
+		t.Errorf("locked with locking off: %q", f.lockCalls)
+	}
+	if len(f.unlocked) != 1 || f.unlocked[0] != "Crash.docx" {
+		t.Errorf("unlocked = %q, want the crashed run's lock released", f.unlocked)
+	}
+	if len(m.list()) != 0 {
+		t.Errorf("held = %+v, want nothing", m.list())
+	}
+}
+
+// A leftover lock the sweep could not release used to go back in the held set,
+// where the heartbeat LOCKed it again every five minutes. It is released by the
+// tick instead.
+func TestSweepLeftoverThatFailsIsRetriedNotRelocked(t *testing.T) {
+	m, f, d := newTestMgr(t)
+	_ = d.SaveHeldLocks([]config.HeldLock{{Account: "adam", RemotePath: "left.docx"}})
+	f.unlockErr["left.docx"] = errors.New("offline")
+	_, _ = m.sweep(context.Background(), true)
+
+	m.heartbeat(context.Background())
+	if len(f.lockCalls) != 0 {
+		t.Errorf("heartbeat re-LOCKed a leftover being released: %q", f.lockCalls)
+	}
+	delete(f.unlockErr, "left.docx")
+	m.tick(context.Background())
+	if len(f.unlocked) != 1 {
+		t.Errorf("tick did not retry the leftover: unlocked=%q", f.unlocked)
 	}
 }

@@ -832,7 +832,7 @@ func (e *Engine) runLockLifetime(ctx context.Context) {
 	if !e.LockingAvailable() {
 		return
 	}
-	if n, err := e.lockMgr.sweep(ctx); n > 0 || err != nil {
+	if n, err := e.lockMgr.sweep(ctx, e.lockingEnabled() && !e.guardStateUnavailable()); n > 0 || err != nil {
 		slog.Info("swept locks left by a previous run", "released", n, "err", err)
 	}
 	if e.lockWarn != nil {
@@ -879,7 +879,7 @@ func (e *Engine) ReleaseLocksForExit(ctx context.Context) (int, error) {
 	if e.lockMgr == nil {
 		return 0, nil
 	}
-	return e.lockMgr.releaseAll(ctx)
+	return e.lockMgr.releaseAllForExit(ctx)
 }
 
 // heldStatus is the flyout line for a pass that finished with nothing to do.
