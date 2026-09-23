@@ -7,6 +7,7 @@ import (
 	"embed"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -93,6 +94,7 @@ func main() {
 		if lerr := applog.Setup(d.LogFile(), verbose); lerr != nil {
 			slog.Warn("file logging unavailable, using stderr only", "err", lerr)
 		}
+		setupCrashLog(filepath.Join(filepath.Dir(d.LogFile()), "crash.log"))
 	} else {
 		applog.SetVerbose(verbose)
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: applog.Level()})))
@@ -121,6 +123,10 @@ func main() {
 		},
 	})
 	svc.app = app
+	// Logged here, not earlier: a second launch (Explorer's Share menu) hands
+	// its arguments to the running app and exits inside application.New, and
+	// must not read as a start that never logged "exiting".
+	slog.Info("starting", "version", version, "pid", os.Getpid())
 
 	// Toast activation: register the COM callback so clicking a toast (or a toast
 	// button) routes to the matching action (sign in, open notifications, run a
@@ -220,6 +226,10 @@ func main() {
 	}
 
 	err := app.Run()
+	// Every clean way out passes here (tray Quit, an update, Windows ending the
+	// session). A log that stops without this line died another way: see
+	// crash.log, or it was killed.
+	slog.Info("exiting", "err", err)
 	// Disconnect WITHOUT unregistering: unregistering makes Windows strip the
 	// cloud state from the whole tree, which is how every app update used to
 	// flatten the mount (placeholders reverted to plain files on each restart).

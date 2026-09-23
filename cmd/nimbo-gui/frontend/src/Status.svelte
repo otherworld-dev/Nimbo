@@ -121,7 +121,22 @@
     : k === "type" ? "Changed to a different type on each side."
     : "Edited on both sides since the last sync.";
 
-  const resolve = (c: Conflict, choice: string) => App.ResolveConflict(c.localDir, c.path, choice);
+  // A choice is recorded at once and the sync does the transfer, except keep
+  // both, which moves files while you wait. Either way the buttons stay off
+  // until it answers, and a refusal shows on the card instead of vanishing.
+  let resolving = $state<Record<string, string>>({});
+  let resolveErr = $state<Record<string, string>>({});
+  async function resolve(c: Conflict, choice: string) {
+    const k = ckey(c);
+    if (resolving[k]) return;
+    resolving[k] = choice;
+    resolveErr[k] = "";
+    try {
+      resolveErr[k] = await App.ResolveConflict(c.localDir, c.path, choice);
+    } finally {
+      delete resolving[k];
+    }
+  }
 
   // Content preview, lazily fetched when a conflict is expanded.
   type Side = { exists: boolean; size: number; isText: boolean; preview: string; truncated: boolean; note: string };
@@ -261,10 +276,11 @@
             {/if}
           {/if}
           <div class="btns">
-            <button class="primary" onclick={() => resolve(c, "local")}>Keep mine</button>
-            <button onclick={() => resolve(c, "remote")}>Keep server</button>
-            <button onclick={() => resolve(c, "both")}>Keep both</button>
+            <button class="primary" disabled={!!resolving[ckey(c)]} onclick={() => resolve(c, "local")}>Keep mine</button>
+            <button disabled={!!resolving[ckey(c)]} onclick={() => resolve(c, "remote")}>Keep server</button>
+            <button disabled={!!resolving[ckey(c)]} onclick={() => resolve(c, "both")}>{resolving[ckey(c)] === "both" ? "Keeping both…" : "Keep both"}</button>
           </div>
+          {#if resolveErr[ckey(c)]}<div class="resolveerr">⚠ {resolveErr[ckey(c)]}</div>{/if}
         </div>
       {/each}
 
@@ -393,6 +409,7 @@
   .line .k { color: var(--accent); min-width: 86px; }
   .line .p { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .line .err { color: #e06b6b; }
+  .resolveerr { margin-top: 8px; font-size: 12.5px; color: #e06b6b; }
   /* Deep-link flash: briefly tint + outline the row the flyout pointed at. */
   .hl { animation: hlflash 3.4s ease-out both; border-radius: 6px; }
   @keyframes hlflash {
@@ -429,6 +446,7 @@
   .btns button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   .btns button.danger { color: #c0392b; border-color: #e6b8b2; }
   .btns button.danger:hover { background: #fdeceb; }
+  .btns button:disabled { opacity: .55; cursor: default; }
   .bulkrow { display: flex; align-items: center; justify-content: space-between; gap: 10px;
              padding: 8px 10px; margin-bottom: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
   .bulkcount { font-size: 12.5px; color: var(--fg2); }

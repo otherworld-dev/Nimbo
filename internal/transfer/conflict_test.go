@@ -70,3 +70,63 @@ func TestConflictNameDoesNotStackMarkers(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+// Deciding whether two edited copies differ downloaded the whole server copy to
+// compare, on every pass the conflict stood: a 24 GB .pst, every ~14 minutes,
+// all evening (Deck #714). The server keeps the SHA1 of what was uploaded, so
+// the comparison needs no download when it has one.
+func TestConflictCheckComparesServerChecksumWithoutDownloading(t *testing.T) {
+	c, gets := conflictServer(t, 0)
+	sum, _ := sha1File(writeTemp(t, "local edit"))
+	for _, tc := range []struct {
+		name       string
+		serverSHA1 string
+		merged     bool
+	}{
+		{"same bytes", sum, true},
+		{"different bytes", "0123456789abcdef0123456789abcdef01234567", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ex := conflictExecutor(t, c)
+			r := ex.Remote["doc.txt"]
+			r.SHA1 = tc.serverSHA1
+			ex.Remote["doc.txt"] = r
+			before := gets.Load()
+			info, merged, err := ex.classifyConflict(context.Background(), engine.Action{Kind: engine.ActConflict, Path: "doc.txt"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if merged != tc.merged {
+				t.Errorf("merged = %v, want %v", merged, tc.merged)
+			}
+			if !tc.merged && info.Kind != "edited" {
+				t.Errorf("kind = %q, want edited", info.Kind)
+			}
+			if n := gets.Load() - before; n != 0 {
+				t.Errorf("downloaded the server copy %d times to compare it", n)
+			}
+		})
+	}
+}
+
+// Without a server checksum the download is still how the copies are compared.
+func TestConflictCheckDownloadsWhenTheServerHasNoChecksum(t *testing.T) {
+	c, gets := conflictServer(t, 0)
+	ex := conflictExecutor(t, c)
+	info, merged, err := ex.classifyConflict(context.Background(), engine.Action{Kind: engine.ActConflict, Path: "doc.txt"})
+	if err != nil || merged || info.Kind != "edited" {
+		t.Fatalf("info=%+v merged=%v err=%v", info, merged, err)
+	}
+	if gets.Load() != 1 {
+		t.Errorf("GETs = %d, want 1", gets.Load())
+	}
+}
+
+func writeTemp(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}

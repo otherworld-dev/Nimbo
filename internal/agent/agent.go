@@ -149,6 +149,7 @@ type Engine struct {
 	conflictMu   sync.Mutex
 	conflicts    map[string][]ConflictItem // key = pair LocalDir
 	conflictSubs []chan struct{}
+	resolving    map[string]bool // conflicts a choice is being applied to (LocalDir|path; | is not allowed in a Windows path)
 
 	detachedMu   sync.Mutex
 	detachedSubs []chan struct{} // notified when the parked-folder list changes (see detach.go)
@@ -1202,8 +1203,31 @@ func (e *Engine) SubscribeConflicts() <-chan struct{} {
 	return ch
 }
 
-// ResolveConflict applies a user's choice to a deferred conflict.
+// ErrResolving is a choice refused because the same conflict is still being
+// settled by an earlier one.
+var ErrResolving = errors.New("this conflict is already being settled")
+
+// ResolveConflict applies a user's choice to a deferred conflict. Keep mine
+// and Keep server only record it (transfer.RecordChoice) and nudge the path
+// into a quick pass, which does the transfer; keep both is done here.
 func (e *Engine) ResolveConflict(ctx context.Context, item ConflictItem, choice transfer.Choice) error {
+	key := item.LocalDir + "|" + item.Path
+	e.conflictMu.Lock()
+	if e.resolving == nil {
+		e.resolving = make(map[string]bool)
+	}
+	if e.resolving[key] {
+		e.conflictMu.Unlock()
+		return ErrResolving
+	}
+	e.resolving[key] = true
+	e.conflictMu.Unlock()
+	defer func() {
+		e.conflictMu.Lock()
+		delete(e.resolving, key)
+		e.conflictMu.Unlock()
+	}()
+
 	st, err := e.getStore()
 	if err != nil {
 		return err
@@ -1217,11 +1241,27 @@ func (e *Engine) ResolveConflict(ctx context.Context, item ConflictItem, choice 
 		RemoteRoot: item.RemoteRoot,
 		Escaper:    e.escaper.Load(),
 	}
-	if err := ex.ApplyChoice(ctx, item.Path, choice); err != nil {
+	if err := ex.RecordChoice(ctx, item.Path, choice); err != nil {
 		return err
 	}
 	e.removeConflict(item.LocalDir, item.Path)
+	e.nudgePath(item.LocalDir, item.RemoteRoot, filepath.Join(item.LocalDir, filepath.FromSlash(item.Path)))
 	return nil
+}
+
+// nudgePath asks the pair's watcher to sync abs as if it had seen it change.
+// Best effort: with no watcher, or its queue full, the next pass finds it.
+func (e *Engine) nudgePath(localDir, remoteRoot, abs string) {
+	e.watchMu.Lock()
+	ch := e.nudges[PairKey(localDir, remoteRoot)]
+	e.watchMu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- abs:
+	default:
+	}
 }
 
 func (e *Engine) setConflicts(p Pair, infos []transfer.ConflictInfo) {
@@ -3815,6 +3855,15 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			probMu.Unlock()
 		},
 		OnEvent: func(a engine.Action, aerr error) {
+			if errors.Is(aerr, transfer.ErrUploadInProgress) {
+				// Another pass is uploading this very file (Deck #714). It owns
+				// the icon, the activity entry and the outcome; this pass only
+				// must not count the folder as settled while that runs.
+				probMu.Lock()
+				problems = append(problems, a.Path)
+				probMu.Unlock()
+				return
+			}
 			abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
 			e.markInflight(abs, false)
 			if e.lockWarn != nil {
@@ -3834,8 +3883,10 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			if (a.Kind == engine.ActDownload || a.Kind == engine.ActConflict) && errors.As(aerr, &damaged) {
 				e.noteDamaged(pk, a.Path, remote[a.Path].ETag)
 			}
+			// A conflict check that could not read the file (Outlook has the
+			// .pst) waits the same way an upload of it does (Deck #714).
 			var inUse *transfer.InUseError
-			if a.Kind == engine.ActUpload && errors.As(aerr, &inUse) {
+			if (a.Kind == engine.ActUpload || a.Kind == engine.ActConflict) && errors.As(aerr, &inUse) {
 				probMu.Lock()
 				busyUploads = append(busyUploads, a.Path)
 				probMu.Unlock()

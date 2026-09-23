@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/otherworld/nimbo/internal/cfapi"
+	"github.com/otherworld/nimbo/internal/transfer"
 	"github.com/otherworld/nimbo/internal/transport"
 )
 
@@ -1673,6 +1674,13 @@ func (w *Watcher) handleChange(path string) {
 				// — marking it synced would let a later refresh dehydrate the
 				// edit away.
 				w.ops.Log("vfs upload %s held: someone else has it locked", server)
+				w.reforce(path, forced)
+				w.scheduleUploadAfter(path, heldRetry)
+			case errors.Is(err, transfer.ErrUploadInProgress):
+				// This file is already on its way up (Deck #714). Try again
+				// after it: if that upload settles it, the retry finds nothing
+				// to do; if the file changed since, the retry sends the change.
+				w.ops.Log("vfs upload %s already running, retrying after it", server)
 				w.reforce(path, forced)
 				w.scheduleUploadAfter(path, heldRetry)
 			case isFileBusy(err):
