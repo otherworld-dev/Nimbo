@@ -732,7 +732,11 @@ type PlaceholderInfo struct {
 	ModTime  time.Time
 	Identity []byte // opaque per-file blob (we use the UTF-8 remote path)
 	ETag     string // server ETag (carried for the write-back conflict baseline; not stored in the placeholder)
-	FileID   string // server oc:fileid — stable across renames; used for down-sync rename detection
+	// UploadTime is the server's nc:upload_time for this version (0 = not
+	// reported); with Size and ModTime it tells a metadata-only ETag bump
+	// from a real edit (transport.ContentKey). Not stored in the placeholder.
+	UploadTime int64
+	FileID     string // server oc:fileid — stable across renames; used for down-sync rename detection
 	// MountRoot marks the top of a share received from someone else or of a
 	// mount: the one entry whose later disappearance from a listing means
 	// "detached from this account", not "deleted" (Deck #557).

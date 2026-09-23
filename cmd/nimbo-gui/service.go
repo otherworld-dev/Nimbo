@@ -1237,7 +1237,7 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			}
 			items = append(items, cfapi.PlaceholderInfo{
 				Name: name, Size: e.Size, IsDir: e.IsDir, ModTime: e.LastModified,
-				Identity: []byte(p), ETag: e.ETag, FileID: e.FileID, MountRoot: isRoot,
+				Identity: []byte(p), ETag: e.ETag, UploadTime: e.UploadTime, FileID: e.FileID, MountRoot: isRoot,
 			})
 		}
 		mountroots.setMany(roots)
@@ -1259,15 +1259,18 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		}
 		base := make(map[string]string, len(items))
 		fids := make(map[string]string, len(items))
+		keys := make(map[string]string, len(items))
 		for _, it := range items {
 			if !it.IsDir {
 				base[string(it.Identity)] = it.ETag
+				keys[string(it.Identity)] = transport.ContentKey(it.Size, it.ModTime, it.UploadTime)
 				if it.FileID != "" {
 					fids[string(it.Identity)] = it.FileID
 				}
 			}
 		}
 		etags.setMany(base)
+		etags.setContentKeys(keys)
 		fileids.setMany(fids)
 		return items
 	}
@@ -1375,6 +1378,8 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			RecordBaseline: func(remote, etag string) { etags.set(remote, etag) },
 			Baseline:       func(remote string) (string, bool) { e := etags.get(remote); return e, e != "" },
 			ForgetBaseline: func(remote string) { etags.del(remote) },
+			RecordContent:  func(m map[string]string) { etags.setContentKeys(m) },
+			Content:        func(remote string) string { return etags.contentKey(remote) },
 			// Batch forms: each store write rewrites the whole JSON file, so a
 			// moved directory's carry and a directory's pull each have to be
 			// ONE write rather than one per item.
@@ -1559,7 +1564,7 @@ func (a *App) uploadWithConflictFor(eng *agent.Engine, etags *etagStore) func(ct
 		base := etags.get(remotePath)
 		cur, curExists, statErr := eng.StatRemote(ctx, remotePath)
 		switch {
-		case base != "" && statErr == nil && curExists && cur.ETag != base && !sameBytesAsServer(localPath, cur):
+		case base != "" && statErr == nil && curExists && serverEditedSince(base, etags.contentKey(remotePath), cur) && !sameBytesAsServer(localPath, cur):
 			// Server changed too — keep both: park the server's version. A
 			// failed park must ABORT the upload: proceeding would overwrite
 			// the very edit the check just detected. The watcher retries.
@@ -1584,14 +1589,21 @@ func (a *App) uploadWithConflictFor(eng *agent.Engine, etags *etagStore) func(ct
 		}
 		// Baseline from the upload's OWN revision when the server names it — a
 		// fresh Stat could adopt a concurrent writer's newer revision as ours.
-		if etag == "" {
-			if cur, ok, serr := eng.StatRemote(ctx, remotePath); serr == nil && ok {
-				etag = cur.ETag
-			}
+		// The Stat is still needed for the content key, which the PUT does not
+		// return; it is recorded only when the Stat IS our revision, and
+		// cleared otherwise so an older version's key can't vouch for this one.
+		after, ok, serr := eng.StatRemote(ctx, remotePath)
+		if etag == "" && serr == nil && ok {
+			etag = after.ETag
 		}
 		if etag != "" {
 			etags.set(remotePath, etag)
 		}
+		key := ""
+		if serr == nil && ok && etag != "" && after.ETag == etag {
+			key = after.ContentKey()
+		}
+		etags.setContentKeys(map[string]string{remotePath: key})
 		return nil
 	}
 }

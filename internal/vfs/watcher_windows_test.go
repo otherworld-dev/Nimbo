@@ -508,6 +508,7 @@ type recorder struct {
 	deletes   []string
 	moves     [][2]string
 	baselines map[string]string
+	contents  map[string]string // Ops.RecordContent: content-version key per remote path
 	fileids   map[string]string
 	listCalls map[string]int
 	listing   map[string][]cfapi.PlaceholderInfo
@@ -595,7 +596,7 @@ type reportRec struct {
 
 func newRecorder() *recorder {
 	return &recorder{
-		baselines: map[string]string{}, fileids: map[string]string{},
+		baselines: map[string]string{}, contents: map[string]string{}, fileids: map[string]string{},
 		listCalls: map[string]int{}, listing: map[string][]cfapi.PlaceholderInfo{},
 		uploadSawBase: map[string]string{},
 		uploaded:      make(chan string, 16), deleted: make(chan string, 16), moved: make(chan [2]string, 16),
@@ -751,6 +752,22 @@ func (r *recorder) ops() Ops {
 			defer r.mu.Unlock()
 			e, ok := r.baselines[remote]
 			return e, ok
+		},
+		RecordContent: func(m map[string]string) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			for remote, key := range m {
+				if key == "" {
+					delete(r.contents, remote)
+				} else {
+					r.contents[remote] = key
+				}
+			}
+		},
+		Content: func(remote string) string {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			return r.contents[remote]
 		},
 		ForgetBaseline: func(remote string) {
 			r.mu.Lock()
@@ -1418,6 +1435,97 @@ func TestReconcileRefreshesChangedFile(t *testing.T) {
 	}
 	if rec.baselines["doc.txt"] != "etag-v2" {
 		t.Error("baseline not advanced to the refreshed version")
+	}
+}
+
+// A files_lock lock or unlock changes the ETag and nothing else. When the
+// recorded content key says the server still holds the version this clean
+// placeholder mirrors, the ETag change is metadata: the local copy must stay
+// (GitHub #7 — every colleague opening a document dehydrated everyone else's
+// downloaded copy, and a pinned one downloaded twice) and the baseline must
+// move on to the new ETag.
+func TestReconcileKeepsLocalCopyOnMetadataOnlyETagBump(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	doc := filepath.Join(root, "doc.txt")
+	if err := os.WriteFile(doc, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(doc)
+	rec := newRecorder()
+	rec.baselines["doc.txt"] = "etag-v1"
+	rec.contents["doc.txt"] = transport.ContentKey(fi.Size(), fi.ModTime(), 1790160705)
+	r := ph("doc.txt", false, "etag-locked", "fid")
+	r.Size, r.ModTime, r.UploadTime = fi.Size(), fi.ModTime(), 1790160705 // same version, new ETag
+	rec.listing[""] = []cfapi.PlaceholderInfo{r}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	f.mu.Lock()
+	refreshed := len(f.refreshed)
+	f.mu.Unlock()
+	if refreshed != 0 {
+		t.Fatal("a lock's ETag bump dehydrated an unchanged local copy")
+	}
+	if rec.baselines["doc.txt"] != "etag-locked" {
+		t.Errorf("baseline = %q, want it moved on to etag-locked", rec.baselines["doc.txt"])
+	}
+}
+
+// The content key must not hide a real edit: a new upload of the same size and
+// mtime has a new upload time, so it is still refreshed.
+func TestReconcileRefreshesSameSizeUploadDespiteContentKey(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	doc := filepath.Join(root, "doc.txt")
+	if err := os.WriteFile(doc, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(doc)
+	rec := newRecorder()
+	rec.baselines["doc.txt"] = "etag-v1"
+	rec.contents["doc.txt"] = transport.ContentKey(fi.Size(), fi.ModTime(), 1790160705)
+	r := ph("doc.txt", false, "etag-v2", "fid")
+	r.Size, r.ModTime, r.UploadTime = fi.Size(), fi.ModTime(), 1790160846 // re-uploaded
+	rec.listing[""] = []cfapi.PlaceholderInfo{r}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	f.mu.Lock()
+	refreshed := len(f.refreshed)
+	f.mu.Unlock()
+	if refreshed != 1 {
+		t.Fatalf("same-size re-upload refreshed %d times, want 1 (stale local copy)", refreshed)
+	}
+	if want := transport.ContentKey(r.Size, r.ModTime, r.UploadTime); rec.contents["doc.txt"] != want {
+		t.Errorf("content key after refresh = %q, want %q", rec.contents["doc.txt"], want)
+	}
+}
+
+// A placeholder created by reconcile mirrors the listed version, so its content
+// key is recorded with its ETag — or the first lock on a file that arrived
+// after its folder was populated would still read as an edit.
+func TestReconcilePullRecordsContentKeys(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	rec := newRecorder()
+	r := ph("new.txt", false, "etag-n", "fid-n")
+	r.Size, r.UploadTime = 5, 1790160705
+	rec.listing[""] = []cfapi.PlaceholderInfo{r, ph("sub", true, "etag-sub", "")}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	if want := transport.ContentKey(5, r.ModTime, 1790160705); rec.contents["new.txt"] != want {
+		t.Errorf("content key = %q, want %q", rec.contents["new.txt"], want)
+	}
+	if _, ok := rec.contents["sub"]; ok {
+		t.Error("a directory got a content key")
 	}
 }
 

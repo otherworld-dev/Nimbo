@@ -36,3 +36,21 @@ func sameBytesAsServer(localPath string, ent transport.Entry) bool {
 	}
 	return false
 }
+
+// serverEditedSince reports whether cur, the server's copy now, is a different
+// version from the one a local edit started from: the baseline ETag base, and
+// baseKey, the content key recorded with it (transport.ContentKey).
+//
+// A new ETag alone is not enough. files_lock moves the ETag when a colleague
+// locks and again when they unlock, so an edit made while they had the file
+// open used to park their untouched copy as a conflicted copy (GitHub #7,
+// VM-reproduced 2026-09-23). A matching content key proves the server still
+// holds the version we started from. Conservative: an unknown key on either
+// side leaves the ETag to decide, as before.
+func serverEditedSince(base, baseKey string, cur transport.Entry) bool {
+	if cur.ETag == base {
+		return false
+	}
+	k := cur.ContentKey()
+	return k == "" || k != baseKey
+}

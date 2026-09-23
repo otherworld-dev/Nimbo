@@ -15,14 +15,78 @@ type etagStore struct {
 	mu   sync.Mutex
 	path string
 	m    map[string]string
+	// keys holds, per file, the content-version key (transport.ContentKey)
+	// of the server version its baseline was recorded for, so a new ETag
+	// with the same content — files_lock bumps it on every lock and unlock
+	// (GitHub #7) — is not read as an edit. Kept in a SEPARATE file so the
+	// ETag file stays the flat map older builds read; moves and forgets
+	// carry both.
+	keys map[string]string
 }
 
 func newEtagStore(path string) *etagStore {
-	s := &etagStore{path: path, m: map[string]string{}}
+	s := &etagStore{path: path, m: map[string]string{}, keys: map[string]string{}}
 	if b, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(b, &s.m)
 	}
+	if b, err := os.ReadFile(s.keysPath()); err == nil {
+		_ = json.Unmarshal(b, &s.keys)
+	}
 	return s
+}
+
+// keysPath is the content-key file beside the ETag file:
+// vfs-etags.json -> vfs-etags-content.json.
+func (s *etagStore) keysPath() string {
+	return strings.TrimSuffix(s.path, ".json") + "-content.json"
+}
+
+// keysJSONLocked marshals the content keys for a write after unlocking, or
+// returns nil when there is nothing to write because nothing changed.
+func (s *etagStore) keysJSONLocked(changed bool) []byte {
+	if !changed {
+		return nil
+	}
+	b, _ := json.Marshal(s.keys)
+	return b
+}
+
+func (s *etagStore) writeKeys(b []byte) {
+	if b != nil {
+		_ = os.WriteFile(s.keysPath(), b, 0o644)
+	}
+}
+
+// contentKey returns the recorded content-version key for remote ("" = none).
+func (s *etagStore) contentKey(remote string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keys[etagKey(remote)]
+}
+
+// setContentKeys records several content keys with a single persist; an empty
+// key removes that path's entry.
+func (s *etagStore) setContentKeys(m map[string]string) {
+	s.mu.Lock()
+	changed := false
+	for r, k := range m {
+		key := etagKey(r)
+		if key == "" {
+			continue
+		}
+		if k == "" {
+			if _, ok := s.keys[key]; ok {
+				delete(s.keys, key)
+				changed = true
+			}
+		} else if s.keys[key] != k {
+			s.keys[key] = k
+			changed = true
+		}
+	}
+	b := s.keysJSONLocked(changed)
+	s.mu.Unlock()
+	s.writeKeys(b)
 }
 
 func etagKey(remote string) string { return strings.Trim(remote, "/") }
@@ -49,14 +113,19 @@ func (s *etagStore) set(remote, etag string) {
 // away, e.g. after a rename repoints it).
 func (s *etagStore) del(remote string) {
 	s.mu.Lock()
+	_, hadKey := s.keys[etagKey(remote)]
+	delete(s.keys, etagKey(remote))
+	kb := s.keysJSONLocked(hadKey)
 	if _, ok := s.m[etagKey(remote)]; !ok {
 		s.mu.Unlock()
+		s.writeKeys(kb)
 		return
 	}
 	delete(s.m, etagKey(remote))
 	b, _ := json.Marshal(s.m)
 	s.mu.Unlock()
 	_ = os.WriteFile(s.path, b, 0o644)
+	s.writeKeys(kb)
 }
 
 // delUnder removes remote and every entry beneath it, with a single persist.
@@ -70,6 +139,14 @@ func (s *etagStore) delUnder(remote string) {
 	}
 	prefix := key + "/"
 	s.mu.Lock()
+	nk := 0
+	for k := range s.keys {
+		if k == key || strings.HasPrefix(k, prefix) {
+			delete(s.keys, k)
+			nk++
+		}
+	}
+	kb := s.keysJSONLocked(nk > 0)
 	n := 0
 	for k := range s.m {
 		if k == key || strings.HasPrefix(k, prefix) {
@@ -79,11 +156,13 @@ func (s *etagStore) delUnder(remote string) {
 	}
 	if n == 0 {
 		s.mu.Unlock()
+		s.writeKeys(kb)
 		return
 	}
 	b, _ := json.Marshal(s.m)
 	s.mu.Unlock()
 	_ = os.WriteFile(s.path, b, 0o644)
+	s.writeKeys(kb)
 }
 
 // setMany records several baselines with a single persist (for directory
@@ -117,7 +196,7 @@ func (s *etagStore) moveMany(pairs [][2]string) {
 		return
 	}
 	s.mu.Lock()
-	changed := 0
+	changed, keysChanged := 0, false
 	for _, p := range pairs {
 		src, dst := etagKey(p[0]), etagKey(p[1])
 		// A blank end, or the same path twice, cannot move anything — and
@@ -125,6 +204,18 @@ func (s *etagStore) moveMany(pairs [][2]string) {
 		// spurious conflict the next time that file is edited.
 		if src == "" || dst == "" || strings.EqualFold(src, dst) {
 			continue
+		}
+		// The content key travels with the baseline: a move keeps the
+		// version, so it still describes the file under its new name.
+		// A key already at dst belonged to whatever lived there before and
+		// must not vouch for the arriving file.
+		if k, ok := s.keys[src]; ok {
+			s.keys[dst] = k
+			delete(s.keys, src)
+			keysChanged = true
+		} else if _, ok := s.keys[dst]; ok {
+			delete(s.keys, dst)
+			keysChanged = true
 		}
 		e, ok := s.m[src]
 		if !ok || e == "" {
@@ -134,13 +225,16 @@ func (s *etagStore) moveMany(pairs [][2]string) {
 		delete(s.m, src)
 		changed++
 	}
+	kb := s.keysJSONLocked(keysChanged)
 	if changed == 0 {
 		s.mu.Unlock()
+		s.writeKeys(kb)
 		return
 	}
 	b, _ := json.Marshal(s.m)
 	s.mu.Unlock()
 	_ = os.WriteFile(s.path, b, 0o644)
+	s.writeKeys(kb)
 }
 
 // knownDir reports whether remote is a directory the server is known to have:

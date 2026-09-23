@@ -19,6 +19,8 @@ type Ops struct {
 	Report         func(kind, remotePath string, err error)
 	RecordBaseline func(remotePath, etag string)
 	Baseline       func(remotePath string) (string, bool)
+	RecordContent  func(keyByRemotePath map[string]string)
+	Content        func(remotePath string) string
 	RecordFileID   func(remotePath, fileid string)
 	FileID         func(remotePath string) (string, bool)
 	DropFileID     func(remotePath string)
