@@ -2054,7 +2054,7 @@ func (a *App) animateTray() {
 	}
 	t := time.NewTicker(120 * time.Millisecond)
 	defer t.Stop()
-	frame, last := 0, ""
+	frame, last, lastTip := 0, "", ""
 	for {
 		select {
 		case <-a.ctx.Done():
@@ -2062,20 +2062,38 @@ func (a *App) animateTray() {
 		case <-t.C:
 			state := a.trayState()
 			badge := a.trayBadge()
+			tip := trayTooltip(brand.Current.Name, a.status, a.eng != nil && a.eng.Paused())
 			key := state
 			if badge {
 				key += "+badge"
 			}
-			if state == "sync" {
+			switch {
+			case state == "sync":
 				frame++
-				a.setTrayIcon(trayIcon("sync", frame, badge))
+				a.setTrayIcon(trayIcon("sync", frame, badge), tip)
 				last = key
-			} else if key != last {
-				a.setTrayIcon(trayIcon(state, 0, badge))
+			case key != last:
+				a.setTrayIcon(trayIcon(state, 0, badge), tip)
 				last = key
+			case tip != lastTip:
+				a.tray.SetTooltip(tip)
 			}
+			lastTip = tip
 		}
 	}
+}
+
+// trayTooltip is the tray icon's hover text: the app's name, and on a second
+// line what it is doing, as OneDrive's does. The name alone said nothing about
+// whether it was syncing (GitHub #9 follow-up).
+func trayTooltip(name, status string, paused bool) string {
+	if paused {
+		return name + "\nPaused"
+	}
+	if s := strings.TrimSpace(status); s != "" {
+		return name + "\n" + s
+	}
+	return name
 }
 
 // setTrayIcon changes the tray icon and puts its tooltip back. Wails changes
@@ -2083,9 +2101,9 @@ func (a *App) animateTray() {
 // NOTIFYICON_VERSION_4 an update without NIF_SHOWTIP hides the standard
 // tooltip again, so the name set at startup was gone the first time the icon
 // changed, a moment after launch (GitHub #9).
-func (a *App) setTrayIcon(icon []byte) {
+func (a *App) setTrayIcon(icon []byte, tip string) {
 	a.tray.SetIcon(icon)
-	a.tray.SetTooltip(brand.Current.Name)
+	a.tray.SetTooltip(tip)
 }
 
 // busyStatusWords are the status-text fragments that mean "the engine is
