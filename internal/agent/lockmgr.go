@@ -112,6 +112,14 @@ func (m *lockMgr) refreshOne(ctx context.Context, remotePath string) error {
 	return err
 }
 
+// holds reports whether we hold remotePath's lock (or are taking it).
+func (m *lockMgr) holds(remotePath string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.held[remotePath]
+	return ok
+}
+
 // release unlocks a path and forgets it. The UNLOCK comes first: if it fails we
 // keep the record, so a later sweep can try again. Forgetting first would strand
 // a real lock on a transient error.
@@ -275,10 +283,18 @@ func (e *Engine) handleEditorLockFiles(ctx context.Context, p Pair, changed []st
 	if e.guardStateUnavailable() {
 		return
 	}
+	e.editorLockMu.Lock()
+	defer e.editorLockMu.Unlock()
 	esc := e.escaper.Load()
 	for _, abs := range changed {
 		base := filepath.Base(abs)
 		if !officelock.IsOwnerFile(base) && !strings.HasPrefix(base, ".~lock.") {
+			continue
+		}
+		// The lockout writes owner files of its own beside a colleague's
+		// document. Those say "someone ELSE has it open", not that the user
+		// opened it; locking on them would try to take the colleague's file.
+		if e.lockWarn != nil && e.lockWarn.isSynth(abs) {
 			continue
 		}
 		dir := filepath.Dir(abs)
@@ -308,6 +324,13 @@ func (e *Engine) handleEditorLockFiles(ctx context.Context, p Pair, changed []st
 		remote := strings.Trim(p.RemoteRoot+"/"+esc.Encode(rel), "/")
 
 		if _, statErr := os.Lstat(abs); statErr == nil {
+			// Already ours: one open is one LOCK. Word's owner file changes
+			// more than once while it opens, and on the live server repeated
+			// LOCKs in quick succession left a lock behind that the UNLOCK at
+			// close did not clear (VM, 2026-09-23). The heartbeat refreshes it.
+			if e.lockMgr.holds(remote) {
+				continue
+			}
 			if err := e.TakeLock(ctx, remote); err != nil {
 				if transport.IsLocked(err) {
 					// Somebody got there first. Entirely normal contention — the
@@ -322,6 +345,24 @@ func (e *Engine) handleEditorLockFiles(ctx context.Context, p Pair, changed []st
 		if err := e.ReleaseLock(ctx, remote); err != nil {
 			slog.Warn("could not release the lock on a file that was closed", "path", remote, "err", err)
 		}
+	}
+}
+
+// NoteEditorLockFiles is the on-demand entry to handleEditorLockFiles: the
+// watcher of an on-demand mount hands over the editor lock files it saw come
+// and go, and the mount folder and its server root stand in for a sync pair's
+// (on-demand mode has no pairs; Deck #721).
+func (e *Engine) NoteEditorLockFiles(ctx context.Context, mountDir, remoteRoot string, absPaths []string) {
+	e.handleEditorLockFiles(ctx, Pair{LocalDir: mountDir, RemoteRoot: strings.Trim(remoteRoot, "/")}, absPaths)
+}
+
+// ReleaseLockoutHandle lets go of the deny-write handle the lockout holds on
+// abs, keeping the warning itself. The on-demand watcher calls it just before
+// it dehydrates a downloaded file (a refresh, or "Free up space"), which the
+// handle would otherwise make fail. A path with no handle is a no-op.
+func (e *Engine) ReleaseLockoutHandle(abs string) {
+	if e.lockWarn != nil {
+		e.lockWarn.release(abs)
 	}
 }
 
@@ -370,6 +411,12 @@ func (e *Engine) NoteRemoteLocks(mountDir, remoteRoot string, entries []transpor
 		return
 	}
 	e.reconcileLocked(mountDir, examined, locked)
+	// The listing is where on-demand mode sees a colleague's lock come and go,
+	// so it drives the lockout as applyPlan does for live sync, with the full
+	// set: apply undoes whatever is missing from what it is given.
+	if e.lockWarn != nil && e.lockoutEnabled() {
+		e.lockWarn.apply(e.LockedFiles())
+	}
 }
 
 // lockoutEnabled reports whether we may hold other people's locked files open

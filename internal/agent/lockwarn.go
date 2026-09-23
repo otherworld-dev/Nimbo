@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,10 +15,14 @@ import (
 
 // lockWarner makes somebody else's lock visible to the local user's editor.
 //
-// LIVE SYNC ONLY. It writes real files next to the document, and a real file
-// inside an on-demand root makes the cloud filter treat that directory as
-// already populated — the placeholders then never appear and the folder looks
-// empty. Drive it from applyPlan, never from the on-demand lister.
+// Live sync drives it from applyPlan; on-demand mode from NoteRemoteLocks
+// (Deck #721). It writes real files next to the document, and a real file in an
+// on-demand folder the filter has not populated yet makes it look populated —
+// the placeholders then never appear. That cannot happen here, because warn
+// only acts on a document that is already downloaded, so its folder is
+// populated; online-only documents are skipped (fileOnlineOnly). The watcher
+// keeps these files off the server, and calls BeforeReplace (release, below)
+// before it dehydrates a held file.
 //
 // Two halves, and BOTH are needed for Microsoft Office:
 //
@@ -92,6 +97,12 @@ func (w *lockWarner) apply(locked []LockedFile) {
 func (w *lockWarner) warn(f LockedFile) {
 	if _, err := os.Stat(f.Abs); err != nil {
 		return // not downloaded here; nothing to protect
+	}
+	// An on-demand file whose data is not here: the handle's open would
+	// download it, and an owner file without the handle stops nothing. Left
+	// unrecorded, so a later apply picks it up once it has been downloaded.
+	if fileOnlineOnly(f.Abs) {
+		return
 	}
 	e := &warnEntry{who: f.Who()}
 
@@ -234,6 +245,22 @@ func (w *lockWarner) writeSynth(path string) (string, bool) {
 	w.mu.Unlock()
 	_ = w.dirs.SaveSynthFiles(list)
 	return path, true
+}
+
+// isSynth reports whether path is an editor lock file WE wrote (compared
+// without case: the change journal reports the name as Windows stored it).
+func (w *lockWarner) isSynth(path string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.synth[path] {
+		return true
+	}
+	for p := range w.synth {
+		if strings.EqualFold(p, path) {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *lockWarner) forgetSynth(path string) {

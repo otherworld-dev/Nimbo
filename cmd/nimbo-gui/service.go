@@ -1380,6 +1380,13 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			ForgetBaseline: func(remote string) { etags.del(remote) },
 			RecordContent:  func(m map[string]string) { etags.setContentKeys(m) },
 			Content:        func(remote string) string { return etags.contentKey(remote) },
+			// Word's "~$" / LibreOffice's ".~lock." appearing and vanishing is
+			// how a document being opened and closed shows itself; the engine
+			// turns it into a lock on the server (Deck #721).
+			EditorLockFiles: func(paths []string) { eng.NoteEditorLockFiles(a.ctx, localDir, root, paths) },
+			// The lockout's deny-write handle would make the watcher's own
+			// dehydrate of that file fail.
+			BeforeReplace: eng.ReleaseLockoutHandle,
 			// Batch forms: each store write rewrites the whole JSON file, so a
 			// moved directory's carry and a directory's pull each have to be
 			// ONE write rather than one per item.

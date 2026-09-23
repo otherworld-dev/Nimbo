@@ -42,6 +42,7 @@ var (
 	cfShellNotify         = cfapi.ShellNotifyUpdated
 	cfShellCreated        = cfapi.ShellNotifyCreated
 	cfSettlePin           = cfapi.SettlePin
+	cfWantsFreeUp         = cfapi.WantsFreeUp
 	cfExclude             = cfapi.ExcludeFromSync
 	cfPlaceholderIdentity = cfapi.PlaceholderIdentity
 	cfPlaceholderModified = cfapi.PlaceholderModified
@@ -93,6 +94,19 @@ type Ops struct {
 	// outlives the version it was recorded for. Nil disables it.
 	RecordContent func(keyByRemotePath map[string]string)
 	Content       func(remotePath string) string
+	// EditorLockFiles receives the absolute paths of editor lock files
+	// (Office "~$…", LibreOffice ".~lock.…#") that were created or removed,
+	// straight from the change journal and before they are skipped, so the
+	// engine can lock a document on the server while it is open (Deck #721).
+	// Called on its own goroutine. Nil disables it.
+	EditorLockFiles func(absPaths []string)
+	// BeforeReplace runs just before the watcher dehydrates a downloaded file
+	// (a refresh after a server edit, or "Free up space"). The lockout holds a
+	// deny-write handle on a file a colleague has open, and while it is held
+	// the dehydrate fails and the file is left wearing pending arrows
+	// (measured on the VM, 2026-09-23); this is where it lets go. Nil
+	// disables it.
+	BeforeReplace func(absPath string)
 	// ForgetBaseline drops the recorded ETag for a remote path the server no
 	// longer holds under that name (the source of a MOVE). Nil disables it.
 	ForgetBaseline func(remotePath string)
@@ -498,6 +512,16 @@ func (w *Watcher) noteEventLoss() {
 func (w *Watcher) parse(b []byte) {
 	var renameOld string
 	removed := map[string]string{}
+	// Editor lock files are skipped below like every other temporary, but
+	// they are also how a document being opened or closed shows itself, so
+	// they go to the EditorLockFiles hook first. Off the event pump: taking a
+	// lock is a network round trip.
+	var editorLocks []string
+	defer func() {
+		if len(editorLocks) > 0 && w.ops.EditorLockFiles != nil {
+			go w.ops.EditorLockFiles(editorLocks)
+		}
+	}()
 	for off := 0; off+12 <= len(b); {
 		next := *(*uint32)(unsafe.Pointer(&b[off]))
 		action := *(*uint32)(unsafe.Pointer(&b[off+4]))
@@ -508,6 +532,9 @@ func (w *Watcher) parse(b []byte) {
 		}
 		name := windows.UTF16ToString(unsafe.Slice((*uint16)(unsafe.Pointer(&b[nameStart])), nameLen/2))
 		if skipName(name) {
+			if isEditorLockName(name) {
+				editorLocks = append(editorLocks, filepath.Join(w.root, name))
+			}
 			if next == 0 {
 				break
 			}
@@ -1060,6 +1087,17 @@ func (w *Watcher) recentlyMoved(path string) bool {
 // skipName reports whether a change to rel (a sync-root-relative path) should be
 // ignored: the diff engine's download temp files and well-known OS/editor
 // temporaries must never be pushed to the server.
+// isEditorLockName reports whether rel names an editor's lock file: Office's
+// "~$" owner file or LibreOffice's ".~lock.<name>#". Which document it belongs
+// to is the engine's business (officelock); this only picks the events out.
+func isEditorLockName(rel string) bool {
+	base := rel
+	if i := strings.LastIndexAny(rel, `\/`); i >= 0 {
+		base = rel[i+1:]
+	}
+	return strings.HasPrefix(base, "~$") || strings.HasPrefix(strings.ToLower(base), ".~lock.")
+}
+
 func skipName(rel string) bool {
 	base := rel
 	if i := strings.LastIndexAny(rel, `\/`); i >= 0 {
@@ -1677,6 +1715,9 @@ func (w *Watcher) handleChange(path string) {
 		// Nothing to upload — but the event may be a PIN change: Explorer's
 		// "Free up space" sets UNPINNED and waits for US to dehydrate; until
 		// then the item and its ancestors wear sync-pending arrows.
+		if w.ops.BeforeReplace != nil && cfWantsFreeUp(path) {
+			w.ops.BeforeReplace(path)
+		}
 		if ok, serr := cfSettlePin(path); serr != nil {
 			w.ops.Log("vfs settle pin %s: %v", path, serr)
 		} else if ok {
@@ -3108,6 +3149,9 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 			} else if ierr == nil && !ch.NeedsUpload {
 				// Same inspect as the rescue above (it is a metadata OPEN now for
 				// anything not in sync, so it is not re-run per branch).
+				if w.ops.BeforeReplace != nil {
+					w.ops.BeforeReplace(full)
+				}
 				// VERIFY_IN_SYNC closes the race between that inspect and the
 				// refresh: an edit landing in between fails the update (and we
 				// skip) instead of being dehydrated away.

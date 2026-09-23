@@ -57,3 +57,19 @@ func holdDenyWrite(path string) (*denyWriteHandle, error) {
 	}
 	return &denyWriteHandle{h: h}, nil
 }
+
+// fileOnlineOnly reports whether path is an on-demand placeholder whose data
+// is not on this PC (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS). An attributes-only
+// query: it cannot hydrate the file, which holdDenyWrite's open would. A var so
+// tests can stand in for the cloud filter.
+var fileOnlineOnly = func(path string) bool {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return false
+	}
+	attrs, err := windows.GetFileAttributes(p)
+	if err != nil {
+		return false
+	}
+	return attrs&0x400000 != 0 // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+}

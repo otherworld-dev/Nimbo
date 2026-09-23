@@ -130,6 +130,10 @@ type Engine struct {
 	// plus the synthesised name carrier. Separate from lockMgr, which owns the
 	// locks we take ourselves.
 	lockWarn *lockWarner
+	// editorLockMu makes handleEditorLockFiles run one batch at a time. The
+	// on-demand watcher hands each change batch over on its own goroutine,
+	// and Word writes its owner file in several steps (Deck #721).
+	editorLockMu sync.Mutex
 
 	// lockMgr owns the locks WE take (as opposed to `locked`, which is what other
 	// people hold). Separate because their lifetimes are entirely different: ours
