@@ -86,6 +86,9 @@ func installFakeCf(t *testing.T) *fakeCf {
 	opm := cfPlaceholderModified
 	ouk := cfUpdateIdentityKeep
 	opd, ohp := cfPinnedDehydrated, cfHydrateIfPinned
+	owf := cfWantsFreeUp
+	t.Cleanup(func() { cfWantsFreeUp = owf })
+	cfWantsFreeUp = func(string) bool { return false }
 	osi := cfSetInSync
 	odp := cfDirPopulated
 	t.Cleanup(func() {
@@ -1028,6 +1031,45 @@ func TestParseDispatch(t *testing.T) {
 	}
 }
 
+// An editor's lock file is never synced, but its appearing and vanishing is
+// how on-demand mode learns a document was opened or closed (GitHub #7, Deck
+// #721): parse hands those raw events to the EditorLockFiles hook, and only
+// those. Other skipped names (temp files, Thumbs.db) never reach it.
+func TestParseHandsEditorLockFilesToTheHook(t *testing.T) {
+	got := make(chan []string, 4)
+	ops := newRecorder().ops()
+	ops.EditorLockFiles = func(paths []string) { got <- paths }
+	w := bareWatcher(`C:oot`, ops)
+	defer w.cancel()
+
+	w.parse(notifyBuf(t, []struct {
+		action uint32
+		name   string
+	}{
+		{fileActionAdded, `~$report.docx`},
+		{fileActionAdded, `sub\.~lock.plan.odt#`},
+		{fileActionAdded, `Thumbs.db`},
+		{fileActionAdded, `save.tmp`},
+		{fileActionRemoved, `~$budget.xlsx`},
+	}))
+
+	select {
+	case paths := <-got:
+		want := []string{`C:oot\~$report.docx`, `C:oot\sub\.~lock.plan.odt#`, `C:oot\~$budget.xlsx`}
+		if strings.Join(paths, "|") != strings.Join(want, "|") {
+			t.Errorf("hook got %q, want %q", paths, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EditorLockFiles hook never called")
+	}
+	w.mu.Lock()
+	_, uploaded := w.upload[`C:oot\~$report.docx`]
+	w.mu.Unlock()
+	if uploaded {
+		t.Error("an editor lock file was scheduled for upload")
+	}
+}
+
 func TestParseRenamePair(t *testing.T) {
 	rec := newRecorder()
 	w := bareWatcher(`C:\root`, rec.ops())
@@ -1810,6 +1852,73 @@ func TestChangeEventSettlesPendingUnpin(t *testing.T) {
 	rec.mu.Unlock()
 	if ups != 0 {
 		t.Fatalf("clean file wrongly uploaded (%d uploads)", ups)
+	}
+}
+
+// The lockout (a colleague has the file open) holds a deny-write handle on a
+// downloaded file, and while it is held "Free up space" cannot dehydrate it:
+// measured on the VM 2026-09-23, the file is left UNPINNED and still
+// downloaded, wearing pending arrows. So when a file is waiting to be freed,
+// BeforeReplace must run first to drop the handle (Deck #721) — and only then,
+// or every change event would undo the lockout.
+func TestFreeUpReleasesTheLockoutHandleFirst(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	doc := filepath.Join(root, "doc.txt")
+	if err := os.WriteFile(doc, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var order []string
+	note := func(s string) { mu.Lock(); order = append(order, s); mu.Unlock() }
+	cfSettlePin = func(path string) (bool, error) { note("settle"); return false, nil }
+	wants := false
+	cfWantsFreeUp = func(path string) bool { return wants }
+	ops := newRecorder().ops()
+	ops.BeforeReplace = func(path string) { note("release:" + filepath.Base(path)) }
+	w := bareWatcher(root, ops)
+	defer w.cancel()
+
+	w.handleChange(doc) // an ordinary change event: the handle stays
+	wants = true
+	w.handleChange(doc) // a pending "Free up space": drop it, then dehydrate
+
+	mu.Lock()
+	got := strings.Join(order, ",")
+	mu.Unlock()
+	if got != "settle,release:doc.txt,settle" {
+		t.Errorf("order = %s, want settle,release:doc.txt,settle", got)
+	}
+}
+
+// A refresh dehydrates the file too, so it also drops the handle first.
+func TestRefreshReleasesTheLockoutHandleFirst(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	doc := filepath.Join(root, "doc.txt")
+	if err := os.WriteFile(doc, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := newRecorder()
+	rec.baselines["doc.txt"] = "etag-v1"
+	r := ph("doc.txt", false, "etag-v2", "fid")
+	rec.listing[""] = []cfapi.PlaceholderInfo{r}
+	ops := rec.ops()
+	ops.BeforeReplace = func(path string) {
+		f.mu.Lock()
+		f.events = append(f.events, "release:"+path)
+		f.mu.Unlock()
+	}
+	w := bareWatcher(root, ops)
+	defer w.cancel()
+
+	w.Reconcile()
+
+	f.mu.Lock()
+	got := strings.Join(f.events, ",")
+	f.mu.Unlock()
+	if want := "release:" + doc + ",refresh:" + doc; got != want {
+		t.Errorf("events = %s, want %s", got, want)
 	}
 }
 

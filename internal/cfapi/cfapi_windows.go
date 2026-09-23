@@ -2101,6 +2101,17 @@ func SweepDirsInSync(root string, quiesce time.Duration) int {
 // (the platform refuses that anyway — ERROR_CLOUD_FILE_NOT_IN_SYNC — but we
 // don't rely on it). Directories carry the unpinned attribute purely as the
 // recursive preference marker and are never touched.
+// WantsFreeUp reports whether path is a file Explorer has asked to free up
+// (UNPINNED) that still holds its data — the state SettlePin acts on. An
+// attributes-only query: it never opens the file, so it cannot hydrate it.
+func WantsFreeUp(path string) bool {
+	attrs, _, err := findAttrTag(path)
+	if err != nil {
+		return false
+	}
+	return attrs&fileAttrDirectory == 0 && attrs&fileAttrUnpinned != 0 && attrs&0x400000 == 0
+}
+
 func SettlePin(path string) (bool, error) {
 	attrs, tag, err := findAttrTag(path)
 	if err != nil {

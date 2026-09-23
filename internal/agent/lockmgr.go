@@ -281,6 +281,12 @@ func (e *Engine) handleEditorLockFiles(ctx context.Context, p Pair, changed []st
 		if !officelock.IsOwnerFile(base) && !strings.HasPrefix(base, ".~lock.") {
 			continue
 		}
+		// The lockout writes owner files of its own beside a colleague's
+		// document. Those say "someone ELSE has it open", not that the user
+		// opened it; locking on them would try to take the colleague's file.
+		if e.lockWarn != nil && e.lockWarn.isSynth(abs) {
+			continue
+		}
 		dir := filepath.Dir(abs)
 		var names []string
 		if ents, err := os.ReadDir(dir); err == nil {
@@ -322,6 +328,24 @@ func (e *Engine) handleEditorLockFiles(ctx context.Context, p Pair, changed []st
 		if err := e.ReleaseLock(ctx, remote); err != nil {
 			slog.Warn("could not release the lock on a file that was closed", "path", remote, "err", err)
 		}
+	}
+}
+
+// NoteEditorLockFiles is the on-demand entry to handleEditorLockFiles: the
+// watcher of an on-demand mount hands over the editor lock files it saw come
+// and go, and the mount folder and its server root stand in for a sync pair's
+// (on-demand mode has no pairs; Deck #721).
+func (e *Engine) NoteEditorLockFiles(ctx context.Context, mountDir, remoteRoot string, absPaths []string) {
+	e.handleEditorLockFiles(ctx, Pair{LocalDir: mountDir, RemoteRoot: strings.Trim(remoteRoot, "/")}, absPaths)
+}
+
+// ReleaseLockoutHandle lets go of the deny-write handle the lockout holds on
+// abs, keeping the warning itself. The on-demand watcher calls it just before
+// it dehydrates a downloaded file (a refresh, or "Free up space"), which the
+// handle would otherwise make fail. A path with no handle is a no-op.
+func (e *Engine) ReleaseLockoutHandle(abs string) {
+	if e.lockWarn != nil {
+		e.lockWarn.release(abs)
 	}
 }
 
@@ -370,6 +394,12 @@ func (e *Engine) NoteRemoteLocks(mountDir, remoteRoot string, entries []transpor
 		return
 	}
 	e.reconcileLocked(mountDir, examined, locked)
+	// The listing is where on-demand mode sees a colleague's lock come and go,
+	// so it drives the lockout as applyPlan does for live sync, with the full
+	// set: apply undoes whatever is missing from what it is given.
+	if e.lockWarn != nil && e.lockoutEnabled() {
+		e.lockWarn.apply(e.LockedFiles())
+	}
 }
 
 // lockoutEnabled reports whether we may hold other people's locked files open

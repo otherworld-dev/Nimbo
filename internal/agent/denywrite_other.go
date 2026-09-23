@@ -18,3 +18,6 @@ func (d *denyWriteHandle) Close() error { return nil }
 func holdDenyWrite(path string) (*denyWriteHandle, error) {
 	return nil, errors.New("deny-write handles are Windows-only")
 }
+
+// fileOnlineOnly: there are no on-demand placeholders off Windows.
+var fileOnlineOnly = func(path string) bool { return false }
