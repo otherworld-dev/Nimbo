@@ -94,6 +94,7 @@ type Engine struct {
 	triggersFull map[string]chan struct{} // key -> force-a-full-local-pass trigger (name-rule changes)
 	nudges       map[string]chan string   // key -> paths to sync as if the watcher saw them (see inuse.go)
 	awaiting     map[string]bool          // absolute paths awaitClosed is watching
+	tl           *lane                    // long transfers (lane.go, lanejobs.go); created on first use
 	busyMu       sync.Mutex
 	busy         map[string]string        // absolute path -> pair-relative: uploads waiting on a program (inuse.go)
 	watchDone    map[string]chan struct{} // key -> closed when the watcher goroutine exits (for a synchronous, drained stop)
@@ -2526,7 +2527,9 @@ func (e *Engine) SetStatusFunc(f func(string)) { e.onStatus = f }
 
 func (e *Engine) status(s string) {
 	if s == "Up to date" {
-		if w := e.busyStatus(); w != "" {
+		if w := e.laneStatus(); w != "" {
+			s = w // large files still transferring outside the pass (lanejobs.go)
+		} else if w := e.busyStatus(); w != "" {
 			s = w // an upload is still waiting on a program (see inuse.go)
 		} else if w := e.heldDamagedStatus(); w != "" {
 			s = w // a local edit is held back by a damaged server copy (damaged.go)
@@ -3955,12 +3958,35 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		}
 	}
 
+	// The long-transfer lane (Deck #702, lane.go). Every guard above has judged
+	// the whole plan; now leave what the lane is already transferring alone,
+	// stop what a move or delete here would pull out from under it, and send
+	// this plan's large transfers to it, so this pass ends in seconds and the
+	// next one isn't stuck behind a 300 GB upload.
+	tl := e.transferLane()
+	actions, laneHeld, laneStops := gateOnLane(actions,
+		func(rel string) bool { return tl.has(pk, rel) },
+		func(rel string) bool { return tl.covers(pk, rel) })
+	for _, rel := range laneStops {
+		slog.Info("stopping a large transfer: its file is being moved or deleted", "path", rel)
+		tl.stop(func(j *laneJob) bool { return j.pk == pk && relUnder(j.rel, rel) })
+	}
+	actions, bigTransfers := splitForLane(actions, func(a engine.Action) int64 { return transferSize(p, a, remote) })
+	for _, a := range bigTransfers {
+		if e.sendToLane(p, pk, a, transferSize(p, a, remote), remote) {
+			laneHeld = append(laneHeld, a.Path) // unsent: its folder isn't settled
+		} else {
+			actions = append(actions, a)
+		}
+	}
+
 	if len(actions) == 0 {
 		// Nothing to do — but re-listed dirs still need their etags stamped, or
 		// they are re-listed on every future scan (this quiet case is the common
 		// steady state: our own transfers stale the ancestor dir etags).
-		maintainDirBaselines(st, pk, base, remote, append(append([]string(nil), heldUploads...), skippedDamaged...))
-		if base != nil && len(skippedDamaged) == 0 {
+		unfinished := append(append(append([]string(nil), heldUploads...), skippedDamaged...), laneHeld...)
+		maintainDirBaselines(st, pk, base, remote, unfinished)
+		if base != nil && len(skippedDamaged) == 0 && len(laneHeld) == 0 {
 			e.clearCheckpoint(st, pk) // clean pass — the crawl's rescue rows served their purpose
 		}
 		// A quiet pass must still clear "Scanning…" — nothing else will until the
@@ -3979,9 +4005,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	for _, a := range actions {
 		if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
 			transfers++
-			if r, ok := remote[a.Path]; ok {
-				bytes += r.Size
-			}
+			bytes += transferSize(p, a, remote) // an upload's size is the local file's: new uploads counted 0
 		}
 	}
 	if transfers > 0 {
@@ -4031,7 +4055,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		title, msg := movedAsideToast(p.LocalDir, movedAside)
 		e.toast(title, msg, "")
 	}
-	// A cancelled pass (quit, pause, a restart) stops starting transfers but Run
+	// A cancelled pass (quit, sign-out, a folder move) stops starting transfers but Run
 	// still reports no error, and what it never started is in no problem list.
 	// Treat it as the partway stop it is: stamping its folders as seen hid the
 	// files it never fetched from every later scan (Deck #691).
@@ -4048,6 +4072,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	// pending local change stops being re-detected until something else there
 	// changes.
 	problems = append(problems, heldUploads...)
+	problems = append(problems, laneHeld...) // still transferring in the lane
 	problems = append(problems, skippedDamaged...)
 	for _, c := range ex.Pending {
 		problems = append(problems, c.Path)
