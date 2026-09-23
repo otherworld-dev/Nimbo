@@ -297,3 +297,41 @@ func (a *App) suggestedFolder() string {
 	}
 	return filepath.Join(home, "Nextcloud")
 }
+
+// heldReasoner is the part of the engine localDeleteBlocked needs.
+type heldReasoner interface{ HeldReason(localDir string) string }
+
+// localDeleteBlocked refuses deleting the local files of a held-back folder:
+// another account syncs the same folder, so the files are that account's too,
+// and it would push the deletions to its server once it resumes. Removing or
+// deselecting the folder while keeping the files is always allowed.
+func localDeleteBlocked(eng heldReasoner, localDir string, deleteLocal bool) string {
+	if !deleteLocal || eng.HeldReason(localDir) == "" {
+		return ""
+	}
+	return "Another account uses this folder too, so its files can't be deleted from here. " +
+		"Remove it and keep the files, or deal with it from the other account."
+}
+
+// mountableUnchosen accepts a folder for mounting without the user choosing
+// it: one that is missing or empty, or already a sync root this install
+// registered (so an account that lost its folder record keeps its folder).
+func mountableUnchosen(registered func(string) bool) func(string) bool {
+	return func(dir string) bool { return missingOrEmpty(dir) || registered(dir) }
+}
+
+// regateAll asks every engine's gate again, so a folder freed by a change in
+// one account (removed, moved, re-pointed) starts syncing in another at once
+// rather than at its next start. Live mode only: in on-demand mode an
+// account's pairs must never get live watchers.
+func (a *App) regateAll() {
+	if a.GetSyncMode() == "ondemand" {
+		return
+	}
+	if a.eng != nil {
+		_ = a.eng.ReloadPairs()
+	}
+	for _, se := range a.secondaries {
+		_ = se.eng.ReloadPairs()
+	}
+}

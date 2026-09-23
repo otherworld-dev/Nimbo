@@ -163,3 +163,44 @@ func TestClearSyncDataRemovesTheAccountFolderRecord(t *testing.T) {
 		t.Fatalf("another account's folder record was touched: %+v", s)
 	}
 }
+
+type heldStub map[string]string
+
+func (h heldStub) HeldReason(dir string) string { return h[dir] }
+
+// A held-back folder is also another account's folder, so deleting its local
+// files would delete that account's files too (and push the deletions to its
+// server once it resumes). Removing or deselecting it without deleting is fine.
+func TestLocalDeleteBlockedOnHeldFolders(t *testing.T) {
+	held := heldStub{`C:\Shared`: "used by bob"}
+	if msg := localDeleteBlocked(held, `C:\Shared`, true); msg == "" {
+		t.Fatal("deleting a held folder's files was allowed")
+	}
+	if msg := localDeleteBlocked(held, `C:\Shared`, false); msg != "" {
+		t.Fatalf("keeping the files was refused: %q", msg)
+	}
+	if msg := localDeleteBlocked(held, `C:\Mine`, true); msg != "" {
+		t.Fatalf("an ordinary folder was refused: %q", msg)
+	}
+}
+
+// A folder nobody chose is only mounted if it is missing or empty, or already
+// this install's own registered sync root (a single-account install that lost
+// its folder record must keep its existing folder, as before).
+func TestMountableUnchosen(t *testing.T) {
+	empty, full := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(full, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notRoot := mountableUnchosen(func(string) bool { return false })
+	isRoot := mountableUnchosen(func(string) bool { return true })
+	if !notRoot(empty) || !notRoot(filepath.Join(empty, "missing")) {
+		t.Fatal("an empty or missing folder was refused")
+	}
+	if notRoot(full) {
+		t.Fatal("a folder holding files was accepted")
+	}
+	if !isRoot(full) {
+		t.Fatal("the install's own sync root was refused")
+	}
+}

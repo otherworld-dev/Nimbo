@@ -60,6 +60,7 @@ func (a *App) MoveSyncFolder(oldLocal, newLocal string) string {
 	// The whole-account pair defines the account root: refresh the stored baseDir
 	// and the Explorer sidebar so "Open folder" and the sidebar follow the move.
 	a.healBaseDir()
+	a.regateAll() // a folder this one held back in another account may sync now
 	a.syncSidebar()
 	a.rebuildTrayMenu()
 	a.eng.TriggerSync() // a confirming pass; should be a no-op (everything already in sync)

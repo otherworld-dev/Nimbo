@@ -427,7 +427,7 @@ func (a *App) mountSecondaryOnDemand(eng *agent.Engine) {
 		if d, st, ok := accountsAndDirs(); ok {
 			claimed = otherAccountFolders(d, st, eng.Account.ID)
 		}
-		root = suggestAccountFolder(home, eng.Account.LoginName, claimed, missingOrEmpty)
+		root = suggestAccountFolder(home, eng.Account.LoginName, claimed, mountableUnchosen(cfapi.ShellSyncRootRegistered))
 		if root == "" {
 			a.warnNoFolder(eng)
 			return
@@ -1094,7 +1094,7 @@ func (a *App) mountAccountOnDemand() {
 		if d, st, ok := accountsAndDirs(); ok {
 			claimed = otherAccountFolders(d, st, a.eng.Account.ID)
 		}
-		dir = suggestAccountFolder(home, a.eng.Account.LoginName, claimed, missingOrEmpty)
+		dir = suggestAccountFolder(home, a.eng.Account.LoginName, claimed, mountableUnchosen(cfapi.ShellSyncRootRegistered))
 		if dir == "" {
 			a.mountRefused = "There is no free, empty folder to use for this account. Choose a folder for it in Settings."
 			a.warnNoFolder(a.eng)
@@ -4617,14 +4617,7 @@ func (a *App) RemoveAccount(id string) string {
 	// Folders held back because the removed account used them too can sync
 	// again: re-ask the gate now rather than at the next start. Live mode only;
 	// in on-demand mode an account's pairs must never get live watchers.
-	if a.GetSyncMode() != "ondemand" {
-		if a.eng != nil {
-			_ = a.eng.ReloadPairs()
-		}
-		for _, se := range a.secondaries {
-			_ = se.eng.ReloadPairs()
-		}
-	}
+	a.regateAll()
 	a.emit("account")
 	return ""
 }
@@ -5199,6 +5192,7 @@ func (a *App) SetBaseDir(dir string) {
 		return
 	}
 	_ = a.eng.SetBaseDir(dir)
+	a.regateAll()
 }
 
 // healBaseDir repairs a stored baseDir that no longer matches the whole-account
@@ -5341,6 +5335,7 @@ func (a *App) AddSyncPair(localDir, remotePath string) string {
 	if strings.Trim(remotePath, "/") == "" {
 		_ = a.eng.SetBaseDir(localDir)
 	}
+	a.regateAll()
 	a.rebuildTrayMenu()
 	return ""
 }
@@ -5434,11 +5429,19 @@ func (a *App) RemoveSyncFolder(remotePath string, deleteLocal bool) {
 			}
 		}
 	}
+	if msg := localDeleteBlocked(a.eng, localDir, deleteLocal); msg != "" {
+		slog.Warn("refused deleting the files of a folder another account uses", "dir", localDir)
+		if a.app != nil {
+			a.app.Dialog.Warning().SetTitle("Files not deleted").SetMessage(msg).Show()
+		}
+		return
+	}
 	if err := a.eng.ForgetSyncFolder(remotePath, deleteLocal); err != nil {
 		slog.Warn("could not remove the sync folder", "remote", remotePath, "err", err)
 	} else if localDir != "" {
 		a.eng.DisableStatusIcons(localDir)
 	}
+	a.regateAll() // another account's folder held back by this one may sync now
 	a.rebuildTrayMenu()
 }
 
@@ -5462,6 +5465,9 @@ func (a *App) RemoveExclude(localDir, rel string) {
 func (a *App) DeselectFolder(localDir, rel string, deleteLocal bool) string {
 	if a.eng == nil {
 		return "not signed in"
+	}
+	if msg := localDeleteBlocked(a.eng, localDir, deleteLocal); msg != "" {
+		return msg
 	}
 	if err := a.eng.DeselectFolder(localDir, rel, deleteLocal); err != nil {
 		return err.Error()
