@@ -626,11 +626,24 @@ func (e *Executor) saveFileBaseline(rel string, res FileResult) error {
 		RemoteETag: res.ETag, RemoteFileID: res.FileID,
 		LocalSize: res.Size, LocalMTimeNanos: res.MTimeNanos,
 		ContentSHA1: res.ContentSHA1,
+		ContentKey:  e.listedContentKey(rel, res.ETag),
 		// A single file shared with the user is a mount root of its own; the
 		// listing said so. A path the listing never saw (a fresh upload) reads
 		// as the zero value, i.e. not one.
 		MountRoot: e.Remote[rel].MountRoot,
 	})
+}
+
+// listedContentKey is the content key of the version the listing showed for
+// rel, but only when etag says that is the version just synced. An upload
+// makes a version the listing never saw, and the old key must not vouch for
+// it: "" then, and the ETag alone decides until the next listing.
+func (e *Executor) listedContentKey(rel, etag string) string {
+	r, ok := e.Remote[rel]
+	if !ok || etag == "" || r.ETag != etag {
+		return ""
+	}
+	return r.ContentKey()
 }
 
 func (e *Executor) saveDirBaseline(rel, etag, fileID string, mountRoot bool) error {

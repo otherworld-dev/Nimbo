@@ -60,14 +60,19 @@ func classify(p string, b BaselineState, hasB bool, r RemoteState, hasR bool, l 
 // with a genuine local edit it manufactures a conflict and a conflicted copy out
 // of a file nobody touched on the server.
 //
-// Conservative: it only overrides when BOTH checksums are known. An absent one
-// (the server did not send oc:checksums, or the baseline predates it) falls back
-// to trusting the ETag.
+// Two proofs are accepted, each only when known on BOTH sides: matching SHA1
+// checksums, or a matching content key (size, mtime and nc:upload_time — see
+// transport.ContentKey), which is what covers the many files the server holds
+// no checksum for (GitHub #7). Anything unknown falls back to trusting the ETag.
 func sameContentAsBaseline(r RemoteState, b BaselineState) bool {
-	if r.IsDir || r.SHA1 == "" || b.ContentSHA1 == "" {
+	if r.IsDir {
 		return false
 	}
-	return strings.EqualFold(r.SHA1, b.ContentSHA1)
+	if r.SHA1 != "" && b.ContentSHA1 != "" {
+		return strings.EqualFold(r.SHA1, b.ContentSHA1)
+	}
+	k := r.ContentKey()
+	return k != "" && k == b.ContentKey
 }
 
 // classifyBoth handles a path present on both remote and local.

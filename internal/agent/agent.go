@@ -4240,8 +4240,10 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 // feature working on cold scans and dead on the path an Office save takes.
 //
 // Note this is a Stat, not a listing: fields a depth-0 PROPFIND does not carry
-// meaningfully here (SHA1, ReadOnly, LastModified) are deliberately left unset,
-// as they were before.
+// meaningfully here (SHA1, ReadOnly) are deliberately left unset, as they were
+// before. LastModified and UploadTime ARE set: with Size they make the content
+// key that tells a files_lock ETag bump from an edit, and this is the path an
+// Office save takes, which is where the bumps happen (GitHub #7).
 //
 // A share's root is told apart from anything inside it only by its PARENT's
 // permissions, which a Stat doesn't see. So the flag is kept from wasRoot, the
@@ -4250,14 +4252,16 @@ func (e *Engine) SyncPaths(ctx context.Context, p Pair, relPaths []string) (tran
 // copy instead of keeping it (#557, Deck #691).
 func remoteStateFrom(rel string, ent transport.Entry, wasRoot bool) engine.RemoteState {
 	return engine.RemoteState{
-		Path:      rel,
-		IsDir:     ent.IsDir,
-		ETag:      ent.ETag,
-		FileID:    ent.FileID,
-		Size:      ent.Size,
-		Lock:      ent.Lock,
-		LockKnown: true, // a Stat DID look, so its answer is authoritative
-		MountRoot: wasRoot && ent.OnMount(),
+		Path:         rel,
+		IsDir:        ent.IsDir,
+		ETag:         ent.ETag,
+		FileID:       ent.FileID,
+		Size:         ent.Size,
+		LastModified: ent.LastModified,
+		UploadTime:   ent.UploadTime,
+		Lock:         ent.Lock,
+		LockKnown:    true, // a Stat DID look, so its answer is authoritative
+		MountRoot:    wasRoot && ent.OnMount(),
 	}
 }
 

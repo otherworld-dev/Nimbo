@@ -213,3 +213,69 @@ func TestDeleteBaselineAll(t *testing.T) {
 		t.Errorf("another pair's baseline was touched: %v", got)
 	}
 }
+
+// The content key (GitHub #7) must survive both upsert forms and a reopen, and
+// an install whose baseline table predates the column must gain it with every
+// old row read as "no key", so the ETag alone decides until the file syncs.
+func TestBaselineContentKeyPersistsAndMigrates(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	old, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`CREATE TABLE baseline (
+  account_id        TEXT    NOT NULL,
+  pair_key          TEXT    NOT NULL,
+  path              TEXT    NOT NULL,
+  is_dir            INTEGER NOT NULL,
+  remote_etag       TEXT    NOT NULL,
+  remote_fileid     TEXT    NOT NULL,
+  local_size        INTEGER NOT NULL,
+  local_mtime_nanos INTEGER NOT NULL,
+  content_sha1      TEXT    NOT NULL DEFAULT '',
+  mount_root        INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, pair_key, path)
+)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`INSERT INTO baseline VALUES ('acct1', 'P', 'old.txt', 0, 'e', 'f', 1, 2, '', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	for _, cached := range []bool{false, true} {
+		st, err := Open(dbPath, "acct1", cached)
+		if err != nil {
+			t.Fatalf("Open(cached=%v) on an older database: %v", cached, err)
+		}
+		got, err := st.LoadBaseline("P")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b := got["old.txt"]; b.RemoteETag != "e" || b.ContentKey != "" {
+			t.Errorf("cached=%v: old row misread: %+v", cached, b)
+		}
+		single := engine.BaselineState{Path: "a.txt", RemoteETag: "e1", ContentKey: "5:1:2"}
+		if err := st.UpsertBaseline("P", single); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpsertBaselineBatch("P", []engine.BaselineState{{Path: "b.txt", RemoteETag: "e2", ContentKey: "6:1:3"}}); err != nil {
+			t.Fatal(err)
+		}
+		st.Close()
+
+		st, err = Open(dbPath, "acct1", cached)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ = st.LoadBaseline("P")
+		if got["a.txt"].ContentKey != "5:1:2" || got["b.txt"].ContentKey != "6:1:3" {
+			t.Errorf("cached=%v: keys not persisted: %+v / %+v", cached, got["a.txt"], got["b.txt"])
+		}
+		paths, _ := st.LoadBaselinePaths("P", []string{"a.txt"})
+		if paths["a.txt"].ContentKey != "5:1:2" {
+			t.Errorf("cached=%v: LoadBaselinePaths dropped the key", cached)
+		}
+		st.Close()
+	}
+}
