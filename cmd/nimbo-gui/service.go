@@ -2556,6 +2556,42 @@ func (a *App) absURL(href string) string {
 	return strings.TrimRight(a.eng.Account.ServerURL, "/") + "/" + strings.TrimLeft(href, "/")
 }
 
+// releaseLocksOnExit gives back every account's file locks, and lets go of
+// colleagues' files held by the lockout, before the process exits (Deck #722).
+// The tray Quit, an in-app update and Windows ending the session all return
+// from app.Run without stopping the engines, and a default Nextcloud never
+// expires a lock, so without this a document open when Nimbo went away stayed
+// locked for everyone until Nimbo next started. Accounts go in parallel under
+// one deadline: Windows allows little time at the end of a session, and
+// anything left over is still recorded for the startup sweep.
+func (a *App) releaseLocksOnExit(timeout time.Duration) {
+	var engs []*agent.Engine
+	if a.eng != nil {
+		engs = append(engs, a.eng)
+	}
+	for _, se := range a.secondaries {
+		if se != nil && se.eng != nil {
+			engs = append(engs, se.eng)
+		}
+	}
+	if len(engs) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, e := range engs {
+		wg.Add(1)
+		go func(e *agent.Engine) {
+			defer wg.Done()
+			if n, err := e.ReleaseLocksForExit(ctx); n > 0 || err != nil {
+				slog.Info("released locks on exit", "account", e.Account.ID, "released", n, "err", err)
+			}
+		}(e)
+	}
+	wg.Wait()
+}
+
 // Quit exits the application.
 func (a *App) Quit() { a.quit("asked by the app window") }
 

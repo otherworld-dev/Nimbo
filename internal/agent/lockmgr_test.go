@@ -604,3 +604,143 @@ func TestEditorLockFilesLockOncePerOpen(t *testing.T) {
 		t.Errorf("%d LOCK requests for one open, want 1", n)
 	}
 }
+
+// A failed UNLOCK used to say "will retry on the next sweep", but the sweep
+// only runs at startup and the five-minute heartbeat re-LOCKed the path because
+// it was still recorded, so one network blip at close kept a colleague locked
+// out for the whole session (Deck #722). Now the path is marked as releasing:
+// the heartbeat leaves it alone and the next tick tries the UNLOCK again.
+func TestFailedReleaseIsRetriedAndNeverRelocked(t *testing.T) {
+	m, f, _ := newTestMgr(t)
+	ctx := context.Background()
+	if err := m.take(ctx, "a.docx"); err != nil {
+		t.Fatal(err)
+	}
+	f.unlockErr["a.docx"] = errors.New("network blip")
+	if err := m.release(ctx, "a.docx"); err == nil {
+		t.Fatal("release reported success on a failed UNLOCK")
+	}
+
+	m.heartbeat(ctx)
+	if n := len(f.lockCalls); n != 1 {
+		t.Errorf("heartbeat re-LOCKed a file being released (%d LOCKs, want 1)", n)
+	}
+
+	delete(f.unlockErr, "a.docx")
+	m.tick(ctx)
+	if len(f.unlocked) != 1 || f.unlocked[0] != "a.docx" {
+		t.Errorf("tick did not retry the UNLOCK: unlocked=%q", f.unlocked)
+	}
+	if len(m.list()) != 0 {
+		t.Errorf("record kept after the retried release: %+v", m.list())
+	}
+}
+
+// If the document is opened again before the retry lands, the lock is wanted
+// after all: the pending release is dropped.
+func TestReopeningCancelsAPendingRelease(t *testing.T) {
+	m, f, _ := newTestMgr(t)
+	ctx := context.Background()
+	_ = m.take(ctx, "a.docx")
+	f.unlockErr["a.docx"] = errors.New("network blip")
+	_ = m.release(ctx, "a.docx")
+	delete(f.unlockErr, "a.docx")
+
+	_ = m.take(ctx, "a.docx") // Word opened it again
+	m.tick(ctx)
+	if len(f.unlocked) != 0 {
+		t.Errorf("a reopened document was unlocked: %q", f.unlocked)
+	}
+}
+
+// A close event can be missed (a watcher overflow drops the batch's paths, or
+// the guard-state gate returns before the release). The lock remembers the
+// editor lock file that caused it, and the tick releases it once that file is
+// gone, whatever happened to the event.
+func TestTickReleasesALockWhoseEditorFileIsGone(t *testing.T) {
+	m, f, _ := newTestMgr(t)
+	ctx := context.Background()
+	owner := filepath.Join(t.TempDir(), "~$Report.docx")
+	if err := os.WriteFile(owner, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.takeFor(ctx, "Report.docx", owner); err != nil {
+		t.Fatal(err)
+	}
+	m.tick(ctx)
+	if len(f.unlocked) != 0 {
+		t.Fatalf("unlocked while the document is still open: %q", f.unlocked)
+	}
+	if err := os.Remove(owner); err != nil {
+		t.Fatal(err)
+	}
+	m.tick(ctx)
+	if len(f.unlocked) != 1 || f.unlocked[0] != "Report.docx" {
+		t.Errorf("lock outlived its closed document: unlocked=%q", f.unlocked)
+	}
+}
+
+// A lock taken without an editor lock file (an explicit "Lock this file") has
+// nothing to watch, so the tick must leave it be.
+func TestTickLeavesLocksWithNoEditorFile(t *testing.T) {
+	m, f, _ := newTestMgr(t)
+	ctx := context.Background()
+	_ = m.take(ctx, "manual.docx")
+	m.tick(ctx)
+	if len(f.unlocked) != 0 {
+		t.Errorf("an explicit lock was released: %q", f.unlocked)
+	}
+}
+
+// The editor trigger records which lock file caused the lock.
+func TestEditorLockRecordsItsLockFile(t *testing.T) {
+	e, _ := newEditorLockEngine(t)
+	mount := t.TempDir()
+	doc := filepath.Join(mount, "Report.docx")
+	owner := filepath.Join(mount, "~$Report.docx")
+	for _, p := range []string{doc, owner} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.NoteEditorLockFiles(context.Background(), mount, "", []string{owner})
+	held := e.lockMgr.list()
+	if len(held) != 1 || held[0].LockFile != owner {
+		t.Errorf("held = %+v, want one lock recording %s", held, owner)
+	}
+}
+
+// Quitting Nimbo, an in-app update and Windows ending the session all return
+// from app.Run without cancelling the engine, so nothing released the locks
+// until the next start; on a default server nothing expires them either
+// (Deck #722). ReleaseLocksForExit is what the exit path now calls: every lock
+// goes, and so does the lockout, handle and owner files alike.
+func TestReleaseLocksForExit(t *testing.T) {
+	e := newLockoutEngine(t)
+	f := e.lockMgr.cl.(*fakeLocker)
+	ctx := context.Background()
+	_ = e.lockMgr.take(ctx, "a.docx")
+	_ = e.lockMgr.take(ctx, "b.xlsx")
+	mount := t.TempDir()
+	doc := filepath.Join(mount, "Theirs.docx")
+	if err := os.WriteFile(doc, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteRemoteLocks(mount, "", []transport.Entry{{Path: "Theirs.docx", Lock: &transport.LockInfo{Owner: "bob"}}})
+
+	n, err := e.ReleaseLocksForExit(ctx)
+	if err != nil || n != 2 {
+		t.Errorf("released %d (err %v), want 2", n, err)
+	}
+	if len(f.unlocked) != 2 {
+		t.Errorf("unlocked = %q", f.unlocked)
+	}
+	if _, err := os.Stat(filepath.Join(mount, "~$Theirs.docx")); !os.IsNotExist(err) {
+		t.Errorf("lockout owner file left behind (err=%v)", err)
+	}
+	if fh, err := os.OpenFile(doc, os.O_RDWR, 0); err != nil {
+		t.Errorf("lockout handle still held: %v", err)
+	} else {
+		fh.Close()
+	}
+}
