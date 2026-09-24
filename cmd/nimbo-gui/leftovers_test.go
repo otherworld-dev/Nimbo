@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -35,12 +36,26 @@ func TestLeftoverRoots(t *testing.T) {
 func TestOrphanNavNodes(t *testing.T) {
 	nodes := []shellns.NavNode{
 		{CLSID: "{AAAA}", Target: `C:\Live`},
+		{CLSID: "{CCCC}", Target: `c:\byPATH\`},
 		{CLSID: "{BBBB}", Target: `C:\Gone`},
 	}
-	live := map[string]bool{"{aaaa}": true}
-	got := orphanNavNodes(nodes, live)
+	roots := []cfapi.ShellSyncRoot{
+		{Path: `C:\Live`, NamespaceCLSID: "{aaaa}"},
+		{Path: `C:\ByPath`, NamespaceCLSID: "{DDDD}"},
+	}
+	got := orphanNavNodes(nodes, roots)
 	if len(got) != 1 || got[0].CLSID != "{BBBB}" {
 		t.Fatalf("got %v", got)
+	}
+}
+
+// Where Windows hasn't recorded (or not yet) which sidebar entry belongs to a
+// root, nothing can be told apart safely: no entry is removed at all.
+func TestOrphanNavNodesDoesNothingWithoutNamespaceIDs(t *testing.T) {
+	nodes := []shellns.NavNode{{CLSID: "{BBBB}", Target: `C:\Gone`}}
+	roots := []cfapi.ShellSyncRoot{{Path: `C:\Live`}}
+	if got := orphanNavNodes(nodes, roots); len(got) != 0 {
+		t.Fatalf("removed entries while a root's entry ID is unknown: %v", got)
 	}
 }
 
@@ -77,20 +92,23 @@ func TestRootOwnedBy(t *testing.T) {
 func TestMissingRootAction(t *testing.T) {
 	now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
 	cases := []struct {
-		name               string
-		exists, registered bool
-		since              time.Time
-		want               missingAction
-		keepSince          bool
+		name                       string
+		exists, parent, registered bool
+		since                      time.Time
+		want                       missingAction
+		keepSince                  bool
 	}{
-		{"there", true, true, time.Time{}, mountRoot, false},
-		{"never registered", false, false, time.Time{}, mountRoot, false},
-		{"just vanished", false, true, time.Time{}, waitForRoot, true},
-		{"still within a day", false, true, now.Add(-2 * time.Hour), waitForRoot, true},
-		{"gone for a day", false, true, now.Add(-25 * time.Hour), recreateRoot, false},
+		{"there", true, true, true, time.Time{}, mountRoot, false},
+		{"never registered", false, true, false, time.Time{}, mountRoot, false},
+		{"just vanished", false, true, true, time.Time{}, waitForRoot, true},
+		{"still within a day", false, true, true, now.Add(-2 * time.Hour), waitForRoot, true},
+		{"gone for a day", false, true, true, now.Add(-25 * time.Hour), recreateRoot, false},
+		// The whole drive or parent folder is away (a USB disk, a locked
+		// BitLocker volume): never re-create, however long it takes.
+		{"drive away for days", false, false, true, now.Add(-72 * time.Hour), waitForRoot, true},
 	}
 	for _, c := range cases {
-		got, since := missingRootAction(c.exists, c.registered, c.since, now)
+		got, since := missingRootAction(c.exists, c.parent, c.registered, c.since, now)
 		if got != c.want {
 			t.Errorf("%s: action %v, want %v", c.name, got, c.want)
 		}
@@ -131,22 +149,20 @@ func TestClaimedFoldersStrictRefusesUnreadableState(t *testing.T) {
 }
 
 // A folder that is already a Nimbo root may hold another account's files. It
-// is only mounted without the user choosing it for a single-account install,
-// or when it is this account's own "<brand> - <login>" folder.
+// is only mounted without the user choosing it for a single-account install.
 func TestUnchosenUsableLimitsRegisteredRoots(t *testing.T) {
 	full := t.TempDir()
 	if err := os.WriteFile(filepath.Join(full, "f.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	registered := func(string) bool { return true }
-	if !unchosenUsable(registered, true, "")(full) {
+	if !unchosenUsable(registered, true)(full) {
 		t.Error("single account: its registered root was refused")
 	}
-	if unchosenUsable(registered, false, "")(full) {
-		t.Error("several accounts: another root was accepted")
-	}
-	if !unchosenUsable(registered, false, full)(full) {
-		t.Error("several accounts: the account's own folder was refused")
+	// With several accounts even a folder with this account's own default
+	// name may be another's: the same login on a different server.
+	if unchosenUsable(registered, false)(full) {
+		t.Error("several accounts: a registered root was accepted")
 	}
 }
 
@@ -161,5 +177,21 @@ func TestOnDemandRootOrder(t *testing.T) {
 	}
 	if got := onDemandRootOrder("", "", `C:\Base`); got != `C:\Base` {
 		t.Errorf("got %q", got)
+	}
+}
+
+// The same folder can be written more than one way (a junction, a short name,
+// a \?\ prefix); before unregistering, folders are compared by identity.
+func TestSameFolderAsAny(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", link, dir).CombinedOutput(); err != nil {
+		t.Skipf("no junction: %v %s", err, out)
+	}
+	if !sameFolderAsAny(link, []string{dir}) {
+		t.Fatal("a junction to a claimed folder was not recognised")
+	}
+	if sameFolderAsAny(t.TempDir(), []string{dir}) {
+		t.Fatal("a different folder was taken for the same one")
 	}
 }

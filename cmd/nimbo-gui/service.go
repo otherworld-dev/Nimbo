@@ -433,7 +433,7 @@ func (a *App) mountSecondaryOnDemand(eng *agent.Engine) {
 		if d, st, ok := accountsAndDirs(); ok {
 			claimed = otherAccountFolders(d, st, eng.Account.ID)
 		}
-		usable := unchosenUsable(cfapi.ShellSyncRootRegistered, accountCount() <= 1, ownFolderName(home, eng.Account.LoginName))
+		usable := unchosenUsable(cfapi.ShellSyncRootRegistered, accountCount() <= 1)
 		root = suggestAccountFolder(home, eng.Account.LoginName, claimed, usable)
 		if root == "" {
 			a.warnNoFolder(eng)
@@ -1121,7 +1121,7 @@ func (a *App) mountAccountOnDemand() {
 		// fresh folder, or its own existing root, as before.
 		home, _ := os.UserHomeDir()
 		dir = suggestAccountFolder(home, a.eng.Account.LoginName, nil,
-			unchosenUsable(cfapi.ShellSyncRootRegistered, true, ""))
+			unchosenUsable(cfapi.ShellSyncRootRegistered, true))
 		if dir == "" {
 			a.mountRefused = "There is no free, empty folder to use for this account. Choose a folder for it in Settings."
 			a.warnNoFolder(a.eng)

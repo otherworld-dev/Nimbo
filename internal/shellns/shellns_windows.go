@@ -618,12 +618,13 @@ func refresh() {
 
 // --- sidebar entries left behind (GitHub #10) ---
 
-// NimboNavNodes lists the sidebar folder entries in HKCU whose icon is a Nimbo
-// executable, other than Nimbo's own entry (NavGUID). Windows creates one per
-// registered sync root, and has been seen to leave them behind after the root
-// itself is gone. Reads are safe from inside the MSIX container for keys the
-// app never wrote, which these are (Windows writes them).
-func NimboNavNodes() []NavNode {
+// NavNodes lists the sidebar folder entries in HKCU that carry an icon, other
+// than Nimbo's own entry (NavGUID). Windows creates one per registered sync
+// root, and has been seen to leave them behind after the root itself is gone;
+// the caller decides which are its own by their icon. Reads are safe from
+// inside the MSIX container for keys the app never wrote, which these are
+// (Windows writes them).
+func NavNodes() []NavNode {
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Classes\CLSID`, registry.ENUMERATE_SUB_KEYS)
 	if err != nil {
 		return nil
@@ -649,7 +650,7 @@ func NimboNavNodes() []NavNode {
 			icon, _, _ = ik.GetStringValue("")
 			_ = ik.Close()
 		}
-		if !strings.Contains(strings.ToLower(icon), "nimbo") {
+		if icon == "" {
 			continue
 		}
 		out = append(out, NavNode{CLSID: c, Target: target, Icon: icon})

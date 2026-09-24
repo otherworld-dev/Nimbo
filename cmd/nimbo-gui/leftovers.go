@@ -76,14 +76,29 @@ func leftoverRoots(roots []cfapi.ShellSyncRoot, claimed []string, mounted map[st
 	return out
 }
 
-// orphanNavNodes picks the Nimbo sidebar entries that belong to no registered
-// sync root (live holds the lower-cased NamespaceCLSIDs of the roots).
-func orphanNavNodes(nodes []shellns.NavNode, live map[string]bool) []shellns.NavNode {
+// orphanNavNodes picks the sidebar entries that belong to no registered sync
+// root: an entry is live when it is a root's NamespaceCLSID or points at a
+// root's folder. If any root has no NamespaceCLSID recorded (a Windows build
+// that doesn't write it, or hasn't yet), entries can't be told apart safely
+// and none is returned.
+func orphanNavNodes(nodes []shellns.NavNode, roots []cfapi.ShellSyncRoot) []shellns.NavNode {
+	live := map[string]bool{}
+	var paths []string
+	for _, r := range roots {
+		if r.NamespaceCLSID == "" {
+			return nil
+		}
+		live[strings.ToLower(r.NamespaceCLSID)] = true
+		if r.Path != "" {
+			paths = append(paths, r.Path)
+		}
+	}
 	var out []shellns.NavNode
 	for _, n := range nodes {
-		if !live[strings.ToLower(n.CLSID)] {
-			out = append(out, n)
+		if live[strings.ToLower(n.CLSID)] || sameFolderAsAny(n.Target, paths) {
+			continue
 		}
+		out = append(out, n)
 	}
 	return out
 }
@@ -143,13 +158,18 @@ const missingRootWait = 24 * time.Hour
 // (the reporter renamed his). Re-creating it at once, as mounting used to,
 // leaves the moved copy's files stranded for good; renaming it back while it
 // is still registered is what recovers it. So Nimbo waits for it, and only
-// after a day drops the registration and sets the folder up again. since is
-// when it was first seen missing (zero = not missing); the returned value is
-// what to store.
-func missingRootAction(exists, registered bool, since, now time.Time) (missingAction, time.Time) {
+// after a day drops the registration and sets the folder up again. When the
+// parent folder is gone too, the drive itself is most likely away (a USB
+// disk, a locked BitLocker volume): that is waited for however long it takes,
+// because re-creating the folder elsewhere would split the account in two and
+// strand the edits made on the drive. since is when it was first seen missing
+// (zero = not missing); the returned value is what to store.
+func missingRootAction(exists, parentExists, registered bool, since, now time.Time) (missingAction, time.Time) {
 	switch {
 	case exists || !registered:
 		return mountRoot, time.Time{}
+	case !parentExists:
+		return waitForRoot, since // the drive is away: the clock doesn't run
 	case since.IsZero():
 		return waitForRoot, now
 	case now.Sub(since) < missingRootWait:
@@ -161,18 +181,12 @@ func missingRootAction(exists, registered bool, since, now time.Time) (missingAc
 
 // unchosenUsable accepts a folder for mounting without the user choosing it:
 // missing or empty; or already a registered root when this is the only
-// account (a single-account install keeps its folder) or the folder is this
-// account's own ownDir. With several accounts, another registered root may
-// hold another account's files.
-func unchosenUsable(registered func(string) bool, single bool, ownDir string) func(string) bool {
+// account (a single-account install keeps its folder). With several accounts a
+// registered root may hold another account's files, even one with this
+// account's own default name (the same login on a different server).
+func unchosenUsable(registered func(string) bool, single bool) func(string) bool {
 	return func(dir string) bool {
-		if missingOrEmpty(dir) {
-			return true
-		}
-		if !registered(dir) {
-			return false
-		}
-		return single || (ownDir != "" && strings.EqualFold(filepath.Clean(dir), filepath.Clean(ownDir)))
+		return missingOrEmpty(dir) || (single && registered(dir))
 	}
 }
 
@@ -211,10 +225,6 @@ func accountCount() int {
 	return len(st.Accounts)
 }
 
-// ownFolderName is the account's own default folder name, "<brand> - <login>".
-func ownFolderName(home, login string) string {
-	return filepath.Join(home, brand.Current.Name+" - "+login)
-}
 
 // rootReady applies missingRootAction to an account's root before it is
 // mounted, persisting when the folder was first seen missing. It returns false
@@ -228,7 +238,8 @@ func (a *App) rootReady(eng *agent.Engine, dir string) bool {
 	s, _ := ad.LoadAccountState()
 	since, _ := time.Parse(time.RFC3339, s.RootMissingSince)
 	_, statErr := os.Stat(dir)
-	act, next := missingRootAction(statErr == nil, cfapi.ShellSyncRootRegistered(dir), since, time.Now())
+	_, parentErr := os.Stat(filepath.Dir(dir))
+	act, next := missingRootAction(statErr == nil, parentErr == nil, cfapi.ShellSyncRootRegistered(dir), since, time.Now())
 	stamp := ""
 	if !next.IsZero() {
 		stamp = next.UTC().Format(time.RFC3339)
@@ -240,6 +251,10 @@ func (a *App) rootReady(eng *agent.Engine, dir string) bool {
 	case waitForRoot:
 		msg := fmt.Sprintf("%s is missing. If you renamed or moved it, move it back to %s and %s will reconnect it. "+
 			"Otherwise it will be set up again in a day.", filepath.Base(dir), dir, brand.Current.Name)
+		if parentErr != nil {
+			msg = fmt.Sprintf("%s isn't available (is its drive connected?). %s will reconnect it when it is back.",
+				dir, brand.Current.Name)
+		}
 		if eng == a.eng {
 			a.mountRefused = msg
 		}
@@ -287,7 +302,7 @@ func (a *App) unregisterRecordedRoot(accountID string) {
 		}
 	}
 	for _, dir := range cands {
-		if dir == "" || a.onDemandMounts[dir] != nil || overlapsAny(dir, claimed) || !cfapi.ShellSyncRootRegistered(dir) {
+		if dir == "" || a.onDemandMounts[dir] != nil || overlapsAny(dir, claimed) || sameFolderAsAny(dir, claimed) || !cfapi.ShellSyncRootRegistered(dir) {
 			continue
 		}
 		slog.Info("unregistering the root of an account that is going", "account", accountID, "dir", dir)
@@ -303,6 +318,9 @@ func (a *App) sweepLeftovers(mounted map[string]bool) {
 	if !cfapi.Supported() {
 		return
 	}
+	// Roots first, then claims: every flow records its claim before it
+	// registers a root, so a root registered meanwhile is already claimed.
+	roots := cfapi.NimboShellSyncRoots()
 	d, st, ok := accountsAndDirs()
 	if !ok {
 		return
@@ -312,26 +330,52 @@ func (a *App) sweepLeftovers(mounted map[string]bool) {
 		slog.Warn("leftover clean-up skipped: an account's folder setup couldn't be read")
 		return
 	}
+	var inUse []string
+	for dir := range mounted {
+		inUse = append(inUse, dir)
+	}
+	inUse = append(inUse, claimed...)
 	exe, _ := os.Executable()
-	for _, r := range leftoverRoots(cfapi.NimboShellSyncRoots(), claimed, mounted) {
-		if !rootOwnedBy(r.Icon, exe) {
+	for _, r := range leftoverRoots(roots, claimed, mounted) {
+		if !rootOwnedBy(r.Icon, exe) || sameFolderAsAny(r.Path, inUse) {
 			continue
 		}
 		slog.Info("unregistering a leftover sync root no account uses", "dir", r.Path, "id", r.ID)
 		cfapi.UnregisterShellSyncRootByID(r.ID, r.Path)
 	}
-	live := map[string]bool{}
-	for _, r := range cfapi.NimboShellSyncRoots() {
-		if r.NamespaceCLSID != "" {
-			live[strings.ToLower(r.NamespaceCLSID)] = true
-		}
-	}
 	var clsids []string
-	for _, n := range orphanNavNodes(shellns.NimboNavNodes(), live) {
+	for _, n := range orphanNavNodes(shellns.NavNodes(), cfapi.NimboShellSyncRoots()) {
+		if !rootOwnedBy(n.Icon, exe) {
+			continue // another build's entry: not this build's to judge
+		}
 		slog.Info("removing a leftover sidebar entry", "clsid", n.CLSID, "target", n.Target)
 		clsids = append(clsids, n.CLSID)
 	}
 	if err := shellns.RemoveNavNodes(clsids); err != nil {
 		slog.Warn("could not remove leftover sidebar entries", "err", err)
 	}
+}
+
+// sameFolderAsAny reports whether dir is the same folder as any of dirs:
+// the same path, or (for folders that exist) the same folder on disk reached
+// another way (a junction, a short name, a \\?\ prefix).
+func sameFolderAsAny(dir string, dirs []string) bool {
+	if dir == "" {
+		return false
+	}
+	fi, err := os.Stat(dir)
+	for _, d := range dirs {
+		if d == "" {
+			continue
+		}
+		if pathWithin(dir, d) && pathWithin(d, dir) {
+			return true
+		}
+		if err == nil {
+			if di, derr := os.Stat(d); derr == nil && os.SameFile(fi, di) {
+				return true
+			}
+		}
+	}
+	return false
 }
