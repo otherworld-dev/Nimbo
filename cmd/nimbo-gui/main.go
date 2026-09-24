@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -124,6 +125,12 @@ func main() {
 		},
 	})
 	svc.app = app
+	// Lets work that must go through the main loop wait for it (afterStart).
+	svc.started = make(chan struct{})
+	var startedOnce sync.Once
+	app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
+		startedOnce.Do(func() { close(svc.started) })
+	})
 	// Logged here, not earlier: a second launch (Explorer's Share menu) hands
 	// its arguments to the running app and exits inside application.New, and
 	// must not read as a start that never logged "exiting".

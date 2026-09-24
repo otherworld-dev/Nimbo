@@ -75,6 +75,7 @@ type App struct {
 	pendingApp      string                                // app id to open once the engine is ready (--app launch)
 	startRetrying   atomic.Bool                           // one engine-start retry loop at a time
 	authLost        atomic.Bool                           // the server turned our credentials down; cleared once an engine starts
+	started         chan struct{}                         // closed once the Wails main loop runs (see afterStart); nil = assume running
 	overlayServe    sync.Once                             // the status pipe is process-global; serve it once
 	appsCacheMu     sync.Mutex
 	appsCache       []transport.App // last-fetched navigation apps (flyout refreshes keep it warm)
@@ -161,13 +162,15 @@ func (a *App) start(ctx context.Context) {
 		// until a manual relaunch (bit the VM on 2026-08-21, twice). Say what is
 		// actually happening and keep retrying.
 		//
-		// EXCEPT a missing app password: the account exists but its secret is
-		// gone from the keychain (store wiped, profile trouble). No amount of
-		// retrying brings a credential back — that spun "trying to connect"
-		// forever on the VM. It is the auth-lost case: ask for a sign-in.
+		// EXCEPT a missing or rejected app password: the account exists but its
+		// secret is gone from the keychain (store wiped, profile trouble), or the
+		// server refuses it (revoked in the web UI). No amount of retrying brings
+		// a credential back — the missing one spun "trying to connect" forever on
+		// the VM, and the rejected one sent the server a failed login every 15 s
+		// (GitHub #12 testing). It is the auth-lost case: ask for a sign-in.
 		if a.hasConfiguredAccount() {
-			if errors.Is(err, account.ErrNoSecret) {
-				a.onAuthLost()
+			if errors.Is(err, account.ErrNoSecret) || errors.Is(err, transport.ErrUnauthorized) {
+				a.afterStart(a.onAuthLost)
 				return
 			}
 			a.setStatus("Can't reach your server — retrying")
@@ -4998,6 +5001,20 @@ func (a *App) showLogin() {
 		a.cancelLoginPoll()
 		a.loginWin = nil
 	})
+}
+
+// afterStart runs fn once the Wails main loop is up. onAuthLost goes through
+// InvokeAsync, which panics before app.Run (the VM crash of 2026-08-21), and
+// the launch-time engine start runs on a goroutine that can beat Run to it.
+func (a *App) afterStart(fn func()) {
+	if a.started == nil {
+		fn()
+		return
+	}
+	go func() {
+		<-a.started
+		fn()
+	}()
 }
 
 // cancelLoginPoll stops any in-flight login-flow poll.
