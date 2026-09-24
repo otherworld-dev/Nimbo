@@ -2809,6 +2809,19 @@ func (e *Engine) PauseFor(d time.Duration) {
 	e.pauseChanged()
 }
 
+// CopyPauseFrom gives e the manual or timed pause src has now, so an account
+// engine started while the app is paused starts paused as well. Quiet hours
+// are not copied: every engine loads those from settings itself.
+func (e *Engine) CopyPauseFrom(src *Engine) {
+	src.mu.Lock()
+	paused, until := src.paused, src.pauseUntil
+	src.mu.Unlock()
+	e.mu.Lock()
+	e.paused, e.pauseUntil = paused, until
+	e.mu.Unlock()
+	e.pauseChanged()
+}
+
 // SetPauseSchedule sets the quiet-hours auto-pause window.
 func (e *Engine) SetPauseSchedule(s PauseSchedule) {
 	e.mu.Lock()
