@@ -3,6 +3,15 @@
 All notable changes to Nimbo are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- An account change saved at the same moment as another one (signing in, removing
+  an account, changing the default) is no longer lost. Each change read the whole
+  account list, edited its own copy and wrote it back, so whichever finished second
+  quietly undid the first (#693).
+
 ## [0.1.8] - 2026-09-20
 
 Mostly about deletions, and the ways a folder could be removed when it should not
