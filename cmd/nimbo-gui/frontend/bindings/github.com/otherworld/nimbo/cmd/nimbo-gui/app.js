@@ -634,7 +634,11 @@ export function MoveSyncFolder(oldLocal, newLocal) {
 }
 
 /**
- * NeedsLogin reports whether no account is configured yet.
+ * NeedsLogin reports whether the app is waiting for the user to sign in: no
+ * engine is running and there is no usable account — none configured (first
+ * run, or the last one signed out), its app password gone from the keychain,
+ * or the server turned the credentials down. A server that is only
+ * unreachable is not this: that one retries by itself.
  * @returns {$CancellablePromise<boolean>}
  */
 export function NeedsLogin() {
@@ -1064,6 +1068,9 @@ export function SetAutostart(on) {
 }
 
 /**
+ * SetBaseDir sets the active account's folder. It refuses a folder another
+ * account uses; the refusal is shown as a dialog because this binding returns
+ * nothing (changing that would mean regenerating the Wails bindings).
  * @param {string} dir
  * @returns {$CancellablePromise<void>}
  */

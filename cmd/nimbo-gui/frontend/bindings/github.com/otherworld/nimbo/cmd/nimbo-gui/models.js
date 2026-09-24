@@ -1574,6 +1574,15 @@ export class PairDTO {
              */
             this["freezeSample"] = undefined;
         }
+        if (/** @type {any} */(false)) {
+            /**
+             * HeldReason says why this folder is not syncing because another account
+             * uses it (GitHub #11); "" when it syncs normally.
+             * @member
+             * @type {string | undefined}
+             */
+            this["heldReason"] = undefined;
+        }
 
         Object.assign(this, $$source);
     }

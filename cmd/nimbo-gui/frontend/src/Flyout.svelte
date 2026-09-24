@@ -82,7 +82,69 @@
   let appearance = $state<{ dockIconSize: string; panelWidth: string; density: string; sections: string[] }>(
     { dockIconSize: "medium", panelWidth: "standard", density: "comfortable", sections: ["search", "activity", "storage"] });
 
+  // Waiting for a sign-in (no account yet, the last one signed out, or its
+  // credentials turned down): the panel shows a sign-in card instead of an
+  // empty activity list with nothing to click (GitHub #12). signInHost names
+  // the server when an account exists and only needs signing in again.
+  let needsLogin = $state(false);
+  let signInHost = $state("");
+
+  // Updates while signed out. Settings is where they normally live, and it
+  // can't open without an account, so the sign-in card carries the check and
+  // the beta opt-in itself (GitHub #11). Same calls and wording as Settings →
+  // General; gated on canApply, which is false on Store and loose dev builds.
+  let version = $state("");
+  let canApply = $state(false);
+  let beta = $state(false);
+  let betaConfirm = $state(false);
+  let updateMsg = $state("");
+  let updateAvail = $state(false);
+  let updateBusy = $state(false);
+  (async () => {
+    version = await App.Version();
+    canApply = await App.CanApplyUpdate();
+    beta = await App.BetaUpdates();
+  })();
+  async function toggleBeta(e: Event) {
+    if (!beta) {
+      // Turning betas on needs the same eyes-open consent as in Settings.
+      (e.currentTarget as HTMLInputElement).checked = false;
+      betaConfirm = true;
+      return;
+    }
+    beta = false;
+    await App.SetBetaUpdates(false);
+    updateMsg = ""; updateAvail = false;
+  }
+  async function confirmBeta() {
+    betaConfirm = false;
+    beta = true;
+    await App.SetBetaUpdates(true);
+    updateMsg = ""; updateAvail = false;
+  }
+  async function checkUpdate() {
+    updateBusy = true; updateMsg = "Checking…"; updateAvail = false;
+    const u = await App.CheckForUpdate();
+    updateBusy = false;
+    if (u.err) { updateMsg = "Couldn't check: " + u.err; return; }
+    if (u.available) { updateMsg = "Update available: " + u.latest; updateAvail = true; }
+    else if (u.ahead) { updateMsg = "You're on a newer build than the current release"; }
+    else { updateMsg = "You're up to date"; }
+  }
+  async function applyUpdate() {
+    updateBusy = true; updateMsg = `Updating… ${brandName} will restart.`;
+    const err = await App.ApplyUpdate();
+    if (err) { updateBusy = false; updateMsg = "Update failed: " + err; }
+  }
+
   async function refresh() {
+    needsLogin = await App.NeedsLogin();
+    if (needsLogin) {
+      const accts = (await App.ListAccounts()) ?? [];
+      const cur = accts.find(a => a.active) ?? accts[0];
+      signInHost = cur ? hostOf(cur.server) : "";
+      editStatus = false; moreMenu = false; pauseMenu = false; editApps = false;
+    }
     status = await App.Status();
     pauseInfo = await App.PauseInfo();
     paused = pauseInfo.paused;
@@ -91,7 +153,10 @@
     const a = (await App.Apps()) ?? [];
     if (a.length || !apps.length) apps = a; // don't blank a populated rail on a transient empty fetch
     const h = await App.Header();
-    if (h.user || !header.user) header = h; // don't flap the identity to "logged out"
+    // Don't flap the identity to "logged out" on a transient empty fetch — but
+    // when a sign-in really is needed, the old identity has to go.
+    if (needsLogin) header = h;
+    else if (h.user || !header.user) header = h;
     attention = await fetchAttention();
     notifCount = await App.NotificationCount();
     showDock = await App.ShowAppDock();
@@ -146,11 +211,13 @@
        waiting: "Waiting — open in another program",
        "unshared-empty": "No longer shared with you — nothing was downloaded" } as Record<string, string>)[k] ?? k;
   refresh();
-  Events.On("status", (e: any) => {
+  Events.On("status", async (e: any) => {
     status = e.data;
     // The engine starts asynchronously; the first refresh() at mount may run
     // before it's ready (empty header/folders/apps). Re-fetch once it comes up.
-    if (!header.user) refresh();
+    // Signing out or losing the sign-in leaves the identity on screen, so ask
+    // whether that's what this status change was.
+    if (!header.user || (await App.NeedsLogin()) !== needsLogin) refresh();
   });
   Events.On("progress", (e: any) => { progress = e.data; });
   // Activity fires per file — hundreds/sec during a big sync. Coalesce into a
@@ -343,6 +410,42 @@
     {/if}
   </header>
 
+  {#if needsLogin}
+    <div class="signin">
+      {#if signInHost}
+        <h3>Sign in again</h3>
+        <p>{brandName} can’t sign in to {signInHost} any more. Sign in again to carry on syncing.</p>
+      {:else}
+        <h3>You’re not signed in</h3>
+        <p>Sign in to your Nextcloud to start syncing your files.</p>
+      {/if}
+      <button class="signbtn" onclick={() => App.AddAccount()}>Sign in</button>
+      <button class="link" onclick={() => App.Quit()}>Quit {brandName}</button>
+      {#if canApply}
+        <div class="signupd">
+          {#if betaConfirm}
+            <p class="betawarn">Beta builds come straight from active development: they change often, are less tested, and may contain bugs, including ones that could affect the files being synced. They are provided as-is, without warranty of any kind, and the developer accepts no liability for any loss or damage arising from their use. Keep a backup of anything you can't afford to lose.</p>
+            <div class="uprow">
+              <button class="link" onclick={confirmBeta}>I understand, enable betas</button>
+              <button class="link" onclick={() => (betaConfirm = false)}>Cancel</button>
+            </div>
+          {:else}
+            <div class="uprow">
+              <span class="ver">{brandName} {version}</span>
+              <button class="link" onclick={checkUpdate} disabled={updateBusy}>Check for updates</button>
+            </div>
+            {#if updateMsg}
+              <div class="uprow">
+                <span class="upmsg">{updateMsg}</span>
+                {#if updateAvail}<button class="link" onclick={applyUpdate} disabled={updateBusy}>Update now</button>{/if}
+              </div>
+            {/if}
+            <label class="betachk"><input type="checkbox" checked={beta} onchange={toggleBeta} /> Get beta releases early</label>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {:else}
   {#if attentionTotal > 0}
     <button class="alert" onclick={() => App.OpenStatusTab(attentionTab)}>
       <span class="warn">⚠</span>
@@ -487,6 +590,7 @@
     {:else if key === "storage"}{@render storageSection()}
     {/if}
   {/each}
+  {/if}
 
   {#if editApps}
     <div class="appmanage">
@@ -726,6 +830,19 @@
   .link { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 12px; padding: 2px 4px; }
   .link:hover { text-decoration: underline; }
   .empty { color: var(--muted); font-size: 13px; }
+  .signin { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+            gap: 10px; padding: 24px 28px; text-align: center; }
+  .signin h3 { margin: 0; font-size: 16px; color: var(--fg); }
+  .signin p { margin: 0 0 6px; font-size: 13px; line-height: 1.45; color: var(--fg2); }
+  .signbtn { min-width: 140px; padding: 8px 18px; border: 1px solid var(--accent); border-radius: 8px;
+             background: var(--accent); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .signbtn:hover { background: var(--accent-dark); border-color: var(--accent-dark); }
+  .signupd { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); width: 100%;
+             display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .signupd .uprow { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 6px; }
+  .signupd .upmsg { color: var(--fg2); }
+  .signupd .betachk { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .signupd .betawarn { margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--fg2); text-align: left; }
 
   /* Appearance customisation. Density "compact" tightens spacing/fonts; icon size
      scales the dock icons. Panel width is handled by resizing the window (Go). */

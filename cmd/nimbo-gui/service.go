@@ -74,6 +74,8 @@ type App struct {
 	appOpening      map[string]bool                       // opens in flight (coalesces double-clicks during the slow app-list fetch)
 	pendingApp      string                                // app id to open once the engine is ready (--app launch)
 	startRetrying   atomic.Bool                           // one engine-start retry loop at a time
+	authLost        atomic.Bool                           // the server turned our credentials down; cleared once an engine starts
+	started         chan struct{}                         // closed once the Wails main loop runs (see afterStart); nil = assume running
 	overlayServe    sync.Once                             // the status pipe is process-global; serve it once
 	appsCacheMu     sync.Mutex
 	appsCache       []transport.App // last-fetched navigation apps (flyout refreshes keep it warm)
@@ -160,13 +162,15 @@ func (a *App) start(ctx context.Context) {
 		// until a manual relaunch (bit the VM on 2026-08-21, twice). Say what is
 		// actually happening and keep retrying.
 		//
-		// EXCEPT a missing app password: the account exists but its secret is
-		// gone from the keychain (store wiped, profile trouble). No amount of
-		// retrying brings a credential back — that spun "trying to connect"
-		// forever on the VM. It is the auth-lost case: ask for a sign-in.
+		// EXCEPT a missing or rejected app password: the account exists but its
+		// secret is gone from the keychain (store wiped, profile trouble), or the
+		// server refuses it (revoked in the web UI). No amount of retrying brings
+		// a credential back — the missing one spun "trying to connect" forever on
+		// the VM, and the rejected one sent the server a failed login every 15 s
+		// (GitHub #12 testing). It is the auth-lost case: ask for a sign-in.
 		if a.hasConfiguredAccount() {
-			if errors.Is(err, account.ErrNoSecret) {
-				a.onAuthLost()
+			if errors.Is(err, account.ErrNoSecret) || errors.Is(err, transport.ErrUnauthorized) {
+				a.afterStart(a.onAuthLost)
 				return
 			}
 			a.setStatus("Can't reach your server — retrying")
@@ -181,6 +185,7 @@ func (a *App) start(ctx context.Context) {
 		return
 	}
 	a.eng = eng
+	a.authLost.Store(false)
 	a.appsCacheMu.Lock()
 	a.appsCache, a.appsCacheAt = nil, time.Time{} // stale across engine/account changes
 	a.appsCacheMu.Unlock()
@@ -259,8 +264,6 @@ func (a *App) start(ctx context.Context) {
 	forwardEvents(runCtx, eng.SubscribeBlocked(), func() { a.emit("blocked") })
 	forwardEvents(runCtx, eng.SubscribeLocked(), func() { a.emit("locks") })
 	forwardEvents(runCtx, eng.SubscribeDetached(), func() { a.emit("detached") })
-
-	go a.updateCheckLoop(runCtx) // periodic background "update available" toast
 
 	var pairs []config.SyncPair
 	if a.GetSyncMode() == "ondemand" {
@@ -746,6 +749,26 @@ func (a *App) updateCheckLoop(ctx context.Context) {
 				[]notify.ToastButton{{Label: "Update now", Args: "action=update"}})
 		}
 		timer.Reset(24 * time.Hour)
+	}
+}
+
+// checkForUpdateToast runs an update check and reports the result in a toast,
+// with "Update now" when there is one. It is the signed-out tray menu's check,
+// where there is no Settings window to show the answer in.
+func (a *App) checkForUpdateToast() {
+	u := a.CheckForUpdate()
+	title := brand.Current.Name + " update"
+	switch {
+	case u.Err != "":
+		notify.Toast(title, "Couldn't check for updates: "+u.Err, "")
+	case u.Available:
+		notify.RaiseActionable(brand.Current.Name+" update available",
+			u.Latest+" is ready to install.", "action=settings",
+			[]notify.ToastButton{{Label: "Update now", Args: "action=update"}})
+	case u.Ahead:
+		notify.Toast(title, "You're on a newer build than the current release ("+u.Latest+").", "")
+	default:
+		notify.Toast(title, "You're up to date ("+version+").", "")
 	}
 }
 
@@ -2697,6 +2720,20 @@ func (a *App) quit(reason string) {
 // buildTrayMenu constructs the tray right-click menu reflecting current state.
 func (a *App) buildTrayMenu() *application.Menu {
 	m := application.NewMenu()
+	// Waiting for a sign-in: there is nothing to sync, pause or open, so the
+	// menu is the way back in and the way out. Without it, closing the sign-in
+	// window on a fresh install left no route to either (GitHub #12).
+	if a.NeedsLogin() {
+		m.Add("Sign in…").OnClick(func(*application.Context) { a.showLogin() })
+		// Updating needs no account, and Settings (where updates normally
+		// live) can't open without one (GitHub #11).
+		if canApplyUpdate() {
+			m.Add("Check for updates…").OnClick(func(*application.Context) { go a.checkForUpdateToast() })
+		}
+		m.AddSeparator()
+		m.Add("Quit " + brand.Current.Name).OnClick(func(*application.Context) { a.quit("tray menu") })
+		return m
+	}
 	m.Add("Sync now").OnClick(func(*application.Context) { a.SyncNow() })
 
 	ps := a.PauseInfo()
@@ -2733,7 +2770,7 @@ func (a *App) buildTrayMenu() *application.Menu {
 	m.Add("Sync status").OnClick(func(*application.Context) { a.OpenStatus() })
 	m.Add("Settings").OnClick(func(*application.Context) { a.OpenSettings() })
 	m.AddSeparator()
-	m.Add("Quit Nimbo").OnClick(func(*application.Context) { a.quit("tray menu") })
+	m.Add("Quit " + brand.Current.Name).OnClick(func(*application.Context) { a.quit("tray menu") })
 	return m
 }
 
@@ -3870,8 +3907,16 @@ func (a *App) dispatchToastActivation(args string) {
 		// The "update available" toast's body: open the Settings window on its
 		// General tab, where "Check for updates / Update now" and the release
 		// notes live. (This used to open the sync-status window on a nonexistent
-		// "settings" tab — the wrong menu.)
-		application.InvokeAsync(func() { a.openSettingsTab("general") })
+		// "settings" tab — the wrong menu.) Signed out there are no Settings
+		// to open, so show the flyout, whose sign-in card carries the same
+		// update controls (GitHub #11).
+		application.InvokeAsync(func() {
+			if a.NeedsLogin() && a.tray != nil {
+				a.tray.ShowWindow()
+				return
+			}
+			a.openSettingsTab("general")
+		})
 	case "notify": // a Nextcloud notification's Accept/Decline button
 		acct := v.Get("acct")
 		id, _ := strconv.Atoi(v.Get("id"))
@@ -4948,6 +4993,7 @@ func (a *App) onAuthLost() {
 	application.InvokeAsync(func() {
 		a.disconnectAllOnDemand()
 		a.stopEngine()
+		a.authLost.Store(true) // before the status event: the flyout re-checks NeedsLogin on it
 		a.setStatus("Sign in again")
 		a.rebuildTrayMenu()
 		notify.RaiseActionable("Sign in required", brand.Current.Name+" couldn't authenticate — please sign in again.", "action=login",
@@ -4988,6 +5034,20 @@ func (a *App) showLogin() {
 	})
 }
 
+// afterStart runs fn once the Wails main loop is up. onAuthLost goes through
+// InvokeAsync, which panics before app.Run (the VM crash of 2026-08-21), and
+// the launch-time engine start runs on a goroutine that can beat Run to it.
+func (a *App) afterStart(fn func()) {
+	if a.started == nil {
+		fn()
+		return
+	}
+	go func() {
+		<-a.started
+		fn()
+	}()
+}
+
 // cancelLoginPoll stops any in-flight login-flow poll.
 func (a *App) cancelLoginPoll() {
 	a.loginMu.Lock()
@@ -5001,8 +5061,17 @@ func (a *App) cancelLoginPoll() {
 
 // --- Login (first run) ---
 
-// NeedsLogin reports whether no account is configured yet.
-func (a *App) NeedsLogin() bool { return a.eng == nil }
+// NeedsLogin reports whether the app is waiting for the user to sign in: no
+// engine is running and there is no usable account — none configured (first
+// run, or the last one signed out), its app password gone from the keychain,
+// or the server turned the credentials down. A server that is only
+// unreachable is not this: that one retries by itself.
+func (a *App) NeedsLogin() bool {
+	if a.eng != nil {
+		return false
+	}
+	return a.authLost.Load() || !hasAccount()
+}
 
 // BeginLogin starts Login Flow v2: it opens the browser and polls in the
 // background, emitting "login:done" or "login:error". Returns the login URL (or
