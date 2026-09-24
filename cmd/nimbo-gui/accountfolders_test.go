@@ -204,3 +204,34 @@ func TestMountableUnchosen(t *testing.T) {
 		t.Fatal("the install's own sync root was refused")
 	}
 }
+
+// In on-demand mode the folder an account last mounted is what it syncs, even
+// when its account folder or pairs say otherwise.
+func TestActiveAccountFoldersPrefersTheMountedRoot(t *testing.T) {
+	d := config.Dirs{Config: t.TempDir(), Data: t.TempDir()}
+	st := account.Store{Accounts: []account.Account{{ID: "a"}, {ID: "b", LoginName: "bob"}}}
+	_ = d.WithAccount("b").UpdateAccountState(func(s *config.AccountState) {
+		s.BaseDir = `C:\Old`
+		s.OnDemandRoot = `C:\Mounted`
+	})
+	got := activeAccountFolders(d, st, "a", "ondemand")
+	if len(got) != 1 || got[0].Dir != `C:\Mounted` {
+		t.Fatalf("got %v", got)
+	}
+	if claims := otherAccountFolders(d, st, "a"); folderClash(`C:\Mounted`, claims) == "" {
+		t.Fatalf("the mounted root is not counted as claimed: %v", claims)
+	}
+}
+
+// Re-applying virtual files keeps every account's registration; only a root
+// that nothing mounts or claims any more (e.g. the folder a new account was
+// given before its setup chose another) is unregistered.
+func TestAbandonedRoots(t *testing.T) {
+	before := []string{`C:\Kept`, `C:\Claimed`, `C:\Dropped`}
+	mounted := map[string]bool{`C:\Kept`: true}
+	claimed := []string{`c:\claimed`}
+	got := abandonedRoots(before, mounted, claimed)
+	if len(got) != 1 || got[0] != `C:\Dropped` {
+		t.Fatalf("got %v", got)
+	}
+}

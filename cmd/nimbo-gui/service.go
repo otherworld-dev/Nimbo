@@ -404,8 +404,8 @@ func (a *App) startSecondaries(ctx context.Context) {
 // fell straight through to a fresh folder, so every account switch moved the
 // account to a different folder and left the old sync root behind (#10, #11).
 func (a *App) mountSecondaryOnDemand(eng *agent.Engine) {
-	root := ""
-	if pairs, err := eng.Pairs(); err == nil {
+	root := eng.OnDemandRoot() // the folder it last mounted, if recorded
+	if pairs, err := eng.Pairs(); root == "" && err == nil {
 		for _, p := range pairs {
 			if strings.Trim(p.RemoteRoot, "/") == "" {
 				root = p.LocalDir
@@ -923,13 +923,26 @@ func (a *App) SetSyncMode(mode string) string {
 	// Every step logs before it runs: this sequence once hung permanently on a
 	// live install with the log silent, leaving nothing to diagnose from. The
 	// last breadcrumb printed names the step that never returned.
-	slog.Info("sync mode switch: unmounting on-demand roots", "to", mode)
-	a.unmountAllOnDemand()
+	// Only leaving virtual files unregisters the roots (the revert that comes
+	// with it is the point). Re-applying virtual files, which account setup
+	// does, keeps every registration: unregistering here flattened every
+	// account's folder whenever an account was added (GitHub #11).
+	before := a.mountedRoots()
+	if mode == "ondemand" {
+		slog.Info("sync mode switch: disconnecting on-demand roots (registrations kept)", "to", mode)
+		a.disconnectAllOnDemand()
+	} else {
+		slog.Info("sync mode switch: unmounting on-demand roots", "to", mode)
+		a.unmountAllOnDemand()
+	}
 	slog.Info("sync mode switch: stopping engine")
 	a.stopEngine()
 	slog.Info("sync mode switch: restarting stack")
 	a.start(a.ctx)
 	slog.Info("sync mode switch: stack restarted")
+	if mode == "ondemand" {
+		a.unregisterAbandonedRoots(before)
+	}
 	if a.eng == nil {
 		return "couldn't restart syncing — check the logs"
 	}
@@ -1489,6 +1502,13 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 	}
 	m := &odMount{connKey: connKey, remoteRoot: root, accountID: eng.Account.ID}
 	a.onDemandMounts[localDir] = m
+	if strings.Trim(remoteRoot, "/") == "" {
+		// The account's whole-account root: remember it, so the account
+		// reconnects to this folder next time, primary or background.
+		if err := eng.SetOnDemandRoot(localDir); err != nil {
+			slog.Warn("could not record the virtual-files root", "dir", localDir, "err", err)
+		}
+	}
 	a.refreshOverlayRoots()
 
 	// Background state heal: converts plain directories inside the mount back
@@ -4605,6 +4625,9 @@ func (a *App) RemoveAccount(id string) string {
 	if _, ok := st.Find(id); !ok {
 		return "no such account"
 	}
+	// Its virtual-files root goes with it: left registered, it stays in the
+	// Explorer sidebar pointing at a folder nothing syncs (GitHub #10).
+	a.unmountOnDemandFor(id)
 	a.stopSecondary(id) // stop its background sync before removing its data
 	a.acctMu.Lock()
 	delete(a.acctStatus, id)
@@ -4636,7 +4659,12 @@ func (a *App) SignOut(clearData bool) string {
 	if !a.policyNow().AllowSignOut {
 		return "Sign out is disabled by your organisation's policy."
 	}
-	a.unmountAllOnDemand() // disconnect cloud sync roots + stop watchers
+	// Unmount only the account signing out; the others keep their roots
+	// registered (unmounting them too flattened their folders, GitHub #11).
+	if a.eng != nil {
+		a.unmountOnDemandFor(a.eng.Account.ID)
+	}
+	a.disconnectAllOnDemand()
 	a.stopEngine()
 	moreAccounts := false
 	if d, err := config.Resolve(); err == nil {

@@ -1663,6 +1663,19 @@ func (e *Engine) syncablePairs(pairs []Pair) []Pair {
 	return out
 }
 
+// OnDemandRoot returns the folder this account last mounted as its
+// virtual-files root, or "".
+func (e *Engine) OnDemandRoot() string {
+	s, _ := e.dirs.LoadAccountState()
+	return s.OnDemandRoot
+}
+
+// SetOnDemandRoot records the folder this account has mounted as its
+// virtual-files root.
+func (e *Engine) SetOnDemandRoot(dir string) error {
+	return e.dirs.UpdateAccountState(func(s *config.AccountState) { s.OnDemandRoot = dir })
+}
+
 // RememberedPairs returns this account's parked pairs without clearing them.
 func (e *Engine) RememberedPairs() []config.SyncPair {
 	s, _ := e.dirs.LoadAccountState()

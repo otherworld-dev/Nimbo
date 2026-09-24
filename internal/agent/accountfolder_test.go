@@ -179,3 +179,17 @@ func TestGuardSweepKeepsThisAccountsParkedFolder(t *testing.T) {
 		t.Fatalf("a folder that no longer exists kept its guard state: %v", got)
 	}
 }
+
+// The folder an account last mounted as its virtual-files root is recorded
+// per account, so it reconnects to exactly that folder, primary or background.
+func TestOnDemandRootIsPerAccount(t *testing.T) {
+	root := config.Dirs{Config: t.TempDir(), Data: t.TempDir()}
+	a := &Engine{dirs: root.WithAccount("a")}
+	b := &Engine{dirs: root.WithAccount("b")}
+	if err := a.SetOnDemandRoot(`C:\A`); err != nil {
+		t.Fatal(err)
+	}
+	if a.OnDemandRoot() != `C:\A` || b.OnDemandRoot() != "" {
+		t.Fatalf("a=%q b=%q", a.OnDemandRoot(), b.OnDemandRoot())
+	}
+}

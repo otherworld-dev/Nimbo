@@ -11,6 +11,7 @@ import (
 	"github.com/otherworld/nimbo/internal/account"
 	"github.com/otherworld/nimbo/internal/agent"
 	"github.com/otherworld/nimbo/internal/brand"
+	"github.com/otherworld/nimbo/internal/cfapi"
 	"github.com/otherworld/nimbo/internal/config"
 	"github.com/otherworld/nimbo/internal/notify"
 )
@@ -84,6 +85,7 @@ func otherAccountFolders(d config.Dirs, st account.Store, exclude string) []acco
 		label := accountLabel(acc)
 		if s, err := ad.LoadAccountState(); err == nil {
 			l.add(label, s.BaseDir)
+			l.add(label, s.OnDemandRoot)
 			for _, p := range s.RememberedPairs {
 				l.add(label, p.LocalDir)
 			}
@@ -99,7 +101,8 @@ func otherAccountFolders(d config.Dirs, st account.Store, exclude string) []acco
 
 // activeAccountFolders lists the folders accounts other than exclude are
 // SYNCING in the given mode: their live pairs in live mode; in on-demand mode
-// the root each mounts (its whole-account pair, else its account folder).
+// the root each mounts (the one it last mounted, else its whole-account pair,
+// else its account folder).
 func activeAccountFolders(d config.Dirs, st account.Store, exclude, mode string) []accountFolder {
 	var l folderList
 	for _, acc := range st.Accounts {
@@ -115,17 +118,18 @@ func activeAccountFolders(d config.Dirs, st account.Store, exclude, mode string)
 			}
 			continue
 		}
-		root := ""
-		for _, p := range pairs {
-			if strings.Trim(p.RemoteRoot, "/") == "" {
-				root = p.LocalDir
-				break
+		st, _ := ad.LoadAccountState()
+		root := st.OnDemandRoot
+		if root == "" {
+			for _, p := range pairs {
+				if strings.Trim(p.RemoteRoot, "/") == "" {
+					root = p.LocalDir
+					break
+				}
 			}
 		}
 		if root == "" {
-			if s, err := ad.LoadAccountState(); err == nil {
-				root = s.BaseDir
-			}
+			root = st.BaseDir
 		}
 		l.add(label, root)
 	}
@@ -289,10 +293,19 @@ func (a *App) suggestedFolder() string {
 	}
 	d, st, ok := accountsAndDirs()
 	var others []accountFolder
+	var usable func(string) bool
 	if ok {
 		others = otherAccountFolders(d, st, a.activeAccountID(st))
+		// With other accounts on this PC, a folder that already holds files is
+		// most likely one of theirs (or left over from one), and keeping its
+		// files would upload them to this account's server. Only the first
+		// account is offered a folder with files in it, e.g. the official
+		// client's old folder, which the setup screen then offers to adopt.
+		if len(st.Accounts) > 1 {
+			usable = missingOrEmpty
+		}
 	}
-	if dir := suggestAccountFolder(home, login, others, nil); dir != "" {
+	if dir := suggestAccountFolder(home, login, others, usable); dir != "" {
 		return dir
 	}
 	return filepath.Join(home, "Nextcloud")
@@ -334,4 +347,95 @@ func (a *App) regateAll() {
 	for _, se := range a.secondaries {
 		_ = se.eng.ReloadPairs()
 	}
+}
+
+// abandonedRoots picks, from the roots mounted before a virtual-files restart,
+// the ones nothing mounts now and no account claims: typically the folder a
+// new account was given before its setup chose a different one. Only those are
+// unregistered; every other registration is kept, because unregistering strips
+// the cloud state from the whole tree.
+func abandonedRoots(before []string, mountedNow map[string]bool, claimed []string) []string {
+	var out []string
+	for _, dir := range before {
+		if mountedNow[dir] {
+			continue
+		}
+		used := false
+		for _, c := range claimed {
+			if pathWithin(dir, c) && pathWithin(c, dir) {
+				used = true
+				break
+			}
+		}
+		if !used {
+			out = append(out, dir)
+		}
+	}
+	return out
+}
+
+// allClaimedFolders lists every account's folder, mounted root and pairs.
+func allClaimedFolders() []string {
+	d, st, ok := accountsAndDirs()
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, f := range otherAccountFolders(d, st, "") {
+		out = append(out, f.Dir)
+	}
+	return out
+}
+
+// mountedRoots lists the folders mounted right now, with the owning account.
+func (a *App) mountedRoots() map[string]string {
+	out := make(map[string]string, len(a.onDemandMounts))
+	for dir, m := range a.onDemandMounts {
+		out[dir] = m.accountID
+	}
+	return out
+}
+
+// unregisterAbandonedRoots unregisters the roots mounted before a restart
+// that nothing mounts or claims now (see abandonedRoots).
+func (a *App) unregisterAbandonedRoots(before map[string]string) {
+	var dirs []string
+	for dir := range before {
+		dirs = append(dirs, dir)
+	}
+	now := map[string]bool{}
+	for dir := range a.onDemandMounts {
+		now[dir] = true
+	}
+	for _, dir := range abandonedRoots(dirs, now, allClaimedFolders()) {
+		slog.Info("unregistering a virtual-files root no account uses any more", "dir", dir)
+		cfapi.UnregisterShellSyncRoot(dir)
+		_ = cfapi.UnregisterSyncRoot(dir)
+	}
+}
+
+// unmountOnDemandFor permanently unmounts ONE account's virtual-files roots
+// (sign-out, removal): the registration goes and Windows strips the cloud
+// state from those trees, by design. Other accounts' mounts are left alone;
+// tearing them down too flattened the accounts that stayed (GitHub #11).
+func (a *App) unmountOnDemandFor(accountID string) {
+	for dir, m := range a.onDemandMounts {
+		if m.accountID != accountID {
+			continue
+		}
+		if m.convertCancel != nil {
+			m.convertCancel()
+		}
+		if m.watcher != nil {
+			m.watcher.Close()
+		}
+		if m.healCancel != nil {
+			m.healCancel()
+		}
+		cfapi.Unmount(dir, m.connKey)
+		clearAdoptResume(m.accountID)
+		delete(a.onDemandMounts, dir)
+		slog.Info("on-demand mount removed", "dir", dir, "account", accountID)
+	}
+	a.refreshOverlayRoots()
 }

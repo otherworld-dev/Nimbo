@@ -24,6 +24,10 @@ type AccountState struct {
 	// RememberedPairs are the live sync pairs cleared when entering on-demand
 	// mode, restored when the user switches back to live.
 	RememberedPairs []SyncPair `json:"rememberedPairs,omitempty"`
+	// OnDemandRoot is the folder this account last mounted as its virtual-files
+	// root. A background account reconnects to exactly this folder; before it
+	// was recorded, a registration lost to an unmount made it pick a new folder.
+	OnDemandRoot string `json:"onDemandRoot,omitempty"`
 }
 
 // AccountStateFile is the path to the account's folder setup. Scoped like
