@@ -127,3 +127,9 @@ func PlaceholderModified(string) (bool, error) {
 
 // SetInSync is unavailable off Windows (no cloud placeholders to mark).
 func SetInSync(string) error { return errors.New("on-demand files are Windows-only") }
+
+// NimboShellSyncRoots lists nothing on non-Windows platforms.
+func NimboShellSyncRoots() []ShellSyncRoot { return nil }
+
+// UnregisterShellSyncRootByID is a no-op on non-Windows platforms.
+func UnregisterShellSyncRootByID(string, string) {}

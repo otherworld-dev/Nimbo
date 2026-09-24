@@ -28,6 +28,14 @@ func (a *App) MoveSyncFolder(oldLocal, newLocal string) string {
 	if strings.EqualFold(oldLocal, newLocal) {
 		return "" // same place — nothing to do
 	}
+	if msg := a.folderClashFor(newLocal); msg != "" {
+		return msg
+	}
+	// Moving a folder another account also uses would carry that account's
+	// files away with it (GitHub #11). Re-adding it elsewhere is safe.
+	if msg := a.folderClashFor(oldLocal); msg != "" {
+		return "This folder is also used by another account, so moving it would take that account's files with it. Remove it here and add it again in a new folder instead."
+	}
 	// v1: on-demand (virtual files) folders need cloud-files sync-root
 	// re-registration, which isn't handled yet.
 	if _, ok := a.onDemandMountFor(oldLocal); ok {
@@ -52,6 +60,7 @@ func (a *App) MoveSyncFolder(oldLocal, newLocal string) string {
 	// The whole-account pair defines the account root: refresh the stored baseDir
 	// and the Explorer sidebar so "Open folder" and the sidebar follow the move.
 	a.healBaseDir()
+	a.regateAll() // a folder this one held back in another account may sync now
 	a.syncSidebar()
 	a.rebuildTrayMenu()
 	a.eng.TriggerSync() // a confirming pass; should be a no-op (everything already in sync)

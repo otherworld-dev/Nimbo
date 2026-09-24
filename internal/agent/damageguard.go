@@ -100,9 +100,9 @@ func (e *Engine) sweepGuardState() {
 	if len(pairs) == 0 {
 		return
 	}
-	s, err := e.dirs.LoadSettings()
+	s, err := e.dirs.LoadAccountState()
 	if err != nil {
-		slog.Warn("guard sweep: cannot read the settings, so cannot tell which folders are "+
+		slog.Warn("guard sweep: cannot read the account state, so cannot tell which folders are "+
 			"parked — leaving the state alone", "err", err)
 		return
 	}

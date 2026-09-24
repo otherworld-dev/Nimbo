@@ -87,6 +87,11 @@ type App struct {
 	// between registering the sync root and starting the write-back watcher —
 	// the watcher must never see adopt's local mutations as user actions.
 	pendingAdopt  *adoptPending
+	// mountRefused is why the last account-folder mount was refused (it overlaps
+	// another account's folder), so a mode switch can say so; "" otherwise.
+	mountRefused string
+	// leftoversSwept: the once-per-launch clean-up of leftover roots has run.
+	leftoversSwept atomic.Bool
 	preMountAdopt *adoptPending
 	// adoptScanDirs is the live directory count of an in-flight adopt scan
 	// (0 = none), surfaced via Diagnostics so the scanning overlay has a moving
@@ -264,7 +269,9 @@ func (a *App) start(ctx context.Context) {
 		a.clearLivePairs()       // files kept; leftovers can't reactivate
 		a.mountAccountOnDemand() // mount the account folder (BaseDir) as virtual files
 	} else {
-		pairs, _ = eng.Pairs()
+		// Restores pairs parked by an earlier on-demand spell and holds back
+		// any that overlap another account's folder (GitHub #11).
+		pairs = a.prepareLivePairs(eng)
 		a.cleanupStatusRoots() // live pairs carry badges, never a sync root
 	}
 
@@ -309,6 +316,16 @@ func (a *App) start(ctx context.Context) {
 	// Side-by-side accounts: every other configured account syncs concurrently
 	// in the background.
 	a.startSecondaries(ctx)
+
+	// Once per launch, with every account mounted: clear roots and sidebar
+	// entries older versions left behind (GitHub #10).
+	if a.leftoversSwept.CompareAndSwap(false, true) {
+		mounted := map[string]bool{}
+		for dir := range a.onDemandMounts {
+			mounted[filepath.Clean(dir)] = true
+		}
+		go a.sweepLeftovers(mounted)
+	}
 }
 
 // recordAcctStatus stores an engine's latest status line for the per-account
@@ -380,7 +397,7 @@ func (a *App) startSecondaries(ctx context.Context) {
 			// browsable on demand instead of silently live-syncing.
 			a.mountSecondaryOnDemand(eng)
 		} else {
-			pairs, _ = eng.Pairs()
+			pairs = a.prepareLivePairs(eng)
 		}
 		a.secondaries[id] = &secondaryEngine{eng: eng, cancel: cancel}
 		slog.Info("secondary account syncing", "account", ac.LoginName, "server", ac.ServerURL, "pairs", len(pairs))
@@ -392,24 +409,48 @@ func (a *App) startSecondaries(ctx context.Context) {
 
 // mountSecondaryOnDemand mounts a background account's whole-account virtual
 // root. The root is the account's own whole-account pair directory when it has
-// one (e.g. from when it was the shown account); otherwise a "Nimbo - <user>"
-// sibling of the primary root is created and recorded as that pair, so the
-// location is stable across launches and reused by live mode later.
+// one, else the account's own folder (the one it used while it was the shown
+// account); only a brand-new account gets a fresh "Nimbo - <user>" folder, which
+// is recorded as that pair so the location is stable across launches and
+// reused by live mode later. Before the account folder was per account, this
+// fell straight through to a fresh folder, so every account switch moved the
+// account to a different folder and left the old sync root behind (#10, #11).
 func (a *App) mountSecondaryOnDemand(eng *agent.Engine) {
-	root := ""
-	if pairs, err := eng.Pairs(); err == nil {
-		for _, p := range pairs {
-			if strings.Trim(p.RemoteRoot, "/") == "" {
-				root = p.LocalDir
-				break
-			}
-		}
+	// The same order as the shown account (onDemandRootOrder). The account
+	// folder only counts once it has been mounted: in "choose" mode it is the
+	// PARENT of the account's live folders, and mounting that would lay
+	// placeholders over them.
+	base := eng.StoredBaseDir()
+	if base != "" && !cfapi.ShellSyncRootRegistered(base) {
+		base = ""
 	}
+	root := onDemandRootOrder(wholeAccountPair(eng), eng.OnDemandRoot(), base)
 	if root == "" {
-		root = filepath.Join(filepath.Dir(a.GetBaseDir()), brand.Current.Name+" - "+eng.Account.LoginName)
+		// A fresh folder nobody chose: never one that already holds files,
+		// which would be taken for this account's own and uploaded.
+		home, _ := os.UserHomeDir()
+		var claimed []accountFolder
+		if d, st, ok := accountsAndDirs(); ok {
+			claimed = otherAccountFolders(d, st, eng.Account.ID)
+		}
+		usable := unchosenUsable(cfapi.ShellSyncRootRegistered, accountCount() <= 1)
+		root = suggestAccountFolder(home, eng.Account.LoginName, claimed, usable)
+		if root == "" {
+			a.warnNoFolder(eng)
+			return
+		}
 		if err := eng.AddSyncPair(root, ""); err != nil {
 			slog.Warn("secondary on-demand: could not record account root", "account", eng.Account.LoginName, "err", err)
 		}
+	} else if !a.rootReady(eng, root) {
+		return // renamed or moved away: wait for it rather than re-create it
+	}
+	if msg := a.syncClashFor(eng.Account.ID, root); msg != "" {
+		a.warnFolderClash(eng, root, msg)
+		return
+	}
+	if eng.StoredBaseDir() == "" {
+		_ = eng.SetBaseDir(root)
 	}
 	etags, fileids, mountroots := a.vfsStoresFor(eng.Account.ID)
 	if err := a.mountOnDemandWith(eng, etags, fileids, mountroots, root, ""); err != nil {
@@ -891,13 +932,26 @@ func (a *App) SetSyncMode(mode string) string {
 	// Every step logs before it runs: this sequence once hung permanently on a
 	// live install with the log silent, leaving nothing to diagnose from. The
 	// last breadcrumb printed names the step that never returned.
-	slog.Info("sync mode switch: unmounting on-demand roots", "to", mode)
-	a.unmountAllOnDemand()
+	// Only leaving virtual files unregisters the roots (the revert that comes
+	// with it is the point). Re-applying virtual files, which account setup
+	// does, keeps every registration: unregistering here flattened every
+	// account's folder whenever an account was added (GitHub #11).
+	before := a.mountedRoots()
+	if mode == "ondemand" {
+		slog.Info("sync mode switch: disconnecting on-demand roots (registrations kept)", "to", mode)
+		a.disconnectAllOnDemand()
+	} else {
+		slog.Info("sync mode switch: unmounting on-demand roots", "to", mode)
+		a.unmountAllOnDemand()
+	}
 	slog.Info("sync mode switch: stopping engine")
 	a.stopEngine()
 	slog.Info("sync mode switch: restarting stack")
 	a.start(a.ctx)
 	slog.Info("sync mode switch: stack restarted")
+	if mode == "ondemand" {
+		a.unregisterAbandonedRoots(before)
+	}
 	if a.eng == nil {
 		return "couldn't restart syncing — check the logs"
 	}
@@ -909,31 +963,20 @@ func (a *App) SetSyncMode(mode string) string {
 		if !cfapi.Supported() {
 			return "Virtual files aren't supported on this system."
 		}
-		if _, ok := a.onDemandMounts[a.GetBaseDir()]; !ok {
+		if !a.shownAccountMounted() {
+			if a.mountRefused != "" {
+				return a.mountRefused
+			}
 			return "Couldn't take over the folder for virtual files. If another sync app (like the official Nextcloud client or OneDrive) is still syncing this folder, sign out of it or uninstall it first, then switch again."
 		}
 	}
 	if mode == "live" {
 		a.maybeOfferBadges()
-		// Restore the pairs the on-demand switch cleared: a mode round-trip
-		// must hand the user back their folder setup. Takeover re-adopts the
-		// (now plain) files against the surviving baseline — no re-download.
-		if d, err := config.Resolve(); err == nil {
-			// Take and clear in one locked step, so the pairs can't be restored
-			// twice or dropped by a settings write landing in between.
-			var remembered []config.SyncPair
-			_ = d.UpdateSettings(func(s *config.Settings) {
-				remembered, s.RememberedPairs = s.RememberedPairs, nil
-			})
-			for _, p := range remembered {
-				if msg := a.AddSyncPair(p.LocalDir, p.RemoteRoot); msg != "" {
-					slog.Warn("could not restore sync pair after leaving virtual files",
-						"local", p.LocalDir, "err", msg)
-				} else {
-					slog.Info("restored sync pair after leaving virtual files", "local", p.LocalDir)
-				}
-			}
-		}
+		// The pairs the on-demand switch parked were restored by start() above
+		// (prepareLivePairs), for every account: a mode round-trip must hand the
+		// user back their folder setup. Takeover re-adopts the (now plain) files
+		// against the surviving baseline, so nothing re-downloads.
+		a.rebuildTrayMenu()
 	}
 	// A registered (or just-unregistered) sync root only reaches Explorer at
 	// process start — verified live 2026-08-22: a fresh window in the old
@@ -1013,10 +1056,8 @@ func (a *App) clearLivePairs() {
 	// Remember what we're clearing so switching back to live restores the
 	// user's folder setup instead of silently forgetting it (bit Adam twice).
 	if len(pairs) > 0 {
-		if d, err := config.Resolve(); err == nil {
-			_ = d.UpdateSettings(func(s *config.Settings) {
-				s.RememberedPairs = pairs
-			})
+		if err := a.eng.ParkPairs(pairs); err != nil {
+			slog.Warn("could not remember the live folder setup", "err", err)
 		}
 	}
 	for _, p := range pairs {
@@ -1062,9 +1103,44 @@ func (a *App) mountAccountOnDemand() {
 	if a.eng == nil || !cfapi.Supported() {
 		return
 	}
-	dir := a.GetBaseDir()
-	if _, already := a.onDemandMounts[dir]; already {
+	a.mountRefused = ""
+	dir := onDemandRootOrder(wholeAccountPair(a.eng), a.eng.OnDemandRoot(), a.eng.StoredBaseDir())
+	if _, already := a.onDemandMounts[dir]; dir != "" && already {
 		return
+	}
+	if dir == "" {
+		if accountCount() > 1 {
+			// A new account beside others: nothing is mounted until its setup
+			// has chosen a folder. Mounting a guess here left a registration
+			// behind whenever setup chose another folder, and made setup offer
+			// to "keep" files that were only this mount's placeholders.
+			slog.Info("account has no folder yet; waiting for its setup before mounting", "account", a.eng.Account.LoginName)
+			return
+		}
+		// The only account, with no folder recorded (an older install): a
+		// fresh folder, or its own existing root, as before.
+		home, _ := os.UserHomeDir()
+		dir = suggestAccountFolder(home, a.eng.Account.LoginName, nil,
+			unchosenUsable(cfapi.ShellSyncRootRegistered, true))
+		if dir == "" {
+			a.mountRefused = "There is no free, empty folder to use for this account. Choose a folder for it in Settings."
+			a.warnNoFolder(a.eng)
+			return
+		}
+	} else if !a.rootReady(a.eng, dir) {
+		return // renamed or moved away: wait for it rather than re-create it
+	}
+	// Never mount a folder another account is syncing: both would then own
+	// one folder and see each other's files as their own (GitHub #11).
+	if msg := a.syncClashFor(a.eng.Account.ID, dir); msg != "" {
+		a.mountRefused = msg
+		a.warnFolderClash(a.eng, dir, msg)
+		return
+	}
+	// Record the folder, so the account mounts the same one every time rather
+	// than whatever default is free on the next start.
+	if a.eng.StoredBaseDir() == "" {
+		_ = a.eng.SetBaseDir(dir)
 	}
 	slog.Info("mounting account folder as virtual files", "dir", dir)
 	if err := a.mountOnDemand(dir, ""); err != nil {
@@ -1442,6 +1518,17 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 	}
 	m := &odMount{connKey: connKey, remoteRoot: root, accountID: eng.Account.ID}
 	a.onDemandMounts[localDir] = m
+	if strings.Trim(remoteRoot, "/") == "" {
+		// The account's whole-account root: remember it, so the account
+		// reconnects to this folder next time, primary or background.
+		if err := eng.SetOnDemandRoot(localDir); err != nil {
+			slog.Warn("could not record the virtual-files root", "dir", localDir, "err", err)
+		}
+		if d, err := config.Resolve(); err == nil {
+			vol := volumeID(localDir)
+			_ = d.WithAccount(eng.Account.ID).UpdateAccountState(func(s *config.AccountState) { s.RootVolume = vol })
+		}
+	}
 	a.refreshOverlayRoots()
 
 	// Background state heal: converts plain directories inside the mount back
@@ -1752,6 +1839,9 @@ func (a *App) unmountAllOnDemand() {
 		// unfinished adopt has nothing left to resume into; a later switch back
 		// scans afresh.
 		clearAdoptResume(m.accountID)
+		// Nor is the folder a virtual-files root any more: a switch back must
+		// not prefer it over a folder chosen since.
+		forgetOnDemandRoot(m.accountID)
 		delete(a.onDemandMounts, dir)
 	}
 	a.refreshOverlayRoots()
@@ -4558,7 +4648,11 @@ func (a *App) RemoveAccount(id string) string {
 	if _, ok := st.Find(id); !ok {
 		return "no such account"
 	}
-	a.stopSecondary(id) // stop its background sync before removing its data
+	// Its virtual-files root goes with it: left registered, it stays in the
+	// Explorer sidebar pointing at a folder nothing syncs (GitHub #10).
+	a.unmountOnDemandFor(id)
+	a.unregisterRecordedRoot(id) // and one it had recorded but wasn't mounting
+	a.stopSecondary(id)          // stop its background sync before removing its data
 	a.acctMu.Lock()
 	delete(a.acctStatus, id)
 	a.acctMu.Unlock()
@@ -4567,6 +4661,10 @@ func (a *App) RemoveAccount(id string) string {
 		return err.Error()
 	}
 	a.clearSyncData(d.WithAccount(id), id)
+	// Folders held back because the removed account used them too can sync
+	// again: re-ask the gate now rather than at the next start. Live mode only;
+	// in on-demand mode an account's pairs must never get live watchers.
+	a.regateAll()
 	a.emit("account")
 	return ""
 }
@@ -4585,7 +4683,12 @@ func (a *App) SignOut(clearData bool) string {
 	if !a.policyNow().AllowSignOut {
 		return "Sign out is disabled by your organisation's policy."
 	}
-	a.unmountAllOnDemand() // disconnect cloud sync roots + stop watchers
+	// Unmount only the account signing out; the others keep their roots
+	// registered (unmounting them too flattened their folders, GitHub #11).
+	if a.eng != nil {
+		a.unmountOnDemandFor(a.eng.Account.ID)
+	}
+	a.disconnectAllOnDemand()
 	a.stopEngine()
 	moreAccounts := false
 	if d, err := config.Resolve(); err == nil {
@@ -4599,8 +4702,18 @@ func (a *App) SignOut(clearData bool) string {
 			moreAccounts = len(st.Accounts) > 0
 			return nil
 		})
+		if accID != "" {
+			// Its root, if its engine wasn't running to unmount it above.
+			a.unregisterRecordedRoot(accID)
+		}
 		if clearData {
 			a.clearSyncData(d.WithAccount(accID), accID)
+		}
+	}
+	// No account left: the live-mode sidebar entry has nothing to point at.
+	if !moreAccounts {
+		if err := shellns.Unregister(); err != nil {
+			slog.Warn("could not remove the sidebar entry after signing out", "err", err)
 		}
 	}
 	// Another account is configured: hand over to it instead of signing out of
@@ -4814,6 +4927,7 @@ func (a *App) clearSyncData(d config.Dirs, accountID string) {
 		d.VFSFileIDsFile(),
 		d.VFSMountRootsFile(),
 		d.GuardStateFile(),
+		d.AccountStateFile(), // the account folder and its parked pairs
 	}
 	if accountID != "" {
 		db := d.StateDB(accountID)
@@ -5013,6 +5127,9 @@ func (a *App) CompleteSetup(localDir, mode string) string {
 	if localDir == "" {
 		return "choose a local folder"
 	}
+	if msg := a.folderClashFor(localDir); msg != "" {
+		return msg
+	}
 	switch mode {
 	case "everything":
 		if msg := a.SetSyncMode("live"); msg != "" {
@@ -5111,18 +5228,33 @@ func (a *App) GetBaseDir() string {
 			}
 		}
 	}
-	if d, err := config.Resolve(); err == nil {
-		if s, _ := d.LoadSettings(); s.BaseDir != "" {
-			return s.BaseDir
+	// The account's own folder. Per account: a single global one handed a new
+	// account the first account's folder (GitHub #11).
+	if a.eng != nil {
+		if dir := a.eng.StoredBaseDir(); dir != "" {
+			return dir
 		}
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Nextcloud")
+	// None chosen yet: a default no other account uses.
+	return a.suggestedFolder()
 }
+
+// SetBaseDir sets the active account's folder. It refuses a folder another
+// account uses; the refusal is shown as a dialog because this binding returns
+// nothing (changing that would mean regenerating the Wails bindings).
 func (a *App) SetBaseDir(dir string) {
-	if a.eng != nil {
-		_ = a.eng.SetBaseDir(dir)
+	if a.eng == nil {
+		return
 	}
+	if msg := a.folderClashFor(dir); msg != "" {
+		slog.Warn("refused an account folder that another account uses", "dir", dir)
+		if a.app != nil {
+			a.app.Dialog.Warning().SetTitle("Folder already in use").SetMessage(msg).Show()
+		}
+		return
+	}
+	_ = a.eng.SetBaseDir(dir)
+	a.regateAll()
 }
 
 // healBaseDir repairs a stored baseDir that no longer matches the whole-account
@@ -5192,6 +5324,9 @@ type PairDTO struct {
 	FreezeReason string `json:"freezeReason,omitempty"`
 	// FreezeSample is a few affected paths, so the user can judge the trip.
 	FreezeSample []string `json:"freezeSample,omitempty"`
+	// HeldReason says why this folder is not syncing because another account
+	// uses it (GitHub #11); "" when it syncs normally.
+	HeldReason string `json:"heldReason,omitempty"`
 }
 
 // GetPairs returns configured sync pairs.
@@ -5203,7 +5338,7 @@ func (a *App) GetPairs() []PairDTO {
 	views := a.eng.FrozenViews()
 	out := make([]PairDTO, 0, len(pairs))
 	for _, p := range pairs {
-		d := PairDTO{LocalDir: p.LocalDir, RemoteRoot: p.RemoteRoot, Excludes: p.Excludes}
+		d := PairDTO{LocalDir: p.LocalDir, RemoteRoot: p.RemoteRoot, Excludes: p.Excludes, HeldReason: a.eng.HeldReason(p.LocalDir)}
 		if v, ok := views[p.LocalDir]; ok {
 			d.Frozen = v.Frozen
 			d.FreezeReason = v.FreezeReason
@@ -5230,6 +5365,15 @@ func (a *App) SyncedRemotes() []string {
 // AddSyncFolder / RemoveSyncFolder add or remove a synced folder.
 func (a *App) AddSyncFolder(remotePath string) {
 	if a.eng != nil {
+		// The same path the engine will use (<account folder>/<remote path>).
+		local := filepath.Join(a.eng.BaseDir(), filepath.FromSlash(strings.Trim(remotePath, "/")))
+		if msg := a.folderClashFor(local); msg != "" {
+			slog.Warn("refused a sync folder that another account uses", "dir", local)
+			if a.app != nil {
+				a.app.Dialog.Warning().SetTitle("Folder already in use").SetMessage(msg).Show()
+			}
+			return
+		}
 		_ = a.eng.AddSyncFolder(remotePath)
 		a.rebuildTrayMenu()
 	}
@@ -5241,6 +5385,9 @@ func (a *App) AddSyncPair(localDir, remotePath string) string {
 	if a.eng == nil {
 		return "not signed in"
 	}
+	if msg := a.folderClashFor(localDir); msg != "" {
+		return msg
+	}
 	if err := a.eng.AddSyncPair(localDir, remotePath); err != nil {
 		return err.Error()
 	}
@@ -5250,6 +5397,7 @@ func (a *App) AddSyncPair(localDir, remotePath string) string {
 	if strings.Trim(remotePath, "/") == "" {
 		_ = a.eng.SetBaseDir(localDir)
 	}
+	a.regateAll()
 	a.rebuildTrayMenu()
 	return ""
 }
@@ -5343,11 +5491,19 @@ func (a *App) RemoveSyncFolder(remotePath string, deleteLocal bool) {
 			}
 		}
 	}
+	if msg := localDeleteBlocked(a.eng, localDir, deleteLocal); msg != "" {
+		slog.Warn("refused deleting the files of a folder another account uses", "dir", localDir)
+		if a.app != nil {
+			a.app.Dialog.Warning().SetTitle("Files not deleted").SetMessage(msg).Show()
+		}
+		return
+	}
 	if err := a.eng.ForgetSyncFolder(remotePath, deleteLocal); err != nil {
 		slog.Warn("could not remove the sync folder", "remote", remotePath, "err", err)
 	} else if localDir != "" {
 		a.eng.DisableStatusIcons(localDir)
 	}
+	a.regateAll() // another account's folder held back by this one may sync now
 	a.rebuildTrayMenu()
 }
 
@@ -5371,6 +5527,9 @@ func (a *App) RemoveExclude(localDir, rel string) {
 func (a *App) DeselectFolder(localDir, rel string, deleteLocal bool) string {
 	if a.eng == nil {
 		return "not signed in"
+	}
+	if msg := localDeleteBlocked(a.eng, localDir, deleteLocal); msg != "" {
+		return msg
 	}
 	if err := a.eng.DeselectFolder(localDir, rel, deleteLocal); err != nil {
 		return err.Error()

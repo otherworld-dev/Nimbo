@@ -25,3 +25,9 @@ func CloudRootPinned(string) (pinned, exists bool) { return false, false }
 
 // SetCloudRootPinned is a no-op on non-Windows platforms.
 func SetCloudRootPinned(string, bool) error { return nil }
+
+// NavNodes lists nothing on non-Windows platforms.
+func NavNodes() []NavNode { return nil }
+
+// RemoveNavNodes is a no-op on non-Windows platforms.
+func RemoveNavNodes([]string) error { return nil }
