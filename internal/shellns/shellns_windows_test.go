@@ -208,3 +208,19 @@ func TestWaitGone(t *testing.T) {
 		t.Errorf("not seen going: %v", err)
 	}
 }
+
+// Removing orphaned sidebar entries deletes each entry's CLSID key, its
+// Desktop\NameSpace pin and its hidden-desktop-icon value, quoted safely.
+func TestRemoveNodesScriptRemovesEachEntry(t *testing.T) {
+	s := removeNodesScript([]string{"{AAAA-1}", "{BB'B}"})
+	for _, want := range []string{
+		`HKCU:\Software\Classes\CLSID\{AAAA-1}`,
+		`HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{AAAA-1}`,
+		`-Name '{AAAA-1}'`,
+		`{BB''B}`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("script missing %q:\n%s", want, s)
+		}
+	}
+}

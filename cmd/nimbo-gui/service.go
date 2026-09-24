@@ -90,6 +90,8 @@ type App struct {
 	// mountRefused is why the last account-folder mount was refused (it overlaps
 	// another account's folder), so a mode switch can say so; "" otherwise.
 	mountRefused string
+	// leftoversSwept: the once-per-launch clean-up of leftover roots has run.
+	leftoversSwept atomic.Bool
 	preMountAdopt *adoptPending
 	// adoptScanDirs is the live directory count of an in-flight adopt scan
 	// (0 = none), surfaced via Diagnostics so the scanning overlay has a moving
@@ -314,6 +316,16 @@ func (a *App) start(ctx context.Context) {
 	// Side-by-side accounts: every other configured account syncs concurrently
 	// in the background.
 	a.startSecondaries(ctx)
+
+	// Once per launch, with every account mounted: clear roots and sidebar
+	// entries older versions left behind (GitHub #10).
+	if a.leftoversSwept.CompareAndSwap(false, true) {
+		mounted := map[string]bool{}
+		for dir := range a.onDemandMounts {
+			mounted[filepath.Clean(dir)] = true
+		}
+		go a.sweepLeftovers(mounted)
+	}
 }
 
 // recordAcctStatus stores an engine's latest status line for the per-account
@@ -404,30 +416,25 @@ func (a *App) startSecondaries(ctx context.Context) {
 // fell straight through to a fresh folder, so every account switch moved the
 // account to a different folder and left the old sync root behind (#10, #11).
 func (a *App) mountSecondaryOnDemand(eng *agent.Engine) {
-	root := eng.OnDemandRoot() // the folder it last mounted, if recorded
-	if pairs, err := eng.Pairs(); root == "" && err == nil {
-		for _, p := range pairs {
-			if strings.Trim(p.RemoteRoot, "/") == "" {
-				root = p.LocalDir
-				break
-			}
-		}
+	// The same order as the shown account (onDemandRootOrder). The account
+	// folder only counts once it has been mounted: in "choose" mode it is the
+	// PARENT of the account's live folders, and mounting that would lay
+	// placeholders over them.
+	base := eng.StoredBaseDir()
+	if base != "" && !cfapi.ShellSyncRootRegistered(base) {
+		base = ""
 	}
-	// Its own folder, but only one it has already mounted: in "choose" mode the
-	// account folder is the PARENT of its live folders, and mounting that would
-	// lay placeholders over them.
-	if stored := eng.StoredBaseDir(); root == "" && stored != "" && cfapi.ShellSyncRootRegistered(stored) {
-		root = stored
-	}
+	root := onDemandRootOrder(wholeAccountPair(eng), eng.OnDemandRoot(), base)
 	if root == "" {
-		// A fresh folder, never one that already holds files: nobody chose it,
-		// and whatever is in it would be taken for this account's own files.
+		// A fresh folder nobody chose: never one that already holds files,
+		// which would be taken for this account's own and uploaded.
 		home, _ := os.UserHomeDir()
 		var claimed []accountFolder
 		if d, st, ok := accountsAndDirs(); ok {
 			claimed = otherAccountFolders(d, st, eng.Account.ID)
 		}
-		root = suggestAccountFolder(home, eng.Account.LoginName, claimed, mountableUnchosen(cfapi.ShellSyncRootRegistered))
+		usable := unchosenUsable(cfapi.ShellSyncRootRegistered, accountCount() <= 1, ownFolderName(home, eng.Account.LoginName))
+		root = suggestAccountFolder(home, eng.Account.LoginName, claimed, usable)
 		if root == "" {
 			a.warnNoFolder(eng)
 			return
@@ -435,6 +442,8 @@ func (a *App) mountSecondaryOnDemand(eng *agent.Engine) {
 		if err := eng.AddSyncPair(root, ""); err != nil {
 			slog.Warn("secondary on-demand: could not record account root", "account", eng.Account.LoginName, "err", err)
 		}
+	} else if !a.rootReady(eng, root) {
+		return // renamed or moved away: wait for it rather than re-create it
 	}
 	if msg := a.syncClashFor(eng.Account.ID, root); msg != "" {
 		a.warnFolderClash(eng, root, msg)
@@ -954,7 +963,7 @@ func (a *App) SetSyncMode(mode string) string {
 		if !cfapi.Supported() {
 			return "Virtual files aren't supported on this system."
 		}
-		if _, ok := a.onDemandMounts[a.GetBaseDir()]; !ok {
+		if !a.shownAccountMounted() {
 			if a.mountRefused != "" {
 				return a.mountRefused
 			}
@@ -1094,25 +1103,32 @@ func (a *App) mountAccountOnDemand() {
 	if a.eng == nil || !cfapi.Supported() {
 		return
 	}
-	dir := a.GetBaseDir()
-	if _, already := a.onDemandMounts[dir]; already {
+	a.mountRefused = ""
+	dir := onDemandRootOrder(wholeAccountPair(a.eng), a.eng.OnDemandRoot(), a.eng.StoredBaseDir())
+	if _, already := a.onDemandMounts[dir]; dir != "" && already {
 		return
 	}
-	a.mountRefused = ""
-	if a.eng.StoredBaseDir() == "" {
-		// No folder chosen yet (a legacy account, or one not set up): only a
-		// fresh, empty folder is mounted without the user choosing it.
-		home, _ := os.UserHomeDir()
-		var claimed []accountFolder
-		if d, st, ok := accountsAndDirs(); ok {
-			claimed = otherAccountFolders(d, st, a.eng.Account.ID)
+	if dir == "" {
+		if accountCount() > 1 {
+			// A new account beside others: nothing is mounted until its setup
+			// has chosen a folder. Mounting a guess here left a registration
+			// behind whenever setup chose another folder, and made setup offer
+			// to "keep" files that were only this mount's placeholders.
+			slog.Info("account has no folder yet; waiting for its setup before mounting", "account", a.eng.Account.LoginName)
+			return
 		}
-		dir = suggestAccountFolder(home, a.eng.Account.LoginName, claimed, mountableUnchosen(cfapi.ShellSyncRootRegistered))
+		// The only account, with no folder recorded (an older install): a
+		// fresh folder, or its own existing root, as before.
+		home, _ := os.UserHomeDir()
+		dir = suggestAccountFolder(home, a.eng.Account.LoginName, nil,
+			unchosenUsable(cfapi.ShellSyncRootRegistered, true, ""))
 		if dir == "" {
 			a.mountRefused = "There is no free, empty folder to use for this account. Choose a folder for it in Settings."
 			a.warnNoFolder(a.eng)
 			return
 		}
+	} else if !a.rootReady(a.eng, dir) {
+		return // renamed or moved away: wait for it rather than re-create it
 	}
 	// Never mount a folder another account is syncing: both would then own
 	// one folder and see each other's files as their own (GitHub #11).
@@ -1819,6 +1835,9 @@ func (a *App) unmountAllOnDemand() {
 		// unfinished adopt has nothing left to resume into; a later switch back
 		// scans afresh.
 		clearAdoptResume(m.accountID)
+		// Nor is the folder a virtual-files root any more: a switch back must
+		// not prefer it over a folder chosen since.
+		forgetOnDemandRoot(m.accountID)
 		delete(a.onDemandMounts, dir)
 	}
 	a.refreshOverlayRoots()
@@ -4628,7 +4647,8 @@ func (a *App) RemoveAccount(id string) string {
 	// Its virtual-files root goes with it: left registered, it stays in the
 	// Explorer sidebar pointing at a folder nothing syncs (GitHub #10).
 	a.unmountOnDemandFor(id)
-	a.stopSecondary(id) // stop its background sync before removing its data
+	a.unregisterRecordedRoot(id) // and one it had recorded but wasn't mounting
+	a.stopSecondary(id)          // stop its background sync before removing its data
 	a.acctMu.Lock()
 	delete(a.acctStatus, id)
 	a.acctMu.Unlock()
@@ -4678,8 +4698,18 @@ func (a *App) SignOut(clearData bool) string {
 			moreAccounts = len(st.Accounts) > 0
 			return nil
 		})
+		if accID != "" {
+			// Its root, if its engine wasn't running to unmount it above.
+			a.unregisterRecordedRoot(accID)
+		}
 		if clearData {
 			a.clearSyncData(d.WithAccount(accID), accID)
+		}
+	}
+	// No account left: the live-mode sidebar entry has nothing to point at.
+	if !moreAccounts {
+		if err := shellns.Unregister(); err != nil {
+			slog.Warn("could not remove the sidebar entry after signing out", "err", err)
 		}
 	}
 	// Another account is configured: hand over to it instead of signing out of

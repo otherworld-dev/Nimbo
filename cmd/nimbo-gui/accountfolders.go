@@ -101,8 +101,7 @@ func otherAccountFolders(d config.Dirs, st account.Store, exclude string) []acco
 
 // activeAccountFolders lists the folders accounts other than exclude are
 // SYNCING in the given mode: their live pairs in live mode; in on-demand mode
-// the root each mounts (the one it last mounted, else its whole-account pair,
-// else its account folder).
+// the root each mounts, in onDemandRootOrder.
 func activeAccountFolders(d config.Dirs, st account.Store, exclude, mode string) []accountFolder {
 	var l folderList
 	for _, acc := range st.Accounts {
@@ -118,20 +117,15 @@ func activeAccountFolders(d config.Dirs, st account.Store, exclude, mode string)
 			}
 			continue
 		}
-		st, _ := ad.LoadAccountState()
-		root := st.OnDemandRoot
-		if root == "" {
-			for _, p := range pairs {
-				if strings.Trim(p.RemoteRoot, "/") == "" {
-					root = p.LocalDir
-					break
-				}
+		as, _ := ad.LoadAccountState()
+		pair := ""
+		for _, p := range pairs {
+			if strings.Trim(p.RemoteRoot, "/") == "" {
+				pair = p.LocalDir
+				break
 			}
 		}
-		if root == "" {
-			root = st.BaseDir
-		}
-		l.add(label, root)
+		l.add(label, onDemandRootOrder(pair, as.OnDemandRoot, as.BaseDir))
 	}
 	return l.out
 }
@@ -326,12 +320,6 @@ func localDeleteBlocked(eng heldReasoner, localDir string, deleteLocal bool) str
 		"Remove it and keep the files, or deal with it from the other account."
 }
 
-// mountableUnchosen accepts a folder for mounting without the user choosing
-// it: one that is missing or empty, or already a sync root this install
-// registered (so an account that lost its folder record keeps its folder).
-func mountableUnchosen(registered func(string) bool) func(string) bool {
-	return func(dir string) bool { return missingOrEmpty(dir) || registered(dir) }
-}
 
 // regateAll asks every engine's gate again, so a folder freed by a change in
 // one account (removed, moved, re-pointed) starts syncing in another at once
@@ -357,35 +345,16 @@ func (a *App) regateAll() {
 func abandonedRoots(before []string, mountedNow map[string]bool, claimed []string) []string {
 	var out []string
 	for _, dir := range before {
-		if mountedNow[dir] {
+		// Keeping a registration is always the safe direction, so a root that
+		// holds, or sits in, a claimed folder is kept too.
+		if mountedNow[dir] || overlapsAny(dir, claimed) {
 			continue
 		}
-		used := false
-		for _, c := range claimed {
-			if pathWithin(dir, c) && pathWithin(c, dir) {
-				used = true
-				break
-			}
-		}
-		if !used {
-			out = append(out, dir)
-		}
+		out = append(out, dir)
 	}
 	return out
 }
 
-// allClaimedFolders lists every account's folder, mounted root and pairs.
-func allClaimedFolders() []string {
-	d, st, ok := accountsAndDirs()
-	if !ok {
-		return nil
-	}
-	var out []string
-	for _, f := range otherAccountFolders(d, st, "") {
-		out = append(out, f.Dir)
-	}
-	return out
-}
 
 // mountedRoots lists the folders mounted right now, with the owning account.
 func (a *App) mountedRoots() map[string]string {
@@ -399,15 +368,30 @@ func (a *App) mountedRoots() map[string]string {
 // unregisterAbandonedRoots unregisters the roots mounted before a restart
 // that nothing mounts or claims now (see abandonedRoots).
 func (a *App) unregisterAbandonedRoots(before map[string]string) {
+	if a.eng == nil {
+		return
+	}
+	d, st, ok := accountsAndDirs()
+	if !ok {
+		return
+	}
+	claimed, ok := claimedFoldersStrict(d, st)
+	if !ok {
+		return // never unregister on a guess
+	}
 	var dirs []string
-	for dir := range before {
-		dirs = append(dirs, dir)
+	for dir, owner := range before {
+		// Only the shown account's own roots: another account's registration
+		// is never this restart's to drop.
+		if owner == a.eng.Account.ID {
+			dirs = append(dirs, dir)
+		}
 	}
 	now := map[string]bool{}
 	for dir := range a.onDemandMounts {
 		now[dir] = true
 	}
-	for _, dir := range abandonedRoots(dirs, now, allClaimedFolders()) {
+	for _, dir := range abandonedRoots(dirs, now, claimed) {
 		slog.Info("unregistering a virtual-files root no account uses any more", "dir", dir)
 		cfapi.UnregisterShellSyncRoot(dir)
 		_ = cfapi.UnregisterSyncRoot(dir)
@@ -438,4 +422,26 @@ func (a *App) unmountOnDemandFor(accountID string) {
 		slog.Info("on-demand mount removed", "dir", dir, "account", accountID)
 	}
 	a.refreshOverlayRoots()
+}
+
+// shownAccountMounted reports whether the shown account has a virtual-files
+// root mounted, whichever folder it is.
+func (a *App) shownAccountMounted() bool {
+	if a.eng == nil {
+		return false
+	}
+	for _, m := range a.onDemandMounts {
+		if m.accountID == a.eng.Account.ID {
+			return true
+		}
+	}
+	return false
+}
+
+// forgetOnDemandRoot drops an account's recorded virtual-files root (the
+// account left virtual files, so the folder is no longer one).
+func forgetOnDemandRoot(accountID string) {
+	if d, err := config.Resolve(); err == nil {
+		_ = d.WithAccount(accountID).UpdateAccountState(func(s *config.AccountState) { s.OnDemandRoot = "" })
+	}
 }

@@ -193,3 +193,22 @@ func TestOnDemandRootIsPerAccount(t *testing.T) {
 		t.Fatalf("a=%q b=%q", a.OnDemandRoot(), b.OnDemandRoot())
 	}
 }
+
+// Changing an account's folder makes the recorded virtual-files root stale:
+// the next mount must use the new folder, not the old root.
+func TestSetBaseDirClearsAStaleOnDemandRoot(t *testing.T) {
+	e := &Engine{dirs: config.Dirs{Config: t.TempDir(), Data: t.TempDir()}.WithAccount("a")}
+	_ = e.SetOnDemandRoot(`C:\Old`)
+	if err := e.SetBaseDir(`C:\Old`); err != nil {
+		t.Fatal(err)
+	}
+	if e.OnDemandRoot() != `C:\Old` {
+		t.Fatal("setting the same folder dropped the recorded root")
+	}
+	if err := e.SetBaseDir(`D:\New`); err != nil {
+		t.Fatal(err)
+	}
+	if e.OnDemandRoot() != "" {
+		t.Fatalf("recorded root kept after the folder changed: %q", e.OnDemandRoot())
+	}
+}

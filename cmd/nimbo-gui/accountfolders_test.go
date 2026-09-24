@@ -184,26 +184,6 @@ func TestLocalDeleteBlockedOnHeldFolders(t *testing.T) {
 	}
 }
 
-// A folder nobody chose is only mounted if it is missing or empty, or already
-// this install's own registered sync root (a single-account install that lost
-// its folder record must keep its existing folder, as before).
-func TestMountableUnchosen(t *testing.T) {
-	empty, full := t.TempDir(), t.TempDir()
-	if err := os.WriteFile(filepath.Join(full, "f.txt"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	notRoot := mountableUnchosen(func(string) bool { return false })
-	isRoot := mountableUnchosen(func(string) bool { return true })
-	if !notRoot(empty) || !notRoot(filepath.Join(empty, "missing")) {
-		t.Fatal("an empty or missing folder was refused")
-	}
-	if notRoot(full) {
-		t.Fatal("a folder holding files was accepted")
-	}
-	if !isRoot(full) {
-		t.Fatal("the install's own sync root was refused")
-	}
-}
 
 // In on-demand mode the folder an account last mounted is what it syncs, even
 // when its account folder or pairs say otherwise.

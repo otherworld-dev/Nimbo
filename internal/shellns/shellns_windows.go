@@ -615,3 +615,79 @@ func refresh() {
 	const SHCNF_IDLIST = 0x0000
 	_, _, _ = procSHChangeNotify.Call(uintptr(SHCNE_ASSOCCHANGED), uintptr(SHCNF_IDLIST), 0, 0)
 }
+
+// --- sidebar entries left behind (GitHub #10) ---
+
+// NimboNavNodes lists the sidebar folder entries in HKCU whose icon is a Nimbo
+// executable, other than Nimbo's own entry (NavGUID). Windows creates one per
+// registered sync root, and has been seen to leave them behind after the root
+// itself is gone. Reads are safe from inside the MSIX container for keys the
+// app never wrote, which these are (Windows writes them).
+func NimboNavNodes() []NavNode {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Classes\CLSID`, registry.ENUMERATE_SUB_KEYS)
+	if err != nil {
+		return nil
+	}
+	names, _ := k.ReadSubKeyNames(-1)
+	_ = k.Close()
+	var out []NavNode
+	for _, c := range names {
+		if strings.EqualFold(c, NavGUID) {
+			continue
+		}
+		bag, err := registry.OpenKey(registry.CURRENT_USER, `Software\Classes\CLSID\`+c+`\Instance\InitPropertyBag`, registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		target, _, _ := bag.GetStringValue("TargetFolderPath")
+		_ = bag.Close()
+		if target == "" {
+			continue
+		}
+		icon := ""
+		if ik, err := registry.OpenKey(registry.CURRENT_USER, `Software\Classes\CLSID\`+c+`\DefaultIcon`, registry.QUERY_VALUE); err == nil {
+			icon, _, _ = ik.GetStringValue("")
+			_ = ik.Close()
+		}
+		if !strings.Contains(strings.ToLower(icon), "nimbo") {
+			continue
+		}
+		out = append(out, NavNode{CLSID: c, Target: target, Icon: icon})
+	}
+	return out
+}
+
+// RemoveNavNodes deletes the given sidebar entries. On a packaged build the
+// change is made out of the container, as for Nimbo's own entry, or Explorer
+// would never see it.
+func RemoveNavNodes(clsids []string) error {
+	if len(clsids) == 0 {
+		return nil
+	}
+	if Packaged() {
+		return runOutOfContainer("remove-leftovers", removeNodesScript(clsids))
+	}
+	for _, c := range clsids {
+		deleteTree(`Software\Classes\CLSID\` + c)
+		deleteTree(`Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\` + c)
+		delValue(hideDeskKy, c)
+	}
+	refresh()
+	return nil
+}
+
+// removeNodesScript renders the PowerShell that deletes each entry's CLSID
+// key, its Desktop\NameSpace pin and its hidden-desktop-icon value.
+func removeNodesScript(clsids []string) string {
+	var b strings.Builder
+	b.WriteString("$ErrorActionPreference = 'Continue'\r\n")
+	for _, c := range clsids {
+		for _, k := range []string{`Software\Classes\CLSID\` + c, `Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\` + c} {
+			b.WriteString(fmt.Sprintf("Remove-Item -LiteralPath %s -Recurse -Force -ErrorAction SilentlyContinue\r\n", psQuote(`HKCU:\`+k)))
+		}
+		b.WriteString(fmt.Sprintf("Remove-ItemProperty -LiteralPath %s -Name %s -Force -ErrorAction SilentlyContinue\r\n",
+			psQuote(`HKCU:\`+hideDeskKy), psQuote(c)))
+	}
+	b.WriteString(notifyShellPS)
+	return b.String()
+}

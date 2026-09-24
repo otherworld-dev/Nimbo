@@ -28,6 +28,9 @@ type AccountState struct {
 	// root. A background account reconnects to exactly this folder; before it
 	// was recorded, a registration lost to an unmount made it pick a new folder.
 	OnDemandRoot string `json:"onDemandRoot,omitempty"`
+	// RootMissingSince is when OnDemandRoot was first found missing while
+	// still registered (RFC 3339), most likely renamed or moved; "" otherwise.
+	RootMissingSince string `json:"rootMissingSince,omitempty"`
 }
 
 // AccountStateFile is the path to the account's folder setup. Scoped like

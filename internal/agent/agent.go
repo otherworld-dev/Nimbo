@@ -1562,9 +1562,16 @@ func (e *Engine) StoredBaseDir() string {
 	return s.BaseDir
 }
 
-// SetBaseDir persists this account's local base directory.
+// SetBaseDir persists this account's local base directory. A recorded
+// virtual-files root for a different folder is dropped with it: the account's
+// folder has changed, so the next mount must use the new one.
 func (e *Engine) SetBaseDir(dir string) error {
-	return e.dirs.UpdateAccountState(func(s *config.AccountState) { s.BaseDir = dir })
+	return e.dirs.UpdateAccountState(func(s *config.AccountState) {
+		s.BaseDir = dir
+		if s.OnDemandRoot != "" && !strings.EqualFold(filepath.Clean(s.OnDemandRoot), filepath.Clean(dir)) {
+			s.OnDemandRoot = ""
+		}
+	})
 }
 
 // ParkPairs adds pairs to this account's parked list (live pairs set aside
