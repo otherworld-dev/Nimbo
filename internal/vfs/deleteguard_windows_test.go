@@ -52,9 +52,7 @@ func (r *recorder) deleteList() []string {
 
 func shortRetries(t *testing.T) {
 	t.Helper()
-	ob := retryBase
-	retryBase = 20 * time.Millisecond
-	t.Cleanup(func() { retryBase = ob })
+	setForTest(t, &retryBase, 20*time.Millisecond)
 }
 
 // The reporter's hazard, reproduced on the test VM: a folder the shell never
@@ -315,9 +313,7 @@ func TestDeleteKeepsAFolderWhenSomethingInsideWasKept(t *testing.T) {
 
 // A tree too large to check is kept rather than deleted unchecked.
 func TestDeleteKeepsATreeTooLargeToCheck(t *testing.T) {
-	om := maxDeleteCheckListings
-	maxDeleteCheckListings = 3
-	t.Cleanup(func() { maxDeleteCheckListings = om })
+	setForTest(t, &maxDeleteCheckListings, 3)
 	installFakeCf(t)
 	root := t.TempDir()
 	rec := newRecorder()
