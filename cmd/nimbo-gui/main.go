@@ -245,6 +245,10 @@ func main() {
 	if signedIn {
 		go svc.start(ctx)
 	}
+	// One update check for the life of the process, signed in or not. It used
+	// to start with the engine, so an app waiting for a sign-in never heard
+	// about a release, and the only way to update it was the website (GitHub #11).
+	go svc.updateCheckLoop(ctx)
 
 	err := app.Run()
 	// Every clean way out passes here (tray Quit, an update, Windows ending the

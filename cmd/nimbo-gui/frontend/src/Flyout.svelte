@@ -89,6 +89,54 @@
   let needsLogin = $state(false);
   let signInHost = $state("");
 
+  // Updates while signed out. Settings is where they normally live, and it
+  // can't open without an account, so the sign-in card carries the check and
+  // the beta opt-in itself (GitHub #11). Same calls and wording as Settings →
+  // General; gated on canApply, which is false on Store and loose dev builds.
+  let version = $state("");
+  let canApply = $state(false);
+  let beta = $state(false);
+  let betaConfirm = $state(false);
+  let updateMsg = $state("");
+  let updateAvail = $state(false);
+  let updateBusy = $state(false);
+  (async () => {
+    version = await App.Version();
+    canApply = await App.CanApplyUpdate();
+    beta = await App.BetaUpdates();
+  })();
+  async function toggleBeta(e: Event) {
+    if (!beta) {
+      // Turning betas on needs the same eyes-open consent as in Settings.
+      (e.currentTarget as HTMLInputElement).checked = false;
+      betaConfirm = true;
+      return;
+    }
+    beta = false;
+    await App.SetBetaUpdates(false);
+    updateMsg = ""; updateAvail = false;
+  }
+  async function confirmBeta() {
+    betaConfirm = false;
+    beta = true;
+    await App.SetBetaUpdates(true);
+    updateMsg = ""; updateAvail = false;
+  }
+  async function checkUpdate() {
+    updateBusy = true; updateMsg = "Checking…"; updateAvail = false;
+    const u = await App.CheckForUpdate();
+    updateBusy = false;
+    if (u.err) { updateMsg = "Couldn't check: " + u.err; return; }
+    if (u.available) { updateMsg = "Update available: " + u.latest; updateAvail = true; }
+    else if (u.ahead) { updateMsg = "You're on a newer build than the current release"; }
+    else { updateMsg = "You're up to date"; }
+  }
+  async function applyUpdate() {
+    updateBusy = true; updateMsg = `Updating… ${brandName} will restart.`;
+    const err = await App.ApplyUpdate();
+    if (err) { updateBusy = false; updateMsg = "Update failed: " + err; }
+  }
+
   async function refresh() {
     needsLogin = await App.NeedsLogin();
     if (needsLogin) {
@@ -373,6 +421,29 @@
       {/if}
       <button class="signbtn" onclick={() => App.AddAccount()}>Sign in</button>
       <button class="link" onclick={() => App.Quit()}>Quit {brandName}</button>
+      {#if canApply}
+        <div class="signupd">
+          {#if betaConfirm}
+            <p class="betawarn">Beta builds come straight from active development: they change often, are less tested, and may contain bugs, including ones that could affect the files being synced. They are provided as-is, without warranty of any kind, and the developer accepts no liability for any loss or damage arising from their use. Keep a backup of anything you can't afford to lose.</p>
+            <div class="uprow">
+              <button class="link" onclick={confirmBeta}>I understand, enable betas</button>
+              <button class="link" onclick={() => (betaConfirm = false)}>Cancel</button>
+            </div>
+          {:else}
+            <div class="uprow">
+              <span class="ver">{brandName} {version}</span>
+              <button class="link" onclick={checkUpdate} disabled={updateBusy}>Check for updates</button>
+            </div>
+            {#if updateMsg}
+              <div class="uprow">
+                <span class="upmsg">{updateMsg}</span>
+                {#if updateAvail}<button class="link" onclick={applyUpdate} disabled={updateBusy}>Update now</button>{/if}
+              </div>
+            {/if}
+            <label class="betachk"><input type="checkbox" checked={beta} onchange={toggleBeta} /> Get beta releases early</label>
+          {/if}
+        </div>
+      {/if}
     </div>
   {:else}
   {#if attentionTotal > 0}
@@ -766,6 +837,12 @@
   .signbtn { min-width: 140px; padding: 8px 18px; border: 1px solid var(--accent); border-radius: 8px;
              background: var(--accent); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
   .signbtn:hover { background: var(--accent-dark); border-color: var(--accent-dark); }
+  .signupd { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); width: 100%;
+             display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .signupd .uprow { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 6px; }
+  .signupd .upmsg { color: var(--fg2); }
+  .signupd .betachk { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .signupd .betawarn { margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--fg2); text-align: left; }
 
   /* Appearance customisation. Density "compact" tightens spacing/fonts; icon size
      scales the dock icons. Panel width is handled by resizing the window (Go). */

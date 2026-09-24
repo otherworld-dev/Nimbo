@@ -265,8 +265,6 @@ func (a *App) start(ctx context.Context) {
 	forwardEvents(runCtx, eng.SubscribeLocked(), func() { a.emit("locks") })
 	forwardEvents(runCtx, eng.SubscribeDetached(), func() { a.emit("detached") })
 
-	go a.updateCheckLoop(runCtx) // periodic background "update available" toast
-
 	var pairs []config.SyncPair
 	if a.GetSyncMode() == "ondemand" {
 		// On-demand mode is exclusive: the Cloud Files provider owns the files,
@@ -751,6 +749,26 @@ func (a *App) updateCheckLoop(ctx context.Context) {
 				[]notify.ToastButton{{Label: "Update now", Args: "action=update"}})
 		}
 		timer.Reset(24 * time.Hour)
+	}
+}
+
+// checkForUpdateToast runs an update check and reports the result in a toast,
+// with "Update now" when there is one. It is the signed-out tray menu's check,
+// where there is no Settings window to show the answer in.
+func (a *App) checkForUpdateToast() {
+	u := a.CheckForUpdate()
+	title := brand.Current.Name + " update"
+	switch {
+	case u.Err != "":
+		notify.Toast(title, "Couldn't check for updates: "+u.Err, "")
+	case u.Available:
+		notify.RaiseActionable(brand.Current.Name+" update available",
+			u.Latest+" is ready to install.", "action=settings",
+			[]notify.ToastButton{{Label: "Update now", Args: "action=update"}})
+	case u.Ahead:
+		notify.Toast(title, "You're on a newer build than the current release ("+u.Latest+").", "")
+	default:
+		notify.Toast(title, "You're up to date ("+version+").", "")
 	}
 }
 
@@ -2707,6 +2725,11 @@ func (a *App) buildTrayMenu() *application.Menu {
 	// window on a fresh install left no route to either (GitHub #12).
 	if a.NeedsLogin() {
 		m.Add("Sign in…").OnClick(func(*application.Context) { a.showLogin() })
+		// Updating needs no account, and Settings (where updates normally
+		// live) can't open without one (GitHub #11).
+		if canApplyUpdate() {
+			m.Add("Check for updates…").OnClick(func(*application.Context) { go a.checkForUpdateToast() })
+		}
 		m.AddSeparator()
 		m.Add("Quit " + brand.Current.Name).OnClick(func(*application.Context) { a.quit("tray menu") })
 		return m
@@ -3884,8 +3907,16 @@ func (a *App) dispatchToastActivation(args string) {
 		// The "update available" toast's body: open the Settings window on its
 		// General tab, where "Check for updates / Update now" and the release
 		// notes live. (This used to open the sync-status window on a nonexistent
-		// "settings" tab — the wrong menu.)
-		application.InvokeAsync(func() { a.openSettingsTab("general") })
+		// "settings" tab — the wrong menu.) Signed out there are no Settings
+		// to open, so show the flyout, whose sign-in card carries the same
+		// update controls (GitHub #11).
+		application.InvokeAsync(func() {
+			if a.NeedsLogin() && a.tray != nil {
+				a.tray.ShowWindow()
+				return
+			}
+			a.openSettingsTab("general")
+		})
 	case "notify": // a Nextcloud notification's Accept/Decline button
 		acct := v.Get("acct")
 		id, _ := strconv.Atoi(v.Get("id"))
