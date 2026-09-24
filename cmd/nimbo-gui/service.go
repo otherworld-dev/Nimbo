@@ -1524,6 +1524,10 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		if err := eng.SetOnDemandRoot(localDir); err != nil {
 			slog.Warn("could not record the virtual-files root", "dir", localDir, "err", err)
 		}
+		if d, err := config.Resolve(); err == nil {
+			vol := volumeID(localDir)
+			_ = d.WithAccount(eng.Account.ID).UpdateAccountState(func(s *config.AccountState) { s.RootVolume = vol })
+		}
 	}
 	a.refreshOverlayRoots()
 

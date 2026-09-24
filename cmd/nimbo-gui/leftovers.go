@@ -169,7 +169,9 @@ func missingRootAction(exists, parentExists, registered bool, since, now time.Ti
 	case exists || !registered:
 		return mountRoot, time.Time{}
 	case !parentExists:
-		return waitForRoot, since // the drive is away: the clock doesn't run
+		// The drive is away: wait, and start the day afresh once it is back
+		// rather than counting the time it was gone.
+		return waitForRoot, time.Time{}
 	case since.IsZero():
 		return waitForRoot, now
 	case now.Sub(since) < missingRootWait:
@@ -239,6 +241,13 @@ func (a *App) rootReady(eng *agent.Engine, dir string) bool {
 	since, _ := time.Parse(time.RFC3339, s.RootMissingSince)
 	_, statErr := os.Stat(dir)
 	_, parentErr := os.Stat(filepath.Dir(dir))
+	if parentErr == nil && s.RootVolume != "" {
+		// Another disk with the root's drive letter is the drive being away,
+		// not the folder being gone.
+		if v := volumeID(dir); v != "" && v != s.RootVolume {
+			parentErr = os.ErrNotExist
+		}
+	}
 	act, next := missingRootAction(statErr == nil, parentErr == nil, cfapi.ShellSyncRootRegistered(dir), since, time.Now())
 	stamp := ""
 	if !next.IsZero() {

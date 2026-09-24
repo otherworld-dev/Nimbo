@@ -31,6 +31,10 @@ type AccountState struct {
 	// RootMissingSince is when OnDemandRoot was first found missing while
 	// still registered (RFC 3339), most likely renamed or moved; "" otherwise.
 	RootMissingSince string `json:"rootMissingSince,omitempty"`
+	// RootVolume identifies the disk OnDemandRoot was mounted on (its volume
+	// serial), so a different disk given the same drive letter counts as the
+	// drive being away rather than the folder being gone.
+	RootVolume string `json:"rootVolume,omitempty"`
 }
 
 // AccountStateFile is the path to the account's folder setup. Scoped like

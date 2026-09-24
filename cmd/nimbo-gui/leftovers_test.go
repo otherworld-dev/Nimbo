@@ -104,8 +104,11 @@ func TestMissingRootAction(t *testing.T) {
 		{"still within a day", false, true, true, now.Add(-2 * time.Hour), waitForRoot, true},
 		{"gone for a day", false, true, true, now.Add(-25 * time.Hour), recreateRoot, false},
 		// The whole drive or parent folder is away (a USB disk, a locked
-		// BitLocker volume): never re-create, however long it takes.
-		{"drive away for days", false, false, true, now.Add(-72 * time.Hour), waitForRoot, true},
+		// BitLocker volume, another disk now using its letter): never
+		// re-create, and restart the day once it is back rather than
+		// counting the time it was away.
+		{"drive away for days", false, false, true, now.Add(-72 * time.Hour), waitForRoot, false},
+		{"drive away, never seen missing", false, false, true, time.Time{}, waitForRoot, false},
 	}
 	for _, c := range cases {
 		got, since := missingRootAction(c.exists, c.parent, c.registered, c.since, now)
@@ -193,5 +196,18 @@ func TestSameFolderAsAny(t *testing.T) {
 	}
 	if sameFolderAsAny(t.TempDir(), []string{dir}) {
 		t.Fatal("a different folder was taken for the same one")
+	}
+}
+
+// The volume a folder is on is identified, so a different disk given the same
+// drive letter isn't mistaken for the one the root lived on.
+func TestVolumeIDIdentifiesTheDisk(t *testing.T) {
+	dir := t.TempDir()
+	id := volumeID(dir)
+	if id == "" {
+		t.Skip("no volume id on this system")
+	}
+	if volumeID(filepath.Join(dir, "missing", "deeper")) != id {
+		t.Fatal("a path that doesn't exist yet on the same disk got a different id")
 	}
 }
