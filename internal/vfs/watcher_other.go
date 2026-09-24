@@ -31,6 +31,7 @@ type Ops struct {
 	// the non-Windows build keeps compiling.
 	Encode func(rel string) string
 	Decode func(rel string) string
+	Paused func() bool
 	Log    func(format string, args ...any)
 }
 
@@ -47,3 +48,6 @@ func (*Watcher) Close() {}
 
 // Poke does nothing off Windows.
 func (*Watcher) Poke() {}
+
+// PauseChanged does nothing off Windows.
+func (*Watcher) PauseChanged() {}

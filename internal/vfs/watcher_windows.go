@@ -157,8 +157,23 @@ type Ops struct {
 	// type in Settings, and a mount outlives that.
 	Encode func(rel string) string
 	Decode func(rel string) string
+	// Paused reports whether the user has paused syncing (Pause in the tray,
+	// "pause for", quiet hours). While it does, no file upload starts, a
+	// running one is stopped to wait with the rest, and pinned files are not
+	// downloaded (Deck #723). Opening a file still downloads it: that is the
+	// provider's hydrate callback, not the watcher, and refusing it would
+	// hang the app doing the opening. Folder creates, deletes and moves are
+	// not held either — they carry no file data, and holding them would
+	// leave the server's names out of step with this PC for the whole pause,
+	// for down-sync to "correct". Nil means never paused. The caller calls
+	// PauseChanged whenever the answer changes.
+	Paused func() bool
 	Log    func(format string, args ...any)
 }
+
+// errPaused is the cause an upload's context is cancelled with when a pause
+// stops it, so the run can tell it from a delete or rename superseding it.
+var errPaused = errors.New("sync is paused")
 
 // Watcher monitors a mount root subtree and pushes user changes to the server.
 type Watcher struct {
@@ -183,10 +198,13 @@ type Watcher struct {
 	// inflight holds a cancel func per lower-cased path with an upload running
 	// now — a delete/rename event for the path cancels the doomed upload
 	// instead of letting the assembly recreate a deleted file server-side.
-	inflight    map[string]context.CancelFunc
-	again       map[string]bool // changed while in flight — re-arm on completion
-	attempts    map[string]int  // consecutive upload failures per lower-cased path
-	delAttempts map[string]int  // consecutive server-DELETE failures
+	inflight map[string]context.CancelCauseFunc
+	again    map[string]bool // changed while in flight — re-arm on completion
+	// held holds the uploads a pause stopped or kept from starting (lower-
+	// cased path -> path), re-armed when it ends. Created on first use.
+	held        map[string]string
+	attempts    map[string]int // consecutive upload failures per lower-cased path
+	delAttempts map[string]int // consecutive server-DELETE failures
 	// deleting holds the paths whose delete is being judged or sent right now,
 	// and kept the folders the delete guard kept on the server recently (both
 	// lower-cased); guardSem bounds how many guard listings run at once. All
@@ -243,6 +261,12 @@ type Watcher struct {
 	forced map[string]bool
 
 	loopDone chan struct{} // closed when the watch loop exits (Close joins it)
+
+	// work counts the goroutines and timer callbacks the watcher has running
+	// (spawn, after), so they can be waited out; stopped (guarded by mu)
+	// refuses new ones once that wait has begun.
+	work    sync.WaitGroup
+	stopped bool
 
 	lostEvents atomic.Bool // events were lost (overflow/reopen) — next pass sweeps
 
@@ -330,7 +354,7 @@ func New(parent context.Context, root, remoteRoot string, pollEvery time.Duratio
 		handle: h, ctx: ctx, cancel: cancel,
 		upload: map[string]*time.Timer{}, delete: map[string]*time.Timer{},
 		suppress: map[string]time.Time{},
-		inflight: map[string]context.CancelFunc{}, again: map[string]bool{},
+		inflight: map[string]context.CancelCauseFunc{}, again: map[string]bool{},
 		attempts: map[string]int{}, delAttempts: map[string]int{},
 		mvAttempts: map[string]int{}, busyCount: map[string]int{},
 		moved:       map[string]time.Time{},
@@ -345,11 +369,11 @@ func New(parent context.Context, root, remoteRoot string, pollEvery time.Duratio
 		w.ops.Log = func(string, ...any) {}
 	}
 	for i := 0; i < hydrateWorkers; i++ {
-		go w.hydrateLoop()
+		w.spawn(w.hydrateLoop)
 	}
 	go w.loop()
 	if w.ops.List != nil {
-		go w.pollLoop()
+		w.spawn(w.pollLoop)
 		// pollLoop waits a whole interval before its first pass (30s, or five
 		// minutes where push does the work), and nothing else pokes a freshly
 		// mounted watcher — so after every start the shell's own root fetch
@@ -367,7 +391,7 @@ func (w *Watcher) Poke() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.pokeTimer == nil {
-		w.pokeTimer = time.AfterFunc(pokeDebounce, w.Reconcile)
+		w.pokeTimer = w.after(pokeDebounce, w.Reconcile)
 		return
 	}
 	w.pokeTimer.Reset(pokeDebounce)
@@ -383,6 +407,12 @@ func (w *Watcher) pollLoop() {
 		case <-w.ctx.Done():
 			return
 		case <-t.C:
+			// A resume this watcher never heard about (the caller's
+			// notification raced a mount starting up) must not leave uploads
+			// and pinned downloads waiting for a pause that has ended.
+			if !w.paused() {
+				w.releaseHeld()
+			}
 			w.Reconcile()
 		}
 	}
@@ -519,7 +549,7 @@ func (w *Watcher) parse(b []byte) {
 	var editorLocks []string
 	defer func() {
 		if len(editorLocks) > 0 && w.ops.EditorLockFiles != nil {
-			go w.ops.EditorLockFiles(editorLocks)
+			w.spawn(func() { w.ops.EditorLockFiles(editorLocks) })
 		}
 	}()
 	for off := 0; off+12 <= len(b); {
@@ -571,7 +601,7 @@ func (w *Watcher) parse(b []byte) {
 				old := renameOld
 				renameOld = ""
 				if w.beginRename(old, path) {
-					go w.handleRename(old, path)
+					w.spawn(func() { w.handleRename(old, path) })
 				} else {
 					// The callback (NotifyRenamed) already claimed this pair.
 					// A RENAMED pair proves no REMOVED is coming for old, so
@@ -581,7 +611,7 @@ func (w *Watcher) parse(b []byte) {
 					// item really did end up where the claimant's MOVE was
 					// meant to put it. A redo inside the claim window looks
 					// exactly like a duplicate report and is not one.
-					go w.verifyPlacement(path)
+					w.spawn(func() { w.verifyPlacement(path) })
 				}
 			} else {
 				w.cancelDelete(path)
@@ -742,7 +772,7 @@ func (w *Watcher) scheduleUploadAfter(path string, d time.Duration) {
 		t.Reset(d)
 		return
 	}
-	w.upload[path] = time.AfterFunc(d, func() {
+	w.upload[path] = w.after(d, func() {
 		w.mu.Lock()
 		delete(w.upload, path)
 		w.mu.Unlock()
@@ -757,7 +787,7 @@ func (w *Watcher) scheduleUpload(path string) {
 		t.Reset(uploadDebounce)
 		return
 	}
-	w.upload[path] = time.AfterFunc(uploadDebounce, func() {
+	w.upload[path] = w.after(uploadDebounce, func() {
 		w.mu.Lock()
 		delete(w.upload, path)
 		w.mu.Unlock()
@@ -777,7 +807,7 @@ func (w *Watcher) scheduleUploadIfIdle(path string) {
 	if _, busy := w.inflight[strings.ToLower(path)]; busy {
 		return
 	}
-	w.upload[path] = time.AfterFunc(uploadDebounce, func() {
+	w.upload[path] = w.after(uploadDebounce, func() {
 		w.mu.Lock()
 		delete(w.upload, path)
 		w.mu.Unlock()
@@ -804,8 +834,103 @@ func (w *Watcher) cancelInflight(path string) {
 	delete(w.forced, strings.ToLower(path))
 	w.mu.Unlock()
 	if cancel != nil {
-		cancel()
+		cancel(nil)
 	}
+}
+
+// spawn runs f on its own goroutine as counted watcher work (see work).
+func (w *Watcher) spawn(f func()) {
+	if !w.begin() {
+		return
+	}
+	go func() {
+		defer w.work.Done()
+		f()
+	}()
+}
+
+// after is time.AfterFunc for watcher work: the callback is counted while it
+// runs, and skipped if the watcher has stopped by the time it fires.
+func (w *Watcher) after(d time.Duration, f func()) *time.Timer {
+	return time.AfterFunc(d, func() {
+		if !w.begin() {
+			return
+		}
+		defer w.work.Done()
+		f()
+	})
+}
+
+// begin counts one piece of work in, unless the watcher has stopped. Taking
+// mu for it means every Add happens before stopped is set, so a Wait after
+// that sees them all.
+func (w *Watcher) begin() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		return false
+	}
+	w.work.Add(1)
+	return true
+}
+
+// paused reports whether the user has paused syncing (see Ops.Paused).
+func (w *Watcher) paused() bool { return w.ops.Paused != nil && w.ops.Paused() }
+
+// PauseChanged tells the watcher Ops.Paused may have changed its answer.
+// Pausing stops every upload running now; they wait with the ones the pause
+// kept from starting. Resuming starts them all again, and wakes the pinned
+// downloads. Safe to call from any goroutine, and when nothing changed.
+func (w *Watcher) PauseChanged() {
+	if !w.paused() {
+		w.releaseHeld()
+		return
+	}
+	w.mu.Lock()
+	running := make([]context.CancelCauseFunc, 0, len(w.inflight))
+	for _, cancel := range w.inflight {
+		running = append(running, cancel)
+	}
+	w.mu.Unlock()
+	for _, cancel := range running {
+		cancel(errPaused)
+	}
+}
+
+// hold parks an upload until the pause ends. Its dirty bit stays, so the
+// file keeps Explorer's sync-pending arrows, which is the truth.
+func (w *Watcher) hold(path string, forced bool) {
+	w.reforce(path, forced)
+	key := strings.ToLower(path)
+	w.mu.Lock()
+	if w.held == nil {
+		w.held = map[string]string{}
+	}
+	_, already := w.held[key]
+	w.held[key] = path
+	w.mu.Unlock()
+	if !already {
+		w.ops.Log("vfs upload %s waiting: sync is paused", w.remoteFor(path))
+	}
+	// The pause may have ended between the caller's check and the line
+	// above, and its PauseChanged found nothing held yet. Look again, or
+	// this upload waits for the next pause change.
+	if !w.paused() {
+		w.releaseHeld()
+	}
+}
+
+// releaseHeld re-arms every upload a pause held and wakes the pinned-download
+// workers, which stopped taking work while it lasted.
+func (w *Watcher) releaseHeld() {
+	w.mu.Lock()
+	held := w.held
+	w.held = nil
+	w.mu.Unlock()
+	for _, path := range held {
+		w.scheduleUpload(path)
+	}
+	w.wakeHydrator()
 }
 
 // scheduleDelete debounces a server-side delete so a transient remove (rename
@@ -817,7 +942,7 @@ func (w *Watcher) scheduleDelete(path string) {
 		t.Reset(deleteDebounce)
 		return
 	}
-	w.delete[path] = time.AfterFunc(deleteDebounce, func() {
+	w.delete[path] = w.after(deleteDebounce, func() {
 		// Pending hands over to running under one lock, so a folder waiting
 		// on this path never sees it in neither state. handleDelete counts
 		// its own run; this mark covers only the gap and is released after.
@@ -841,7 +966,7 @@ func (w *Watcher) scheduleDeleteAfter(path string, d time.Duration) {
 		t.Reset(d)
 		return
 	}
-	w.delete[path] = time.AfterFunc(d, func() {
+	w.delete[path] = w.after(d, func() {
 		// Pending hands over to running under one lock, so a folder waiting
 		// on this path never sees it in neither state. handleDelete counts
 		// its own run; this mark covers only the gap and is released after.
@@ -905,10 +1030,10 @@ func (w *Watcher) NotifyRenamed(oldPath, newPath string) {
 		// is a redo of the same move inside the claim window, which nobody
 		// has pushed. Both look identical from here, so the placement is
 		// checked once the claimant's MOVE (if there is one) has settled.
-		go w.verifyPlacement(newPath)
+		w.spawn(func() { w.verifyPlacement(newPath) })
 		return
 	}
-	go w.handleRename(oldPath, newPath)
+	w.spawn(func() { w.handleRename(oldPath, newPath) })
 }
 
 // movedKeyTTL returns how long a key in w.moved stays valid. A PAIR key only
@@ -957,7 +1082,7 @@ func (w *Watcher) forgetMoved(path string) {
 
 // verifyPlacement answers a rename report the pair claim deduplicated, a
 // moment after the fact: is the item at newPath really where the server keeps
-// it? Meant to be started as `go w.verifyPlacement(newPath)`.
+// it? Meant to be started with w.spawn, off the caller's goroutine.
 //
 // A deduplicated report is usually a genuine duplicate — the RENAMED pair and
 // the filter's rename-completion callback describing ONE move — and the
@@ -1579,8 +1704,8 @@ func (w *Watcher) handleChange(path string) {
 	// already happened.
 	forced := w.takeForced(path)
 	key := strings.ToLower(path)
-	uctx, ucancel := context.WithCancel(w.ctx)
-	defer ucancel()
+	uctx, ucancel := context.WithCancelCause(w.ctx)
+	defer ucancel(nil)
 	w.mu.Lock()
 	if _, busy := w.inflight[key]; busy {
 		w.again[key] = true
@@ -1669,7 +1794,7 @@ func (w *Watcher) handleChange(path string) {
 		if id, ierr := cfPlaceholderIdentity(path); ierr == nil && len(id) > 0 &&
 			!strings.EqualFold(string(id), w.serverFor(path, false)) {
 			w.ops.Log("vfs %s still names %s: a move owns it; checking where it belongs", w.remoteFor(path), string(id))
-			go w.verifyPlacement(path)
+			w.spawn(func() { w.verifyPlacement(path) })
 			return
 		}
 	}
@@ -1761,6 +1886,10 @@ func (w *Watcher) handleChange(path string) {
 			}
 			return
 		}
+		if w.paused() {
+			w.hold(path, forced)
+			return
+		}
 		if err := w.ops.Upload(uctx, path, server); err != nil {
 			switch {
 			case errors.Is(err, ErrHeldByLock):
@@ -1795,6 +1924,9 @@ func (w *Watcher) handleChange(path string) {
 				w.scheduleUploadAfter(path, heldRetry)
 			case w.ctx.Err() != nil:
 				// Shutting down — the reconcile rescue re-arms it next start.
+			case errors.Is(context.Cause(uctx), errPaused):
+				// Stopped by a pause: not a failure, and not superseded.
+				w.hold(path, forced)
 			case uctx.Err() != nil:
 				// Cancelled on purpose: a delete or rename superseded this
 				// upload and owns the path now. Drop quietly.
@@ -1918,6 +2050,10 @@ func (w *Watcher) hydrateLoop() {
 		for {
 			if w.ctx.Err() != nil {
 				return
+			}
+			// Paused: leave the rest pending. releaseHeld wakes us.
+			if w.paused() {
+				break
 			}
 			path, ok := w.nextHydration()
 			if !ok {
@@ -2513,7 +2649,7 @@ func (w *Watcher) moveServer(src, newPath string, isDir bool) moveOutcome {
 		w.ops.Log("vfs move %s -> %s: giving up after %d attempts", src, dst, n)
 		return done(moveRetrying)
 	}
-	time.AfterFunc(retryDelay(n), func() {
+	w.after(retryDelay(n), func() {
 		if w.ctx.Err() != nil {
 			done(moveRetrying) // nothing will retry this now: release the mark
 			return
@@ -3088,7 +3224,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 			if id, iderr := cfPlaceholderIdentity(full); iderr == nil && len(id) > 0 &&
 				!strings.EqualFold(string(id), w.serverFor(full, false)) {
 				w.ops.Log("vfs %s still names %s: a move owns it; checking where it belongs", w.remoteFor(full), string(id))
-				go w.verifyPlacement(full)
+				w.spawn(func() { w.verifyPlacement(full) })
 			} else if serr := cfSetInSync(full); serr != nil {
 				w.ops.Log("vfs restore in-sync %s: %v", name, serr)
 			} else {

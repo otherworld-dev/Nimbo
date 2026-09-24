@@ -79,6 +79,7 @@ func (f *fakeCf) createdNames() []string {
 
 func installFakeCf(t *testing.T) *fakeCf {
 	t.Helper()
+	stopFinishedWatchers(t) // an earlier test's watcher may still be using the seams
 	f := &fakeCf{dirty: map[string]bool{}, modified: map[string]bool{}, identities: map[string]string{}, plain: map[string]bool{}, corrupt: map[string]bool{}, populated: map[string]bool{}, dehydrated: map[string]bool{}, pinned: map[string]bool{}, hydrateCalls: map[string]int{}, hydrateErr: map[string]error{}}
 	oi, oc, or, ou, om, op, on, os2, ox := cfInspect, cfCreatePlaceholders, cfRefreshPlaceholder, cfUpdateIdentity, cfMarkInSync, cfIsPlaceholder, cfShellNotify, cfSettlePin, cfExclude
 	ov, orv, od := cfRefreshIfInSync, cfRevertPlaceholder, cfIsDehydrated
@@ -87,11 +88,14 @@ func installFakeCf(t *testing.T) *fakeCf {
 	ouk := cfUpdateIdentityKeep
 	opd, ohp := cfPinnedDehydrated, cfHydrateIfPinned
 	owf := cfWantsFreeUp
-	t.Cleanup(func() { cfWantsFreeUp = owf })
+	t.Cleanup(func() { stopTestWatchers(t); cfWantsFreeUp = owf })
 	cfWantsFreeUp = func(string) bool { return false }
 	osi := cfSetInSync
 	odp := cfDirPopulated
 	t.Cleanup(func() {
+		// Anything a watcher still has running would read these seams as
+		// they are put back.
+		stopTestWatchers(t)
 		cfSetInSync = osi
 		cfDirPopulated = odp
 		cfInspect, cfCreatePlaceholders, cfRefreshPlaceholder, cfUpdateIdentity, cfMarkInSync, cfIsPlaceholder, cfShellNotify, cfSettlePin, cfExclude = oi, oc, or, ou, om, op, on, os2, ox
@@ -174,7 +178,7 @@ func installFakeCf(t *testing.T) *fakeCf {
 		f.notified = append(f.notified, path)
 	}
 	osc := cfShellCreated
-	t.Cleanup(func() { cfShellCreated = osc })
+	t.Cleanup(func() { stopTestWatchers(t); cfShellCreated = osc })
 	cfShellCreated = func(path string, _ bool) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -837,7 +841,7 @@ func bareWatcher(root string, ops Ops) *Watcher {
 		root: root, remoteRoot: "", ops: ops, ctx: ctx, cancel: cancel,
 		upload: map[string]*time.Timer{}, delete: map[string]*time.Timer{},
 		suppress: map[string]time.Time{},
-		inflight: map[string]context.CancelFunc{}, again: map[string]bool{},
+		inflight: map[string]context.CancelCauseFunc{}, again: map[string]bool{},
 		attempts: map[string]int{}, delAttempts: map[string]int{},
 		mvAttempts: map[string]int{}, busyCount: map[string]int{},
 		moved:       map[string]time.Time{},
@@ -851,9 +855,85 @@ func bareWatcher(root string, ops Ops) *Watcher {
 		w.ops.Log = func(string, ...any) {}
 	}
 	for i := 0; i < hydrateWorkers; i++ {
-		go w.hydrateLoop() // New starts these too; they exit with w.cancel()
+		w.spawn(w.hydrateLoop) // New starts these too; they exit with w.cancel()
 	}
+	testWatchers.Lock()
+	testWatchers.ws = append(testWatchers.ws, w)
+	testWatchers.Unlock()
 	return w
+}
+
+// testWatchers are the watchers bareWatcher has built and not yet stopped.
+var testWatchers struct {
+	sync.Mutex
+	ws []*Watcher
+}
+
+// setForTest sets a package variable (a seam or a tuning knob) for the rest
+// of the test. A watcher's goroutines read these variables and a write under
+// them is a data race, so it waits out earlier tests' watchers first, and
+// every watcher before putting the old value back.
+func setForTest[T any](t *testing.T, p *T, v T) {
+	t.Helper()
+	stopFinishedWatchers(t)
+	old := *p
+	*p = v
+	t.Cleanup(func() {
+		stopTestWatchers(t)
+		*p = old
+	})
+}
+
+// stopTestWatchers stops every watcher bareWatcher built and waits for the
+// goroutines and timer callbacks they started. installFakeCf's cleanup runs
+// it before putting the real cfapi functions back: a debounced upload or a
+// rename check still running at that point read the seams while they were
+// being written, which is what failed the package under -race.
+func stopTestWatchers(t *testing.T) {
+	testWatchers.Lock()
+	ws := testWatchers.ws
+	testWatchers.ws = nil
+	testWatchers.Unlock()
+	stopWatchers(t, ws)
+}
+
+// stopFinishedWatchers is stopTestWatchers for the watchers already cancelled,
+// which are the ones earlier tests left behind. It runs before a test writes
+// a seam, when the test's own watcher may already be built and must keep
+// running.
+func stopFinishedWatchers(t *testing.T) {
+	testWatchers.Lock()
+	var done, live []*Watcher
+	for _, w := range testWatchers.ws {
+		if w.ctx.Err() != nil {
+			done = append(done, w)
+		} else {
+			live = append(live, w)
+		}
+	}
+	testWatchers.ws = live
+	testWatchers.Unlock()
+	stopWatchers(t, done)
+}
+
+// stopWatchers stops each watcher and waits for its work to finish.
+func stopWatchers(t *testing.T, ws []*Watcher) {
+	for _, w := range ws {
+		w.cancel()
+		w.mu.Lock()
+		w.stopped = true
+		w.mu.Unlock()
+		done := make(chan struct{})
+		go func() {
+			w.work.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("watcher for %s still busy 10s after the test ended", w.root)
+		}
+	}
 }
 
 func ph(name string, dir bool, etag, fileid string) cfapi.PlaceholderInfo {
@@ -896,6 +976,7 @@ func TestSkipName(t *testing.T) {
 
 func TestRemoteFor(t *testing.T) {
 	w := bareWatcher(`C:\root`, Ops{})
+	defer w.cancel()
 	w.remoteRoot = "Photos"
 	if got := w.remoteFor(`C:\root\sub\a.txt`); got != "Photos/sub/a.txt" {
 		t.Errorf("remoteFor nested = %q", got)
@@ -936,6 +1017,7 @@ func TestRemoteChangedPrefersETag(t *testing.T) {
 	fi, _ := os.Stat(p)
 	rec := newRecorder()
 	w := bareWatcher(dir, rec.ops())
+	defer w.cancel()
 	rec.baselines["f.txt"] = "etag-1"
 	// Same size/mtime (the heuristic would say unchanged) but a new ETag → changed.
 	r := cfapi.PlaceholderInfo{Size: fi.Size(), ModTime: fi.ModTime(), ETag: "etag-2"}
@@ -950,6 +1032,7 @@ func TestRemoteChangedPrefersETag(t *testing.T) {
 
 func TestSuppress(t *testing.T) {
 	w := bareWatcher(`C:\root`, Ops{})
+	defer w.cancel()
 	w.suppressDelete(`C:\root\Sub`)
 	if !w.isSuppressed(`C:\root\sub`) {
 		t.Error("case-insensitive match failed")
@@ -2186,9 +2269,7 @@ func TestHydrateFailureBacksOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.markHydrateErr(p, errors.New("boom"))
-	origBase := retryBase
-	retryBase = 200 * time.Millisecond
-	t.Cleanup(func() { retryBase = origBase })
+	setForTest(t, &retryBase, 200*time.Millisecond)
 	rec := newRecorder()
 	w := bareWatcher(root, rec.ops())
 	defer w.cancel()
@@ -2335,9 +2416,8 @@ func TestReconcileConvertsPopulatedPlainDir(t *testing.T) {
 // file specifically is now ignored. Previous failure and no retry mechanism?"
 // — GitHub issue #1).
 func TestUploadFailureRetriedWithBackoff(t *testing.T) {
-	ob, om := retryBase, retryMax
-	retryBase, retryMax = 20*time.Millisecond, 100*time.Millisecond
-	t.Cleanup(func() { retryBase, retryMax = ob, om })
+	setForTest(t, &retryBase, 20*time.Millisecond)
+	setForTest(t, &retryMax, 100*time.Millisecond)
 
 	f := installFakeCf(t)
 	root := t.TempDir()
@@ -2643,9 +2723,7 @@ func TestUploadDoesNotMarkInSyncOverMidUploadEdit(t *testing.T) {
 // A transiently-failed server DELETE must retry — dropping it resurrects the
 // deleted files at the next reconcile.
 func TestDeleteRetriedOnTransientFailure(t *testing.T) {
-	ob := retryBase
-	retryBase = 20 * time.Millisecond
-	t.Cleanup(func() { retryBase = ob })
+	setForTest(t, &retryBase, 20*time.Millisecond)
 	installFakeCf(t)
 	root := t.TempDir()
 	rec := newRecorder()
@@ -2670,9 +2748,7 @@ func TestDeleteRetriedOnTransientFailure(t *testing.T) {
 // fallback re-uploaded the file under its new name and left the old server
 // copy behind (double storage, then a resurrect on reconcile).
 func TestRenameMoveTransientFailureRetriesMove(t *testing.T) {
-	ob := retryBase
-	retryBase = 20 * time.Millisecond
-	t.Cleanup(func() { retryBase = ob })
+	setForTest(t, &retryBase, 20*time.Millisecond)
 	installFakeCf(t)
 	root := t.TempDir()
 	newp := filepath.Join(root, "new.txt")
@@ -3840,9 +3916,7 @@ func TestReconcileLeavesAPathWithAMoveInFlightAlone(t *testing.T) {
 // file. Whichever lands second 404s: a bogus "X is missing on the server" for
 // an online-only file, or a redundant full re-upload for a hydrated one.
 func TestReconcileInAMoveRetryGapIssuesNoSecondMove(t *testing.T) {
-	ob := retryBase
-	retryBase = 1500 * time.Millisecond // long enough to reconcile inside the gap
-	t.Cleanup(func() { retryBase = ob })
+	setForTest(t, &retryBase, 1500*time.Millisecond) // long enough to reconcile inside the gap
 	f := installFakeCf(t)
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "b"), 0o755); err != nil {
@@ -4525,9 +4599,7 @@ func movePlaceholder(t *testing.T, f *fakeCf, from, to string) {
 // rather than the second it waits in production.
 func shortenRenameVerify(t *testing.T) {
 	t.Helper()
-	old := renameVerifyDelay
-	renameVerifyDelay = 50 * time.Millisecond
-	t.Cleanup(func() { renameVerifyDelay = old })
+	setForTest(t, &renameVerifyDelay, 50*time.Millisecond)
 }
 
 // waitForMoveSettled blocks until no server MOVE onto path is running any
@@ -4790,9 +4862,7 @@ func TestVerifyPlacementStopsIfTheItemIsSuppressedWhileItWaits(t *testing.T) {
 // so that what happens before the check fires can be asserted on its own).
 func setRenameVerifyDelay(t *testing.T, d time.Duration) {
 	t.Helper()
-	old := renameVerifyDelay
-	renameVerifyDelay = d
-	t.Cleanup(func() { renameVerifyDelay = old })
+	setForTest(t, &renameVerifyDelay, d)
 }
 
 // The route the ratified truncate-to-zero tie-break leaves open: a HYDRATED,
@@ -5430,9 +5500,8 @@ func TestCancelInflightDropsTheForcedFlag(t *testing.T) {
 // folder the 404 fallback asked for waits for the next full sweep while every
 // upload into it 409s.
 func TestForcedMkdirReArmStaysForced(t *testing.T) {
-	ob, om := retryBase, retryMax
-	retryBase, retryMax = 20*time.Millisecond, 100*time.Millisecond
-	t.Cleanup(func() { retryBase, retryMax = ob, om })
+	setForTest(t, &retryBase, 20*time.Millisecond)
+	setForTest(t, &retryMax, 100*time.Millisecond)
 
 	installFakeCf(t)
 	root := t.TempDir()

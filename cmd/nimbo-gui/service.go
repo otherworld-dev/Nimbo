@@ -242,7 +242,7 @@ func (a *App) start(ctx context.Context) {
 			eng.SetPauseSchedule(agent.PauseSchedule{Enabled: s.PauseScheduleEnabled, FromMin: s.PauseFromMin, ToMin: s.PauseToMin})
 		}
 	}
-	eng.SetPauseChangeFunc(func() { a.emit("activity"); a.rebuildTrayMenu() })
+	eng.SetPauseChangeFunc(func() { a.emit("activity"); a.rebuildTrayMenu(); a.pauseChangedOnDemand() })
 	// notify_push file changes → reconcile on-demand placeholders immediately.
 	eng.SetFilesChangedFunc(a.pokeOnDemand)
 
@@ -392,6 +392,9 @@ func (a *App) startSecondaries(ctx context.Context) {
 			eng.SetConflictPolicy(conflictPolicy(s.ConflictPolicy))
 			eng.SetPauseSchedule(agent.PauseSchedule{Enabled: s.PauseScheduleEnabled, FromMin: s.PauseFromMin, ToMin: s.PauseToMin})
 		}
+		// Started while the app is paused (an account added, or brought back
+		// after a sign-in), it starts paused like the rest.
+		eng.CopyPauseFrom(a.eng)
 		eng.SetFilesChangedFunc(a.pokeOnDemand) // push events reconcile this account's mounts too
 		var pairs []config.SyncPair
 		if a.GetSyncMode() == "ondemand" && cfapi.Supported() {
@@ -1523,6 +1526,10 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			// type in Settings, and this mount outlives that.
 			Encode: func(rel string) string { return eng.Escaper().Encode(rel) },
 			Decode: func(rel string) string { d, _ := eng.Escaper().Decode(rel); return d },
+			// The app-wide pause (the shown account's engine holds it), so the
+			// tray's Pause stops every account's mount, not just this one's
+			// (Deck #723). pauseChangedOnDemand tells the watcher when it flips.
+			Paused: a.Paused,
 			Log:    func(f string, args ...any) { slog.Info("vfs", "msg", fmt.Sprintf(f, args...)) },
 		})
 		if werr != nil {
@@ -1816,6 +1823,17 @@ func (a *App) pokeOnDemand() {
 	for _, m := range a.onDemandMounts {
 		if m.watcher != nil {
 			m.watcher.Poke()
+		}
+	}
+}
+
+// pauseChangedOnDemand tells every on-demand mount's watcher the pause may
+// have flipped: a pause stops their uploads and pinned downloads, a resume
+// starts them again (Deck #723).
+func (a *App) pauseChangedOnDemand() {
+	for _, m := range a.onDemandMounts {
+		if m.watcher != nil {
+			m.watcher.PauseChanged()
 		}
 	}
 }
@@ -2406,13 +2424,28 @@ func (a *App) SyncNow() {
 // Paused reports whether syncing is paused.
 func (a *App) Paused() bool { return a.eng != nil && a.eng.Paused() }
 
+// eachEngine runs f on every running account engine, the shown account's and
+// the background ones. Pause and quiet hours are one switch for the whole app
+// in the tray and in Settings, so they have to reach every account; they used
+// to reach only the shown one, and background accounts kept syncing.
+func (a *App) eachEngine(f func(*agent.Engine)) {
+	if a.eng != nil {
+		f(a.eng)
+	}
+	for _, se := range a.secondaries {
+		if se.eng != nil {
+			f(se.eng)
+		}
+	}
+}
+
 // TogglePause flips the paused state and returns the new value.
 func (a *App) TogglePause() bool {
 	if a.eng == nil {
 		return false
 	}
 	p := !a.eng.Paused()
-	a.eng.SetPaused(p)
+	a.eachEngine(func(e *agent.Engine) { e.SetPaused(p) })
 	a.rebuildTrayMenu() // update the Pause/Resume label
 	return p
 }
@@ -2423,9 +2456,9 @@ func (a *App) PauseFor(minutes int) {
 		return
 	}
 	if minutes <= 0 {
-		a.eng.SetPaused(true)
+		a.eachEngine(func(e *agent.Engine) { e.SetPaused(true) })
 	} else {
-		a.eng.PauseFor(time.Duration(minutes) * time.Minute)
+		a.eachEngine(func(e *agent.Engine) { e.PauseFor(time.Duration(minutes) * time.Minute) })
 	}
 	a.rebuildTrayMenu()
 }
@@ -2440,14 +2473,14 @@ func (a *App) PauseUntilTomorrow() {
 	if !t.After(now) {
 		t = t.Add(24 * time.Hour)
 	}
-	a.eng.PauseFor(t.Sub(now))
+	a.eachEngine(func(e *agent.Engine) { e.PauseFor(t.Sub(now)) })
 	a.rebuildTrayMenu()
 }
 
 // Resume clears any pause (manual or timed).
 func (a *App) Resume() {
 	if a.eng != nil {
-		a.eng.SetPaused(false)
+		a.eachEngine(func(e *agent.Engine) { e.SetPaused(false) })
 		a.rebuildTrayMenu()
 	}
 }
@@ -2494,9 +2527,9 @@ func (a *App) SetPauseSchedule(enabled bool, fromMin, toMin int) {
 			s.PauseToMin = toMin
 		})
 	}
-	if a.eng != nil {
-		a.eng.SetPauseSchedule(agent.PauseSchedule{Enabled: enabled, FromMin: fromMin, ToMin: toMin})
-	}
+	a.eachEngine(func(e *agent.Engine) {
+		e.SetPauseSchedule(agent.PauseSchedule{Enabled: enabled, FromMin: fromMin, ToMin: toMin})
+	})
 	a.rebuildTrayMenu()
 }
 

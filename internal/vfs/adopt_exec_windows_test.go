@@ -23,6 +23,7 @@ func recordMarks(t *testing.T) *[]string {
 	t.Helper()
 	var mu sync.Mutex
 	marked := []string{}
+	stopFinishedWatchers(t)
 	orig := cfMarkInSync
 	cfMarkInSync = func(path string, identity []byte) error {
 		mu.Lock()
@@ -30,13 +31,13 @@ func recordMarks(t *testing.T) *[]string {
 		marked = append(marked, filepath.ToSlash(path))
 		return nil
 	}
-	t.Cleanup(func() { cfMarkInSync = orig })
+	t.Cleanup(func() { stopTestWatchers(t); cfMarkInSync = orig })
 	// UpdateIdentity is attempted before marking (repointing a foreign hydrated
 	// placeholder); on plain test files the real one would error, which is fine,
 	// but stub it so tests don't depend on cfapi behaviour.
 	origU := cfUpdateIdentity
 	cfUpdateIdentity = func(path string, identity []byte) error { return errors.New("not a placeholder") }
-	t.Cleanup(func() { cfUpdateIdentity = origU })
+	t.Cleanup(func() { stopTestWatchers(t); cfUpdateIdentity = origU })
 	return &marked
 }
 
