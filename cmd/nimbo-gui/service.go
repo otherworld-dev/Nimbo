@@ -74,6 +74,7 @@ type App struct {
 	appOpening      map[string]bool                       // opens in flight (coalesces double-clicks during the slow app-list fetch)
 	pendingApp      string                                // app id to open once the engine is ready (--app launch)
 	startRetrying   atomic.Bool                           // one engine-start retry loop at a time
+	authLost        atomic.Bool                           // the server turned our credentials down; cleared once an engine starts
 	overlayServe    sync.Once                             // the status pipe is process-global; serve it once
 	appsCacheMu     sync.Mutex
 	appsCache       []transport.App // last-fetched navigation apps (flyout refreshes keep it warm)
@@ -181,6 +182,7 @@ func (a *App) start(ctx context.Context) {
 		return
 	}
 	a.eng = eng
+	a.authLost.Store(false)
 	a.appsCacheMu.Lock()
 	a.appsCache, a.appsCacheAt = nil, time.Time{} // stale across engine/account changes
 	a.appsCacheMu.Unlock()
@@ -2697,6 +2699,15 @@ func (a *App) quit(reason string) {
 // buildTrayMenu constructs the tray right-click menu reflecting current state.
 func (a *App) buildTrayMenu() *application.Menu {
 	m := application.NewMenu()
+	// Waiting for a sign-in: there is nothing to sync, pause or open, so the
+	// menu is the way back in and the way out. Without it, closing the sign-in
+	// window on a fresh install left no route to either (GitHub #12).
+	if a.NeedsLogin() {
+		m.Add("Sign in…").OnClick(func(*application.Context) { a.showLogin() })
+		m.AddSeparator()
+		m.Add("Quit " + brand.Current.Name).OnClick(func(*application.Context) { a.quit("tray menu") })
+		return m
+	}
 	m.Add("Sync now").OnClick(func(*application.Context) { a.SyncNow() })
 
 	ps := a.PauseInfo()
@@ -2733,7 +2744,7 @@ func (a *App) buildTrayMenu() *application.Menu {
 	m.Add("Sync status").OnClick(func(*application.Context) { a.OpenStatus() })
 	m.Add("Settings").OnClick(func(*application.Context) { a.OpenSettings() })
 	m.AddSeparator()
-	m.Add("Quit Nimbo").OnClick(func(*application.Context) { a.quit("tray menu") })
+	m.Add("Quit " + brand.Current.Name).OnClick(func(*application.Context) { a.quit("tray menu") })
 	return m
 }
 
@@ -4948,6 +4959,7 @@ func (a *App) onAuthLost() {
 	application.InvokeAsync(func() {
 		a.disconnectAllOnDemand()
 		a.stopEngine()
+		a.authLost.Store(true) // before the status event: the flyout re-checks NeedsLogin on it
 		a.setStatus("Sign in again")
 		a.rebuildTrayMenu()
 		notify.RaiseActionable("Sign in required", brand.Current.Name+" couldn't authenticate — please sign in again.", "action=login",
@@ -5001,8 +5013,17 @@ func (a *App) cancelLoginPoll() {
 
 // --- Login (first run) ---
 
-// NeedsLogin reports whether no account is configured yet.
-func (a *App) NeedsLogin() bool { return a.eng == nil }
+// NeedsLogin reports whether the app is waiting for the user to sign in: no
+// engine is running and there is no usable account — none configured (first
+// run, or the last one signed out), its app password gone from the keychain,
+// or the server turned the credentials down. A server that is only
+// unreachable is not this: that one retries by itself.
+func (a *App) NeedsLogin() bool {
+	if a.eng != nil {
+		return false
+	}
+	return a.authLost.Load() || !hasAccount()
+}
 
 // BeginLogin starts Login Flow v2: it opens the browser and polls in the
 // background, emitting "login:done" or "login:error". Returns the login URL (or

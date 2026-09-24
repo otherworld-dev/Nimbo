@@ -223,11 +223,20 @@ func main() {
 	// particular, which nothing else ever rewrites. See appshortcuts.go.
 	go svc.repairAppShortcutIcons()
 
-	if hasAccount() {
-		go svc.start(ctx)
-	} else {
+	signedIn := hasAccount()
+	if !signedIn {
 		// First run: show the sign-in window. The engine starts after login.
+		// Set directly, not via setStatus: nothing can hear an event yet.
+		svc.status = "Not signed in"
 		svc.showLogin()
+	}
+	// The right-click menu exists from launch, not only once an engine is up:
+	// with no account the engine never starts, and closing the sign-in window
+	// left a tray icon with no menu at all (GitHub #12). Before Run, SetMenu
+	// only stores the menu; start() rebuilds it once the engine is running.
+	tray.SetMenu(svc.buildTrayMenu())
+	if signedIn {
+		go svc.start(ctx)
 	}
 
 	err := app.Run()
