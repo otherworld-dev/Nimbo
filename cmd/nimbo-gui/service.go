@@ -242,7 +242,7 @@ func (a *App) start(ctx context.Context) {
 			eng.SetPauseSchedule(agent.PauseSchedule{Enabled: s.PauseScheduleEnabled, FromMin: s.PauseFromMin, ToMin: s.PauseToMin})
 		}
 	}
-	eng.SetPauseChangeFunc(func() { a.emit("activity"); a.rebuildTrayMenu() })
+	eng.SetPauseChangeFunc(func() { a.emit("activity"); a.rebuildTrayMenu(); a.pauseChangedOnDemand() })
 	// notify_push file changes → reconcile on-demand placeholders immediately.
 	eng.SetFilesChangedFunc(a.pokeOnDemand)
 
@@ -1523,6 +1523,10 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			// type in Settings, and this mount outlives that.
 			Encode: func(rel string) string { return eng.Escaper().Encode(rel) },
 			Decode: func(rel string) string { d, _ := eng.Escaper().Decode(rel); return d },
+			// The app-wide pause (the shown account's engine holds it), so the
+			// tray's Pause stops every account's mount, not just this one's
+			// (Deck #723). pauseChangedOnDemand tells the watcher when it flips.
+			Paused: a.Paused,
 			Log:    func(f string, args ...any) { slog.Info("vfs", "msg", fmt.Sprintf(f, args...)) },
 		})
 		if werr != nil {
@@ -1816,6 +1820,17 @@ func (a *App) pokeOnDemand() {
 	for _, m := range a.onDemandMounts {
 		if m.watcher != nil {
 			m.watcher.Poke()
+		}
+	}
+}
+
+// pauseChangedOnDemand tells every on-demand mount's watcher the pause may
+// have flipped: a pause stops their uploads and pinned downloads, a resume
+// starts them again (Deck #723).
+func (a *App) pauseChangedOnDemand() {
+	for _, m := range a.onDemandMounts {
+		if m.watcher != nil {
+			m.watcher.PauseChanged()
 		}
 	}
 }

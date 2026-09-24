@@ -837,7 +837,7 @@ func bareWatcher(root string, ops Ops) *Watcher {
 		root: root, remoteRoot: "", ops: ops, ctx: ctx, cancel: cancel,
 		upload: map[string]*time.Timer{}, delete: map[string]*time.Timer{},
 		suppress: map[string]time.Time{},
-		inflight: map[string]context.CancelFunc{}, again: map[string]bool{},
+		inflight: map[string]context.CancelCauseFunc{}, again: map[string]bool{},
 		attempts: map[string]int{}, delAttempts: map[string]int{},
 		mvAttempts: map[string]int{}, busyCount: map[string]int{},
 		moved:       map[string]time.Time{},
