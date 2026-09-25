@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Events } from "@wailsio/runtime";
   import { App } from "../bindings/github.com/otherworld/nimbo/cmd/nimbo-gui";
+  import { ask, tell, askText } from "./dialogs.svelte";
 
   type Activity = { time: string; kind: string; path: string; err: string; account: string };
   type OtherAttention = { id: string; user: string; conflicts: number; blocked: number };
@@ -38,7 +39,7 @@
   }
   async function showAccount(id: string) {
     const err = await App.SwitchAccount(id);
-    if (err) { alert(err); return; }
+    if (err) { await tell({ title: "Couldn't switch account", message: err }); return; }
     loadAll();
   }
   async function loadNotifs() { notifs = (await App.NotificationList()) ?? []; }
@@ -58,11 +59,15 @@
   const lockKey = (l: Lock) => l.localDir + "|" + l.path;
   async function unlockStale(l: Lock) {
     const since = new Date(l.since).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
-    if (!confirm(`Unlock "${l.path}"?\n\n${l.owner} has had it locked since ${since}. Only do this if they have finished with it, anything they have not saved yet may end up as a conflicted copy.`)) return;
+    if (!await ask({
+      title: "Unlock file?",
+      message: `${l.path}\n\n${l.owner} has had it locked since ${since}. Only do this if they have finished with it, anything they have not saved yet may end up as a conflicted copy.`,
+      ok: "Unlock",
+    })) return;
     unlocking = lockKey(l);
     const err = await App.UnlockStaleLock(l.account, l.localDir, l.path);
     unlocking = "";
-    if (err) alert(err);
+    if (err) await tell({ title: "Couldn't unlock the file", message: err });
     loadLocks();
   }
   async function loadTrash() { trashBusy = true; trash = (await App.TrashList()) ?? []; trashBusy = false; }
@@ -82,7 +87,7 @@
     detachedBusy = dkey(d);
     const err = await App.ResolveDetached(d.localPath, choice, dest);
     detachedBusy = "";
-    if (err) { alert(err); return; }
+    if (err) { await tell({ title: "Couldn't sort out the folder", message: err }); return; }
     await loadDetached();
   }
 
@@ -176,19 +181,27 @@
   const newer = (c: Conflict): "local" | "remote" | "" =>
     !c.localMTime || !c.remoteMTime ? "" : c.localMTime > c.remoteMTime ? "local" : c.remoteMTime > c.localMTime ? "remote" : "";
 
-  function rename(b: Blocked) {
+  async function rename(b: Blocked) {
     const base = b.abs.split(/[\\/]/).pop() ?? b.path;
-    const name = prompt("Rename to a name the server allows:", base);
-    if (name) App.RenameBlocked(b.abs, name);
+    const name = await askText({ title: "Rename file", message: "Pick a name the server allows.", value: base, ok: "Rename" });
+    if (name && name !== base) App.RenameBlocked(b.abs, name);
   }
-  function deleteBlocked(b: Blocked) {
-    if (confirm(`Delete "${b.path}"?\n\nIt can't sync because of its name and isn't on the server, so this just removes it from this device.`)) {
+  async function deleteBlocked(b: Blocked) {
+    if (await ask({
+      title: "Delete file?",
+      message: `${b.path}\n\nIt can't sync because of its name and isn't on the server, so this just removes it from this device.`,
+      ok: "Delete", danger: true,
+    })) {
       App.DeleteBlocked(b.abs);
     }
   }
   async function deleteAllBlocked() {
     const n = realBlocked.length;
-    if (confirm(`Delete all ${n} can't-sync file${n === 1 ? "" : "s"} from this device?\n\nThey can't sync because of their names and aren't on the server, so this only removes them locally.`)) {
+    if (await ask({
+      title: `Delete ${n} file${n === 1 ? "" : "s"}?`,
+      message: `This deletes all ${n} can't-sync file${n === 1 ? "" : "s"} from this device. They can't sync because of their names and aren't on the server, so this only removes them locally.`,
+      ok: "Delete all", danger: true,
+    })) {
       await App.DeleteAllBlocked();
       loadBlocked();
     }
@@ -201,8 +214,12 @@
     loadBlocked();
   }
   // Stop escaping a type: removes the renamed server copies; files go device-only.
-  function stopEscape(b: Blocked) {
-    if (confirm(`Stop syncing ${b.ext} files?\n\nTheir renamed copies are removed from the server and the files stay on this device only — the server forbids their real names. Nothing is deleted locally.`)) {
+  async function stopEscape(b: Blocked) {
+    if (await ask({
+      title: `Stop syncing ${b.ext} files?`,
+      message: "Their renamed copies are removed from the server and the files stay on this device only, as the server forbids their real names. Nothing is deleted locally.",
+      ok: "Stop syncing",
+    })) {
       App.RenameBlocked("", "//unescape:" + b.ext);
     }
   }
