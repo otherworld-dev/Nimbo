@@ -96,6 +96,7 @@ type Engine struct {
 	triggersFull map[string]chan struct{} // key -> force-a-full-local-pass trigger (name-rule changes)
 	nudges       map[string]chan string   // key -> paths to sync as if the watcher saw them (see inuse.go)
 	awaiting     map[string]bool          // absolute paths awaitClosed is watching
+	tl           *lane                    // long transfers (lane.go, lanejobs.go); created on first use
 	busyMu       sync.Mutex
 	busy         map[string]string        // absolute path -> pair-relative: uploads waiting on a program (inuse.go)
 	watchDone    map[string]chan struct{} // key -> closed when the watcher goroutine exits (for a synchronous, drained stop)
@@ -2700,7 +2701,9 @@ func (e *Engine) SetStatusFunc(f func(string)) { e.onStatus = f }
 
 func (e *Engine) status(s string) {
 	if s == "Up to date" {
-		if w := e.busyStatus(); w != "" {
+		if w := e.laneStatus(); w != "" {
+			s = w // large files still transferring outside the pass (lanejobs.go)
+		} else if w := e.busyStatus(); w != "" {
 			s = w // an upload is still waiting on a program (see inuse.go)
 		} else if w := e.heldDamagedStatus(); w != "" {
 			s = w // a local edit is held back by a damaged server copy (damaged.go)
@@ -3872,6 +3875,79 @@ func maintainDirBaselines(st *state.Store, pk string, base map[string]engine.Bas
 	slog.Info("dir baselines maintained", "healed", healed, "dirtied", dirtied)
 }
 
+// beginAction marks a file transfer as started: the syncing icon, our own
+// deny-write handle let go for the transfer (it would refuse our own
+// download), and the flyout's current file. Shared by a pass's executor and
+// the long-transfer lane (lanejobs.go).
+func (e *Engine) beginAction(p Pair, a engine.Action) {
+	abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
+	e.markInflight(abs, true)
+	if e.lockWarn != nil {
+		e.lockWarn.release(abs)
+	}
+	if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
+		e.progCurrent(filepath.Base(a.Path))
+	}
+}
+
+// finishAction does the bookkeeping for a finished action: icon, deny-write
+// handle, progress, a damaged server copy, a file held open by a program, and
+// the activity row. It returns the paths the pass must count unfinished (their
+// folders are not stamped settled) and whether the file now waits on a
+// program. Shared by a pass's executor and the long-transfer lane.
+func (e *Engine) finishAction(p Pair, pk string, remote map[string]engine.RemoteState, a engine.Action, aerr error) (problems []string, busy bool) {
+	if errors.Is(aerr, transfer.ErrUploadInProgress) {
+		// Another pass is uploading this very file (Deck #714). It owns
+		// the icon, the activity entry and the outcome; this pass only
+		// must not count the folder as settled while that runs.
+		return []string{a.Path}, false
+	}
+	abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
+	e.markInflight(abs, false)
+	if e.lockWarn != nil {
+		e.lockWarn.retake(abs) // no-op unless it is still locked by someone else
+	}
+	if aerr == nil && (a.Kind == engine.ActDownload || a.Kind == engine.ActUpload || a.Kind == engine.ActConflict) {
+		// ActConflict included: keep-both leaves the server's fresh copy
+		// at a.Path (downloaded) and uploads the conflicted twin - both
+		// synced, but neither is a plain Download/Upload action, so the
+		// icon stayed on the pending spinner until the next restart.
+		e.statusIcons.notifySynced(p.LocalDir, a.Path)
+	}
+	if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
+		e.progComplete()
+	}
+	var damaged *transfer.ChecksumMismatchError
+	if (a.Kind == engine.ActDownload || a.Kind == engine.ActConflict) && errors.As(aerr, &damaged) {
+		e.noteDamaged(pk, a.Path, remote[a.Path].ETag)
+	}
+	// A conflict check that could not read the file (Outlook has the
+	// .pst) waits the same way an upload of it does (Deck #714).
+	var inUse *transfer.InUseError
+	if (a.Kind == engine.ActUpload || a.Kind == engine.ActConflict) && errors.As(aerr, &inUse) {
+		// Held, not failed: one neutral "waiting" activity row per wait
+		// instead of a red "failed" one every pass (see noteWaiting).
+		e.noteWaiting(p.LocalDir, abs, a.Path)
+		e.awaitClosed(p, abs) // see inuse.go
+		return []string{a.Path}, true // still unsent: the folder isn't settled
+	} else if a.Kind == engine.ActUpload && aerr == nil {
+		e.clearBusy(abs)
+	}
+	if aerr != nil {
+		problems = append(problems, a.Path)
+		if a.Dest != "" {
+			problems = append(problems, a.Dest)
+		}
+	}
+	ev := activity.Event{Local: p.LocalDir, Path: a.Path, Kind: a.Kind.String()}
+	if a.Dest != "" {
+		ev.Path = a.Path + " → " + a.Dest
+	}
+	ev.Err = e.recordActionResult(a, aerr) // humanised + deduped; "" on success
+	e.recorder.Add(ev)
+	return problems, false
+}
+
 // applyPlan filters, executes, and reports a reconciliation plan — shared by the
 // full SyncOnce and the scoped SyncScope, so both behave identically once a plan
 // exists. actions/remote are keyed relative to the pair root regardless of scope.
@@ -4069,12 +4145,35 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		}
 	}
 
+	// The long-transfer lane (Deck #702, lane.go). Every guard above has judged
+	// the whole plan; now leave what the lane is already transferring alone,
+	// stop what a move or delete here would pull out from under it, and send
+	// this plan's large transfers to it, so this pass ends in seconds and the
+	// next one isn't stuck behind a 300 GB upload.
+	tl := e.transferLane()
+	actions, laneHeld, laneStops := gateOnLane(actions,
+		func(rel string) bool { return tl.has(pk, rel) },
+		func(rel string) bool { return tl.covers(pk, rel) })
+	for _, rel := range laneStops {
+		slog.Info("stopping a large transfer: its file is being moved or deleted", "path", rel)
+		tl.stop(func(j *laneJob) bool { return j.pk == pk && relUnder(j.rel, rel) })
+	}
+	actions, bigTransfers := splitForLane(actions, func(a engine.Action) int64 { return transferSize(p, a, remote) })
+	for _, a := range bigTransfers {
+		if e.sendToLane(p, pk, a, transferSize(p, a, remote), remote) {
+			laneHeld = append(laneHeld, a.Path) // unsent: its folder isn't settled
+		} else {
+			actions = append(actions, a)
+		}
+	}
+
 	if len(actions) == 0 {
 		// Nothing to do — but re-listed dirs still need their etags stamped, or
 		// they are re-listed on every future scan (this quiet case is the common
 		// steady state: our own transfers stale the ancestor dir etags).
-		maintainDirBaselines(st, pk, base, remote, append(append([]string(nil), heldUploads...), skippedDamaged...))
-		if base != nil && len(skippedDamaged) == 0 {
+		unfinished := append(append(append([]string(nil), heldUploads...), skippedDamaged...), laneHeld...)
+		maintainDirBaselines(st, pk, base, remote, unfinished)
+		if base != nil && len(skippedDamaged) == 0 && len(laneHeld) == 0 {
 			e.clearCheckpoint(st, pk) // clean pass — the crawl's rescue rows served their purpose
 		}
 		// A quiet pass must still clear "Scanning…" — nothing else will until the
@@ -4093,9 +4192,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	for _, a := range actions {
 		if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
 			transfers++
-			if r, ok := remote[a.Path]; ok {
-				bytes += r.Size
-			}
+			bytes += transferSize(p, a, remote) // an upload's size is the local file's: new uploads counted 0
 		}
 	}
 	if transfers > 0 {
@@ -4118,18 +4215,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		Escaper:    e.escaper.Load(),
 		Workers:    4,
 		Policy:     e.policy,
-		OnBegin: func(a engine.Action) {
-			abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
-			e.markInflight(abs, true)
-			// Our own deny-write handle would refuse our own download. Let go for
-			// the duration of the transfer and re-take it afterwards.
-			if e.lockWarn != nil {
-				e.lockWarn.release(abs)
-			}
-			if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
-				e.progCurrent(filepath.Base(a.Path))
-			}
-		},
+		OnBegin: func(a engine.Action) { e.beginAction(p, a) },
 		OnProgress: func(a engine.Action, delta int64) {
 			e.progBytes.Add(delta)
 		},
@@ -4139,64 +4225,16 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			probMu.Unlock()
 		},
 		OnEvent: func(a engine.Action, aerr error) {
-			if errors.Is(aerr, transfer.ErrUploadInProgress) {
-				// Another pass is uploading this very file (Deck #714). It owns
-				// the icon, the activity entry and the outcome; this pass only
-				// must not count the folder as settled while that runs.
-				probMu.Lock()
-				problems = append(problems, a.Path)
-				probMu.Unlock()
+			probs, busy := e.finishAction(p, pk, remote, a, aerr)
+			if len(probs) == 0 {
 				return
 			}
-			abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
-			e.markInflight(abs, false)
-			if e.lockWarn != nil {
-				e.lockWarn.retake(abs) // no-op unless it is still locked by someone else
+			probMu.Lock()
+			problems = append(problems, probs...)
+			if busy {
+				busyUploads = append(busyUploads, a.Path) // uploads put off while a program has the file open
 			}
-			if aerr == nil && (a.Kind == engine.ActDownload || a.Kind == engine.ActUpload || a.Kind == engine.ActConflict) {
-				// ActConflict included: keep-both leaves the server's fresh copy
-				// at a.Path (downloaded) and uploads the conflicted twin - both
-				// synced, but neither is a plain Download/Upload action, so the
-				// icon stayed on the pending spinner until the next restart.
-				e.statusIcons.notifySynced(p.LocalDir, a.Path)
-			}
-			if a.Kind == engine.ActDownload || a.Kind == engine.ActUpload {
-				e.progComplete()
-			}
-			var damaged *transfer.ChecksumMismatchError
-			if (a.Kind == engine.ActDownload || a.Kind == engine.ActConflict) && errors.As(aerr, &damaged) {
-				e.noteDamaged(pk, a.Path, remote[a.Path].ETag)
-			}
-			// A conflict check that could not read the file (Outlook has the
-			// .pst) waits the same way an upload of it does (Deck #714).
-			var inUse *transfer.InUseError
-			if (a.Kind == engine.ActUpload || a.Kind == engine.ActConflict) && errors.As(aerr, &inUse) {
-				// Held, not failed: one neutral "waiting" activity row per wait
-				// instead of a red "failed" one every pass (see noteWaiting).
-				probMu.Lock()
-				busyUploads = append(busyUploads, a.Path)
-				problems = append(problems, a.Path) // still unsent: the folder isn't settled
-				probMu.Unlock()
-				e.noteWaiting(p.LocalDir, abs, a.Path)
-				e.awaitClosed(p, abs) // see inuse.go
-				return
-			} else if a.Kind == engine.ActUpload && aerr == nil {
-				e.clearBusy(abs)
-			}
-			if aerr != nil {
-				probMu.Lock()
-				problems = append(problems, a.Path)
-				if a.Dest != "" {
-					problems = append(problems, a.Dest)
-				}
-				probMu.Unlock()
-			}
-			ev := activity.Event{Local: p.LocalDir, Path: a.Path, Kind: a.Kind.String()}
-			if a.Dest != "" {
-				ev.Path = a.Path + " → " + a.Dest
-			}
-			ev.Err = e.recordActionResult(a, aerr) // humanised + deduped; "" on success
-			e.recorder.Add(ev)
+			probMu.Unlock()
 		},
 	}
 	stats, err := ex.Run(ctx, actions)
@@ -4204,7 +4242,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		title, msg := movedAsideToast(p.LocalDir, movedAside)
 		e.toast(title, msg, "")
 	}
-	// A cancelled pass (quit, pause, a restart) stops starting transfers but Run
+	// A cancelled pass (quit, sign-out, a folder move) stops starting transfers but Run
 	// still reports no error, and what it never started is in no problem list.
 	// Treat it as the partway stop it is: stamping its folders as seen hid the
 	// files it never fetched from every later scan (Deck #691).
@@ -4221,6 +4259,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	// pending local change stops being re-detected until something else there
 	// changes.
 	problems = append(problems, heldUploads...)
+	problems = append(problems, laneHeld...) // still transferring in the lane
 	problems = append(problems, skippedDamaged...)
 	for _, c := range ex.Pending {
 		problems = append(problems, c.Path)
