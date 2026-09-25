@@ -16,7 +16,7 @@ now — handled by no-op stubs so everything still builds and runs.
 | Desktop notifications | ✅ | `beeep` → `notify-send`. |
 | Autostart at login | ✅ | `~/.config/autostart/nimbo.desktop` (`autostart_linux.go`). |
 | CLI (`nimbo`) | ✅ | Login, sync, watch, ls/get/put/rm, repair, share, ignore, … |
-| GUI (`nimbo-gui`) | 🟡 | Builds with Wails v3 + GTK4/WebKitGTK 6.0 (checked on Debian 13). Does not run yet, WebKit crashes loading the first page (see below). |
+| GUI (`nimbo-gui`) | 🟡 | Builds with Wails v3 + GTK4/WebKitGTK 6.0 (checked on Debian 13). Does not run yet, WebKit crashes as the windows load (see below). |
 | On-demand / virtual files | ❌ | Windows Cloud Files API only. Linux would need a FUSE/`kio`/`gvfs` approach (future). |
 | Explorer overlays + context menu | ❌ | Windows shell extensions. Linux: Nautilus/Dolphin extensions (future). |
 | In-place auto-update | ❌→🟡 | The App Installer feed is Windows-only. On Linux use the package manager, AppImage update, or the in-app GitHub check. |
@@ -62,9 +62,11 @@ instead (`libgtk-3-dev libwebkit2gtk-4.1-dev`) by adding `-tags gtk3` to the GUI
 appindicator library is needed to build.
 
 **It builds but does not run yet.** With Wails v3.0.0-alpha.96 both builds crash
-in WebKit as soon as the window loads its first page: the GTK4 build in
+in WebKit while the app's windows load their pages: the GTK4 build in
 `soup_message_headers_iter_next` (the response headers of the first request),
-the GTK3 build in `webkit_uri_scheme_request_get_http_body`. Nimbo serves its
+the GTK3 build in `webkit_uri_scheme_request_get_http_body` or
+`soup_message_headers_new` as a second window loads (also on a real Ubuntu 22.04
+desktop, not only in a container). Nimbo serves its
 frontend with Wails' stock `AssetFileServerFS`, so this looks like a Wails/WebKit
 problem, but it has not been tried with a bare Wails app yet.
 
