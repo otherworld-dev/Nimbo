@@ -116,6 +116,9 @@ All notable changes to Nimbo are recorded here. The format follows
   keeping the shortcuts in Nimbo's private copy of AppData, where the Start menu
   can't see them. An app already added this way shows as not added, click Start
   again or open the app to add it properly (#16).
+- An app's own icon in the Start menu and taskbar is no longer sometimes replaced by
+  the Nimbo icon. Two downloads of the same icon could run at once, and the one that
+  lost was treated as a failed download (#743).
 
 ## [0.1.8] - 2026-09-20
 
