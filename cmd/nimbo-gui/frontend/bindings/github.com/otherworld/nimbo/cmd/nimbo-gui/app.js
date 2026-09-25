@@ -234,6 +234,16 @@ export function CheckForUpdate() {
 }
 
 /**
+ * ClearActivity empties the recent activity list for every account, so the
+ * flyout and Sync status → Activity both start again from nothing. Failures
+ * that are still unresolved stay in the "needs attention" count.
+ * @returns {$CancellablePromise<void>}
+ */
+export function ClearActivity() {
+    return $Call.ByID(1860066647);
+}
+
+/**
  * ClearStatusMessage clears the custom status message.
  * @returns {$CancellablePromise<void>}
  */

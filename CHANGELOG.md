@@ -28,6 +28,10 @@ All notable changes to Nimbo are recorded here. The format follows
 
 - Picking Online, Away, Busy or Invisible in the flyout now closes the status
   menu, it only stays open while you are typing a custom status (#7).
+- The flyout's recent activity list now scrolls through everything since Nimbo
+  started instead of stopping at six items, and has a Clear button. Clearing it
+  empties Sync status → Activity as well, anything that still failed stays under
+  needs attention (#7).
 
 ### Fixed
 
