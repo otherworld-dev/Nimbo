@@ -107,6 +107,15 @@ All notable changes to Nimbo are recorded here. The format follows
   sync. It now runs alongside the next sync passes, two at a time per account, so a
   new or changed small file goes up without waiting for it to finish. Pausing stops
   them too, and they carry on when the sync resumes (#702).
+- Pinned app icons in the dock now load, and apps open on the right page, when
+  Nextcloud is installed at a subpath (such as example.com/nextcloud). The subpath
+  was being added twice. An icon that still can't load shows the plain app glyph
+  instead of a broken image (#16).
+- The Start button in the Pin apps editor, and opening an app in its own window,
+  now put the app in the Start menu under Nimbo Apps on a new install. Windows was
+  keeping the shortcuts in Nimbo's private copy of AppData, where the Start menu
+  can't see them. An app already added this way shows as not added, click Start
+  again or open the app to add it properly (#16).
 
 ## [0.1.8] - 2026-09-20
 

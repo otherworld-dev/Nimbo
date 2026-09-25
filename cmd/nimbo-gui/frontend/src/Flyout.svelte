@@ -280,6 +280,11 @@
     apps = (await App.Apps()) ?? [];
   };
   const hasShortcut = (a: AppInfo) => (a as any).shortcut === true;
+  // Icons that failed to load, by URL, so the dock shows the generic glyph
+  // instead of a broken image with its alt text squashed into the box. Keyed
+  // by URL, so an icon whose address changes gets another try.
+  let badIcons = $state<Record<string, boolean>>({});
+  const showIcon = (a: AppInfo) => !!a.icon && !badIcons[a.icon];
   // Clicking a recent-activity row shows the file in its folder (selected in
   // Explorer; a deleted file opens the folder it was in). A row with no local
   // folder to show — or one whose folder tree has since gone — falls back to
@@ -635,7 +640,7 @@
           {#each apps as a}
             <div class="amrow" class:pinned={a.pinned}>
               <button class="amhit" onclick={() => togglePin(a)} title={a.pinned ? "Unpin from dock" : "Pin to dock"}>
-                <span class="ic">{#if a.icon}<img src={a.icon} alt="" />{:else}🗂{/if}</span>
+                <span class="ic">{#if showIcon(a)}<img src={a.icon} alt="" onerror={() => (badIcons[a.icon] = true)} />{:else}🗂{/if}</span>
                 <span class="amname">{a.name}</span>
                 <span class="ampin">{a.pinned ? "★" : "☆"}</span>
               </button>
@@ -658,7 +663,7 @@
           <button class="railapp" onclick={() => openApp(a)}
                   oncontextmenu={(e) => { e.preventDefault(); openAppInBrowser(a); }}
                   title={`${a.name} — opens in its own window (right-click for browser)`}>
-            {#if a.icon}<img src={a.icon} alt={a.name} />{:else}<span class="railglyph">🗂</span>{/if}
+            {#if showIcon(a)}<img src={a.icon} alt={a.name} onerror={() => (badIcons[a.icon] = true)} />{:else}<span class="railglyph">🗂</span>{/if}
           </button>
         {/each}
       </div>

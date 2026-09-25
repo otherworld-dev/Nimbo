@@ -98,6 +98,13 @@ try {
     # The launcher alias must be brand-unique too (Go derives it from brand appId,
     # lowercased + "-app" — keep in step with launcherAlias() in shortcut_windows.go).
     $m = $m -replace '(<desktop:ExecutionAlias Alias=")[^"]*"', "`${1}$($appId.ToLower())-app.exe`""
+    # The unvirtualized Start-menu folder is "<brand name> Apps" (shortcutsDir() in
+    # shortcut_windows.go); a stale "Nimbo Apps" would leave the partner's app
+    # shortcuts in the package's private copy, where Start can't see them.
+    $brandName = (Get-Content $brandSrc -Raw | ConvertFrom-Json).name
+    if (-not $brandName) { throw "brand.json is missing 'name'" }
+    $appsDir = [System.Security.SecurityElement]::Escape("$brandName Apps") -replace '\$', '$$$$'
+    $m = $m -replace '(<virtualization:ExcludedDirectory>\$\(KnownFolder:Programs\)\\)[^<]*', "`${1}$appsDir"
     [System.IO.File]::WriteAllText($mf, $m, (New-Object System.Text.UTF8Encoding($false)))
 
     # 4) Build + sign with the partner's cert (package.ps1 owns Version + Publisher

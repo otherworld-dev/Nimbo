@@ -2709,13 +2709,38 @@ func (a *App) OpenURL(href string) {
 // absURL resolves a possibly-relative Nextcloud href (e.g. "/apps/files/")
 // against the account's server URL. Absolute URLs are returned unchanged.
 func (a *App) absURL(href string) string {
-	if href == "" || strings.Contains(href, "://") {
-		return href
-	}
 	if a.eng == nil {
 		return href
 	}
-	return strings.TrimRight(a.eng.Account.ServerURL, "/") + "/" + strings.TrimLeft(href, "/")
+	return resolveServerHref(a.eng.Account.ServerURL, href)
+}
+
+// resolveServerHref joins a Nextcloud href onto the server URL. Hrefs come in
+// two shapes: our own paths are relative to the webroot ("/index.php/..."),
+// but the server's navigation API returns paths that already carry it
+// ("/nextcloud/apps/files/..." for a server at https://host/nextcloud). The
+// webroot is stripped when present, the way Nextcloud's own getAbsoluteURL
+// does it, so a subpath install doesn't get it twice (GitHub #16). Anything
+// with a scheme (https:, mailto:) is returned unchanged.
+func resolveServerHref(serverURL, href string) string {
+	if href == "" {
+		return href
+	}
+	if u, err := url.Parse(href); err == nil && (u.Scheme != "" || u.Host != "") {
+		return href
+	}
+	base := strings.TrimRight(serverURL, "/")
+	if su, err := url.Parse(base); err == nil {
+		if root := strings.TrimRight(su.Path, "/"); root != "" {
+			if href == root {
+				return base
+			}
+			if rest, ok := strings.CutPrefix(href, root+"/"); ok {
+				href = rest
+			}
+		}
+	}
+	return base + "/" + strings.TrimLeft(href, "/")
 }
 
 // releaseLocksOnExit gives back every account's file locks, and lets go of

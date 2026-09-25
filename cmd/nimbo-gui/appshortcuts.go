@@ -39,11 +39,14 @@ const appIconsFolder = ".icons"
 
 // appIconsDirFor picks where per-app .ico files live: beside the Start-menu
 // shortcuts that reference them. That folder is physically real even inside the
-// package — the shell folders under %APPDATA%\Microsoft are exempt from MSIX
-// AppData virtualization, unlike %APPDATA%\<brand>, which is redirected into
-// the package data root — and it names no package identity, so it survives a
-// re-signing, a Store build and a white-label rebrand alike. Without a Start
-// menu (non-Windows, or no APPDATA) it falls back to the old config location.
+// package, because the manifest excludes it from file-system virtualization
+// (virtualization:ExcludedDirectory in AppxManifest.xml). It is NOT exempt by
+// default: a folder a packaged app creates directly under Start Menu\Programs
+// is redirected into the package data root like %APPDATA%\<brand> is, which
+// hid every shortcut from Start on fresh installs (GitHub #16). It names no
+// package identity, so it survives a re-signing, a Store build and a
+// white-label rebrand alike. Without a Start menu (non-Windows, or no APPDATA)
+// it falls back to the old config location.
 func appIconsDirFor(startMenuDir, configDir string) string {
 	if startMenuDir != "" {
 		return filepath.Join(startMenuDir, appIconsFolder)
