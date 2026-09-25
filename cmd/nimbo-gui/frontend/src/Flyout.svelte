@@ -219,6 +219,17 @@
     // whether that's what this status change was.
     if (!header.user || (await App.NeedsLogin()) !== needsLogin) refresh();
   });
+  // Signing out of the shown account while another one takes over changes
+  // neither of the things the status handler watches, so the old identity
+  // stayed on screen. "account" also fires on every background account's
+  // status line, so the header is only re-fetched when the shown account
+  // really changed.
+  Events.On("account", async () => {
+    const list = (await App.ListAccounts()) ?? [];
+    accounts = list;
+    const cur = list.find(a => a.active);
+    if (!needsLogin && cur && (cur.user !== header.user || cur.server !== header.server)) refresh();
+  });
   Events.On("progress", (e: any) => { progress = e.data; });
   // Activity fires per file — hundreds/sec during a big sync. Coalesce into a
   // light refresh (just the recent list) at most ~2×/sec, so the panel doesn't
