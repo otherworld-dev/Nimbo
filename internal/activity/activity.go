@@ -76,6 +76,14 @@ func (r *Recorder) Recent() []Event {
 	return out
 }
 
+// Clear empties the history the user sees. Unresolved failures are kept: they
+// still need attention, and only a later success for the same path resolves one.
+func (r *Recorder) Clear() {
+	r.mu.Lock()
+	r.events = nil
+	r.mu.Unlock()
+}
+
 // Errors returns the currently-unresolved error events, newest first.
 func (r *Recorder) Errors() []Event {
 	r.mu.Lock()

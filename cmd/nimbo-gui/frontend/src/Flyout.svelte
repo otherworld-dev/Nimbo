@@ -268,6 +268,10 @@
 
   // A preset is a single click, so it closes the editor; typing a custom
   // message is the only reason to keep it open (GitHub #7).
+  // Clears every account's history (the Status window's Activity tab too); the
+  // "activity" event it emits refreshes both.
+  async function clearActivity() { recent = []; await App.ClearActivity(); }
+
   async function setType(t: string) { editStatus = false; await App.SetStatusType(t); await refresh(); }
   async function setMsg() { await App.SetStatusMessage(msgInput.trim()); await refresh(); }
   async function clearMsg() { await App.ClearStatusMessage(); msgInput = ""; await refresh(); }
@@ -542,6 +546,9 @@
   <div class="acthead">
     <div class="acttop">
       <h2>Recent activity</h2>
+      {#if recent.length > 0}
+        <button class="actclear" onclick={clearActivity} title="Clear the recent activity list">Clear</button>
+      {/if}
       <!-- The status text truncates hard in this narrow row, and the scan's live
            count sits at the END of it — so expose the full string on hover. -->
       <div class="syncstat" title={progress.active && !paused ? progress.current : status}>
@@ -588,7 +595,7 @@
       <p class="empty">Nothing synced recently.</p>
     {:else}
       <div class="activity">
-        {#each recent.slice(0, appearance.density === "compact" ? 8 : 6) as r}
+        {#each recent as r}
           <button class="act" class:err={r.err} onclick={() => openActivity(r)}
                   oncontextmenu={(e) => { e.preventDefault(); openInStatus(r); }}
                   title={activityTitle(r)}>
@@ -796,6 +803,9 @@
   .acthead { flex: 0 0 auto; padding: 12px 16px 8px; }
   .acttop { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
   .acthead h2 { margin: 0; }
+  .actclear { flex: 0 0 auto; margin-right: auto; padding: 0 4px; border: 0; background: none;
+              color: var(--fg2); font-size: 12px; cursor: pointer; }
+  .actclear:hover { color: var(--accent); text-decoration: underline; }
   .acttop h2 { flex: 0 0 auto; white-space: nowrap; }   /* never wrap "Recent activity" */
   .acthead .syncbar { margin-top: 8px; }
   .syncmeta { margin-top: 4px; font-size: 11px; color: var(--muted); }
@@ -889,8 +899,8 @@
   .signupd .betachk { display: flex; align-items: center; gap: 6px; cursor: pointer; }
   .signupd .betawarn { margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--fg2); text-align: left; }
 
-  /* Appearance customisation. Density "compact" tightens spacing/fonts and fits
-     more Recent activity rows (8, not 6); icon size scales the dock icons. Panel
+  /* Appearance customisation. Density "compact" tightens spacing/fonts so more
+     Recent activity rows fit before the list scrolls; icon size scales the dock icons. Panel
      width is handled by resizing the window (Go). It used to change only 1-4px
      here, too little to see (GitHub #14), so it now shrinks the header too. */
   .panel.dense header { padding: 7px 12px; }

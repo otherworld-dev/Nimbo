@@ -2938,6 +2938,21 @@ func (a *App) RecentActivity() []ActivityItem {
 	return out
 }
 
+// ClearActivity empties the recent activity list for every account, so the
+// flyout and Sync status → Activity both start again from nothing. Failures
+// that are still unresolved stay in the "needs attention" count.
+func (a *App) ClearActivity() {
+	if a.eng != nil {
+		a.eng.Recorder().Clear()
+	}
+	for _, se := range a.secondaries {
+		if se.eng != nil {
+			se.eng.Recorder().Clear()
+		}
+	}
+	a.emit("activity")
+}
+
 // ConflictItem is a pending conflict awaiting a choice, with both versions'
 // size and modified time so the user can decide.
 type ConflictItem struct {
