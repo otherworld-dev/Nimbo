@@ -215,3 +215,47 @@ func TestAbandonedRoots(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+// GitHub #11 follow-up: the first account on a fresh install was mounted on a
+// guessed folder before its setup had run, so choosing another folder left the
+// guess registered beside it. Only an account whose setup isn't open, and that
+// is the only one, may be mounted on a folder nobody chose.
+func TestUnchosenMountWaitsForSetup(t *testing.T) {
+	for _, c := range []struct {
+		accounts int
+		pending  bool
+		want     bool
+	}{
+		{1, false, true},  // an older install with no folder recorded
+		{1, true, false},  // the first account, its setup still open
+		{2, false, false}, // a new account beside others
+		{2, true, false},
+	} {
+		if got := mayMountUnchosen(c.accounts, c.pending); got != c.want {
+			t.Errorf("accounts=%d pending=%v: got %v, want %v", c.accounts, c.pending, got, c.want)
+		}
+	}
+}
+
+// Setup stays pending from sign-in until it is completed or abandoned, and
+// ending it reports whether it was still pending exactly once, so an abandoned
+// setup falls back to the default folder once and a completed one never does.
+func TestSetupPendingEndsOnce(t *testing.T) {
+	a := &App{}
+	if a.setupPending("acct") {
+		t.Fatal("pending before sign-in")
+	}
+	a.beginSetup("acct")
+	if !a.setupPending("acct") {
+		t.Fatal("not pending after sign-in")
+	}
+	if a.setupPending("other") {
+		t.Fatal("another account reads as pending")
+	}
+	if !a.endSetup("acct") {
+		t.Fatal("first end didn't report pending")
+	}
+	if a.setupPending("acct") || a.endSetup("acct") {
+		t.Fatal("still pending after it ended")
+	}
+}

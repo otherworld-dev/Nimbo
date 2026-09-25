@@ -445,3 +445,43 @@ func forgetOnDemandRoot(accountID string) {
 		_ = d.WithAccount(accountID).UpdateAccountState(func(s *config.AccountState) { s.OnDemandRoot = "" })
 	}
 }
+
+// mayMountUnchosen reports whether an account with no folder recorded may be
+// mounted on a folder nobody chose. Only the only account may, as an older
+// install that never recorded its folder, and not while its setup is open: a
+// fresh sign-in mounted the guess before setup asked, and choosing another
+// folder there left the guess registered beside it (GitHub #11). A new account
+// beside others always waits for its setup.
+func mayMountUnchosen(accounts int, setupPending bool) bool {
+	return accounts <= 1 && !setupPending
+}
+
+// beginSetup marks an account's setup as open: it has just signed in and the
+// setup screen is choosing its folder. Held in memory only, so a setup cut
+// short by a quit falls back to the default folder on the next start, as an
+// abandoned one does.
+func (a *App) beginSetup(accountID string) {
+	a.setupMu.Lock()
+	defer a.setupMu.Unlock()
+	if a.setupOpen == nil {
+		a.setupOpen = map[string]bool{}
+	}
+	a.setupOpen[accountID] = true
+}
+
+// setupPending reports whether an account's setup is still open.
+func (a *App) setupPending(accountID string) bool {
+	a.setupMu.Lock()
+	defer a.setupMu.Unlock()
+	return a.setupOpen[accountID]
+}
+
+// endSetup closes an account's setup and reports whether it was still open,
+// so whatever follows a setup (completed or abandoned) happens only once.
+func (a *App) endSetup(accountID string) bool {
+	a.setupMu.Lock()
+	defer a.setupMu.Unlock()
+	was := a.setupOpen[accountID]
+	delete(a.setupOpen, accountID)
+	return was
+}
