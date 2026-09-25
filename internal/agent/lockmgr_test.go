@@ -351,7 +351,7 @@ func TestNoteRemoteLocks(t *testing.T) {
 		{Path: "Team/Free.xlsx"},
 		{Path: "Team", IsDir: true, Lock: &transport.LockInfo{Owner: "bob"}},
 	}
-	e.NoteRemoteLocks(`C:\Sync`, "", entries)
+	e.NoteRemoteLocks(`C:\Sync`, "", "Team", entries)
 
 	got := e.LockedFiles()
 	if len(got) != 1 {
@@ -365,7 +365,7 @@ func TestNoteRemoteLocks(t *testing.T) {
 	}
 
 	// A later listing of the same folder that finds it free clears it.
-	e.NoteRemoteLocks(`C:\Sync`, "", []transport.Entry{{Path: "Team/Budget.xlsx"}})
+	e.NoteRemoteLocks(`C:\Sync`, "", "Team", []transport.Entry{{Path: "Team/Budget.xlsx"}})
 	if got := e.LockedFiles(); len(got) != 0 {
 		t.Errorf("LockedFiles = %+v after release, want none", got)
 	}
@@ -382,7 +382,7 @@ func TestNoteRemoteLocksStripsRoot(t *testing.T) {
 	e.Account.LoginName = "alice"
 	e.lockMgr = newLockMgr(newFakeLocker(), d, "alice")
 
-	e.NoteRemoteLocks(`C:\Sync`, "Work", []transport.Entry{
+	e.NoteRemoteLocks(`C:\Sync`, "Work", "Work", []transport.Entry{
 		{Path: "Work/Budget.xlsx", Lock: &transport.LockInfo{Owner: "bob"}},
 		{Path: "Elsewhere/Other.xlsx", Lock: &transport.LockInfo{Owner: "bob"}},
 	})
@@ -498,11 +498,11 @@ func TestNoteRemoteLocksAppliesTheLockout(t *testing.T) {
 	}
 	owner := filepath.Join(mount, "~$Budget.xlsx")
 
-	e.NoteRemoteLocks(mount, "", []transport.Entry{{Path: "Budget.xlsx", Lock: &transport.LockInfo{Owner: "bob", OwnerDisplay: "Bob"}}})
+	e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Budget.xlsx", Lock: &transport.LockInfo{Owner: "bob", OwnerDisplay: "Bob"}}})
 	if _, err := os.Stat(owner); err != nil {
 		t.Fatalf("no owner file beside the locked document: %v", err)
 	}
-	e.NoteRemoteLocks(mount, "", []transport.Entry{{Path: "Budget.xlsx"}})
+	e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Budget.xlsx"}})
 	if _, err := os.Stat(owner); !os.IsNotExist(err) {
 		t.Errorf("owner file still there after the unlock (err=%v)", err)
 	}
@@ -521,7 +521,7 @@ func TestLockoutSkipsOnlineOnlyFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.NoteRemoteLocks(mount, "", []transport.Entry{{Path: "Plan.docx", Lock: &transport.LockInfo{Owner: "bob"}}})
+	e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Plan.docx", Lock: &transport.LockInfo{Owner: "bob"}}})
 	if _, err := os.Stat(filepath.Join(mount, "~$Plan.docx")); !os.IsNotExist(err) {
 		t.Errorf("owner file written beside an online-only document (err=%v)", err)
 	}
@@ -535,7 +535,7 @@ func TestNoteRemoteLocksLockoutOffWritesNothing(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mount, "Budget.xlsx"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	e.NoteRemoteLocks(mount, "", []transport.Entry{{Path: "Budget.xlsx", Lock: &transport.LockInfo{Owner: "bob"}}})
+	e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Budget.xlsx", Lock: &transport.LockInfo{Owner: "bob"}}})
 	if _, err := os.Stat(filepath.Join(mount, "~$Budget.xlsx")); !os.IsNotExist(err) {
 		t.Errorf("lockout off, yet an owner file was written (err=%v)", err)
 	}
@@ -551,8 +551,8 @@ func TestReleaseLockoutHandleLetsWritersIn(t *testing.T) {
 	if err := os.WriteFile(doc, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	e.NoteRemoteLocks(mount, "", []transport.Entry{{Path: "Budget.xlsx", Lock: &transport.LockInfo{Owner: "bob"}}})
-	t.Cleanup(func() { e.NoteRemoteLocks(mount, "", []transport.Entry{{Path: "Budget.xlsx"}}) })
+	e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Budget.xlsx", Lock: &transport.LockInfo{Owner: "bob"}}})
+	t.Cleanup(func() { e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Budget.xlsx"}}) })
 	if f, err := os.OpenFile(doc, os.O_RDWR, 0); err == nil {
 		f.Close()
 		t.Fatal("the lockout did not hold the document (a writer got in)")
@@ -726,7 +726,7 @@ func TestReleaseLocksForExit(t *testing.T) {
 	if err := os.WriteFile(doc, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	e.NoteRemoteLocks(mount, "", []transport.Entry{{Path: "Theirs.docx", Lock: &transport.LockInfo{Owner: "bob"}}})
+	e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Theirs.docx", Lock: &transport.LockInfo{Owner: "bob"}}})
 
 	n, err := e.ReleaseLocksForExit(ctx)
 	if err != nil || n != 2 {

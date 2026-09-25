@@ -519,26 +519,46 @@ func (e *Engine) ReleaseLockoutHandle(abs string) {
 // executes. The mount directory stands in for a pair's local root.
 //
 // It is called per directory as the shell populates it, and reconciles only the
-// paths in THAT listing, so other folders' locks are left untouched.
-func (e *Engine) NoteRemoteLocks(mountDir, remoteRoot string, entries []transport.Entry) {
+// paths in THAT listing, so other folders' locks are left untouched. listed is
+// the remote path of the directory the entries are the listing of.
+func (e *Engine) NoteRemoteLocks(mountDir, remoteRoot, listed string, entries []transport.Entry) {
 	if !e.LockingAvailable() || e.lockMgr == nil {
 		return
 	}
 	root := strings.Trim(remoteRoot, "/")
+	// mountRel turns a remote path into a mount-relative one; ok is false for a
+	// path outside the mount.
+	mountRel := func(p string) (string, bool) {
+		p = strings.Trim(p, "/")
+		if root == "" {
+			return p, true
+		}
+		if p == root {
+			return "", true
+		}
+		if !strings.HasPrefix(p, root+"/") {
+			return "", false
+		}
+		return strings.TrimPrefix(p, root+"/"), true
+	}
+	dir, dirOK := mountRel(listed)
 	examined := make(map[string]bool, len(entries))
+	children := make(map[string]bool, len(entries))
 	var locked []LockedFile
 	for _, en := range entries {
-		if en.IsDir {
+		rel, ok := mountRel(en.Path)
+		if !ok || rel == "" || rel == dir {
 			continue
 		}
-		rel := strings.Trim(en.Path, "/")
-		if root != "" {
-			if !strings.HasPrefix(rel, root+"/") {
-				continue
-			}
-			rel = strings.TrimPrefix(rel, root+"/")
+		child := rel
+		if dir != "" {
+			child = strings.TrimPrefix(rel, dir+"/")
 		}
-		if rel == "" {
+		if i := strings.IndexByte(child, '/'); i >= 0 {
+			child = child[:i]
+		}
+		children[child] = true
+		if en.IsDir {
 			continue
 		}
 		examined[rel] = true
@@ -552,10 +572,17 @@ func (e *Engine) NoteRemoteLocks(mountDir, remoteRoot string, entries []transpor
 			RemotePath: strings.Trim(en.Path, "/"), FileOwner: en.Lock.FileOwner,
 		})
 	}
-	if len(examined) == 0 {
+	// The listing is complete, so a lock deeper down whose folder is missing
+	// from it names a file that is gone (#744). Only this listing will ever say
+	// so: a deleted folder is never listed again.
+	var gone map[string]bool
+	if dirOK {
+		gone = e.locksGoneFromListing(mountDir, dir, children)
+	}
+	if len(examined) == 0 && len(gone) == 0 {
 		return
 	}
-	e.reconcileLocked(mountDir, examined, locked)
+	e.reconcileLockedGone(mountDir, examined, locked, gone)
 	// The listing is where on-demand mode sees a colleague's lock come and go,
 	// so it drives the lockout as applyPlan does for live sync, with the full
 	// set: apply undoes whatever is missing from what it is given.

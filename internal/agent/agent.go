@@ -960,6 +960,23 @@ const lockToastWindow = time.Hour
 // every routine pass is a delta, so a lock could sit in the UI for an hour after
 // the other user closed the file.
 func (e *Engine) reconcileLocked(localDir string, examined map[string]bool, l []LockedFile) {
+	e.reconcileLockedGone(localDir, examined, l, nil)
+}
+
+// reconcileLockedGone is reconcileLocked where the pass also knows some locked
+// files no longer exist (gone): they are dropped as well, and logged as gone
+// rather than as released, since nobody closed them (#744).
+func (e *Engine) reconcileLockedGone(localDir string, examined map[string]bool, l []LockedFile, gone map[string]bool) {
+	if len(gone) > 0 {
+		all := make(map[string]bool, len(examined)+len(gone))
+		for p := range examined {
+			all[p] = true
+		}
+		for p := range gone {
+			all[p] = true
+		}
+		examined = all
+	}
 	e.lockedMu.Lock()
 	if e.locked == nil {
 		e.locked = make(map[string][]LockedFile) // engines built outside NewEngineFor (tests)
@@ -1033,6 +1050,10 @@ func (e *Engine) reconcileLocked(localDir string, examined map[string]bool, l []
 			"by", f.Who(), "app", f.AppName, "type", int(f.OwnerType))
 	}
 	for _, f := range removed {
+		if gone[f.Path] {
+			slog.Info("lock dropped, the file is gone", "path", f.Path, "by", f.Who(), "app", f.AppName)
+			continue
+		}
 		slog.Info("lock released", "path", f.Path, "by", f.Who(), "app", f.AppName)
 	}
 	if len(removed) > 0 {
@@ -4096,7 +4117,14 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	var heldUploads []string
 	if e.LockingAvailable() {
 		examined, lockedNow := lockScan(remote, e.Account.LoginName, p.LocalDir, p.RemoteRoot)
-		e.reconcileLocked(p.LocalDir, examined, lockedNow)
+		// Whatever this pass deletes locally is gone, locks and all (#744).
+		var deleted []string
+		for _, a := range actions {
+			if a.Kind == engine.ActDeleteLocal {
+				deleted = append(deleted, a.Path)
+			}
+		}
+		e.reconcileLockedGone(p.LocalDir, examined, lockedNow, e.locksUnder(p.LocalDir, deleted))
 
 		// Warn the local editor, but ONLY from here — the live sync path. The
 		// warner writes a name carrier next to the document, and a real file
