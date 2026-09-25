@@ -4700,22 +4700,20 @@ func (a *App) SwitchAccount(id string) string {
 	if cur, ok := st.Default(); ok && cur.ID == id {
 		return "" // already active
 	}
+	// An account whose app password is gone from the keychain can't be shown
+	// until it signs in again, so ask for that and change nothing yet: the
+	// sign-in makes it the active account itself (account.Complete, then
+	// BeginLogin restarts the engine), and cancelling it must leave the
+	// current account shown and syncing.
+	if _, err := account.LoadSecret(id); err != nil {
+		application.InvokeAsync(a.showLogin)
+		return ""
+	}
 	if err := account.Update(d.AccountsFile(), func(s *account.Store) error { return s.SetDefault(id) }); err != nil {
 		return err.Error()
 	}
 	a.disconnectAllOnDemand()
 	a.stopEngine()
-	// Switching to an account whose app password is gone from the keychain
-	// means the user WANTS that account — ask for its sign-in directly instead
-	// of bouncing through a failing engine start plus an error message on top
-	// of the login window it would open anyway.
-	if _, err := account.LoadSecret(id); err != nil {
-		a.setStatus("Sign in again")
-		a.emit("account")
-		a.rebuildTrayMenu()
-		application.InvokeAsync(a.showLogin)
-		return ""
-	}
 	a.start(a.ctx)
 	if a.eng == nil {
 		return "couldn't start syncing for that account — check its sign-in"
