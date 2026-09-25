@@ -55,6 +55,11 @@
   let acctBusy = $state(false);
   const hostOf = (s: string) => { try { return new URL(s).host; } catch { return s; } };
   async function loadAccounts() { accounts = (await App.ListAccounts()) ?? []; }
+  // With more than one account the header names the shown one on a strip of
+  // its own: in Compact width the name beside the tool buttons only had room
+  // for a few letters, which didn't say which account it was (GitHub #14).
+  let shownAcct = $derived(accounts.length > 1 ? accounts.find(a => a.active) : undefined);
+  function toggleMore() { moreMenu = !moreMenu; pauseMenu = false; if (moreMenu) loadAccounts(); }
   // Errors render inline — a raw alert() in the flyout draws the browser's
   // "wails.localhost says" dialog over the panel, which looks broken.
   let acctError = $state("");
@@ -163,6 +168,7 @@
     dockSide = await App.AppDockSide();
     showSearch = await App.ShowSearch();
     appearance = await App.FlyoutAppearance();
+    if (!needsLogin) await loadAccounts();
     msgInput = header.statusMsg;
   }
 
@@ -337,15 +343,24 @@
 </script>
 
 <div class="panel" class:dock-left={showDock && dockSide === "left"} class:dock-bottom={showDock && dockSide === "bottom"}
-     class:dense={appearance.density === "compact"} class:icons-sm={appearance.dockIconSize === "small"} class:icons-lg={appearance.dockIconSize === "large"}>
+     class:dense={appearance.density === "compact"} class:narrow={appearance.panelWidth === "compact"} class:icons-sm={appearance.dockIconSize === "small"} class:icons-lg={appearance.dockIconSize === "large"}>
   <div class="main">
   <header>
+    {#if header.user && shownAcct}
+      <button class="acctstrip" class:on={moreMenu} onclick={toggleMore}
+              title="{shownAcct.user} on {hostOf(shownAcct.server)} · switch account">
+        <span class="aslbl">Account</span>
+        <span class="asname">{shownAcct.user} <span class="ashost">· {hostOf(shownAcct.server)}</span></span>
+        <span class="caret">{moreMenu ? "▴" : "▾"}</span>
+      </button>
+    {/if}
     <div class="idrow">
       {#if header.user}
-        <button class="user" onclick={() => (editStatus = !editStatus)} title="Set status">
+        <button class="user" class:multi={!!shownAcct} onclick={() => (editStatus = !editStatus)}
+                title="Set status · {header.statusMsg || presenceLabel(header.statusType)}">
           <span class="presence {header.statusType || 'offline'}"></span>
           <span class="idtext">
-            <span class="uname">{header.user}</span>
+            {#if !shownAcct}<span class="uname">{header.user}</span>{/if}
             <span class="ustatus">{header.statusIcon} {header.statusMsg || presenceLabel(header.statusType)}</span>
           </span>
           <span class="caret">{editStatus ? "▴" : "▾"}</span>
@@ -366,7 +381,7 @@
           {:else}
             <button class="tool" class:on={pauseMenu} onclick={() => { pauseMenu = !pauseMenu; moreMenu = false; }} title="Pause syncing">❚❚</button>
           {/if}
-          <button class="tool" class:on={moreMenu} onclick={() => { moreMenu = !moreMenu; pauseMenu = false; if (moreMenu) loadAccounts(); }} title="More">⋯</button>
+          <button class="tool" class:on={moreMenu} onclick={toggleMore} title="More">⋯</button>
         </div>
       {/if}
     </div>
@@ -562,7 +577,7 @@
       <p class="empty">Nothing synced recently.</p>
     {:else}
       <div class="activity">
-        {#each recent.slice(0, 6) as r}
+        {#each recent.slice(0, appearance.density === "compact" ? 8 : 6) as r}
           <button class="act" class:err={r.err} onclick={() => openActivity(r)}
                   oncontextmenu={(e) => { e.preventDefault(); openInStatus(r); }}
                   title={activityTitle(r)}>
@@ -666,6 +681,16 @@
            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ustatus { color: var(--fg2); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .caret { color: var(--muted); font-size: 11px; flex: 0 0 auto; }
+  /* The shown account, on its own line above the name/status row (multi-account only). */
+  .acctstrip { display: flex; align-items: baseline; gap: 6px; width: 100%; box-sizing: border-box; margin: 0 0 8px;
+               padding: 4px 6px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel);
+               color: var(--fg); cursor: pointer; text-align: left; font-size: 12.5px; }
+  .acctstrip:hover, .acctstrip.on { background: var(--tint); border-color: var(--accent); }
+  .aslbl { flex: 0 0 auto; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
+  .asname { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ashost { color: var(--muted); font-weight: 400; }
+  /* With the account named on the strip, the button is just the status, one line. */
+  .user.multi .ustatus { color: var(--fg); font-size: 13px; }
   .presence { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
   .tools { flex: 0 0 auto; display: flex; gap: 5px; }
   .tool { width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center;
@@ -856,16 +881,26 @@
   .signupd .betachk { display: flex; align-items: center; gap: 6px; cursor: pointer; }
   .signupd .betawarn { margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--fg2); text-align: left; }
 
-  /* Appearance customisation. Density "compact" tightens spacing/fonts; icon size
-     scales the dock icons. Panel width is handled by resizing the window (Go). */
-  .panel.dense header { padding: 8px 12px; }
-  .panel.dense .search { padding: 6px 12px 3px; }
-  .panel.dense .acthead { padding: 8px 12px 5px; }
+  /* Appearance customisation. Density "compact" tightens spacing/fonts and fits
+     more Recent activity rows (8, not 6); icon size scales the dock icons. Panel
+     width is handled by resizing the window (Go). It used to change only 1-4px
+     here, too little to see (GitHub #14), so it now shrinks the header too. */
+  .panel.dense header { padding: 7px 12px; }
+  .panel.dense .uname { font-size: 14px; }
+  .panel.dense .tool { width: 28px; height: 28px; font-size: 13px; }
+  .panel.dense .search { padding: 6px 12px 2px; }
+  .panel.dense .searchbar { padding: 4px 8px; }
+  .panel.dense .acthead { padding: 6px 12px 4px; }
+  .panel.dense h2 { margin: 8px 0 5px; }
   .panel.dense .scroll { padding: 0 12px 5px; }
-  .panel.dense .act { padding: 4px 4px; }
+  .panel.dense .act { padding: 3px 4px; gap: 8px; }
+  .panel.dense .aicon { width: 18px; height: 18px; font-size: 10px; }
   .panel.dense .apath { font-size: 12px; }
   .panel.dense .akind, .panel.dense .atime { font-size: 10px; }
   .panel.dense .storage { padding: 5px 12px; }
+  /* Compact width: slimmer tool buttons leave the name/status some room. */
+  .panel.narrow .tools { gap: 4px; }
+  .panel.narrow .tool { width: 28px; height: 28px; font-size: 13px; }
   .panel.icons-sm .railapp { width: 30px; height: 30px; }
   .panel.icons-sm .railapp img { width: 16px; height: 16px; }
   .panel.icons-lg .railapp { width: 44px; height: 44px; }
