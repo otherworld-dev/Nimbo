@@ -1362,7 +1362,7 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		// On-demand mode has no sync pairs, so applyPlan — where the live path
 		// notices other people's locks — never runs. This listing is the only
 		// place lock state passes through, so feed it in here.
-		eng.NoteRemoteLocks(localDir, root, entries)
+		eng.NoteRemoteLocks(localDir, root, remote, entries)
 		return items, nil
 	}
 	// A failed listing returns NIL, which cfapi reads as "do not mark this

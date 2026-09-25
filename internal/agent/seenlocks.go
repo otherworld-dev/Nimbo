@@ -104,3 +104,49 @@ func (e *Engine) lockRoots() map[string]bool {
 func rootKey(dir string) string {
 	return strings.ToLower(strings.TrimRight(filepath.Clean(dir), `\/`))
 }
+
+// locksGoneFromListing returns the locked files under dir that a complete
+// listing of dir proves gone: their first step below dir is not among the
+// listed children. Direct children are left to the listing's own examined set.
+func (e *Engine) locksGoneFromListing(localDir, dir string, children map[string]bool) map[string]bool {
+	prefix := ""
+	if dir != "" {
+		prefix = dir + "/"
+	}
+	gone := map[string]bool{}
+	e.lockedMu.Lock()
+	defer e.lockedMu.Unlock()
+	for _, f := range e.locked[localDir] {
+		if !strings.HasPrefix(f.Path, prefix) {
+			continue
+		}
+		rest := f.Path[len(prefix):]
+		i := strings.IndexByte(rest, '/')
+		if i < 0 {
+			continue // a direct child: the listing looked at it itself
+		}
+		if !children[rest[:i]] {
+			gone[f.Path] = true
+		}
+	}
+	return gone
+}
+
+// locksUnder returns the locked files at or under any of paths.
+func (e *Engine) locksUnder(localDir string, paths []string) map[string]bool {
+	if len(paths) == 0 {
+		return nil
+	}
+	gone := map[string]bool{}
+	e.lockedMu.Lock()
+	defer e.lockedMu.Unlock()
+	for _, f := range e.locked[localDir] {
+		for _, p := range paths {
+			if f.Path == p || strings.HasPrefix(f.Path, p+"/") {
+				gone[f.Path] = true
+				break
+			}
+		}
+	}
+	return gone
+}
