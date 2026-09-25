@@ -566,6 +566,7 @@ type BrandDTO struct {
 	Company   string `json:"company"`
 	Website   string `json:"website"`
 	Support   string `json:"support"`
+	Help      string `json:"help"` // help home, "" when the brand has none
 	AccentHex string `json:"accentHex"`
 }
 
@@ -574,6 +575,7 @@ func (a *App) Brand() BrandDTO {
 	return BrandDTO{
 		Name: brand.Current.Name, Company: brand.Current.Company,
 		Website: brand.Current.Website, Support: brand.Current.SupportEmail,
+		Help:      brand.Current.HelpPage(""),
 		AccentHex: brand.Current.AccentHex,
 	}
 }

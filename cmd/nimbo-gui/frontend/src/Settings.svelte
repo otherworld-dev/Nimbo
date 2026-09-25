@@ -6,12 +6,16 @@
   let brandCompany = $state("Otherworld Dev Ltd");
   let brandWebsite = $state("https://www.nimbosync.com");
   let brandSupport = $state("contact@otherworld.dev");
+  let brandHelp = $state("");
   (async () => {
     const b = await App.Brand();
     brandName = b.name || brandName; brandCompany = b.company || brandCompany;
     brandWebsite = b.website || brandWebsite; brandSupport = b.support || brandSupport;
+    brandHelp = b.help || "";
   })();
   const hostname = (u: string) => { try { return new URL(u).host.replace(/^www\./, ""); } catch { return u; } };
+  // Help links hide themselves when the brand has no help site (white-label).
+  const helpPage = (slug: string) => brandHelp + slug + ".html";
 
   // Admin policy (managed deployments): some settings may be locked by IT.
   let policy = $state<{ managed: boolean; lockServer: boolean; serverUrl: string; allowSignOut: boolean; lockBandwidth: boolean; lockSyncMode: boolean }>(
@@ -882,7 +886,7 @@
       {#if onDemandSupported && (syncMode === "ondemand" || !adding)}
         <div class="field">
           <label>File availability</label>
-          <p class="fhint">Live keeps every file on your disk. Virtual file system shows your whole account as online-only placeholders in your sync folder and downloads each file when you open it. Switching applies to the account and persists across restarts.</p>
+          <p class="fhint">Live keeps every file on your disk. Virtual file system shows your whole account as online-only placeholders in your sync folder and downloads each file when you open it. Switching applies to the account and persists across restarts.{#if brandHelp} <button class="link" onclick={() => App.OpenURL(helpPage("file-modes"))}>Which should I pick?</button>{/if}</p>
           <select bind:value={syncMode} onchange={saveSyncMode} disabled={syncModeBusy || policy.lockSyncMode}>
             <option value="live">Live file system</option>
             <option value="ondemand">Virtual file system</option>
@@ -1460,7 +1464,7 @@ SHA-256: {localTest.fingerprint}</pre>
         <label class="check"><input type="checkbox" checked={navOn} disabled={navBusy} onchange={toggleNav} /> Show {brandName} in the Explorer sidebar (points at your default sync location)</label>
       {/if}
 
-      <h3>Troubleshooting</h3>
+      <div class="row"><h3>Troubleshooting</h3>{#if brandHelp}<button class="link" onclick={() => App.OpenURL(helpPage("troubleshooting"))}>Troubleshooting guide</button>{/if}</div>
       <label class="check"><input type="checkbox" checked={logVerbose} onchange={toggleVerbose} /> Verbose (debug) logging</label>
       <h4 class="dhealth">Connection health</h4>
       {#if diag}
@@ -1543,6 +1547,7 @@ SHA-256: {localTest.fingerprint}</pre>
       <p class="aboutco">
         © {new Date().getFullYear()} {brandCompany}
         · <button class="link" onclick={() => App.OpenURL(brandWebsite)}>{hostname(brandWebsite)}</button>
+        {#if brandHelp}· <button class="link" onclick={() => App.OpenURL(brandHelp)}>Help</button>{/if}
         · <button class="link" onclick={() => App.OpenURL("mailto:" + brandSupport)}>{brandSupport}</button>
       </p>
     {/if}
