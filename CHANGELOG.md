@@ -103,6 +103,10 @@ All notable changes to Nimbo are recorded here. The format follows
   before a list of folders with tick boxes. The list is now called "Keep on this PC
   (offline)", each box says "Keep on this PC", and it explains that ticking a folder
   is the same as Explorer's "Always keep on this device" (#15).
+- A large upload or download (64 MB or more) no longer holds up the rest of the
+  sync. It now runs alongside the next sync passes, two at a time per account, so a
+  new or changed small file goes up without waiting for it to finish. Pausing stops
+  them too, and they carry on when the sync resumes (#702).
 
 ## [0.1.8] - 2026-09-20
 
