@@ -19,15 +19,13 @@ import (
 // succeeded, zero entries included), and the shell then never asks again. A
 // plain directory has no such state at all: everything in it is real.
 //
-// The populated END of that scale cannot be constructed from a test process:
-// this harness never issues FETCH_PLACEHOLDERS for a subdirectory (measured
-// again here - os.ReadDir of a lazy directory placeholder fetches nothing and
-// leaves the attribute untouched), and CfUpdatePlaceholder with
-// CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION (0x20) is refused with
-// 0x8007017C from outside the population callback. That end is evidenced
-// instead by the live VM trace this fix came from (build 0.1.0.284): a /Notes
-// directory whose transfer delivered zero entries sat at attrs 0x100410 - no
-// 0x400000 - while server-side additions inside it never appeared locally.
+// os.ReadDir from this process never populates anything (the filter does not
+// issue FETCH_PLACEHOLDERS for the provider's own enumerations - measured
+// again here). The populated end is covered by TestMarkDirPopulatedLive and
+// TestShellPopulatedDirSettlesLive. (This comment used to say that end could
+// not be built from a test because CfUpdatePlaceholder with
+// DISABLE_ON_DEMAND_POPULATION was refused outside the callback; that attempt
+// passed 0x20, which is REMOVE_FILE_IDENTITY. The flag is 0x10 and works.)
 // Live-driver test, opt in with NIMBO_CFAPI_LIVE=1.
 func TestDirPopulatedReadsTheDirectoryPlaceholderState(t *testing.T) {
 	if os.Getenv("NIMBO_CFAPI_LIVE") == "" {

@@ -50,13 +50,18 @@ type fakeCf struct {
 	// again). Default false, like a freshly created lazy directory; a PLAIN
 	// directory is always populated and is answered from plain, not here.
 	populated     map[string]bool
-	notified      []string         // paths passed to the shell change-notify seam
-	createdNote   []string         // paths passed to the shell "item created" seam
-	settleChecked []string         // paths offered to the pin-settle seam
-	excluded      []string         // paths passed to the exclude-from-sync seam
-	reverted      []string         // paths passed to RevertPlaceholder (they become plain)
-	dehydrated    map[string]bool  // paths that are online-only stubs (no bytes)
-	pinned        map[string]bool  // paths that read as pinned, online-only placeholders
+	notified      []string        // paths passed to the shell change-notify seam
+	createdNote   []string        // paths passed to the shell "item created" seam
+	settleChecked []string        // paths offered to the pin-settle seam
+	excluded      []string        // paths passed to the exclude-from-sync seam
+	reverted      []string        // paths passed to RevertPlaceholder (they become plain)
+	dehydrated    map[string]bool // paths that are online-only stubs (no bytes)
+	pinned        map[string]bool // paths that read as pinned, online-only placeholders
+	// pinnedDirs holds directories carrying "always keep on this device".
+	// Children created in one inherit the pin, as on the live driver: files
+	// land in pinned, folders here. Keyed like populated.
+	pinnedDirs    map[string]bool
+	filled        []string         // directories passed to the mark-populated seam
 	hydrated      []string         // paths passed to the hydrate-if-pinned seam
 	hydrateGate   chan struct{}    // when non-nil, hydration blocks until it closes
 	hydrateCalls  map[string]int   // per-path invocation count of the hydrate-if-pinned seam
@@ -80,7 +85,21 @@ func (f *fakeCf) createdNames() []string {
 func installFakeCf(t *testing.T) *fakeCf {
 	t.Helper()
 	stopFinishedWatchers(t) // an earlier test's watcher may still be using the seams
-	f := &fakeCf{dirty: map[string]bool{}, modified: map[string]bool{}, identities: map[string]string{}, plain: map[string]bool{}, corrupt: map[string]bool{}, populated: map[string]bool{}, dehydrated: map[string]bool{}, pinned: map[string]bool{}, hydrateCalls: map[string]int{}, hydrateErr: map[string]error{}}
+	f := &fakeCf{dirty: map[string]bool{}, modified: map[string]bool{}, identities: map[string]string{}, plain: map[string]bool{}, corrupt: map[string]bool{}, populated: map[string]bool{}, dehydrated: map[string]bool{}, pinned: map[string]bool{}, pinnedDirs: map[string]bool{}, hydrateCalls: map[string]int{}, hydrateErr: map[string]error{}}
+	opn, omp := cfPinned, cfMarkDirPopulated
+	t.Cleanup(func() { stopTestWatchers(t); cfPinned, cfMarkDirPopulated = opn, omp })
+	cfPinned = func(path string) bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.pinnedDirs[strings.ToLower(filepath.ToSlash(path))]
+	}
+	cfMarkDirPopulated = func(path string) error {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.filled = append(f.filled, path)
+		f.populated[strings.ToLower(filepath.ToSlash(path))] = true
+		return nil
+	}
 	oi, oc, or, ou, om, op, on, os2, ox := cfInspect, cfCreatePlaceholders, cfRefreshPlaceholder, cfUpdateIdentity, cfMarkInSync, cfIsPlaceholder, cfShellNotify, cfSettlePin, cfExclude
 	ov, orv, od := cfRefreshIfInSync, cfRevertPlaceholder, cfIsDehydrated
 	opi := cfPlaceholderIdentity
@@ -229,12 +248,21 @@ func installFakeCf(t *testing.T) *fakeCf {
 	}
 	cfCreatePlaceholders = func(baseDir string, items []cfapi.PlaceholderInfo) error {
 		f.mu.Lock()
+		parentPinned := f.pinnedDirs[strings.ToLower(filepath.ToSlash(baseDir))]
 		for _, it := range items {
 			f.created = append(f.created, it.Name)
 			// What it says on the tin: whatever was at that path, there is a
 			// PLACEHOLDER there now (and a directory placeholder starts out
 			// lazy - nothing has populated it yet).
-			delete(f.plain, strings.ToLower(filepath.ToSlash(filepath.Join(baseDir, it.Name))))
+			p := filepath.Join(baseDir, it.Name)
+			delete(f.plain, strings.ToLower(filepath.ToSlash(p)))
+			if parentPinned {
+				if it.IsDir {
+					f.pinnedDirs[strings.ToLower(filepath.ToSlash(p))] = true
+				} else {
+					f.pinned[strings.ToLower(p)] = true
+				}
+			}
 		}
 		f.mu.Unlock()
 		for _, it := range items {
@@ -455,6 +483,20 @@ func (f *fakeCf) markPinned(path string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pinned[strings.ToLower(path)] = true
+}
+
+// markPinnedDir gives a directory the "always keep on this device" pin.
+func (f *fakeCf) markPinnedDir(dir string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pinnedDirs[strings.ToLower(filepath.ToSlash(dir))] = true
+}
+
+// filledDirs returns the directories marked populated by the provider itself.
+func (f *fakeCf) filledDirs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.filled...)
 }
 
 // hydrateCompleted counts the downloads that ran to completion — hydratedPaths
@@ -6402,5 +6444,185 @@ func TestACorruptSyncRootIsNamedNotRenderedAsADot(t *testing.T) {
 	}
 	if !strings.Contains(rec.reports[0].err.Error(), root) {
 		t.Errorf("the recovery does not name the root's full path: %v", rec.reports[0].err)
+	}
+}
+
+// --- keep on device reaches folders nobody opened (GitHub #17) ---------------
+
+// waitHydrated waits for the hydrate workers to have started every one of want.
+func waitHydrated(t *testing.T, f *fakeCf, want ...string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got := map[string]bool{}
+		for _, p := range f.hydratedPaths() {
+			got[strings.ToLower(p)] = true
+		}
+		missing := []string{}
+		for _, p := range want {
+			if !got[strings.ToLower(p)] {
+				missing = append(missing, p)
+			}
+		}
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never downloaded %v (downloaded %v)", missing, f.hydratedPaths())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The reporter's case: "Always keep on this device" on a folder whose
+// subfolders were never opened. The pin lands on the lazy folder itself, but
+// it has no children to download and the shell will only fetch them when
+// something opens it. Reconcile has to fill it in, all the way down, and hand
+// every file to the downloader.
+func TestReconcileFillsAPinnedNeverOpenedFolder(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	photos := filepath.Join(root, "Photos")
+	if err := os.MkdirAll(photos, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.markPinnedDir(photos) // pinned, never populated
+
+	rec := newRecorder()
+	rec.listing[""] = []cfapi.PlaceholderInfo{ph("Photos", true, "e-photos", "")}
+	rec.listing["Photos"] = []cfapi.PlaceholderInfo{ph("a.jpg", false, "e-a", "fa"), ph("2024", true, "e-2024", "")}
+	rec.listing["Photos/2024"] = []cfapi.PlaceholderInfo{ph("b.jpg", false, "e-b", "fb"), ph("deep", true, "e-deep", "")}
+	rec.listing["Photos/2024/deep"] = []cfapi.PlaceholderInfo{ph("c.jpg", false, "e-c", "fc")}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	rec.mu.Lock()
+	for _, rel := range []string{"Photos", "Photos/2024", "Photos/2024/deep"} {
+		if rec.listCalls[rel] == 0 {
+			t.Errorf("%s was never listed", rel)
+		}
+	}
+	rec.mu.Unlock()
+	filled := map[string]bool{}
+	for _, d := range f.filledDirs() {
+		filled[strings.ToLower(d)] = true
+	}
+	for _, d := range []string{photos, filepath.Join(photos, "2024"), filepath.Join(photos, "2024", "deep")} {
+		if !filled[strings.ToLower(d)] {
+			t.Errorf("%s was not marked populated (marked: %v)", d, f.filledDirs())
+		}
+	}
+	waitHydrated(t, f,
+		filepath.Join(photos, "a.jpg"),
+		filepath.Join(photos, "2024", "b.jpg"),
+		filepath.Join(photos, "2024", "deep", "c.jpg"))
+}
+
+// The fill must not claim a folder it could not list: the populated flag is
+// permanent, so a folder marked after a failed listing would stay empty.
+func TestPinFillLeavesTheFolderLazyWhenTheListingFails(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	photos := filepath.Join(root, "Photos")
+	if err := os.MkdirAll(photos, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.markPinnedDir(photos)
+
+	rec := newRecorder()
+	rec.listErr = os.ErrDeadlineExceeded
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	if w.reconcileDir("Photos", "") {
+		t.Error("reconcileDir reported success for a folder it could not list")
+	}
+	if got := f.filledDirs(); len(got) != 0 {
+		t.Errorf("marked %v populated after a failed listing", got)
+	}
+}
+
+// A pinned folder that already holds some of its children (a fill that
+// failed part way) is still finished off: it has entries, so the empty-folder
+// test alone would never have looked at its population state.
+func TestPinFillFinishesAPartlyFilledFolder(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	photos := filepath.Join(root, "Photos")
+	if err := os.MkdirAll(photos, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(photos, "a.jpg"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.markPinnedDir(photos)
+
+	rec := newRecorder()
+	rec.listing[""] = []cfapi.PlaceholderInfo{ph("Photos", true, "e-photos", "")}
+	rec.listing["Photos"] = []cfapi.PlaceholderInfo{ph("a.jpg", false, "e-a", "fa"), ph("b.jpg", false, "e-b", "fb")}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	if got := f.createdNames(); len(got) != 1 || got[0] != "b.jpg" {
+		t.Errorf("created %v, want exactly [b.jpg]", got)
+	}
+	if got := f.filledDirs(); len(got) != 1 || !strings.EqualFold(got[0], photos) {
+		t.Errorf("marked populated %v, want [%s]", got, photos)
+	}
+}
+
+// Pinning while Nimbo runs: the recursive pin raises an attribute event on
+// the never-opened folder, and that event alone must fill it in — a pin is a
+// local change, so no server ETag moves and no reconcile pass would get there.
+func TestPinnedFolderEventFillsIt(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	photos := filepath.Join(root, "Photos")
+	if err := os.MkdirAll(photos, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.markPinnedDir(photos)
+
+	rec := newRecorder()
+	rec.listing[""] = []cfapi.PlaceholderInfo{ph("Photos", true, "e-photos", "")}
+	rec.listing["Photos"] = []cfapi.PlaceholderInfo{ph("a.jpg", false, "e-a", "fa")}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.handleChange(photos) // what the debounced ATTRIBUTES event runs
+
+	waitHydrated(t, f, filepath.Join(photos, "a.jpg"))
+	if got := f.filledDirs(); len(got) != 1 || !strings.EqualFold(got[0], photos) {
+		t.Errorf("marked populated %v, want [%s]", got, photos)
+	}
+}
+
+// An unpinned folder's event changes nothing: filling it would race the
+// shell's own first fetch for a folder the user never asked to keep.
+func TestUnpinnedFolderEventDoesNotFillIt(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	photos := filepath.Join(root, "Photos")
+	if err := os.MkdirAll(photos, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := newRecorder()
+	rec.listing["Photos"] = []cfapi.PlaceholderInfo{ph("a.jpg", false, "e-a", "fa")}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.handleChange(photos)
+	time.Sleep(200 * time.Millisecond)
+
+	rec.mu.Lock()
+	listed := rec.listCalls["Photos"]
+	rec.mu.Unlock()
+	if listed != 0 || len(f.filledDirs()) != 0 {
+		t.Errorf("listed %d time(s), marked %v: an unpinned folder was filled in", listed, f.filledDirs())
 	}
 }

@@ -1484,13 +1484,18 @@ func fetchPlaceholdersCallback(info, params uintptr) uintptr {
 		defer close(syncDone)
 		items := p.list(rel)
 		dbg("FETCH_PLACEHOLDERS rel=%q -> %d entries", rel, len(items))
-		cfTransferPlaceholders(connKey, transferKey, filepath.Join(p.path, filepath.FromSlash(rel)), items)
+		dir := filepath.Join(p.path, filepath.FromSlash(rel))
+		ok := cfTransferPlaceholders(connKey, transferKey, dir, items)
 		// Deliberately NOT marked in-sync here. Marking the directory while the
 		// enumeration that triggered this fetch is still in flight makes that
 		// enumeration return EMPTY (measured on the live driver — the first
 		// attempt at Deck #576 did exactly this and TestStateBitsAcrossLifecycle
-		// caught it). SweepDirsInSync gives populated directories their in-sync
-		// state later, once they have been quiet for a while.
+		// caught it). It is marked a minute later instead; SweepDirsInSync
+		// still covers anything that timer misses (a disconnect in between).
+		// The root is never marked, as in the sweep.
+		if ok && items != nil && rel != "" {
+			settleLater(connKey, dir)
+		}
 	}()
 	if experimentSyncFetch {
 		<-syncDone // EXPERIMENT: complete before the callback returns
@@ -2061,33 +2066,65 @@ func SweepDirsInSync(root string, quiesce time.Duration) int {
 		if err != nil || !d.IsDir() || path == root {
 			return nil
 		}
-		attrs, tag, ferr := findAttrTag(path)
-		if ferr != nil {
-			return nil
-		}
-		r1, _, _ := procCfGetPlaceholderStateFromAttrTag.Call(uintptr(attrs), uintptr(tag))
-		state := uint32(r1)
-		if state == cfPlaceholderStateInvalid {
-			return nil
-		}
-		if state&cfPlaceholderStatePlaceholder == 0 || state&cfPlaceholderStateInSync != 0 {
-			return nil // not ours, or already correct
-		}
-		if state&cfPlaceholderStatePartial != 0 {
-			return nil // not (successfully) populated yet — marking would freeze it empty
-		}
 		if info, ierr := d.Info(); ierr == nil && info.ModTime().After(cutoff) {
 			return nil // recently active; let it settle until the next sweep
 		}
-		if merr := MarkInSync(path, nil); merr == nil {
-			ShellNotifyUpdated(path) // redraw the folder glyph without a manual refresh
+		if settleDir(path) {
 			marked++
-		} else {
-			dbg("SweepDirsInSync %q: %v", path, merr)
 		}
 		return nil
 	})
 	return marked
+}
+
+// settleDir gives one populated, not-yet-in-sync directory placeholder its
+// in-sync state and redraws it. Returns true when it marked it. Everything
+// that is not exactly that — a plain directory, one already in sync, one whose
+// population never completed (PARTIAL: marking it would freeze it empty) — is
+// left alone. Timing is the caller's job: see SweepDirsInSync and settleLater.
+func settleDir(path string) bool {
+	attrs, tag, ferr := findAttrTag(path)
+	if ferr != nil || attrs&fileAttrDirectory == 0 {
+		return false
+	}
+	r1, _, _ := procCfGetPlaceholderStateFromAttrTag.Call(uintptr(attrs), uintptr(tag))
+	state := uint32(r1)
+	if state == cfPlaceholderStateInvalid {
+		return false
+	}
+	if state&cfPlaceholderStatePlaceholder == 0 || state&cfPlaceholderStateInSync != 0 {
+		return false // not ours, or already correct
+	}
+	if state&cfPlaceholderStatePartial != 0 {
+		return false // not (successfully) populated yet — marking would freeze it empty
+	}
+	if merr := MarkInSync(path, nil); merr != nil {
+		dbg("settleDir %q: %v", path, merr)
+		return false
+	}
+	ShellNotifyUpdated(path) // redraw the folder glyph without a manual refresh
+	return true
+}
+
+// dirSettleDelay is how long after the shell populates a directory we give it
+// its in-sync state. Marking it inside the transfer poisons the enumeration
+// that asked for it (see fetchPlaceholdersCallback), and that enumeration is
+// done in well under a second once the transfer lands; a minute leaves a wide
+// margin. Waiting for SweepDirsInSync instead left every folder the user
+// opened wearing the "sync pending" arrows for up to six hours (GitHub #17).
+// A var so a test need not sleep through it.
+var dirSettleDelay = time.Minute
+
+// settleLater marks dir in sync dirSettleDelay from now, if the provider that
+// populated it is still connected then. A directory the shell re-asks about
+// only gets another timer, and settleDir is a no-op on one already marked.
+func settleLater(connKey int64, dir string) {
+	time.AfterFunc(dirSettleDelay, func() {
+		if _, ok := providers.Load(connKey); !ok {
+			return // disconnected: the next mount's SweepDirsInSync catches it
+		}
+		settleDir(dir)
+	})
 }
 
 // SettlePin completes a pending free-up-space request on one FILE: Explorer's
@@ -2646,6 +2683,51 @@ func DirPopulated(path string) (bool, error) {
 	}
 	return attrs&fileAttrRecallOnDataAccess == 0, nil
 }
+
+// CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION is 0x10 (cfapi.h 10.0.26100).
+// Not 0x20: that is REMOVE_FILE_IDENTITY, which is refused on a directory
+// with 0x8007017C and once led us to believe this call only works inside the
+// population callback. It works from anywhere (measured 2026-09-25).
+const cfUpdateFlagDisableOnDemandPopulation = 0x00000010
+
+// MarkDirPopulated records that the provider has itself created every child of
+// a directory placeholder, the way a FETCH_PLACEHOLDERS transfer would have:
+// the directory stops being "not fetched yet" (RECALL_ON_DATA_ACCESS and
+// PARTIAL clear, so the shell never asks for it) and is marked in sync, which
+// is what takes the "sync pending" arrows off it. Nothing is enumerating it on
+// our behalf, so there is no pending enumeration for the in-sync bit to
+// poison. Measured on the live driver: it works outside the callback, the
+// bits survive a child being created or hydrated afterwards, and children
+// created in a pinned directory inherit the pin.
+//
+// Call it only once every child is in place. The flag is permanent: a
+// directory marked with entries missing is never asked for them again, and
+// only reconcile's listing would bring them in.
+func MarkDirPopulated(path string) error {
+	h, err := openForCloud(path)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	var usn int64
+	hr, _, _ := procCfUpdatePlaceholder.Call(
+		uintptr(h),
+		0,    // FsMetadata (unchanged)
+		0, 0, // identity (unchanged)
+		0, 0, // no dehydrate ranges
+		uintptr(cfUpdateFlagDisableOnDemandPopulation|cfUpdateFlagMarkInSync),
+		uintptr(unsafe.Pointer(&usn)),
+		0, // Overlapped
+	)
+	if int32(hr) < 0 {
+		return fmt.Errorf("CfUpdatePlaceholder(populated): 0x%08x", uint32(hr))
+	}
+	return nil
+}
+
+// Pinned reports whether path carries the user's "always keep on this device"
+// preference. Attributes only, like PinStateOf.
+func Pinned(path string) bool { return PinStateOf(path) == "pinned" }
 
 // HydrateIfPinned completes the pin contract for one file: Explorer's own
 // verb hydrates as it pins, but Nimbo's context-menu entry and pins applied
