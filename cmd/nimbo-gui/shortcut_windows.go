@@ -99,7 +99,10 @@ func utf16Arg(s string) (uintptr, error) {
 	return uintptr(unsafe.Pointer(p)), nil
 }
 
-// shortcutsDir is the Start-menu folder holding the per-app shortcuts.
+// shortcutsDir is the Start-menu folder holding the per-app shortcuts. Its
+// name must match the manifest's virtualization:ExcludedDirectory (patched by
+// build-partner.ps1 for white-label builds), or a packaged install writes the
+// shortcuts into its private AppData copy and Start never shows them.
 func shortcutsDir() string {
 	appData := os.Getenv("APPDATA")
 	if appData == "" {

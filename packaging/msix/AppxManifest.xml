@@ -10,7 +10,8 @@
     xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
     xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
     xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3"
-    IgnorableNamespaces="uap uap3 rescap com com3 desktop desktop3 desktop4 desktop5">
+    xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
+    IgnorableNamespaces="uap uap3 rescap com com3 desktop desktop3 desktop4 desktop5 virtualization">
 
   <!-- Name + Publisher must match the signing certificate's subject (CN=Nimbo Dev). -->
   <Identity Name="Nimbo" Publisher="CN=Nimbo Dev" Version="0.1.0.0" ProcessorArchitecture="x64" />
@@ -19,6 +20,19 @@
     <DisplayName>Nimbo</DisplayName>
     <PublisherDisplayName>Otherworld</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
+    <!-- The Start-menu folder for app-window shortcuts (shortcutsDir() in
+         cmd/nimbo-gui/shortcut_windows.go) must be the REAL folder, not the
+         package's private copy. A folder a packaged app creates directly under
+         Start Menu\Programs is otherwise redirected into
+         Packages\<PFN>\LocalCache\Roaming, where Nimbo sees its shortcuts and
+         Start never does (GitHub #16). Needs the unvirtualizedResources
+         capability. The name is "<brand name> Apps", so build-partner.ps1
+         patches it for white-label builds. -->
+    <virtualization:FileSystemWriteVirtualization>
+      <virtualization:ExcludedDirectories>
+        <virtualization:ExcludedDirectory>$(KnownFolder:Programs)\Nimbo Apps</virtualization:ExcludedDirectory>
+      </virtualization:ExcludedDirectories>
+    </virtualization:FileSystemWriteVirtualization>
   </Properties>
 
   <Dependencies>
@@ -32,6 +46,8 @@
 
   <Capabilities>
     <rescap:Capability Name="runFullTrust" />
+    <!-- Only for the Start-menu folder excluded under Properties. -->
+    <rescap:Capability Name="unvirtualizedResources" />
   </Capabilities>
 
   <Applications>
