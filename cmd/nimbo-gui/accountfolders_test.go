@@ -259,3 +259,30 @@ func TestSetupPendingEndsOnce(t *testing.T) {
 		t.Fatal("still pending after it ended")
 	}
 }
+
+// A folder setup records before asking whether to keep the files already in
+// it is only provisional: cancelling that question, or closing setup on it,
+// must put back the folder the account had before, so skipping afterwards
+// still uses the default instead of leaving the account with nothing mounted.
+// The previous setup is handed back exactly once.
+func TestSetupFolderHandedBackOnce(t *testing.T) {
+	a := &App{}
+	if _, ok := a.takeSetupFolder("acct"); ok {
+		t.Fatal("a folder held before any setup asked")
+	}
+	a.holdSetupFolder("acct", setupFolder{baseDir: `C:\Old`, root: `C:\Old`})
+	got, ok := a.takeSetupFolder("acct")
+	if !ok || got.baseDir != `C:\Old` || got.root != `C:\Old` {
+		t.Fatalf("got %+v, %v; want the held folder", got, ok)
+	}
+	if _, ok := a.takeSetupFolder("acct"); ok {
+		t.Fatal("handed back twice")
+	}
+	a.holdSetupFolder("acct", setupFolder{})
+	if _, ok := a.takeSetupFolder("other"); ok {
+		t.Fatal("another account's folder handed back")
+	}
+	if got, ok := a.takeSetupFolder("acct"); !ok || got.baseDir != "" {
+		t.Fatalf("an empty previous folder must still be handed back: %+v, %v", got, ok)
+	}
+}

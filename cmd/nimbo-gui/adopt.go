@@ -145,6 +145,9 @@ func (a *App) adoptAndSwitch() string {
 	}
 	pending := a.pendingAdopt
 	a.pendingAdopt = nil
+	// Keeping the files is agreed, so a folder setup recorded for this is now
+	// chosen for good.
+	a.takeSetupFolder(a.eng.Account.ID)
 	// This switch was scanned afresh, so an older resume record describes a
 	// folder state that no longer exists; the new plan records its own.
 	clearAdoptResume(a.eng.Account.ID)

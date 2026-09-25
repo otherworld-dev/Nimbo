@@ -94,6 +94,9 @@ type App struct {
 	// mountRefused is why the last account-folder mount was refused (it overlaps
 	// another account's folder), so a mode switch can say so; "" otherwise.
 	mountRefused string
+	// setupPrev holds an account's folder setup while its setup asks whether
+	// to keep the files in a folder it recorded provisionally (guarded by setupMu).
+	setupPrev map[string]setupFolder
 	// leftoversSwept: the once-per-launch clean-up of leftover roots has run.
 	leftoversSwept atomic.Bool
 	preMountAdopt *adoptPending
@@ -912,6 +915,11 @@ func (a *App) SetSyncMode(mode string) string {
 			a.adoptScanCancel()
 		}
 		a.adoptScanMu.Unlock()
+		// Setup asked about a folder it had recorded provisionally; the answer
+		// is no, so the account goes back to the folder it had before.
+		if a.eng != nil {
+			a.restoreSetupFolder(a.eng)
+		}
 		return ""
 	case "badges-enable":
 		// One UAC consent registers the Explorer corner badges — the piece an
@@ -5198,6 +5206,9 @@ func (a *App) setupClosed() {
 	if eng == nil || !a.endSetup(eng.Account.ID) {
 		return
 	}
+	// Closed while asking whether to keep a folder's files: that folder was
+	// never chosen.
+	a.restoreSetupFolder(eng)
 	if a.GetSyncMode() != "ondemand" || eng.StoredBaseDir() != "" {
 		return
 	}
@@ -5289,10 +5300,14 @@ func (a *App) completeSetup(localDir, mode string) string {
 			return "virtual files aren't supported on this system"
 		}
 		// The account folder becomes the single whole-account virtual-files
-		// mount; SetSyncMode("ondemand") mounts it.
+		// mount; SetSyncMode("ondemand") mounts it. The scan below reads it
+		// from the account, so it is recorded now, and put back if setup ends
+		// without the switch.
+		prev := setupFolder{baseDir: a.eng.StoredBaseDir(), root: a.eng.OnDemandRoot()}
 		if err := a.eng.SetBaseDir(localDir); err != nil {
 			return err.Error()
 		}
+		a.holdSetupFolder(a.eng.Account.ID, prev)
 		// A folder that already holds files (e.g. the official client's old
 		// sync folder) gets the adopt flow here too, not just in Settings: the
 		// summary JSON goes back to the setup UI, which shows the same confirm
@@ -5302,13 +5317,15 @@ func (a *App) completeSetup(localDir, mode string) string {
 		var sum adoptSummary
 		if json.Unmarshal([]byte(raw), &sum) == nil {
 			if sum.Error != "" && !folderEmpty(localDir) {
+				a.restoreSetupFolder(a.eng)
 				return sum.Error
 			}
 			if sum.Keep+sum.Conflict+sum.Upload+sum.Replace > 0 {
-				return raw
+				return raw // the folder stays provisional until this is answered
 			}
 		}
 		a.pendingAdopt = nil
+		a.takeSetupFolder(a.eng.Account.ID) // switching now: the folder is chosen
 		return a.SetSyncMode("ondemand")
 	default:
 		return "unknown setup mode"
