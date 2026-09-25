@@ -720,11 +720,12 @@
   .moremenu .quit { color: #c0392b; }
   .moremenu .quit:hover { background: #fdeceb; border-color: #f0c0bb; }
   /* Account rows in the ⋯ menu: full-width, name left + live status right. */
-  .moremenu .acctitem { flex: 1 1 100%; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; text-align: left; }
+  /* A status too long to sit beside the name wraps onto its own line below it. */
+  .moremenu .acctitem { flex: 1 1 100%; min-width: 0; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 8px; text-align: left; }
   .moremenu .acctitem.cur { font-weight: 600; cursor: default; }
-  .moremenu .acctmain { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .moremenu .acctmain { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .moremenu .accthost { color: var(--muted, #888); font-weight: 400; }
-  .moremenu .acctstat { color: var(--muted, #888); font-size: 11px; white-space: nowrap; max-width: 40%; overflow: hidden; text-overflow: ellipsis; }
+  .moremenu .acctstat { color: var(--muted, #888); font-size: 11px; min-width: 0; overflow-wrap: anywhere; }
   .accterror { margin-top: 8px; padding: 6px 10px; border: 1px solid #e6b8b2; border-radius: 6px;
                color: #c0392b; font-size: 12px; }
   .search { padding: 8px 16px 4px; position: relative; }
