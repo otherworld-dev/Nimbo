@@ -5,8 +5,81 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- In on-demand mode, opening a document in Word or LibreOffice now locks it on the
+  server the way live mode does, and a downloaded document a colleague has locked
+  opens read-only with their name on it (#7).
+- Hovering the tray icon shows what Nimbo is doing ("Syncing…", "Up to date",
+  "Paused"), and the icon now has a name in Windows' taskbar settings so it can be
+  set to always show (#9).
+- While signed out, the flyout can check for updates and turn on beta releases, and
+  the tray menu can check for updates too. Before, the only way to update without
+  an account was to download the new version from GitHub (#11).
+- A crash now leaves a crash.log beside nimbo.log, and it is included in the
+  problem report.
+
 ### Fixed
 
+- Two accounts can no longer sync the same folder. A second account was offered the
+  first account's folder, and each then uploaded the other's files to its own
+  server. Every account now has a folder of its own, and an install already set up
+  that way holds the shared folder back, with a notification, until one of the
+  accounts is given a different folder (#11).
+- Adding an account in on-demand mode no longer turns the other accounts' folders
+  into plain copies, and signing out of or removing an account only disconnects
+  that account's folder (#11).
+- Leftover Nimbo entries in the Explorer sidebar, from accounts that were switched,
+  removed or moved, are cleared up at launch. A synced folder that has been renamed
+  or moved is now waited for instead of being created again empty, and a folder on
+  a drive that isn't connected is waited for however long it takes (#10).
+- The "Show Nimbo in the Explorer sidebar" setting now works in on-demand mode, the
+  entry stayed whatever the box said (#7).
+- A colleague opening or closing a document no longer makes everyone else download
+  it again, or turns an edit made while it was locked into a conflicted copy.
+  Locking a file changes its tag on the server without changing its content, and
+  both modes now tell the two apart (#7).
+- A document open when Nimbo quits, updates or Windows shuts down is now unlocked,
+  it used to stay locked for everyone until Nimbo next started. It is locked again
+  when Nimbo starts if it is still open, and an unlock that fails is retried every
+  30 seconds. Opening one document also sends one lock rather than several, which
+  could leave it locked after it was closed.
+- Pausing, including "pause for" and quiet hours, now works in on-demand mode.
+  Uploads and "Always keep on this device" downloads used to carry on while the app
+  said it was paused. Opening a file still downloads it.
+- With more than one account, pausing and quiet hours now reach every account
+  rather than only the one shown.
+- Closing the sign-in window on a fresh install no longer leaves an empty flyout and
+  a tray menu that does nothing, both now offer Sign in and Quit (#12).
+- An app password the server refuses at launch now asks you to sign in again,
+  instead of showing "Can't reach your server" and trying again every 15 seconds
+  (#12).
+- An Outlook .pst or .ost file is held from the start while Outlook has it open, and
+  uploaded once when Outlook lets go of it. Outlook writes to it in bursts that fell
+  between uploads, so the whole file was sent again after each one. The flyout
+  lists it as waiting rather than as a failed upload.
+- Two uploads of the same file no longer run at the same time. They shared one
+  upload session on the server and failed with "Chunks on server do not sum up".
+- Keep mine and Keep server on a conflict now sync the file with progress and
+  retries, instead of doing the whole transfer inside the click with any error only
+  in the log. Checking a conflict also uses the server's checksum rather than
+  downloading the server copy on every pass.
+- Clicking the "Sync conflict" notification opens the Conflicts tab, and the
+  "File in use" notification's link works.
+- Uploads keep the file's own modified date. The server stamped each file with the
+  time it arrived, so other computers downloaded it with the wrong date.
+- Switching a live folder to on-demand no longer lists the whole server again when
+  the existing sync already knows the folders, and a switch interrupted by closing
+  the app finishes its remaining files the next time it starts.
+- In on-demand mode, a kept-on-this-device file whose download stalls is retried
+  after 90 seconds instead of waiting for good, and a failed download is reported
+  once in the activity feed rather than twice.
+- A folder with a name the server doesn't allow (such as .htaccess) is now blocked
+  like a file would be. Live mode uploaded the folder under a changed name while the
+  files inside it still went up under the original one.
+- In on-demand mode, a file whose name the server doesn't allow is no longer
+  uploaded over a file that already carries its renamed form, and a failed download
+  of such a file no longer stays in the Status window after it has synced.
 - An account change saved at the same moment as another one (signing in, removing
   an account, changing the default) is no longer lost. Each change read the whole
   account list, edited its own copy and wrote it back, so whichever finished second
