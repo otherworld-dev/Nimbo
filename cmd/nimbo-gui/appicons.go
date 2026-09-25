@@ -184,40 +184,67 @@ func (a *App) ensureAppIcon(id string, wait bool) {
 		return
 	}
 	migrateOnce.Do(func() { a.migrateAppIcons(filepath.Dir(path)) })
-	marker := path + ".fallback"
-	if _, err := os.Stat(path); err == nil {
-		if _, ferr := os.Stat(marker); ferr != nil {
-			return // cached, and it's the real app icon
-		}
-		// Cached icon is the brand fallback (a past fetch failed) — retry so a
-		// transient server error can't brand-icon the app forever.
+	if realIconCached(path) {
+		return
 	}
 	fetch := func() {
-		if err := ensureAppIconsDir(filepath.Dir(path)); err != nil {
-			return
-		}
-		if err := a.fetchAppIcon(id, path); err != nil {
-			slog.Debug("app icon fetch failed; using brand icon", "app", id, "err", err)
-			// Fallback re-encodes the brand image (shell-safe DIB frames) rather
-			// than copying the raw embedded ico, whose all-PNG frames the shell
-			// icon extractor can't render for .lnk/pin icons.
-			if badge := brandBadge(); badge != nil {
-				if err := writeIcoFromImage(path, badge); err == nil {
-					_ = os.WriteFile(marker, nil, 0o600)
-					return
-				}
-			}
-			_ = os.WriteFile(path, navIconICO, 0o600) // last resort
-			_ = os.WriteFile(marker, nil, 0o600)
-			return
-		}
-		_ = os.Remove(marker) // real icon landed — clear any fallback flag
+		ensureIconFile(path, func(p string) error { return a.fetchAppIcon(id, p) })
 	}
 	if wait {
 		fetch()
 	} else {
 		go fetch()
 	}
+}
+
+// realIconCached reports whether the icon at path exists and is the real app
+// icon. One marked as the brand fallback (a past fetch failed) doesn't count,
+// so a transient server error can't brand-icon the app forever.
+func realIconCached(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	_, err := os.Stat(path + ".fallback")
+	return err != nil
+}
+
+// iconLocks holds one mutex per icon path (path -> *sync.Mutex).
+var iconLocks sync.Map
+
+// ensureIconFile fetches the icon at path, or on failure writes the brand icon
+// there and marks it as the fallback: a shortcut points at the path, so
+// something must exist. Callers for the same path take turns, and a caller
+// that waited finds the icon already there. Opening an app while the icon
+// migration regenerated it ran two fetches at once, and the second rename onto
+// the finished icon ("Access is denied") went down the failure path and wrote
+// the brand icon over the good one (#743).
+func ensureIconFile(path string, fetch func(path string) error) {
+	mu, _ := iconLocks.LoadOrStore(path, new(sync.Mutex))
+	mu.(*sync.Mutex).Lock()
+	defer mu.(*sync.Mutex).Unlock()
+	if realIconCached(path) {
+		return
+	}
+	marker := path + ".fallback"
+	if err := ensureAppIconsDir(filepath.Dir(path)); err != nil {
+		return
+	}
+	if err := fetch(path); err != nil {
+		slog.Debug("app icon fetch failed; using brand icon", "path", path, "err", err)
+		// Fallback re-encodes the brand image (shell-safe DIB frames) rather
+		// than copying the raw embedded ico, whose all-PNG frames the shell
+		// icon extractor can't render for .lnk/pin icons.
+		if badge := brandBadge(); badge != nil {
+			if err := writeIcoFromImage(path, badge); err == nil {
+				_ = os.WriteFile(marker, nil, 0o600)
+				return
+			}
+		}
+		_ = os.WriteFile(path, navIconICO, 0o600) // last resort
+		_ = os.WriteFile(marker, nil, 0o600)
+		return
+	}
+	_ = os.Remove(marker) // real icon landed — clear any fallback flag
 }
 
 // fetchAppIcon downloads the theming PNG for an app and writes a multi-size ICO.
