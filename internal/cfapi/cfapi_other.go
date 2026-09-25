@@ -133,3 +133,15 @@ func NimboShellSyncRoots() []ShellSyncRoot { return nil }
 
 // UnregisterShellSyncRootByID is a no-op on non-Windows platforms.
 func UnregisterShellSyncRootByID(string, string) {}
+
+// UnregisterShellSyncRoot is a no-op on non-Windows platforms.
+func UnregisterShellSyncRoot(string) {}
+
+// MarkInSync is unavailable off Windows (no cloud placeholders to mark).
+func MarkInSync(string, []byte) error { return errors.New("on-demand files are Windows-only") }
+
+// SweepDirsInSync marks nothing off Windows (no cloud placeholders).
+func SweepDirsInSync(string, time.Duration) int { return 0 }
+
+// SweepSettlePins settles nothing off Windows (no cloud placeholders).
+func SweepSettlePins(string, time.Duration) int { return 0 }
