@@ -3298,6 +3298,37 @@ type LockDTO struct {
 	OwnerType int    `json:"ownerType"` // 0 manual, 1 an app (Text/Office), 2 token
 	Since     string `json:"since"`     // RFC3339; empty when the server gave no time
 	Account   string `json:"account"`   // login name of the account it belongs to
+	LocalDir  string `json:"localDir"`  // the sync folder it is listed under, for UnlockStaleLock
+	CanUnlock bool   `json:"canUnlock"` // a stale lock on a file this account owns (#733)
+}
+
+// UnlockStaleLock clears another person's stale lock on a file the account
+// owns: the In use list's Unlock button (#733). account, localDir and path are
+// the LockDTO's. Returns "" on success or a message for the UI.
+func (a *App) UnlockStaleLock(account, localDir, path string) string {
+	eng := a.engineForLogin(account)
+	if eng == nil {
+		return "That account is not signed in."
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	if err := eng.UnlockStale(ctx, localDir, path); err != nil {
+		return "Could not unlock " + filepath.Base(filepath.FromSlash(path)) + ": " + err.Error()
+	}
+	return ""
+}
+
+// engineForLogin finds the shown or background account with this login name.
+func (a *App) engineForLogin(login string) *agent.Engine {
+	if a.eng != nil && a.eng.Account.LoginName == login {
+		return a.eng
+	}
+	for _, se := range a.secondaries {
+		if se.eng != nil && se.eng.Account.LoginName == login {
+			return se.eng
+		}
+	}
+	return nil
 }
 
 // Diagnostics returns Nimbo's current health (no network calls) for the UI.
@@ -3337,6 +3368,7 @@ func (a *App) Diagnostics() DiagnosticsDTO {
 		if eng == nil {
 			return
 		}
+		now := time.Now()
 		for _, f := range eng.LockedFiles() {
 			var since string
 			if !f.Since.IsZero() {
@@ -3345,6 +3377,7 @@ func (a *App) Diagnostics() DiagnosticsDTO {
 			dto.ObservedLocks = append(dto.ObservedLocks, LockDTO{
 				Path: f.Path, Owner: f.Who(), Summary: f.Summary(), OwnerType: int(f.OwnerType),
 				Since: since, Account: eng.Account.LoginName,
+				LocalDir: f.LocalDir, CanUnlock: f.CanUnlock(eng.Account.LoginName, now),
 			})
 		}
 	}

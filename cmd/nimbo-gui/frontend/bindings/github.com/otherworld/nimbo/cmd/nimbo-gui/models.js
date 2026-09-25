@@ -1310,6 +1310,22 @@ export class LockDTO {
              */
             this["account"] = "";
         }
+        if (!("localDir" in $$source)) {
+            /**
+             * the sync folder it is listed under, for UnlockStaleLock
+             * @member
+             * @type {string}
+             */
+            this["localDir"] = "";
+        }
+        if (!("canUnlock" in $$source)) {
+            /**
+             * a stale lock on a file this account owns (#733)
+             * @member
+             * @type {boolean}
+             */
+            this["canUnlock"] = false;
+        }
 
         Object.assign(this, $$source);
     }

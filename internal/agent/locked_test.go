@@ -97,7 +97,7 @@ func TestLockedIgnoresUnknownEntries(t *testing.T) {
 	// remote carries the path, but replayed from the baseline: LockKnown false.
 	examined, locked := lockScan(map[string]engine.RemoteState{
 		"a.xlsx": {Path: "a.xlsx", LockKnown: false},
-	}, "me", "d")
+	}, "me", "d", "")
 	if len(examined) != 0 || len(locked) != 0 {
 		t.Fatalf("a replayed entry must not count as examined: examined=%v locked=%v", examined, locked)
 	}
@@ -109,7 +109,7 @@ func TestLockedIgnoresUnknownEntries(t *testing.T) {
 	// The same path from a real listing, now unlocked, DOES clear it.
 	examined, locked = lockScan(map[string]engine.RemoteState{
 		"a.xlsx": {Path: "a.xlsx", LockKnown: true},
-	}, "me", "d")
+	}, "me", "d", "")
 	e.reconcileLocked("d", examined, locked)
 	if n := len(e.locked["d"]); n != 0 {
 		t.Fatalf("a listed, unlocked path did not clear the lock: %d, want 0", n)
@@ -123,7 +123,7 @@ func TestLockScanIgnoresOwnLock(t *testing.T) {
 		"theirs.xlsx": {Path: "theirs.xlsx", LockKnown: true, Lock: &transport.LockInfo{Owner: "bob"}},
 		"adir":        {Path: "adir", IsDir: true, LockKnown: true, Lock: &transport.LockInfo{Owner: "bob"}},
 	}
-	examined, locked := lockScan(remote, "me", "d")
+	examined, locked := lockScan(remote, "me", "d", "")
 	if len(locked) != 1 || locked[0].Path != "theirs.xlsx" {
 		t.Fatalf("locked = %+v, want only theirs.xlsx", locked)
 	}

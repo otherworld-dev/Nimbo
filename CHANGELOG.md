@@ -23,6 +23,11 @@ All notable changes to Nimbo are recorded here. The format follows
   for changes every 30 seconds in the meantime (#13).
 - Help pages at nimbosync.com/help, linked from a Help item in the tray menu and
   from Settings, and Report a problem now opens the bug report form directly.
+- A lock someone else has left on one of your own files can now be cleared from
+  Sync status → In use. The Unlock button only shows for a person's lock that has
+  been there for over an hour, and Nimbo checks it is still the same lock before
+  clearing it. This helps on hosted servers where occ isn't available and the
+  official client has left a lock behind (#7).
 
 ### Changed
 

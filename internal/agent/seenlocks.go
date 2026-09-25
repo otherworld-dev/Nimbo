@@ -27,6 +27,7 @@ func (e *Engine) saveSeenLocksLocked() {
 				LocalDir: dir, Path: f.Path,
 				Owner: f.Owner, OwnerDisplay: f.OwnerDisplay, AppName: f.AppName,
 				OwnerType: int(f.OwnerType), Since: f.Since,
+				RemotePath: f.RemotePath, FileOwner: f.FileOwner,
 			})
 		}
 	}
@@ -63,6 +64,7 @@ func (e *Engine) restoreSeenLocks() {
 			Path: s.Path, LocalDir: s.LocalDir,
 			Owner: s.Owner, OwnerDisplay: s.OwnerDisplay, AppName: s.AppName,
 			OwnerType: transport.LockOwnerType(s.OwnerType), Since: s.Since,
+			RemotePath: s.RemotePath, FileOwner: s.FileOwner,
 		})
 		n++
 	}

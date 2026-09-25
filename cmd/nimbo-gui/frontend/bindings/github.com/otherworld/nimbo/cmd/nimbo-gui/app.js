@@ -1471,6 +1471,19 @@ export function TrashList() {
 }
 
 /**
+ * UnlockStaleLock clears another person's stale lock on a file the account
+ * owns: the In use list's Unlock button (#733). account, localDir and path are
+ * the LockDTO's. Returns "" on success or a message for the UI.
+ * @param {string} account
+ * @param {string} localDir
+ * @param {string} path
+ * @returns {$CancellablePromise<string>}
+ */
+export function UnlockStaleLock(account, localDir, path) {
+    return $Call.ByID(228820321, account, localDir, path);
+}
+
+/**
  * @param {string} id
  * @returns {$CancellablePromise<void>}
  */

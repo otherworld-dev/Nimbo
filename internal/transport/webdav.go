@@ -86,6 +86,10 @@ type LockInfo struct {
 	Token        string        // nc:lock-token
 	Since        time.Time     // nc:lock-time (epoch seconds)
 	Timeout      time.Duration // nc:lock-timeout; zero means the server set no expiry
+	// FileOwner is oc:owner-id, the user who owns the FILE (not the lock). The
+	// owner can clear anyone's lock on it, which is how a stale lock left by
+	// another client gets cleared without an admin (#733). Empty when unknown.
+	FileOwner string
 }
 
 // AppName is the editor holding an app lock, as a human would say it. Empty for
@@ -230,6 +234,7 @@ const entryProps = `    <d:getetag/>
     <nc:lock-timeout/>
     <nc:lock-token/>
     <nc:upload_time/>
+    <oc:owner-id/>
 `
 
 // propfindBody requests exactly the properties Entry exposes.
@@ -286,6 +291,7 @@ type davProp struct {
 	LockTimeout      string `xml:"lock-timeout"`
 	LockToken        string `xml:"lock-token"`
 	UploadTime       string `xml:"upload_time"`
+	OwnerID          string `xml:"owner-id"` // oc:owner-id, the file's owner
 	// Trashbin properties (nc namespace; only populated for trashbin PROPFINDs).
 	TrashFilename string `xml:"trashbin-filename"`
 	TrashOrigLoc  string `xml:"trashbin-original-location"`
@@ -462,6 +468,7 @@ func (c *Client) parseResponse(r davResponse) (Entry, bool, error) {
 			OwnerDisplay: strings.TrimSpace(prop.LockOwnerDisplay),
 			OwnerEditor:  strings.TrimSpace(prop.LockOwnerEditor),
 			Token:        strings.TrimSpace(prop.LockToken),
+			FileOwner:    strings.TrimSpace(prop.OwnerID),
 		}
 		if n, err := strconv.Atoi(strings.TrimSpace(prop.LockOwnerType)); err == nil {
 			li.OwnerType = LockOwnerType(n)
@@ -830,7 +837,9 @@ func (c *Client) Lock(ctx context.Context, remotePath string) (LockResult, error
 // Unlock releases a lock WE hold.
 //
 // Only ever call this for a lock in our own registry: releasing somebody else's
-// returns 423 and is not ours to clear. A second UNLOCK of the same path returns
+// returns 423 and is not ours to clear. The one exception is the file's OWNER,
+// who the server lets clear anyone's lock (measured 2026-09-24), and that only
+// through agent.Engine.UnlockStale's checks. A second UNLOCK of the same path returns
 // 412 Precondition Failed — NOT 404 — which simply means the lock is already
 // gone, so it counts as success. The startup sweep hits that routinely, and
 // treating it as an error would log a failure on every boot.
