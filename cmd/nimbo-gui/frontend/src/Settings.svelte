@@ -1471,7 +1471,8 @@ SHA-256: {localTest.fingerprint}</pre>
           <span class="dv">{diag.account || "—"}</span>
           <span class="dk">Real-time push</span>
           <span class="dv">
-            {#if !diag.pushAvailable}<span class="dmuted">not available on this server</span>
+            {#if !diag.pushAvailable}<span class="dmuted">not set up on this server, so {brandName} checks for changes every 30 seconds instead.
+              It needs the Client Push app on the server (restart {brandName} once it is)</span> · <button class="link" onclick={() => App.OpenURL("https://github.com/nextcloud/notify_push#readme")}>Client Push setup</button>
             {:else if diag.pushConnected}<span class="dok">● connected</span>{#if diag.pushUptime} · up {diag.pushUptime}{/if}
             {:else}<span class="dbad">● reconnecting…</span>{/if}
           </span>

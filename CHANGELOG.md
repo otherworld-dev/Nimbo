@@ -18,6 +18,9 @@ All notable changes to Nimbo are recorded here. The format follows
   an account was to download the new version from GitHub (#11).
 - A crash now leaves a crash.log beside nimbo.log, and it is included in the
   problem report.
+- When real-time push isn't available, Settings → Troubleshooting now says it needs
+  the Client Push app on the server, links to its setup notes, and says Nimbo checks
+  for changes every 30 seconds in the meantime (#13).
 
 ### Fixed
 
