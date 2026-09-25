@@ -32,6 +32,10 @@ All notable changes to Nimbo are recorded here. The format follows
 - Adding an account in on-demand mode no longer turns the other accounts' folders
   into plain copies, and signing out of or removing an account only disconnects
   that account's folder (#11).
+- Signing in for the first time in on-demand mode no longer sets up the default
+  folder before the setup screen has asked where your files should go. The folder
+  you choose is the only one set up, and skipping setup still uses the default
+  (#11).
 - Leftover Nimbo entries in the Explorer sidebar, from accounts that were switched,
   removed or moved, are cleared up at launch. A synced folder that has been renamed
   or moved is now waited for instead of being created again empty, and a folder on
