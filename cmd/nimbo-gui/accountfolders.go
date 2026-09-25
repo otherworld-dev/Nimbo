@@ -487,3 +487,46 @@ func (a *App) endSetup(accountID string) bool {
 	delete(a.setupOpen, accountID)
 	return was
 }
+
+// setupFolder is an account's folder setup as it was before setup recorded a
+// folder provisionally.
+type setupFolder struct{ baseDir, root string }
+
+// holdSetupFolder keeps an account's previous folder setup while setup asks
+// whether to keep the files already in the folder it just recorded. The
+// folder is only chosen once that question is answered.
+func (a *App) holdSetupFolder(accountID string, prev setupFolder) {
+	a.setupMu.Lock()
+	defer a.setupMu.Unlock()
+	if a.setupPrev == nil {
+		a.setupPrev = map[string]setupFolder{}
+	}
+	a.setupPrev[accountID] = prev
+}
+
+// takeSetupFolder hands back an account's held previous folder setup once,
+// reporting whether one was held.
+func (a *App) takeSetupFolder(accountID string) (setupFolder, bool) {
+	a.setupMu.Lock()
+	defer a.setupMu.Unlock()
+	prev, ok := a.setupPrev[accountID]
+	delete(a.setupPrev, accountID)
+	return prev, ok
+}
+
+// restoreSetupFolder puts back an account's folder setup from before setup
+// recorded a folder whose files the user never agreed to keep (the question
+// was cancelled, or setup closed on it). Without it a skipped setup found a
+// folder recorded and mounted nothing at all.
+func (a *App) restoreSetupFolder(eng *agent.Engine) {
+	prev, ok := a.takeSetupFolder(eng.Account.ID)
+	if !ok {
+		return
+	}
+	if err := eng.SetBaseDir(prev.baseDir); err != nil {
+		slog.Warn("could not put back the account folder", "err", err)
+		return
+	}
+	_ = eng.SetOnDemandRoot(prev.root)
+	slog.Info("setup's folder not kept; the account's previous folder is back", "account", eng.Account.LoginName, "dir", prev.baseDir)
+}
