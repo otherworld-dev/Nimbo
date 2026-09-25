@@ -3219,6 +3219,17 @@ func (e *Engine) drainWatchers(timeout time.Duration) {
 	}
 }
 
+// closeRun is what Run does as it returns, after its sync passes have
+// drained. The lane goes first: its transfers outlive the pass that planned
+// them, and one still running would finish against the closed state DB (no
+// baseline for what it wrote) and report through a stopped engine's
+// listener. Android stops and restarts the engine in a live process, so it
+// meets this every time; a stopped transfer resumes on the next pass.
+func (e *Engine) closeRun() {
+	e.closeLane()
+	e.closeStoreFinal()
+}
+
 // closeStoreFinal closes the resident store and refuses future opens — after
 // Run exits nothing owns the handle, so a straggling sync pass lazily
 // reopening it would leak the DB until process exit.
@@ -4861,7 +4872,7 @@ func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transf
 	go e.sharesRefreshLoop(ctx) // keeps the shared-folder markers current
 	go e.presenceLoop(ctx)      // keeps the user's Nextcloud presence "online"
 	go e.routeLoop(ctx)         // re-tries the local network address while on public
-	defer e.closeStoreFinal()   // resident baseline cache lives only while running
+	defer e.closeRun()          // lane transfers and the resident baseline cache live only while running
 	// Drop backup entries whose folder is gone. Here, and only here: the config
 	// is quiescent, no watcher exists yet, and a stale entry is otherwise both
 	// permanent and invisible (BackupViews iterates over pairs).
@@ -4904,7 +4915,7 @@ func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transf
 	// auto-pauses daily, so a purge driven from there would strand indefinitely
 	// and the attic would grow without bound.
 	<-ctx.Done()
-	// Wait for in-flight sync passes before the deferred closeStoreFinal
+	// Wait for in-flight sync passes before the deferred closeRun
 	// closes the state DB under them; a Stop-then-Start cycle also can't
 	// overlap two engines' watchers on the same folders and DB this way.
 	e.drainWatchers(30 * time.Second)

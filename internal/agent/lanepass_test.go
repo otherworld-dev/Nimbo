@@ -184,6 +184,35 @@ func TestAQuitMidDownloadLeavesItsFolderToBeScannedAgain(t *testing.T) {
 	}
 }
 
+// Stopping the engine stops its lane. Android stops and restarts the engine
+// in a live process (sign-out, account change, the sync service going away),
+// so a lane that outlived Run finished its download against a closed state
+// DB: the file landed with no baseline, and the dead engine said "Up to
+// date" through the listener it was given.
+func TestStoppingTheEngineStopsItsLaneTransfers(t *testing.T) {
+	f, g, e, p := lanePair(t, "GET", "D/big.bin")
+	f.setNode("D/big.bin", davNode{etag: "e-big", body: bigBody})
+	f.setNode("D", davNode{isDir: true, etag: "e-d2"})
+	f.setNode("", davNode{isDir: true, etag: "e-root2"})
+	var err error
+	returnsSoon(t, "the pass that met the large file", func() { _, err = e.SyncOnce(context.Background(), p) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the large transfer to start", g.hasStarted)
+
+	returnsSoon(t, "the engine stopping", e.closeRun) // what Run does as it returns
+	if !g.wasCancelled() {
+		t.Fatal("the large download was still running after the engine stopped")
+	}
+	if n := e.transferLane().count(); n != 0 {
+		t.Fatalf("%d lane transfers left after the engine stopped, want 0", n)
+	}
+	if _, serr := os.Stat(filepath.Join(p.LocalDir, "D", "big.bin")); !os.IsNotExist(serr) {
+		t.Fatalf("the large file was written after the engine stopped (%v)", serr)
+	}
+}
+
 // The server deletes the folder of a large download mid-transfer: the
 // download is stopped first, then the folder goes, and the pass doesn't hang.
 func TestAFolderDeletedOnTheServerStopsItsLaneDownload(t *testing.T) {
