@@ -58,6 +58,8 @@ type App struct {
 	settingsWin     *application.WebviewWindow
 	loginWin        *application.WebviewWindow
 	loginMu         sync.Mutex         // guards loginCancel
+	setupMu         sync.Mutex         // guards setupOpen
+	setupOpen       map[string]bool    // accounts whose setup is still choosing a folder (GitHub #11)
 	loginCancel     context.CancelFunc // cancels the in-flight login-flow poll (nil when none)
 	shareWin        *application.WebviewWindow
 	sharePath       string
@@ -1135,11 +1137,15 @@ func (a *App) mountAccountOnDemand() {
 		return
 	}
 	if dir == "" {
-		if accountCount() > 1 {
-			// A new account beside others: nothing is mounted until its setup
-			// has chosen a folder. Mounting a guess here left a registration
-			// behind whenever setup chose another folder, and made setup offer
-			// to "keep" files that were only this mount's placeholders.
+		if !mayMountUnchosen(accountCount(), a.setupPending(a.eng.Account.ID)) {
+			// A new account, beside others or just signed in: nothing is
+			// mounted until its setup has chosen a folder. Beside others, a
+			// guess mounted here was left registered when setup chose another
+			// folder, and setup offered to "keep" files that were only this
+			// mount's placeholders. For the first account, choosing another
+			// folder did unregister the guess on the VM, but a reporter was
+			// still left with one beside their chosen folder (GitHub #11), so
+			// no guess is mounted there either.
 			slog.Info("account has no folder yet; waiting for its setup before mounting", "account", a.eng.Account.LoginName)
 			return
 		}
@@ -5064,6 +5070,7 @@ func (a *App) showLogin() {
 	a.loginWin.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) {
 		a.cancelLoginPoll()
 		a.loginWin = nil
+		a.setupClosed()
 	})
 }
 
@@ -5147,13 +5154,17 @@ func (a *App) BeginLogin(server string) string {
 			return
 		}
 		d, cerr := config.Resolve()
+		var acct account.Account
 		if cerr == nil {
-			_, cerr = account.Complete(d.AccountsFile(), creds)
+			acct, cerr = account.Complete(d.AccountsFile(), creds)
 		}
 		if cerr != nil {
 			a.app.Event.Emit("login:error", cerr.Error())
 			return
 		}
+		// The setup screen comes next and chooses the account's folder, so the
+		// start below must not mount a default one ahead of it (GitHub #11).
+		a.beginSetup(acct.ID)
 		// Adding an account while one is already syncing: tear the old engine
 		// down first — the fresh login is now the default account (Complete
 		// sets it) and start() binds to the default.
@@ -5174,6 +5185,27 @@ func (a *App) CloseLogin() {
 		a.loginWin.Close()
 		a.loginWin = nil
 	}
+	a.setupClosed()
+}
+
+// setupClosed ends the shown account's setup when the sign-in window goes. A
+// setup that was skipped or closed without choosing a folder gets the default
+// one, mounted now rather than before setup asked, which keeps what skipping
+// did before (GitHub #11). A completed setup has already ended, and a folder
+// chosen but not yet switched to (an adopt still to confirm) is left alone.
+func (a *App) setupClosed() {
+	eng := a.eng
+	if eng == nil || !a.endSetup(eng.Account.ID) {
+		return
+	}
+	if a.GetSyncMode() != "ondemand" || eng.StoredBaseDir() != "" {
+		return
+	}
+	slog.Info("setup closed without choosing a folder; using the default", "account", eng.Account.LoginName)
+	go func() {
+		a.mountAccountOnDemand()
+		a.syncSidebar()
+	}()
 }
 
 // --- First-run setup (mirrors the official client's final "Add account" step) ---
@@ -5226,6 +5258,16 @@ func (a *App) CompleteSetup(localDir, mode string) string {
 	if a.eng == nil {
 		return "not signed in"
 	}
+	// Captured first: a successful setup restarts the engine under the mode.
+	id := a.eng.Account.ID
+	msg := a.completeSetup(localDir, mode)
+	if msg == "" {
+		a.endSetup(id)
+	}
+	return msg
+}
+
+func (a *App) completeSetup(localDir, mode string) string {
 	if localDir == "" {
 		return "choose a local folder"
 	}
