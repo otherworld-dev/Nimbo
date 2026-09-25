@@ -73,3 +73,33 @@ func contains(hay, needle string) bool {
 	}
 	return false
 }
+
+// Nextcloud's navigation API hands back hrefs and icons that already carry the
+// server's webroot ("/nextcloud/apps/..."), while our own calls pass paths
+// relative to the webroot ("/index.php/..."). Both must land on the same
+// server, once — GitHub #16 was every dock icon at /nextcloud/nextcloud/.
+func TestResolveServerHref(t *testing.T) {
+	cases := []struct {
+		name   string
+		server string
+		href   string
+		want   string
+	}{
+		{"root install, nav href", "https://cloud.example.com", "/apps/files/", "https://cloud.example.com/apps/files/"},
+		{"root install, trailing slash", "https://cloud.example.com/", "/index.php/apps/theming/icon/deck", "https://cloud.example.com/index.php/apps/theming/icon/deck"},
+		{"subpath, nav href carries webroot", "https://example.com/nextcloud", "/nextcloud/index.php/apps/files/", "https://example.com/nextcloud/index.php/apps/files/"},
+		{"subpath, nav icon carries webroot", "https://example.com/nextcloud/", "/nextcloud/apps/files/img/app.svg", "https://example.com/nextcloud/apps/files/img/app.svg"},
+		{"subpath, webroot-relative path", "https://example.com/nextcloud", "/index.php/apps/theming/icon/deck", "https://example.com/nextcloud/index.php/apps/theming/icon/deck"},
+		{"subpath, no leading slash", "https://example.com/nextcloud", "apps/files/", "https://example.com/nextcloud/apps/files/"},
+		{"subpath, webroot is only a name prefix", "https://example.com/nextcloud", "/nextcloudish/x", "https://example.com/nextcloud/nextcloudish/x"},
+		{"subpath, bare webroot", "https://example.com/nextcloud", "/nextcloud", "https://example.com/nextcloud"},
+		{"absolute URL untouched", "https://example.com/nextcloud", "https://other.example.org/a", "https://other.example.org/a"},
+		{"mailto untouched", "https://example.com/nextcloud", "mailto:help@example.com", "mailto:help@example.com"},
+		{"empty", "https://example.com/nextcloud", "", ""},
+	}
+	for _, c := range cases {
+		if got := resolveServerHref(c.server, c.href); got != c.want {
+			t.Errorf("%s: resolveServerHref(%q, %q) = %q, want %q", c.name, c.server, c.href, got, c.want)
+		}
+	}
+}
