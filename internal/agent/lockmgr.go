@@ -549,6 +549,7 @@ func (e *Engine) NoteRemoteLocks(mountDir, remoteRoot string, entries []transpor
 			Path: rel, LocalDir: mountDir,
 			Owner: en.Lock.Owner, OwnerDisplay: en.Lock.OwnerDisplay,
 			AppName: en.Lock.AppName(), OwnerType: en.Lock.OwnerType, Since: en.Lock.Since,
+			RemotePath: strings.Trim(en.Path, "/"), FileOwner: en.Lock.FileOwner,
 		})
 	}
 	if len(examined) == 0 {

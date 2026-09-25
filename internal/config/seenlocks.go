@@ -25,6 +25,8 @@ type SeenLock struct {
 	AppName      string    `json:"appName,omitempty"`
 	OwnerType    int       `json:"ownerType"`
 	Since        time.Time `json:"since,omitempty"`
+	RemotePath   string    `json:"remotePath,omitempty"` // files-root-relative
+	FileOwner    string    `json:"fileOwner,omitempty"`  // oc:owner-id of the file
 }
 
 // SeenLocksFile is the per-account list of other people's locks, scoped like

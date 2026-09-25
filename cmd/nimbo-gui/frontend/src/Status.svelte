@@ -11,7 +11,8 @@
   };
   type Notif = { id: number; app: string; subject: string; message: string; link: string; actions: { label: string }[] };
   type Blocked = { abs: string; path: string; reason: string; ext: string; escapable: boolean; escaping: boolean };
-  type Lock = { path: string; owner: string; summary: string; ownerType: number; since: string; account: string };
+  type Lock = { path: string; owner: string; summary: string; ownerType: number; since: string; account: string;
+                localDir: string; canUnlock: boolean };
   type Trash = { href: string; name: string; originalLocation: string; deletedAt: string; size: number; isDir: boolean };
   // A folder that stopped being shared with the user (or whose storage was
   // unmounted): the local copy was kept and parked, and awaits a decision.
@@ -50,6 +51,19 @@
     const d = (await App.Diagnostics()) as any;
     locks = (d?.observedLocks ?? []) as Lock[];
     lockingAvailable = !!d?.lockingAvailable;
+  }
+  // Clears someone's stale lock on a file you own (#733). Only offered once the
+  // lock is over an hour old; the engine checks it is still that same lock.
+  let unlocking = $state("");
+  const lockKey = (l: Lock) => l.localDir + "|" + l.path;
+  async function unlockStale(l: Lock) {
+    const since = new Date(l.since).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+    if (!confirm(`Unlock "${l.path}"?\n\n${l.owner} has had it locked since ${since}. Only do this if they have finished with it, anything they have not saved yet may end up as a conflicted copy.`)) return;
+    unlocking = lockKey(l);
+    const err = await App.UnlockStaleLock(l.account, l.localDir, l.path);
+    unlocking = "";
+    if (err) alert(err);
+    loadLocks();
   }
   async function loadTrash() { trashBusy = true; trash = (await App.TrashList()) ?? []; trashBusy = false; }
   async function loadDetached() { detached = (await App.DetachedFolders()) ?? []; }
@@ -368,6 +382,12 @@
             {#if l.since}
               <div class="locksub">Open since {new Date(l.since).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</div>
             {/if}
+            {#if l.canUnlock}
+              <div class="btns lockbtns">
+                <button onclick={() => unlockStale(l)} disabled={unlocking === lockKey(l)}
+                        title="You own this file, so you can clear a lock that has been left behind">Unlock</button>
+              </div>
+            {/if}
           </div>
         {/each}
       {/if}
@@ -420,6 +440,7 @@
   .card .title { font-weight: 600; font-size: 13px; }
   .card .desc { color: var(--fg2); font-size: 12px; margin: 4px 0 10px; }
   .locksub { font-size: 11.5px; color: var(--muted); }
+  .lockbtns { margin-top: 8px; }
   .versions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 12px; }
   .ver { border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; background: var(--panel); }
   .ver.newest { border-color: var(--accent); background: var(--tint); }

@@ -143,6 +143,7 @@ func TestParseResponseLock(t *testing.T) {
       <nc:lock-time>1786228737</nc:lock-time>
       <nc:lock-timeout>1800</nc:lock-timeout>
       <nc:lock-token>files_lock/c1339370-96d3-4151-a2a3-5f193a1cd67b</nc:lock-token>
+      <oc:owner-id>alice</oc:owner-id>
     </d:prop></d:propstat>
   </d:response>
   <d:response>
@@ -207,6 +208,10 @@ func TestParseResponseLock(t *testing.T) {
 	}
 	if !locked.Lock.Since.Equal(time.Unix(1786228737, 0)) {
 		t.Errorf("Since = %v, want the epoch-seconds value", locked.Lock.Since)
+	}
+	// Who owns the FILE, not the lock: the owner may clear a stale lock (#733).
+	if locked.Lock.FileOwner != "alice" {
+		t.Errorf("FileOwner = %q, want alice (oc:owner-id)", locked.Lock.FileOwner)
 	}
 
 	// Explicitly unlocked, and "the server never answered", must BOTH be nil: the

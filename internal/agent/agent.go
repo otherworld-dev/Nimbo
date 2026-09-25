@@ -742,6 +742,8 @@ type LockedFile struct {
 	AppName      string // for an app lock, the editor holding it (e.g. "Text"); empty otherwise
 	OwnerType    transport.LockOwnerType
 	Since        time.Time
+	RemotePath   string // files-root-relative, for UNLOCK; empty in entries saved before it was kept
+	FileOwner    string // oc:owner-id of the FILE; the owner may clear a stale lock (#733)
 }
 
 // Who names the lock holder as a human would. An APP lock has no person behind
@@ -915,7 +917,8 @@ func heldStatus(held []string) string {
 // lockScan reads a pass's remote map and returns the paths whose lock state it
 // can vouch for, plus the ones another user holds. Split out of applyPlan so the
 // examined/locked distinction is unit-testable.
-func lockScan(remote map[string]engine.RemoteState, login, localDir string) (map[string]bool, []LockedFile) {
+func lockScan(remote map[string]engine.RemoteState, login, localDir, remoteRoot string) (map[string]bool, []LockedFile) {
+	root := strings.Trim(remoteRoot, "/")
 	examined := make(map[string]bool, len(remote))
 	var locked []LockedFile
 	for rel, r := range remote {
@@ -931,6 +934,7 @@ func lockScan(remote map[string]engine.RemoteState, login, localDir string) (map
 			Owner: r.Lock.Owner, OwnerDisplay: r.Lock.OwnerDisplay,
 			AppName:   r.Lock.AppName(),
 			OwnerType: r.Lock.OwnerType, Since: r.Lock.Since,
+			RemotePath: strings.Trim(path.Join(root, rel), "/"), FileOwner: r.Lock.FileOwner,
 		})
 	}
 	return examined, locked
@@ -3934,7 +3938,7 @@ func (e *Engine) finishAction(p Pair, pk string, remote map[string]engine.Remote
 		// Held, not failed: one neutral "waiting" activity row per wait
 		// instead of a red "failed" one every pass (see noteWaiting).
 		e.noteWaiting(p.LocalDir, abs, a.Path)
-		e.awaitClosed(p, abs) // see inuse.go
+		e.awaitClosed(p, abs)         // see inuse.go
 		return []string{a.Path}, true // still unsent: the folder isn't settled
 	} else if a.Kind == engine.ActUpload && aerr == nil {
 		e.clearBusy(abs)
@@ -4091,7 +4095,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 
 	var heldUploads []string
 	if e.LockingAvailable() {
-		examined, lockedNow := lockScan(remote, e.Account.LoginName, p.LocalDir)
+		examined, lockedNow := lockScan(remote, e.Account.LoginName, p.LocalDir, p.RemoteRoot)
 		e.reconcileLocked(p.LocalDir, examined, lockedNow)
 
 		// Warn the local editor, but ONLY from here — the live sync path. The
@@ -4221,7 +4225,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		Escaper:    e.escaper.Load(),
 		Workers:    4,
 		Policy:     e.policy,
-		OnBegin: func(a engine.Action) { e.beginAction(p, a) },
+		OnBegin:    func(a engine.Action) { e.beginAction(p, a) },
 		OnProgress: func(a engine.Action, delta int64) {
 			e.progBytes.Add(delta)
 		},
