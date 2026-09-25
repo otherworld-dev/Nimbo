@@ -690,8 +690,8 @@
                color: var(--fg); text-align: left; font-size: 13px; }
   .acctstrip.multi { cursor: pointer; }
   .acctstrip.multi:hover, .acctstrip.on { background: var(--tint); border-color: var(--accent); }
-  .asname { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ashost { color: var(--muted); font-weight: 400; }
+  .asname { flex: 1; min-width: 0; font-weight: 600; text-transform: capitalize; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ashost { color: var(--muted); font-weight: 400; text-transform: none; }
   .presence { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
   .tools { flex: 0 0 auto; display: flex; gap: 5px; }
   .tool { width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center;
