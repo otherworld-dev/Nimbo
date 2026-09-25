@@ -124,10 +124,11 @@ All notable changes to Nimbo are recorded here. The format follows
   Explorer. Before, only folders that had already been browsed were reached, and
   new files added on the server to a kept folder waited until the next restart to
   download (#17).
-- Folders in on-demand mode no longer keep the "sync pending" arrows for hours
-  after they have been opened or their files downloaded. A folder is now marked up
-  to date about a minute after it is opened, rather than by a pass that ran every
-  six hours (#17).
+- Folders in on-demand mode no longer show the "sync pending" arrows when there is
+  nothing waiting to sync. Folders that had never been opened kept them for good,
+  and opened folders kept them for up to six hours. Folders now show the cloud
+  until their files are downloaded, and ones set up by an earlier version are put
+  right a couple of minutes after Nimbo starts (#17).
 
 ## [0.1.8] - 2026-09-20
 
