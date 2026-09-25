@@ -449,9 +449,11 @@ func forgetOnDemandRoot(accountID string) {
 // mayMountUnchosen reports whether an account with no folder recorded may be
 // mounted on a folder nobody chose. Only the only account may, as an older
 // install that never recorded its folder, and not while its setup is open: a
-// fresh sign-in mounted the guess before setup asked, and choosing another
-// folder there left the guess registered beside it (GitHub #11). A new account
-// beside others always waits for its setup.
+// fresh sign-in mounted the default before setup asked where the files should
+// go. Choosing another folder there unregistered it on the VM, but a reporter
+// was still left with the default registered beside their chosen folder
+// (GitHub #11, cause not found), so it isn't mounted until setup has run. A new
+// account beside others always waits for its setup.
 func mayMountUnchosen(accounts int, setupPending bool) bool {
 	return accounts <= 1 && !setupPending
 }

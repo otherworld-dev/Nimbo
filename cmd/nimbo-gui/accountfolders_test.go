@@ -217,9 +217,9 @@ func TestAbandonedRoots(t *testing.T) {
 }
 
 // GitHub #11 follow-up: the first account on a fresh install was mounted on a
-// guessed folder before its setup had run, so choosing another folder left the
-// guess registered beside it. Only an account whose setup isn't open, and that
-// is the only one, may be mounted on a folder nobody chose.
+// guessed folder before its setup had run, and a reporter was left with the
+// guess registered beside the folder they chose. Only an account whose setup
+// isn't open, and that is the only one, may be mounted on a folder nobody chose.
 func TestUnchosenMountWaitsForSetup(t *testing.T) {
 	for _, c := range []struct {
 		accounts int

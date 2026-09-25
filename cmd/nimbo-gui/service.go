@@ -1139,10 +1139,13 @@ func (a *App) mountAccountOnDemand() {
 	if dir == "" {
 		if !mayMountUnchosen(accountCount(), a.setupPending(a.eng.Account.ID)) {
 			// A new account, beside others or just signed in: nothing is
-			// mounted until its setup has chosen a folder. Mounting a guess
-			// here left a registration behind whenever setup chose another
-			// folder, and made setup offer to "keep" files that were only this
-			// mount's placeholders.
+			// mounted until its setup has chosen a folder. Beside others, a
+			// guess mounted here was left registered when setup chose another
+			// folder, and setup offered to "keep" files that were only this
+			// mount's placeholders. For the first account, choosing another
+			// folder did unregister the guess on the VM, but a reporter was
+			// still left with one beside their chosen folder (GitHub #11), so
+			// no guess is mounted there either.
 			slog.Info("account has no folder yet; waiting for its setup before mounting", "account", a.eng.Account.LoginName)
 			return
 		}
