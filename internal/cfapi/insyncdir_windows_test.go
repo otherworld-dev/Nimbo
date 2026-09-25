@@ -4,25 +4,32 @@ package cfapi
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
-// TestInSyncDirStillPopulates settles the claim behind Deck #576.
+// TestInSyncDirStillPopulates pins the driver behaviour directory placeholders
+// are built on: a lazy directory that is IN SYNC before anything has opened it
+// still asks the provider to populate it on its first open, gets its
+// children, and stays in sync afterwards. So folders are created in sync
+// (buildPlaceholders), and a folder nobody has opened shows Explorer's cloud
+// rather than the "sync pending" arrows (GitHub #17).
 //
-// buildPlaceholders creates directory placeholders NOT in-sync, and the comment
-// asserts that is what makes the shell issue FETCH_PLACEHOLDERS on first open.
-// The cost of that design is Explorer's Status column showing the "sync
-// pending" arrows on every folder forever.
-//
-// This test asks the driver directly whether the claim is true: create a lazy
-// directory placeholder, force it IN-SYNC before anything enumerates it, then
-// enumerate and see whether the filter still asks the provider to populate it.
-// If the children arrive, in-sync state and population state are independent
-// axes, the not-in-sync design buys nothing, and folders can carry the correct
-// status.
+// This test once asserted the opposite (Deck #576, 2026-08-18) and every
+// folder was created not in sync because of it, arrows and all. Its mistake
+// was listing the folder with os.ReadDir from the test process, which is the
+// provider, and the filter never populates for the provider's own listings
+// whatever the folder's state. Listing from a child process, as Explorer
+// lists from its own, is what drives population. Both kinds of lazy folder
+// are covered: one created by CreatePlaceholders (reconcile's pull) and one
+// created inside a FETCH_PLACEHOLDERS transfer (a subfolder of an opened
+// folder).
 //
 // Live-driver test, opt in with NIMBO_CFAPI_LIVE=1.
 func TestInSyncDirStillPopulates(t *testing.T) {
@@ -38,25 +45,23 @@ func TestInSyncDirStillPopulates(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = Purge(root) })
 
-	var listCalls atomic.Int32
+	var mu sync.Mutex
+	fetches := map[string]int{}
 	list := func(rel string) []PlaceholderInfo {
-		listCalls.Add(1)
-		t.Logf("FETCH_PLACEHOLDERS for %q", rel)
-		if rel == "sub" {
-			return []PlaceholderInfo{
-				{Name: "child.txt", Size: 4, ModTime: time.Now(), Identity: []byte("remote/sub/child.txt")},
-			}
-		}
+		mu.Lock()
+		fetches[rel]++
+		mu.Unlock()
 		// The root must return at least one entry, mirroring production, where
 		// Mount seeds the root's top level eagerly. A root whose transfer
 		// delivers ZERO entries reproduces an infinite FETCH_PLACEHOLDERS storm
-		// for "" (same transferKey re-issued forever, count=0 completions
-		// accepted but ignored) — measured here 2026-08-18, recorded on Deck
-		// #569 as a likely mechanism for the field spin loop.
+		// for "" (measured 2026-08-18, Deck #569).
 		if rel == "" {
 			return []PlaceholderInfo{{Name: "seed.txt", Size: 1, ModTime: time.Now(), Identity: []byte("remote/seed.txt")}}
 		}
-		return []PlaceholderInfo{}
+		return []PlaceholderInfo{
+			{Name: "child.txt", Size: 4, ModTime: time.Now(), Identity: []byte("remote/" + rel + "/child.txt")},
+			{Name: "inner", IsDir: true, ModTime: time.Now(), Identity: []byte("remote/" + rel + "/inner")},
+		}
 	}
 	hydrate := func(identity []byte, offset, length int64) ([]byte, error) {
 		return make([]byte, length), nil
@@ -72,60 +77,73 @@ func TestInSyncDirStillPopulates(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreatePlaceholders: %v", err)
 	}
-	sub := filepath.Join(root, "sub")
 
-	// Force the directory in-sync BEFORE anything enumerates it.
-	if err := MarkInSync(sub, []byte("remote/sub")); err != nil {
-		t.Fatalf("MarkInSync(dir): %v", err)
+	// "sub" comes from CreatePlaceholders; "sub/inner" is created by the
+	// transfer that populates "sub".
+	for _, rel := range []string{"sub", "sub/inner"} {
+		dir := filepath.Join(root, filepath.FromSlash(rel))
+		attrs := placeholderAttrs(t, dir)
+		if s := placeholderStateOf(t, dir); s&cfPlaceholderStateInSync == 0 || attrs&fileAttrRecallOnDataAccess == 0 {
+			t.Fatalf("%s: want a lazy directory created in sync, got attrs=0x%x state=0x%x", rel, attrs, s)
+		}
+		out, err := exec.Command("cmd", "/c", "dir", "/b", dir).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: dir: %v: %s", rel, err, out)
+		}
+		mu.Lock()
+		n := fetches[rel]
+		mu.Unlock()
+		if n == 0 {
+			t.Errorf("%s: the in-sync lazy directory never asked to be populated", rel)
+		}
+		got := map[string]bool{}
+		for _, e := range listNames(t, dir) {
+			got[e] = true
+		}
+		if !got["child.txt"] || !got["inner"] {
+			t.Errorf("%s: after the open it holds %v, want child.txt and inner", rel, got)
+		}
+		if s := placeholderStateOf(t, dir); s&cfPlaceholderStateInSync == 0 {
+			t.Errorf("%s: population cleared the in-sync bit (state=0x%x) - Explorer would show the arrows", rel, s)
+		}
 	}
-	if s := placeholderStateOf(t, sub); s&cfPlaceholderStateInSync == 0 {
-		t.Fatalf("setup failed: dir state=0x%x, in-sync bit not set", s)
-	}
+}
 
-	// Now enumerate it. If population still works, the child appears. Delivery
-	// is asynchronous, so give a genuinely-working population ample time to
-	// land before concluding it never fires.
-	if _, err := os.ReadDir(sub); err != nil {
-		t.Fatalf("ReadDir(sub): %v", err)
+func placeholderAttrs(t *testing.T, path string) uint32 {
+	t.Helper()
+	attrs, _, err := findAttrTag(path)
+	if err != nil {
+		t.Fatalf("findAttrTag(%s): %v", path, err)
+	}
+	return attrs
+}
+
+func listNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", dir, err)
 	}
 	var names []string
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		entries, err := os.ReadDir(sub)
-		if err != nil {
-			t.Fatalf("ReadDir(sub): %v", err)
-		}
-		names = names[:0]
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		if len(names) > 0 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	for _, e := range entries {
+		names = append(names, e.Name())
 	}
-	t.Logf("enumeration returned %v after %d FETCH_PLACEHOLDERS call(s)", names, listCalls.Load())
+	return names
+}
 
-	// MEASURED 2026-08-18 on the live driver: the in-sync directory does NOT
-	// populate — no FETCH_PLACEHOLDERS fires for it and enumeration comes back
-	// empty. Directory in-sync state and population are coupled by the filter,
-	// so the not-in-sync creation design is LOAD-BEARING: dirs must be created
-	// not-in-sync, and may only be marked in-sync AFTER their population has
-	// actually happened (which is when "populated and matches the server" is
-	// true anyway). This assertion pins that driver behaviour; if a future
-	// Windows decouples the two, this failing is worth knowing about.
-	if len(names) != 0 {
-		t.Errorf("driver behaviour changed: an in-sync directory now populates (got %v) — dirs could be created in-sync again", names)
+// clearInSync puts a placeholder back to NOT in sync, the state older versions
+// created every directory in, for tests of what heals them.
+func clearInSync(t *testing.T, path string) {
+	t.Helper()
+	h, err := openForCloud(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
 	}
-	if got := listCalls.Load(); got > 2 { // mount seed + at most one root fetch
-		t.Errorf("driver behaviour changed: %d FETCH_PLACEHOLDERS calls, want <=2 (none may be for the in-sync dir)", got)
-	}
-
-	// And does the filter leave the in-sync bit alone across population?
-	if s := placeholderStateOf(t, sub); s&cfPlaceholderStateInSync == 0 {
-		t.Logf("note: population CLEARED the in-sync bit (state=0x%x) — a post-population re-mark would be needed", s)
-	} else {
-		t.Log("in-sync bit survived population")
+	defer windows.CloseHandle(h)
+	var usn int64
+	hr, _, _ := procCfSetInSyncState.Call(uintptr(h), 0 /* CF_IN_SYNC_STATE_NOT_IN_SYNC */, uintptr(cfSetInSyncFlagNone), uintptr(unsafe.Pointer(&usn)))
+	if int32(hr) < 0 {
+		t.Fatalf("CfSetInSyncState(NOT_IN_SYNC) %s: 0x%08x", path, uint32(hr))
 	}
 }
 

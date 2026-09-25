@@ -114,9 +114,10 @@ func TestMarkDirPopulatedLive(t *testing.T) {
 	}
 }
 
-// TestShellPopulatedDirSettlesLive: a folder the shell populates (another
-// process opens it) is marked in sync once dirSettleDelay has passed, instead
-// of waiting hours for SweepDirsInSync (GitHub #17's lingering arrows).
+// TestShellPopulatedDirSettlesLive: a folder an older version created (not
+// in sync) that the shell then populates (another process opens it) is marked
+// in sync once dirSettleDelay has passed, instead of waiting hours for
+// SweepDirsInSync (GitHub #17's lingering arrows).
 // Live-driver test, opt in with NIMBO_CFAPI_LIVE=1.
 func TestShellPopulatedDirSettlesLive(t *testing.T) {
 	if os.Getenv("NIMBO_CFAPI_LIVE") == "" {
@@ -152,15 +153,13 @@ func TestShellPopulatedDirSettlesLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	opened := filepath.Join(root, "opened")
+	clearInSync(t, opened) // how older versions created every folder
 
 	// This process is the provider, and the filter does not populate for its
 	// own enumerations; a child process's does.
 	out, err := exec.Command("cmd", "/c", "dir", "/b", opened).CombinedOutput()
 	if err != nil {
 		t.Fatalf("dir: %v: %s", err, out)
-	}
-	if _, state := placeholderState(t, opened); state&cfPlaceholderStateInSync != 0 {
-		t.Fatal("marked in sync straight after the transfer - that poisons the enumeration that asked for it")
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {

@@ -790,9 +790,19 @@ func toFiletime(t time.Time) int64 {
 
 // buildPlaceholders turns items into the CF_PLACEHOLDER_CREATE_INFO array that
 // both CfCreatePlaceholders and CfExecute(TRANSFER_PLACEHOLDERS) consume. The
-// returned names/ids slices must be kept alive until the call completes. Entries
-// are marked in-sync only — directories are NOT flagged DisableOnDemandPopulation
-// so opening them triggers their own FETCH_PLACEHOLDERS (lazy population).
+// returned names/ids slices must be kept alive until the call completes. Every
+// entry is created in sync. Directories are NOT flagged
+// DisableOnDemandPopulation, so opening them still triggers their own
+// FETCH_PLACEHOLDERS (lazy population).
+//
+// Directories used to be created NOT in sync, on the belief that an in-sync
+// directory never asks to be populated. That belief came from a test that
+// listed the folder from the provider's own process, which never populates
+// anything whatever its state (TestDirPopulatedReadsTheDirectoryPlaceholderState).
+// Listed from another process, the way Explorer lists it, an in-sync lazy
+// directory populates normally and stays in sync
+// (TestInSyncDirStillPopulates, 2026-09-25). The cost of the old way was the
+// "sync pending" arrows on every folder nobody had opened (GitHub #17).
 func buildPlaceholders(items []PlaceholderInfo) (arr []placeholderCreateInfo, names [][]uint16, ids [][]byte, err error) {
 	arr = make([]placeholderCreateInfo, len(items))
 	names = make([][]uint16, len(items))
@@ -809,9 +819,6 @@ func buildPlaceholders(items []PlaceholderInfo) (arr []placeholderCreateInfo, na
 		flags := uint32(cfPlaceholderCreateFlagMarkInSync)
 		if it.IsDir {
 			attr = fileAttrDirectory
-			// A not-in-sync directory is treated as not-yet-populated, so the
-			// shell issues FETCH_PLACEHOLDERS when it's first opened.
-			flags = cfCreateFlagNone
 		}
 		arr[i] = placeholderCreateInfo{
 			RelativeFileName: &nameW[0],
@@ -1486,13 +1493,10 @@ func fetchPlaceholdersCallback(info, params uintptr) uintptr {
 		dbg("FETCH_PLACEHOLDERS rel=%q -> %d entries", rel, len(items))
 		dir := filepath.Join(p.path, filepath.FromSlash(rel))
 		ok := cfTransferPlaceholders(connKey, transferKey, dir, items)
-		// Deliberately NOT marked in-sync here. Marking the directory while the
-		// enumeration that triggered this fetch is still in flight makes that
-		// enumeration return EMPTY (measured on the live driver — the first
-		// attempt at Deck #576 did exactly this and TestStateBitsAcrossLifecycle
-		// caught it). It is marked a minute later instead; SweepDirsInSync
-		// still covers anything that timer misses (a disconnect in between).
-		// The root is never marked, as in the sweep.
+		// A directory created by an older version is not in sync; mark it a
+		// minute from now (dirSettleDelay). SweepDirsInSync covers anything
+		// that timer misses (a disconnect in between). The root is never
+		// marked, as in the sweep.
 		if ok && items != nil && rel != "" {
 			settleLater(connKey, dir)
 		}
@@ -1860,12 +1864,9 @@ func cfTransferPlaceholders(connKey, transferKey int64, dir string, items []Plac
 		}
 	}
 	// A failed entry leaves the directory partially populated with the shell
-	// re-requesting it, and a directory in that state must NOT be marked
-	// in-sync (an in-sync directory is never asked to populate — see
-	// TestInSyncDirStillPopulates). Nothing does that on this path today, so
-	// say the long-alone failure out loud: it is the one outcome the
-	// per-entry results above cannot show, since such an entry was never in
-	// the array.
+	// re-requesting it. Say the long-alone failure out loud: it is the one
+	// outcome the per-entry results above cannot show, since such an entry
+	// was never in the array.
 	if !longOK {
 		dbg("TRANSFER_PLACEHOLDERS: transfer incomplete: a long-identity entry failed; the shell may re-ask")
 	}
@@ -1954,10 +1955,10 @@ func Inspect(path string) (Change, error) {
 	ch := Change{IsDir: isDir, Placeholder: isPlaceholder, InSync: inSync}
 	switch {
 	case isDir:
-		// Our directory placeholders are deliberately NOT in-sync (that's how
-		// lazy FETCH_PLACEHOLDERS population is triggered), so "not in sync" must
-		// NOT be read as a change. Only a non-placeholder dir is a folder the
-		// user just created and needs MKCOL.
+		// A directory placeholder's in-sync bit says nothing about local
+		// changes (older versions created them all not in sync, and a move
+		// clears it), so "not in sync" must NOT be read as a change. Only a
+		// non-placeholder dir is a folder the user just created and needs MKCOL.
 		ch.NeedsUpload = !isPlaceholder
 	case !isPlaceholder:
 		ch.NeedsUpload = true // never uploaded: all of it is local-only content
@@ -2036,29 +2037,18 @@ func MarkInSync(path string, identity []byte) error {
 // present: for a directory, "not yet populated".
 const cfPlaceholderStatePartial = 0x00000010
 
-// SweepDirsInSync walks an on-demand mount and gives every POPULATED directory
-// its in-sync state, so Explorer stops showing the perpetual "sync pending"
-// arrows on folders. Returns how many directories it marked.
+// SweepDirsInSync walks an on-demand mount and gives every directory
+// placeholder that is not in sync its in-sync state, so Explorer stops showing
+// the "sync pending" arrows on folders. Returns how many directories it
+// marked.
 //
-// Why this is a sweep and not part of population — all measured on the live
-// driver and pinned by tests in this package:
-//   - A directory placeholder cannot be created in-sync: the filter then never
-//     asks it to populate at all, and it enumerates empty forever
-//     (TestInSyncDirStillPopulates).
-//   - It cannot be marked immediately after its population transfer either:
-//     that poisons the very enumeration that triggered the fetch, which then
-//     returns empty once (TestStateBitsAcrossLifecycle caught this).
-//
-// So populated directories are marked LATER, from here. Safety rules:
-//   - Only directories whose PARTIAL bit is clear (population complete —
-//     a failed listing leaves the bit set, so those are skipped and the shell
-//     keeps retrying them).
-//   - Only after quiesce of write inactivity, so a directory whose triggering
-//     enumeration might still be draining is left for the next pass.
-//
-// The sweep also HEALS mounts created before this existed: every directory a
-// user ever opened is populated-but-unmarked on those, permanently, because
-// population never fires twice.
+// Directories are created in sync now (see buildPlaceholders), so this is a
+// HEAL for what older versions left behind: every folder they created was not
+// in sync, opened or not, and nothing else ever marks one that nobody opens.
+// Unopened (lazy) ones are marked too: an in-sync lazy directory still
+// populates when it is first opened (TestInSyncDirStillPopulates). It also
+// catches a directory whose bit a move cleared. Directories written to within
+// quiesce are left for the next pass.
 func SweepDirsInSync(root string, quiesce time.Duration) int {
 	marked := 0
 	cutoff := time.Now().Add(-quiesce)
@@ -2077,11 +2067,10 @@ func SweepDirsInSync(root string, quiesce time.Duration) int {
 	return marked
 }
 
-// settleDir gives one populated, not-yet-in-sync directory placeholder its
-// in-sync state and redraws it. Returns true when it marked it. Everything
-// that is not exactly that — a plain directory, one already in sync, one whose
-// population never completed (PARTIAL: marking it would freeze it empty) — is
-// left alone. Timing is the caller's job: see SweepDirsInSync and settleLater.
+// settleDir gives one not-yet-in-sync directory placeholder its in-sync state
+// and redraws it. Returns true when it marked it. A plain directory, or one
+// already in sync, is left alone. Timing is the caller's job: see
+// SweepDirsInSync and settleLater.
 func settleDir(path string) bool {
 	attrs, tag, ferr := findAttrTag(path)
 	if ferr != nil || attrs&fileAttrDirectory == 0 {
@@ -2095,9 +2084,6 @@ func settleDir(path string) bool {
 	if state&cfPlaceholderStatePlaceholder == 0 || state&cfPlaceholderStateInSync != 0 {
 		return false // not ours, or already correct
 	}
-	if state&cfPlaceholderStatePartial != 0 {
-		return false // not (successfully) populated yet — marking would freeze it empty
-	}
 	if merr := MarkInSync(path, nil); merr != nil {
 		dbg("settleDir %q: %v", path, merr)
 		return false
@@ -2107,12 +2093,14 @@ func settleDir(path string) bool {
 }
 
 // dirSettleDelay is how long after the shell populates a directory we give it
-// its in-sync state. Marking it inside the transfer poisons the enumeration
-// that asked for it (see fetchPlaceholdersCallback), and that enumeration is
-// done in well under a second once the transfer lands; a minute leaves a wide
-// margin. Waiting for SweepDirsInSync instead left every folder the user
-// opened wearing the "sync pending" arrows for up to six hours (GitHub #17).
-// A var so a test need not sleep through it.
+// its in-sync state, when it has not got it already: a folder created by an
+// older version (not in sync) that the user opens now. Waiting for
+// SweepDirsInSync instead left such a folder wearing the "sync pending"
+// arrows for up to six hours (GitHub #17). The minute is a margin, not a
+// measured need: the claim that marking during the transfer spoils the
+// listing came from the same provider-process harness that misread in-sync
+// directories (see buildPlaceholders), and folders now spend their whole
+// population in sync. A var so a test need not sleep through it.
 var dirSettleDelay = time.Minute
 
 // settleLater marks dir in sync dirSettleDelay from now, if the provider that
@@ -2322,10 +2310,7 @@ type placeholderStandardInfo struct {
 var ErrNotPlaceholder = errors.New("not a cloud placeholder")
 
 // ErrIsDirectory reports that a call refused a DIRECTORY placeholder. Only
-// SetInSync returns it: the filter couples a directory's in-sync state to its
-// population, so a directory marked in-sync enumerates EMPTY forever
-// (measured live — TestInSyncDirStillPopulates), which is why ours are
-// created not in sync in the first place.
+// SetInSync returns it (see there).
 var ErrIsDirectory = errors.New("cloud placeholder is a directory")
 
 const (
@@ -2450,11 +2435,11 @@ func SetInSync(path string) error {
 	if err != nil {
 		return err
 	}
-	// A DIRECTORY never gets the bit from here. The filter couples a
-	// directory's in-sync state to its population, so one marked in-sync
-	// enumerates EMPTY forever (TestInSyncDirStillPopulates) — the reason our
-	// directory placeholders are created not in sync at all. Refusing it in
-	// the call means no future caller has to remember.
+	// A DIRECTORY never gets the bit from here. This is the heal for a FILE
+	// whose bit a rename cleared; a directory's bit is set when it is created,
+	// by its repoint after a move, and by SweepDirsInSync. (This refusal used
+	// to rest on the belief that an in-sync directory never populates; it
+	// does, see buildPlaceholders. The call stays file-only regardless.)
 	if attrs&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
 		return ErrIsDirectory
 	}
@@ -2694,9 +2679,9 @@ const cfUpdateFlagDisableOnDemandPopulation = 0x00000010
 // a directory placeholder, the way a FETCH_PLACEHOLDERS transfer would have:
 // the directory stops being "not fetched yet" (RECALL_ON_DATA_ACCESS and
 // PARTIAL clear, so the shell never asks for it) and is marked in sync, which
-// is what takes the "sync pending" arrows off it. Nothing is enumerating it on
-// our behalf, so there is no pending enumeration for the in-sync bit to
-// poison. Measured on the live driver: it works outside the callback, the
+// is what takes the "sync pending" arrows off it (a folder an older version
+// created is not in sync yet). Measured on the live driver: it works outside
+// the callback, the
 // bits survive a child being created or hydrated afterwards, and children
 // created in a pinned directory inherit the pin.
 //

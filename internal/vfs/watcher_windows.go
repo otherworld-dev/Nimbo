@@ -1828,15 +1828,12 @@ func (w *Watcher) handleChange(path string) {
 		// all). Put the bit back; a later repoint on top is harmless. Never on
 		// a file with a pending upload: that bit IS the pending upload.
 		//
-		// DIRECTORIES are excluded, and that exclusion is load-bearing, not
-		// tidiness: our directory placeholders are deliberately left NOT
-		// in-sync because that is what makes the shell ask them to populate,
-		// and a directory marked in-sync enumerates EMPTY forever
-		// (cfapi.TestInSyncDirStillPopulates). Folders get FILE_ACTION_MODIFIED
-		// constantly — a move into one delivers MODIFIED for the destination
-		// FOLDER as well as the file — so this branch sees them often.
-		// Marking a populated directory settled is SweepDirsInSync's job,
-		// which knows to wait for the PARTIAL bit to clear.
+		// DIRECTORIES are excluded (cfSetInSync refuses them anyway).
+		// Folders get FILE_ACTION_MODIFIED constantly — a move into one
+		// delivers MODIFIED for the destination FOLDER as well as the file —
+		// and their bit is owned elsewhere: set when they are created, by the
+		// repoint after a move, and by SweepDirsInSync for what older
+		// versions left not in sync.
 		if !ch.IsDir && ch.Placeholder && !ch.InSync && !ch.NeedsUpload {
 			if serr := cfSetInSync(path); serr != nil {
 				w.ops.Log("vfs restore in-sync %s: %v", path, serr)

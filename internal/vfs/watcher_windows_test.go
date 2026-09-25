@@ -4581,13 +4581,11 @@ func TestReconcileStillRescuesAnEditedInBothFile(t *testing.T) {
 	}
 }
 
-// A directory placeholder is deliberately NOT in sync — that is what makes the
-// shell ask it to populate — and marking one in-sync leaves it enumerating
-// EMPTY forever (cfapi.TestInSyncDirStillPopulates pins the driver behaviour).
-// Folders get FILE_ACTION_MODIFIED constantly, including for every move made
-// INTO them (the live trace shows MODIFIED for the destination folder next to
-// MODIFIED for the file), so the in-sync heal meets directories all day and
-// must leave every one of them alone.
+// The in-sync heal is for files. Folders get FILE_ACTION_MODIFIED constantly,
+// including for every move made INTO them (the live trace shows MODIFIED for
+// the destination folder next to MODIFIED for the file), so the heal meets
+// directories all day and must leave every one of them alone: a folder's bit
+// is set at creation, by its repoint, and by cfapi.SweepDirsInSync.
 func TestModifiedEventOnADirectoryNeverMarksItInSync(t *testing.T) {
 	f := installFakeCf(t)
 	root := t.TempDir()
@@ -4604,7 +4602,7 @@ func TestModifiedEventOnADirectoryNeverMarksItInSync(t *testing.T) {
 	modifiedEvent(t, w, "sub")
 
 	if got := f.inSyncedPaths(); len(got) != 0 {
-		t.Errorf("in-sync restored for %v — a directory marked in-sync never populates again", got)
+		t.Errorf("in-sync restored for %v — the file heal reached a directory", got)
 	}
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
