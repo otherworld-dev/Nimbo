@@ -2769,6 +2769,9 @@ func (a *App) buildTrayMenu() *application.Menu {
 		if canApplyUpdate() {
 			m.Add("Check for updates…").OnClick(func(*application.Context) { go a.checkForUpdateToast() })
 		}
+		if u := brand.Current.HelpPage(""); u != "" {
+			m.Add("Help").OnClick(func(*application.Context) { openURL(u) })
+		}
 		m.AddSeparator()
 		m.Add("Quit " + brand.Current.Name).OnClick(func(*application.Context) { a.quit("tray menu") })
 		return m
@@ -2808,6 +2811,9 @@ func (a *App) buildTrayMenu() *application.Menu {
 	}
 	m.Add("Sync status").OnClick(func(*application.Context) { a.OpenStatus() })
 	m.Add("Settings").OnClick(func(*application.Context) { a.OpenSettings() })
+	if u := brand.Current.HelpPage(""); u != "" {
+		m.Add("Help").OnClick(func(*application.Context) { openURL(u) })
+	}
 	m.AddSeparator()
 	m.Add("Quit " + brand.Current.Name).OnClick(func(*application.Context) { a.quit("tray menu") })
 	return m

@@ -4,6 +4,7 @@
   "tagline": "Native Nextcloud sync for desktop",
   "website": "https://www.nimbosync.com",
   "supportEmail": "contact@otherworld.dev",
+  "helpUrl": "https://www.nimbosync.com/help/",
   "feedUrl": "https://github.com/otherworld-dev/Nimbo/releases/latest/download/Nimbo.appinstaller",
   "apiBase": "https://api.github.com/repos/otherworld-dev/Nimbo",
   "accentHex": "#5856E0",
