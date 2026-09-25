@@ -99,6 +99,10 @@ All notable changes to Nimbo are recorded here. The format follows
 - Compact spacing in Settings → Appearance now makes a visible difference: a smaller
   header and rows, and 8 files in Recent activity instead of 6. Before, it changed a
   few pixels of padding. Settings also says what Width and Spacing do (#14).
+- In on-demand mode, Settings → Folders no longer says folders aren't used right
+  before a list of folders with tick boxes. The list is now called "Keep on this PC
+  (offline)", each box says "Keep on this PC", and it explains that ticking a folder
+  is the same as Explorer's "Always keep on this device" (#15).
 
 ## [0.1.8] - 2026-09-20
 

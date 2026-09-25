@@ -508,7 +508,7 @@
   let syncMode = $state("live");
   let syncModeBusy = $state(false);
 
-  // "Available offline" browser over the virtual root's local placeholder tree.
+  // "Keep on this PC (offline)" browser over the virtual root's local placeholder tree.
   type OffEntry = { name: string; rel: string; pinned: boolean };
   let offCur = $state("");
   let offEntries = $state<OffEntry[]>([]);
@@ -1010,18 +1010,18 @@
         </p>
       {/if}
       {#if syncMode === "ondemand"}
-        <!-- On-demand mode: the whole account is virtual; per-folder sync is off. -->
+        <!-- On-demand mode: the whole account is virtual; the list below pins folders, it doesn't pick what syncs. -->
         <div class="row"><h3>Virtual file system</h3></div>
-        <p class="fhint">Your whole Nextcloud account is available on demand in your sync folder — files stay online-only and download when you open them. Per-folder sync folders aren’t used in this mode. To sync individual folders to disk instead, switch <b>File availability</b> to <b>Live file system</b> above.</p>
+        <p class="fhint">Your whole Nextcloud account is in your sync folder. Files stay online-only and download when you open them. To copy chosen folders to this PC as ordinary files instead, switch <b>File availability</b> to <b>Live file system</b> above.</p>
         <div class="logrow"><button class="primary small" onclick={() => App.OpenSyncFolder()}>Open sync folder</button></div>
 
-        <h3>Available offline</h3>
-        <p class="fhint">Tick a folder to keep it fully on this PC — it downloads now and stays up to date for offline use. Untick to go back to online-only (already-downloaded files stay until you free them: right-click → <b>Free up space</b> in Explorer). Folders appear here as you browse them in Explorer.</p>
+        <h3>Keep on this PC (offline)</h3>
+        <p class="fhint">Tick a folder to keep everything in it on this PC for offline use. It downloads now and stays up to date. This is the same as right-clicking the folder in Explorer and choosing <b>Always keep on this device</b>. Unticked folders stay online-only. Unticking doesn't remove files that are already downloaded; to do that, right-click → <b>Free up space</b> in Explorer. Folders show up here once you've opened them in Explorer.</p>
         <div class="crumb"><button onclick={offUp} disabled={!offCur}>⬆ Up</button><span>/{offCur}</span></div>
         {#if offEntries.length === 0}<p class="empty">(no folders here yet — open the sync folder and browse to populate it)</p>{/if}
         {#each offEntries as e}
           <div class="frow">
-            <label class="cov"><input type="checkbox" checked={e.pinned} disabled={pinBusy} onchange={() => togglePin(e)} /> offline</label>
+            <label class="cov"><input type="checkbox" checked={e.pinned} disabled={pinBusy} onchange={() => togglePin(e)} /> Keep on this PC</label>
             <button class="name" onclick={() => offNav(e.rel)}>📁 {e.name}</button>
           </div>
         {/each}
