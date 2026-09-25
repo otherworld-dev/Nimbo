@@ -70,10 +70,11 @@ func TestBuildPlaceholders(t *testing.T) {
 		t.Errorf("identity length = %d", arr[0].FileIdentityLength)
 	}
 
-	// A directory must NOT be in-sync (not-in-sync is what triggers lazy
-	// FETCH_PLACEHOLDERS population when it's first opened).
-	if arr[1].Flags != cfCreateFlagNone {
-		t.Errorf("dir flags = %#x, want none (lazy population)", arr[1].Flags)
+	// A directory is created in sync too, and NOT population-disabled: it
+	// still populates lazily on its first open (TestInSyncDirStillPopulates),
+	// and in sync is what keeps the arrows off a folder nobody has opened.
+	if arr[1].Flags != cfPlaceholderCreateFlagMarkInSync {
+		t.Errorf("dir flags = %#x, want MARK_IN_SYNC only", arr[1].Flags)
 	}
 	if arr[1].FsMetadata.BasicInfo.FileAttributes != fileAttrDirectory {
 		t.Errorf("dir attrs = %#x", arr[1].FsMetadata.BasicInfo.FileAttributes)

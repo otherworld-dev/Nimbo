@@ -57,11 +57,12 @@ func (a *App) healMountState(ctx context.Context, localDir, remoteRoot string, e
 			slog.Info("vfs state heal: converted plain directories back to cloud placeholders",
 				"dir", localDir, "converted", n)
 		}
-		// And give populated-but-unmarked directory PLACEHOLDERS their in-sync
-		// state (the sweep skips partial/unpopulated dirs and needs quiet —
-		// validated by TestStateBitsAcrossLifecycle).
+		// And give directory PLACEHOLDERS that are not in sync their in-sync
+		// state: older versions created every folder that way, opened or not,
+		// which Explorer draws as the sync pending arrows (GitHub #17). Needs
+		// quiet; validated by TestStateBitsAcrossLifecycle.
 		if m := cfapi.SweepDirsInSync(localDir, healQuiesce); m > 0 {
-			slog.Info("vfs state heal: marked populated directories in-sync", "dir", localDir, "marked", m)
+			slog.Info("vfs state heal: marked directories in-sync", "dir", localDir, "marked", m)
 		}
 		// And settle pending free-up-space requests: Explorer's verb only sets
 		// UNPINNED and waits for the provider to dehydrate — until then the

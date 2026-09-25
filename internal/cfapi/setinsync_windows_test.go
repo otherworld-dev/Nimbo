@@ -214,12 +214,11 @@ func TestTruncationToZeroCountsAsUnsyncedContent(t *testing.T) {
 }
 
 // TestSetInSyncRefusesADirectoryPlaceholder pins the refusal the wave-3 review
-// asked for. A directory placeholder marked in-sync never populates again -
-// TestInSyncDirStillPopulates measures that on the live driver, and it is why
-// ours are created NOT in sync — and until now nothing but the two call sites
-// stood between a future caller and that landmine. SetInSync refuses the whole
-// call instead, and the directory is left exactly as it was: not in sync, and
-// still able to populate.
+// asked for: SetInSync is the heal for a FILE whose bit a rename cleared, and
+// a directory's bit is owned elsewhere (set at creation, by its repoint, and
+// by SweepDirsInSync). The call is refused and the directory is left exactly
+// as it was. The directory is put in the state older versions created every
+// folder in (not in sync) first, so an accidental mark would show.
 // Live-driver test, opt in with NIMBO_CFAPI_LIVE=1.
 func TestSetInSyncRefusesADirectoryPlaceholder(t *testing.T) {
 	if os.Getenv("NIMBO_CFAPI_LIVE") == "" {
@@ -266,34 +265,18 @@ func TestSetInSyncRefusesADirectoryPlaceholder(t *testing.T) {
 		t.Fatalf("CreatePlaceholders: %v", err)
 	}
 	sub := filepath.Join(root, "sub")
+	clearInSync(t, sub)
+	before := placeholderStateOf(t, sub)
 
 	if err := SetInSync(sub); !errors.Is(err, ErrIsDirectory) {
 		t.Fatalf("SetInSync(dir) = %v, want %v", err, ErrIsDirectory)
 	}
-	if s := placeholderStateOf(t, sub); s&cfPlaceholderStateInSync != 0 {
-		t.Fatalf("the directory was marked in sync anyway (state=0x%x) — it would enumerate empty forever", s)
+	if after := placeholderStateOf(t, sub); after != before {
+		t.Fatalf("the refused call changed the directory (state 0x%x -> 0x%x)", before, after)
 	}
-
 	if ch, ierr := Inspect(sub); ierr != nil {
 		t.Fatalf("Inspect(sub): %v", ierr)
-	} else if !ch.IsDir || !ch.Placeholder || ch.InSync {
-		t.Errorf("Inspect(sub) = %+v, want a directory placeholder that is NOT in sync", ch)
-	}
-
-	// Whether it still POPULATES cannot be asserted from here: this harness
-	// never issues FETCH_PLACEHOLDERS for a subdirectory at all — measured in
-	// this test (only the root is ever fetched), and TestInSyncDirStillPopulates
-	// sees the same two root-only fetches. os.ReadDir from a test process is
-	// not the shell open that drives population. What CAN be asserted is that
-	// the call changed nothing, which is the whole point of the refusal; the
-	// enumeration is logged for the record.
-	if entries, rerr := os.ReadDir(sub); rerr != nil {
-		t.Fatalf("ReadDir(sub): %v", rerr)
-	} else {
-		var names []string
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		t.Logf("enumeration of the refused directory returned %v", names)
+	} else if !ch.IsDir || !ch.Placeholder || ch.InSync || ch.NeedsUpload {
+		t.Errorf("Inspect(sub) = %+v, want a clean directory placeholder that is NOT in sync", ch)
 	}
 }

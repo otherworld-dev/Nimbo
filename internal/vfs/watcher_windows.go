@@ -49,6 +49,8 @@ var (
 	cfHydrateIfPinned     = cfapi.HydrateIfPinned
 	cfPinnedDehydrated    = cfapi.PinnedDehydrated
 	cfDirPopulated        = cfapi.DirPopulated
+	cfPinned              = cfapi.Pinned
+	cfMarkDirPopulated    = cfapi.MarkDirPopulated
 )
 
 // Ops are the server-side actions the watcher performs (backed by the engine).
@@ -241,6 +243,11 @@ type Watcher struct {
 	// both guarded by mu like the maps above.
 	hydrateFails map[string]int
 	hydrateNext  map[string]time.Time
+	// pinFilling holds the lower-cased paths of pinned, never-opened folders
+	// being filled in right now (requestPinFill), so the burst of attribute
+	// events a recursive pin raises fills each one once. Guarded by mu,
+	// created on first use.
+	pinFilling map[string]bool
 	// inMove holds lower-cased DESTINATION paths with a server MOVE running
 	// right now. Reconcile's foreign-identity check reads the same evidence a
 	// live move does (an identity naming another server path), so without this
@@ -1821,15 +1828,12 @@ func (w *Watcher) handleChange(path string) {
 		// all). Put the bit back; a later repoint on top is harmless. Never on
 		// a file with a pending upload: that bit IS the pending upload.
 		//
-		// DIRECTORIES are excluded, and that exclusion is load-bearing, not
-		// tidiness: our directory placeholders are deliberately left NOT
-		// in-sync because that is what makes the shell ask them to populate,
-		// and a directory marked in-sync enumerates EMPTY forever
-		// (cfapi.TestInSyncDirStillPopulates). Folders get FILE_ACTION_MODIFIED
-		// constantly — a move into one delivers MODIFIED for the destination
-		// FOLDER as well as the file — so this branch sees them often.
-		// Marking a populated directory settled is SweepDirsInSync's job,
-		// which knows to wait for the PARTIAL bit to clear.
+		// DIRECTORIES are excluded (cfSetInSync refuses them anyway).
+		// Folders get FILE_ACTION_MODIFIED constantly — a move into one
+		// delivers MODIFIED for the destination FOLDER as well as the file —
+		// and their bit is owned elsewhere: set when they are created, by the
+		// repoint after a move, and by SweepDirsInSync for what older
+		// versions left not in sync.
 		if !ch.IsDir && ch.Placeholder && !ch.InSync && !ch.NeedsUpload {
 			if serr := cfSetInSync(path); serr != nil {
 				w.ops.Log("vfs restore in-sync %s: %v", path, serr)
@@ -1850,6 +1854,11 @@ func (w *Watcher) handleChange(path string) {
 		}
 		if cfPinnedDehydrated(path) {
 			w.requestHydration(path)
+		}
+		// A pinned folder nobody has opened has nothing in it to download
+		// yet: fill it in, so the pin reaches everything below it.
+		if ch.IsDir && ch.Placeholder && cfPinned(path) {
+			w.requestPinFill(path)
 		}
 		return
 	}
@@ -2006,6 +2015,51 @@ func (w *Watcher) requestHydration(path string) {
 	w.hydratePending = append(w.hydratePending, path)
 	w.mu.Unlock()
 	w.wakeHydrator()
+}
+
+// requestPinFill fills in a pinned folder the shell has never populated
+// (GitHub #17). "Always keep on this device" sets the pin on every existing
+// placeholder below the folder, but a subfolder nobody has opened has no
+// children yet, and the shell only fetches them when something opens it — so
+// its files were never downloaded. reconcileDir does the fill (see its pinned
+// branch) and recurses into the pinned subfolders it creates; the new files
+// inherit the pin and go to the hydrate queue. Deduplicated per path, since a
+// recursive pin raises an attribute event on every folder in the tree.
+func (w *Watcher) requestPinFill(path string) {
+	if populated, err := cfDirPopulated(path); err != nil || populated {
+		return
+	}
+	rel, err := filepath.Rel(w.root, path)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return
+	}
+	key := strings.ToLower(path)
+	w.mu.Lock()
+	if w.pinFilling[key] {
+		w.mu.Unlock()
+		return
+	}
+	if w.pinFilling == nil {
+		w.pinFilling = map[string]bool{}
+	}
+	w.pinFilling[key] = true
+	w.mu.Unlock()
+	w.spawn(func() {
+		defer func() {
+			w.mu.Lock()
+			delete(w.pinFilling, key)
+			w.mu.Unlock()
+		}()
+		// Serialised with reconcile passes, which walk the same directories.
+		w.reconMu.Lock()
+		if w.ctx.Err() == nil && !w.reconcileDir(filepath.ToSlash(rel), "") {
+			w.ops.Log("vfs keep on device %s: not every folder could be filled in yet; the next pass retries", w.remoteFor(path))
+		}
+		w.reconMu.Unlock()
+		// A push-driven pass that arrived while this held the lock was
+		// dropped (Reconcile only TryLocks); ask for it again.
+		w.Poke()
+	})
 }
 
 // wakeHydrator nudges one sleeping hydrateLoop. The channel holds a single
@@ -2887,7 +2941,11 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		w.noteCorrupt(localDir, err)
 		return false // can't read locally — don't claim reconciled
 	}
-	if len(entries) == 0 && rel != "" {
+	// pinFill: a pinned directory the shell never populated, which this pass
+	// fills in itself (see below).
+	pinFill := false
+	pinned := rel != "" && cfPinned(localDir)
+	if (len(entries) == 0 || pinned) && rel != "" {
 		// An empty directory is either LAZY — never populated, so the shell
 		// will issue FETCH_PLACEHOLDERS the first time it is opened and
 		// pulling its children here would race that transfer — or genuinely
@@ -2908,7 +2966,16 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 			return false // unknown — don't claim this subtree reconciled
 		}
 		if !populated {
-			return true // lazy: the shell owns its first fetch
+			// Lazy: the shell owns its first fetch — unless the user pinned
+			// it. "Always keep on this device" has to reach folders nobody
+			// has opened, and nothing ever will open them (GitHub #17), so
+			// fill it in here: list it, create its children, then mark it
+			// populated. A pinned lazy folder can already hold some
+			// children (a fill that failed part way), hence `pinned` above.
+			if !pinned {
+				return true
+			}
+			pinFill = true
 		}
 	}
 	remote, err := w.ops.List(rel)
@@ -3359,10 +3426,54 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 				if !r.IsDir {
 					w.recordFileID(string(r.Identity), r.FileID) // enable rename detection later
 				}
-				w.report("download", w.localName(string(r.Identity)), nil) // new server files in the activity feed, by their user-visible name
+				// New server files in the activity feed, by their user-visible
+				// name. Not in a pinned folder: its files are about to be
+				// downloaded, and the download reports itself.
+				if !pinned {
+					w.report("download", w.localName(string(r.Identity)), nil)
+				}
 			}
 			w.recordBaselines(base)
 			w.recordContents(toCreate...)
+			// Children created in a pinned directory inherit the pin
+			// (measured on the live driver). Their files are downloaded now,
+			// not left for a pass that may never walk here again (the subtree
+			// skip), and their folders are walked in this pass, so a pinned
+			// tree is filled all the way down in one go.
+			for _, r := range toCreate {
+				full := filepath.Join(localDir, r.Name)
+				if !r.IsDir {
+					if cfPinnedDehydrated(full) {
+						w.requestHydration(full)
+					}
+					continue
+				}
+				if cfPinned(full) {
+					child := r.Name
+					if rel != "" {
+						child = rel + "/" + r.Name
+					}
+					// No ETag: the pull above just recorded this folder's
+					// ETag as its baseline, so passing it would make the
+					// subtree skip read the walk as "nothing changed" and
+					// stop the fill one level down (seen on the VM). The
+					// folder was created a moment ago; nothing below it
+					// has been reconciled for the skip to vouch for.
+					subdirs = append(subdirs, subdir{rel: child})
+				}
+			}
+		}
+	}
+	// Only once every child is in place: the populated flag is permanent. A
+	// fill that fell short leaves the folder lazy, and the next pass (or the
+	// shell, if the user opens it first) finishes the job.
+	if pinFill && dirOK {
+		if merr := cfMarkDirPopulated(localDir); merr != nil {
+			w.ops.Log("vfs keep on device %q: mark populated: %v", rel, merr)
+			dirOK = false
+		} else {
+			w.ops.Log("vfs filled in pinned folder %q (%d item(s))", rel, len(toCreate))
+			cfShellNotify(localDir)
 		}
 	}
 

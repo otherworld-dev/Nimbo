@@ -119,6 +119,16 @@ All notable changes to Nimbo are recorded here. The format follows
 - An app's own icon in the Start menu and taskbar is no longer sometimes replaced by
   the Nimbo icon. Two downloads of the same icon could run at once, and the one that
   lost was treated as a failed download (#743).
+- In on-demand mode, "Always keep on this device" on a folder now downloads
+  everything under it, including subfolders that have never been opened in
+  Explorer. Before, only folders that had already been browsed were reached, and
+  new files added on the server to a kept folder waited until the next restart to
+  download (#17).
+- Folders in on-demand mode no longer show the "sync pending" arrows when there is
+  nothing waiting to sync. Folders that had never been opened kept them for good,
+  and opened folders kept them for up to six hours. Folders now show the cloud
+  until their files are downloaded, and ones set up by an earlier version are put
+  right a couple of minutes after Nimbo starts (#17).
 
 ## [0.1.8] - 2026-09-20
 
