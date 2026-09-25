@@ -569,6 +569,7 @@ type BrandDTO struct {
 	Company   string `json:"company"`
 	Website   string `json:"website"`
 	Support   string `json:"support"`
+	Help      string `json:"help"` // help home, "" when the brand has none
 	AccentHex string `json:"accentHex"`
 }
 
@@ -577,6 +578,7 @@ func (a *App) Brand() BrandDTO {
 	return BrandDTO{
 		Name: brand.Current.Name, Company: brand.Current.Company,
 		Website: brand.Current.Website, Support: brand.Current.SupportEmail,
+		Help:      brand.Current.HelpPage(""),
 		AccentHex: brand.Current.AccentHex,
 	}
 }
@@ -2777,6 +2779,9 @@ func (a *App) buildTrayMenu() *application.Menu {
 		if canApplyUpdate() {
 			m.Add("Check for updates…").OnClick(func(*application.Context) { go a.checkForUpdateToast() })
 		}
+		if u := brand.Current.HelpPage(""); u != "" {
+			m.Add("Help").OnClick(func(*application.Context) { openURL(u) })
+		}
 		m.AddSeparator()
 		m.Add("Quit " + brand.Current.Name).OnClick(func(*application.Context) { a.quit("tray menu") })
 		return m
@@ -2816,6 +2821,9 @@ func (a *App) buildTrayMenu() *application.Menu {
 	}
 	m.Add("Sync status").OnClick(func(*application.Context) { a.OpenStatus() })
 	m.Add("Settings").OnClick(func(*application.Context) { a.OpenSettings() })
+	if u := brand.Current.HelpPage(""); u != "" {
+		m.Add("Help").OnClick(func(*application.Context) { openURL(u) })
+	}
 	m.AddSeparator()
 	m.Add("Quit " + brand.Current.Name).OnClick(func(*application.Context) { a.quit("tray menu") })
 	return m
@@ -4568,7 +4576,7 @@ func (a *App) ReportProblem() string {
 		return err.Error()
 	}
 	revealPath(out)
-	openURL("https://github.com/otherworld-dev/Nimbo/issues/new")
+	openURL("https://github.com/otherworld-dev/Nimbo/issues/new?template=bug_report.yml")
 	return ""
 }
 

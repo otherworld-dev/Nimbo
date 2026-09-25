@@ -21,6 +21,8 @@ All notable changes to Nimbo are recorded here. The format follows
 - When real-time push isn't available, Settings → Troubleshooting now says it needs
   the Client Push app on the server, links to its setup notes, and says Nimbo checks
   for changes every 30 seconds in the meantime (#13).
+- Help pages at nimbosync.com/help, linked from a Help item in the tray menu and
+  from Settings, and Report a problem now opens the bug report form directly.
 
 ### Fixed
 

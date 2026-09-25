@@ -10,6 +10,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"log/slog"
+	"strings"
 )
 
 //go:embed brand.json
@@ -23,6 +24,7 @@ type Brand struct {
 	Tagline      string `json:"tagline"`      // short descriptor
 	Website      string `json:"website"`      // marketing site
 	SupportEmail string `json:"supportEmail"` // shown in About / business page
+	HelpURL      string `json:"helpUrl"`      // user help site; empty hides every help link (white-label)
 	FeedURL      string `json:"feedUrl"`      // App Installer feed (in-app update target check)
 	APIBase      string `json:"apiBase"`      // GitHub releases API root for the update check
 	AccentHex    string `json:"accentHex"`    // brand accent (tray badge, UI accent fallback)
@@ -40,9 +42,23 @@ func init() {
 		Current = Brand{
 			Name: "Nimbo", Company: "Otherworld Dev Ltd",
 			Website: "https://www.nimbosync.com", SupportEmail: "contact@otherworld.dev",
+			HelpURL:   "https://www.nimbosync.com/help/",
 			FeedURL:   "https://github.com/otherworld-dev/Nimbo/releases/latest/download/Nimbo.appinstaller",
 			APIBase:   "https://api.github.com/repos/otherworld-dev/Nimbo",
 			AccentHex: "#5856E0", AppID: "Nimbo",
 		}
 	}
+}
+
+// HelpPage returns the address of one help page ("" = the help home), or ""
+// when this brand has no help site, in which case callers hide the link.
+func (b Brand) HelpPage(slug string) string {
+	if b.HelpURL == "" {
+		return ""
+	}
+	base := strings.TrimSuffix(b.HelpURL, "/") + "/"
+	if slug == "" {
+		return base
+	}
+	return base + slug + ".html"
 }

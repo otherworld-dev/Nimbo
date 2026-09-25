@@ -41,6 +41,7 @@ user-visible identity value:
 | `company` | copyright line in About |
 | `tagline` | app description (taskbar tooltip / OS metadata) |
 | `website`, `supportEmail` | About links and the business-licensing link |
+| `helpUrl` | Help links (tray menu, Settings). Leave empty to hide them all. If you point it at your own help site, that address must also serve `file-modes.html` and `troubleshooting.html`, which Settings links to directly |
 | `feedUrl`, `apiBase` | the in-app update check + "Update now" target — point these at the partner's OWN release feed |
 | `accentHex` | brand accent — **drives the app icon** (tile + cloud, auto-derived), plus the tray badge and UI accent fallback |
 | `appId` | the MSIX Application Id used in the AUMID and the self-update task name — must match the manifest's `<Application Id="…">` |

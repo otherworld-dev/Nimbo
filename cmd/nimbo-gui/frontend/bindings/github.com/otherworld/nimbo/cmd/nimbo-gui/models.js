@@ -447,6 +447,14 @@ export class BrandDTO {
              */
             this["support"] = "";
         }
+        if (!("help" in $$source)) {
+            /**
+             * help home, "" when the brand has none
+             * @member
+             * @type {string}
+             */
+            this["help"] = "";
+        }
         if (!("accentHex" in $$source)) {
             /**
              * @member

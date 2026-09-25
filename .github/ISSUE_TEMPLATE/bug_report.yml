@@ -1,0 +1,74 @@
+name: Bug report
+description: Something in Nimbo isn't working.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Settings → General → Troubleshooting → Report a problem…** in Nimbo saves your logs to a zip in your Downloads folder. Please attach it below.
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Help pages
+      options:
+        - label: I checked https://www.nimbosync.com/help/ and it doesn't cover this.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Nimbo version
+      description: Settings → General → About
+      placeholder: 0.1.8.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install Nimbo?
+      options:
+        - Nimbo-Setup.exe
+        - Microsoft Store
+        - App Installer / PowerShell
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: File availability
+      description: Settings → Folders → File availability
+      options:
+        - Live file system
+        - Virtual file system
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+  - type: input
+    id: nextcloud
+    attributes:
+      label: Nextcloud server version
+      description: Shown in Settings → General → Troubleshooting → Connection health
+      placeholder: "31.0.5"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Report zip or logs
+      description: Drag the zip from Report a problem here. Check it for anything you'd rather not share first.
