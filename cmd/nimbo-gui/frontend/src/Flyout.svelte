@@ -266,7 +266,9 @@
     s === "online" ? "Online" : s === "away" ? "Away" : s === "dnd" ? "Do not disturb"
     : s === "invisible" ? "Invisible" : "Offline";
 
-  async function setType(t: string) { await App.SetStatusType(t); await refresh(); }
+  // A preset is a single click, so it closes the editor; typing a custom
+  // message is the only reason to keep it open (GitHub #7).
+  async function setType(t: string) { editStatus = false; await App.SetStatusType(t); await refresh(); }
   async function setMsg() { await App.SetStatusMessage(msgInput.trim()); await refresh(); }
   async function clearMsg() { await App.ClearStatusMessage(); msgInput = ""; await refresh(); }
 

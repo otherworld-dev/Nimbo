@@ -24,6 +24,11 @@ All notable changes to Nimbo are recorded here. The format follows
 - Help pages at nimbosync.com/help, linked from a Help item in the tray menu and
   from Settings, and Report a problem now opens the bug report form directly.
 
+### Changed
+
+- Picking Online, Away, Busy or Invisible in the flyout now closes the status
+  menu, it only stays open while you are typing a custom status (#7).
+
 ### Fixed
 
 - Two accounts can no longer sync the same folder. A second account was offered the
