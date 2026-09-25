@@ -348,6 +348,9 @@ func NewEngineFor(ctx context.Context, accountID string) (*Engine, error) {
 	eng.lockMgr = newLockMgr(client, d, acc.LoginName)
 	eng.lockWarn = newLockWarner(d, func() string { return acc.LoginName })
 	eng.statusIcons = newStatusRoots()
+	// Other people's locks from the last run, so the In use list and the
+	// lockout have them before the first listing (GitHub #7).
+	eng.restoreSeenLocks()
 	eng.forbidden.Store(forbidden)
 	eng.escaper.Store(escaper)
 	// Load the backup set before the engine is handed out: the zero value reads
@@ -1014,6 +1017,9 @@ func (e *Engine) reconcileLocked(localDir string, examined map[string]bool, l []
 			e.lockToast[key] = now
 			fresh = append(fresh, nl)
 		}
+	}
+	if len(added) > 0 || len(removed) > 0 {
+		e.saveSeenLocksLocked()
 	}
 	e.lockedMu.Unlock()
 	notifyAll(subs)
