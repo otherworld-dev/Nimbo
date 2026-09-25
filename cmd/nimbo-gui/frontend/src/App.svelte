@@ -7,6 +7,7 @@
   import Versions from "./Versions.svelte";
   import Logs from "./Logs.svelte";
   import AppSplash from "./AppSplash.svelte";
+  import Dialog from "./Dialog.svelte";
   import { Events } from "@wailsio/runtime";
   import { App } from "../bindings/github.com/otherworld/nimbo/cmd/nimbo-gui";
 
@@ -101,3 +102,6 @@
 {:else}
   <Flyout />
 {/if}
+
+<!-- Titled replacements for alert/confirm/prompt, shared by every window. -->
+<Dialog />

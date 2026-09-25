@@ -37,6 +37,9 @@ All notable changes to Nimbo are recorded here. The format follows
   started instead of stopping at six items, and has a Clear button. Clearing it
   empties Sync status → Activity as well, anything that still failed stays under
   needs attention (#7).
+- Questions and error messages in Settings and Sync status now open in the app's
+  own dialog with a proper title, instead of a browser box titled
+  "wails.localhost says". They also follow the light or dark theme.
 
 ### Fixed
 

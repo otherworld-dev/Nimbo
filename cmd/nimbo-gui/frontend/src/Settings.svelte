@@ -1,5 +1,6 @@
 <script lang="ts">
   import { App } from "../bindings/github.com/otherworld/nimbo/cmd/nimbo-gui";
+  import { ask, tell } from "./dialogs.svelte";
   import { Events } from "@wailsio/runtime";
 
   let brandName = $state("Nimbo");
@@ -225,7 +226,7 @@
   async function resumeFrozen(p: Pair) {
     resumeBusy = p.localDir;
     const err = await App.SetSyncMode("guard-resume:" + p.localDir);
-    if (err) alert(err);
+    if (err) tell({ title: "Couldn't resume syncing", message: err });
     await loadFolders();
     resumeBusy = "";
   }
@@ -248,11 +249,15 @@
     const sep = newParent.includes("\\") ? "\\" : "/";
     const dest = newParent.replace(/[\\/]+$/, "") + sep + localName(p.localDir);
     if (dest === p.localDir) return; // same place — nothing to do
-    if (!confirm(`Move this sync folder to:\n\n${dest}\n\nNimbo moves your files there itself and keeps syncing — nothing is re-downloaded. Don't move the folder yourself in Explorer while Nimbo is running.`)) return;
+    if (!await ask({
+      title: "Move sync folder?",
+      message: `It moves to:\n${dest}\n\n${brandName} moves your files there itself and keeps syncing, nothing is re-downloaded. Don't move the folder yourself in Explorer while ${brandName} is running.`,
+      ok: "Move",
+    })) return;
     moveBusy = true;
     const err = await App.MoveSyncFolder(p.localDir, dest);
     moveBusy = false;
-    if (err) { alert("Couldn't move the folder:\n\n" + err); return; }
+    if (err) { tell({ title: "Couldn't move the folder", message: err }); return; }
     await loadFolders();
   }
 
@@ -311,7 +316,11 @@
     await App.RenameBlocked("x" + ext, "//escape");
   }
   async function rmEscape(ext: string) {
-    if (!confirm(`Stop syncing ${ext} files?\n\nTheir disguised copies are removed from the server and the files stay on this device only. Nothing is deleted locally.`)) return;
+    if (!await ask({
+      title: `Stop syncing ${ext} files?`,
+      message: "Their disguised copies are removed from the server and the files stay on this device only. Nothing is deleted locally.",
+      ok: "Stop syncing",
+    })) return;
     removingExt = ext;
     clearTimeout(removeTimer);
     removeTimer = setTimeout(() => { if (removingExt === ext) removingExt = ""; }, 300000);
@@ -379,7 +388,7 @@
   let clearOnSignOut = $state(false);
   async function signOut() {
     const err = await App.SignOut(clearOnSignOut);
-    if (err) { alert(err); return; }
+    if (err) { tell({ title: "Couldn't sign out", message: err }); return; }
     signOutOpen = false;
     // Signing out may hand over to another configured account (multi-account);
     // re-query rather than assuming we're signed out.
@@ -433,7 +442,7 @@
     localBusy = true;
     try {
       const err = await App.SaveLocalAddress(localAddr, localPin);
-      if (err) { alert(err); return; }
+      if (err) { tell({ title: "Couldn't save the local address", message: err }); return; }
       localTest = null; localPin = "";
       account = await App.AccountInfo();
       flashSaved("local");
@@ -443,7 +452,7 @@
     localBusy = true;
     try {
       const err = await App.SaveLocalAddress("", "");
-      if (err) { alert(err); return; }
+      if (err) { tell({ title: "Couldn't clear the local address", message: err }); return; }
       localTest = null; localPin = ""; localAddr = "";
       account = await App.AccountInfo();
     } finally { localBusy = false; }
@@ -459,30 +468,30 @@
     acctBusy = true;
     const err = await App.SwitchAccount(id);
     acctBusy = false;
-    if (err) { alert(err); return; }
+    if (err) { tell({ title: "Couldn't switch account", message: err }); return; }
     account = await App.AccountInfo();
     await loadAccounts();
   }
   async function removeAccount(id: string) {
     const err = await App.RemoveAccount(id);
-    if (err) { alert(err); return; }
+    if (err) { tell({ title: "Couldn't remove the account", message: err }); return; }
     await loadAccounts();
   }
 
   let autoSupported = $state(false), auto = $state(false);
   (async () => { autoSupported = await App.AutostartSupported(); auto = await App.AutostartEnabled(); })();
-  async function toggleAuto() { auto = !auto; const err = await App.SetAutostart(auto); if (err) { auto = !auto; alert(err); } }
+  async function toggleAuto() { auto = !auto; const err = await App.SetAutostart(auto); if (err) { auto = !auto; tell({ title: "Couldn't change starting when you log in", message: err }); } }
 
   let shellSupported = $state(false), shellOn = $state(false);
   (async () => { shellSupported = await App.ShellMenuSupported(); shellOn = await App.ShellMenuEnabled(); })();
-  async function toggleShell() { shellOn = !shellOn; const err = await App.SetShellMenu(shellOn); if (err) { shellOn = !shellOn; alert(err); } }
+  async function toggleShell() { shellOn = !shellOn; const err = await App.SetShellMenu(shellOn); if (err) { shellOn = !shellOn; tell({ title: "Couldn't change the Explorer menu", message: err }); } }
 
   let navSupported = $state(false), navOn = $state(false), navBusy = $state(false);
   (async () => { navSupported = await App.SidebarSupported(); navOn = await App.SidebarEnabled(); })();
   // SetSidebar returns once Explorer has been updated (a second or two on a
   // packaged build), so the box is held until then: a second click mid-way
   // used to queue a second change on top of the first.
-  async function toggleNav() { if (navBusy) return; navBusy = true; navOn = !navOn; const err = await App.SetSidebar(navOn); navBusy = false; if (err) { navOn = !navOn; alert(err); } }
+  async function toggleNav() { if (navBusy) return; navBusy = true; navOn = !navOn; const err = await App.SetSidebar(navOn); navBusy = false; if (err) { navOn = !navOn; tell({ title: "Couldn't change the Explorer sidebar", message: err }); } }
 
   let notifyOn = $state(true);
   (async () => { notifyOn = await App.NotificationsEnabled(); })();
@@ -520,7 +529,7 @@
     pinBusy = true;
     const err = await App.SetOfflinePin(e.rel, !e.pinned);
     pinBusy = false;
-    if (err) { alert(err); return; }
+    if (err) { tell({ title: "Couldn't change Keep on this PC", message: err }); return; }
     await loadOffline();
   }
   $effect(() => { if (tab === "folders" && syncMode === "ondemand") loadOffline(); });
@@ -549,7 +558,7 @@
       scanning = false;
       let sum: any = null;
       try { sum = JSON.parse(raw); } catch { sum = null; }
-      if (sum?.error) { alert("File availability: " + sum.error); syncMode = await App.GetSyncMode(); return; }
+      if (sum?.error) { tell({ title: "File availability", message: sum.error }); syncMode = await App.GetSyncMode(); return; }
       if (sum && (sum.hydrated || sum.dehydrated)) { revert = sum; return; }
       // Nothing mounted/nothing to revert — plain switch below.
     }
@@ -561,7 +570,7 @@
       let sum: any = null;
       try { sum = JSON.parse(raw); } catch { sum = null; }
       if (sum?.error) {
-        alert("File availability: " + sum.error);
+        tell({ title: "File availability", message: sum.error });
         syncMode = await App.GetSyncMode(); // the mode didn't change; put the control back
         return;
       }
@@ -571,7 +580,7 @@
     syncModeBusy = true;
     const err = await App.SetSyncMode(syncMode);
     syncModeBusy = false;
-    if (err) alert("File availability: " + err);
+    if (err) tell({ title: "File availability", message: err });
     await refreshModeAndFolders(); // the plain switch restores/clears pairs synchronously
   }
   async function cancelScan() {
@@ -601,7 +610,7 @@
     syncModeBusy = true;
     const err = await App.SetSyncMode("live-revert"); // returns immediately; overlay takes over
     syncModeBusy = false;
-    if (err) { alert("File availability: " + err); }
+    if (err) { tell({ title: "File availability", message: err }); }
     stopRevertPoll();
     // The mode is persisted at the START of the switch but the remembered
     // pairs are restored at its END (after the engine restart), so the first
@@ -644,7 +653,7 @@
     syncModeBusy = true;
     const err = await App.SetSyncMode("live");
     syncModeBusy = false;
-    if (err) alert("File availability: " + err);
+    if (err) tell({ title: "File availability", message: err });
     await refreshModeAndFolders();
   }
   async function confirmAdopt() {
@@ -652,7 +661,7 @@
     syncModeBusy = true;
     const err = await App.SetSyncMode("ondemand-adopt");
     syncModeBusy = false;
-    if (err) alert("File availability: " + err);
+    if (err) tell({ title: "File availability", message: err });
     await refreshModeAndFolders();
   }
   // "Start fresh": switch WITHOUT keeping the local files. A second, explicit
@@ -703,7 +712,7 @@
     freshBusy = true;
     const err = await App.SetSyncMode(cmd);
     freshBusy = false;
-    if (err) alert("File availability: " + err);
+    if (err) tell({ title: "File availability", message: err });
     await refreshModeAndFolders();
   }
   async function cancelAdopt() {
@@ -736,19 +745,19 @@
   let releasingLocks = $state(false);
   async function toggleFileLockout(on: boolean) {
     const err = await App.SetSyncMode(on ? "lockout-enable" : "lockout-disable");
-    if (err) alert(err);
+    if (err) tell({ title: "Couldn't change the file lockout", message: err });
     diag = await App.Diagnostics();
   }
   async function toggleFileLocking(on: boolean) {
     const err = await App.SetSyncMode(on ? "lock-enable" : "lock-disable");
-    if (err) alert(err);
+    if (err) tell({ title: "Couldn't change file locking", message: err });
     diag = await App.Diagnostics();
   }
   async function releaseLocks() {
     releasingLocks = true;
     const err = await App.SetSyncMode("lock-release-all");
     releasingLocks = false;
-    if (err) alert(err);
+    if (err) tell({ title: "Couldn't release the locks", message: err });
     diag = await App.Diagnostics();
   }
 
