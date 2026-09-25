@@ -8,3 +8,6 @@ func relaunchSelf() {}
 // canApplyUpdate / applyUpdate: in-app MSIX self-update is Windows-only.
 func canApplyUpdate() bool     { return false }
 func applyUpdate(string) error { return nil }
+
+// packageFamilyName is always "" off Windows: there is no MSIX package.
+func packageFamilyName() string { return "" }
