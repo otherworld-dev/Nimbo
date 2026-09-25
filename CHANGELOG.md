@@ -93,6 +93,12 @@ All notable changes to Nimbo are recorded here. The format follows
   an account, changing the default) is no longer lost. Each change read the whole
   account list, edited its own copy and wrote it back, so whichever finished second
   quietly undid the first (#693).
+- The flyout names the account it is showing, with its server, on a line of its own
+  above the buttons. In Compact width the name used to be cut down to a few letters.
+  With more than one account, clicking it lists the accounts to switch to (#14).
+- Compact spacing in Settings → Appearance now makes a visible difference: a smaller
+  header and rows, and 8 files in Recent activity instead of 6. Before, it changed a
+  few pixels of padding. Settings also says what Width and Spacing do (#14).
 
 ## [0.1.8] - 2026-09-20
 

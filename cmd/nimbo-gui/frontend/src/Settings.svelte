@@ -1321,6 +1321,7 @@
           {/each}
         </div>
       </div>
+      <p class="fhint">Width is how wide the panel opens. Compact spacing makes the header and rows smaller and fits 8 files into Recent activity instead of 6.</p>
 
       <h3>App dock</h3>
       <label class="check"><input type="checkbox" checked={dockOn} onchange={toggleDock} /> Show the app dock (a strip of your pinned apps along an edge of the menu)</label>
