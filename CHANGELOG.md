@@ -35,6 +35,9 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ### Fixed
 
+- Files a colleague has open show under In use as soon as Nimbo starts. Before,
+  after a restart a lock only reappeared once something else in its folder
+  changed, which could take a long time (#7).
 - Two accounts can no longer sync the same folder. A second account was offered the
   first account's folder, and each then uploaded the other's files to its own
   server. Every account now has a folder of its own, and an install already set up
