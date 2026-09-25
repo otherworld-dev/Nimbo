@@ -6576,8 +6576,12 @@ func TestPinFillFinishesAPartlyFilledFolder(t *testing.T) {
 }
 
 // Pinning while Nimbo runs: the recursive pin raises an attribute event on
-// the never-opened folder, and that event alone must fill it in — a pin is a
-// local change, so no server ETag moves and no reconcile pass would get there.
+// the never-opened folder, and that event alone must fill it in, all the way
+// down — a pin is a local change, so no server ETag moves and no reconcile
+// pass would get there. This runs after the first (skip-free) pass, as it
+// does in real use: on the VM the fill stopped one level down, because each
+// new subfolder's ETag was recorded as its baseline as it was created, and
+// the subtree skip then read the walk into it as "nothing changed".
 func TestPinnedFolderEventFillsIt(t *testing.T) {
 	f := installFakeCf(t)
 	root := t.TempDir()
@@ -6589,15 +6593,27 @@ func TestPinnedFolderEventFillsIt(t *testing.T) {
 
 	rec := newRecorder()
 	rec.listing[""] = []cfapi.PlaceholderInfo{ph("Photos", true, "e-photos", "")}
-	rec.listing["Photos"] = []cfapi.PlaceholderInfo{ph("a.jpg", false, "e-a", "fa")}
+	// Identities are full server paths, as the real listing has them: that is
+	// what the baselines are keyed by, and what the subtree skip looks up.
+	at := func(dir string, p cfapi.PlaceholderInfo) cfapi.PlaceholderInfo {
+		p.Identity = []byte(dir + "/" + p.Name)
+		return p
+	}
+	rec.listing["Photos"] = []cfapi.PlaceholderInfo{at("Photos", ph("a.jpg", false, "e-a", "fa")), at("Photos", ph("2024", true, "e-2024", ""))}
+	rec.listing["Photos/2024"] = []cfapi.PlaceholderInfo{at("Photos/2024", ph("b.jpg", false, "e-b", "fb")), at("Photos/2024", ph("deep", true, "e-deep", ""))}
+	rec.listing["Photos/2024/deep"] = []cfapi.PlaceholderInfo{at("Photos/2024/deep", ph("c.jpg", false, "e-c", "fc"))}
 	w := bareWatcher(root, rec.ops())
 	defer w.cancel()
+	w.firstPassDone = true // steady state: the subtree skip is live
 
 	w.handleChange(photos) // what the debounced ATTRIBUTES event runs
 
-	waitHydrated(t, f, filepath.Join(photos, "a.jpg"))
-	if got := f.filledDirs(); len(got) != 1 || !strings.EqualFold(got[0], photos) {
-		t.Errorf("marked populated %v, want [%s]", got, photos)
+	waitHydrated(t, f,
+		filepath.Join(photos, "a.jpg"),
+		filepath.Join(photos, "2024", "b.jpg"),
+		filepath.Join(photos, "2024", "deep", "c.jpg"))
+	if got := f.filledDirs(); len(got) != 3 {
+		t.Errorf("marked populated %v, want Photos, Photos\\2024 and Photos\\2024\\deep", got)
 	}
 }
 

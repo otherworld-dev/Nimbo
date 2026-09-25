@@ -3456,7 +3456,13 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 					if rel != "" {
 						child = rel + "/" + r.Name
 					}
-					subdirs = append(subdirs, subdir{rel: child, etag: r.ETag})
+					// No ETag: the pull above just recorded this folder's
+					// ETag as its baseline, so passing it would make the
+					// subtree skip read the walk as "nothing changed" and
+					// stop the fill one level down (seen on the VM). The
+					// folder was created a moment ago; nothing below it
+					// has been reconciled for the skip to vouch for.
+					subdirs = append(subdirs, subdir{rel: child})
 				}
 			}
 		}
