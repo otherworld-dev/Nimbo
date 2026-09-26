@@ -104,3 +104,39 @@ jobs:
         env:
           CGO_ENABLED: "1"
         run: go build -o bin/nimbo-gui ./cmd/nimbo-gui
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v6
+
+      # The runner image ships the Android SDK and several NDKs.
+      - name: NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Install gomobile (the version go.mod uses)
+        run: |
+          v="$(go list -m -f '{{.Version}}' golang.org/x/mobile)"
+          go install "golang.org/x/mobile/cmd/gomobile@$v" "golang.org/x/mobile/cmd/gobind@$v"
+          gomobile init
+
+      # Same flags as android/scripts/build-core.ps1 — keep the two in step.
+      # arm64 only, like the debug APK.
+      - name: Build the Go core (.aar)
+        run: >-
+          gomobile bind -target android/arm64 -androidapi 26 -javapkg dev.otherworld
+          -ldflags=-extldflags=-Wl,-z,max-page-size=16384
+          -o android/core/nimbo-core.aar ./mobile
+
+      - name: Unit tests and debug build
+        working-directory: android
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
