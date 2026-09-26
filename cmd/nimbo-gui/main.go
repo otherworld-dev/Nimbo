@@ -40,6 +40,10 @@ var channel = "direct"
 // isStoreBuild reports whether this is the Microsoft Store distribution build.
 func isStoreBuild() bool { return channel == "store" }
 
+// wailsLogger is the logger handed to Wails: Nimbo's own, with Wails' lines
+// marked src=wails. Call it after the log is set up.
+func wailsLogger() *slog.Logger { return slog.Default().With("src", "wails") }
+
 // hasAccount reports whether an account is configured AND its app password is
 // still in the keychain. An account whose secret has vanished (wiped store,
 // profile trouble) must take the sign-in path here: starting the engine can
@@ -114,6 +118,10 @@ func main() {
 		// need a bound method (and so can't disturb the generated bindings).
 		// Today that's only "open this link in the real browser".
 		RawMessageHandler: svc.handleRawMessage,
+		// Wails' own messages (a WebView2 process rebuilt, a bound method that
+		// panicked) go to Nimbo's log; left alone they go to a stderr the
+		// windowsgui build doesn't have.
+		Logger: wailsLogger(),
 		// Single instance: a second launch (e.g. the Explorer "Share" menu running
 		// `nimbo-gui --share <path>`) forwards its args to the running tray
 		// app and exits, rather than starting a duplicate.
