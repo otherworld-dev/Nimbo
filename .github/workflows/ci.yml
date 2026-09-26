@@ -70,3 +70,37 @@ jobs:
       - name: Generated files are fresh
         shell: bash
         run: tools/ci/check-generated.sh
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Everything that builds on Linux; Windows-only packages drop out by
+      # build tag. The GUI is covered by the build step below, not tests.
+      - name: Vet
+        run: go vet -unsafeptr=false ./internal/... ./cmd/nimbo ./mobile
+
+      - name: Test
+        run: go test ./internal/... ./cmd/nimbo ./mobile
+
+      - name: Build CLI
+        env:
+          CGO_ENABLED: "0"
+        run: go build -o bin/nimbo ./cmd/nimbo
+
+      # GTK4 + WebKitGTK 6.0, as packaging/linux/README.md says. A build
+      # check only: the Linux GUI still crashes as its windows load.
+      - name: GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev
+
+      - name: Build GUI
+        env:
+          CGO_ENABLED: "1"
+        run: go build -o bin/nimbo-gui ./cmd/nimbo-gui
