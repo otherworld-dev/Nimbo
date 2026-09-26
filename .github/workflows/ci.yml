@@ -54,3 +54,19 @@ jobs:
         env:
           CGO_ENABLED: "1"
         run: go build -ldflags "-H windowsgui" -o bin/nimbo-gui.exe ./cmd/nimbo-gui
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cmd/nimbo-gui/frontend/package-lock.json
+
+      - name: Install wails3 (the version go.mod uses)
+        shell: bash
+        run: go install "github.com/wailsapp/wails/v3/cmd/wails3@$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v3)"
+
+      # Fails if the committed bindings or frontend dist don't match the
+      # source: the break that shipped in 0.1.0.97.
+      - name: Generated files are fresh
+        shell: bash
+        run: tools/ci/check-generated.sh
