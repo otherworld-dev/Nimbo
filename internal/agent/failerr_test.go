@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"strings"
-	"syscall"
 	"testing"
 
 	"github.com/otherworld/nimbo/internal/engine"
@@ -27,7 +26,7 @@ func TestHumanActionErr(t *testing.T) {
 	}{
 		{".Collectives/Home Network", status("MKCOL", ".Collectives/Home Network", 507, "507 Insufficient Storage"), "Collectives"},
 		{"docs/x.txt", status("PUT", "docs/x.txt", 403, "403 Forbidden"), "permission denied"},
-		{"a/b", &os.PathError{Op: "mkdir", Path: `E:\Nextcloud\a`, Err: syscall.Errno(5)}, "Windows denied access"},
+		{"a/b", &os.PathError{Op: "mkdir", Path: `E:\Nextcloud\a`, Err: accessDenied}, "Windows denied access"},
 		{"deep/file.md", status("MKCOL", "deep", 409, "409 Conflict"), "parent folder"},
 		{"Team/Budget.xlsx", status("PUT", "Team/Budget.xlsx", 423, "423 Locked"), "someone else"},
 		{"q/r", errors.New("some unrecognised transport error"), "some unrecognised transport error"}, // falls back to raw

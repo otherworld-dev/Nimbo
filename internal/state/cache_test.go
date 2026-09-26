@@ -289,8 +289,11 @@ func TestLoadBaselineScopedIsExact(t *testing.T) {
 // call, once per file of a mass delete: 208k deletes over a 370k-row cache is
 // tens of billions of steps with the store locked. A file has nothing beneath
 // it, and a folder's rows are found by the index.
+//
+// The database is in memory so the timing measures that walk, not the disk: on
+// a CI runner the 2,000 file-backed commits alone took longer than the budget.
 func TestDeleteBaselineUnderDoesNotWalkTheWholeCache(t *testing.T) {
-	st, err := Open(filepath.Join(t.TempDir(), "state.db"), "acct", true)
+	st, err := Open(":memory:", "acct", true)
 	if err != nil {
 		t.Fatal(err)
 	}

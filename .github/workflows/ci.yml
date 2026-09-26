@@ -1,0 +1,142 @@
+# Builds and tests Nimbo on every push to GitHub. Three independent jobs:
+# windows (the product), linux (core + CLI + GUI build), android (the app).
+name: CI
+
+on:
+  push:
+    branches: [dev, main, "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # The GUI is built with cgo, like package.ps1 does. The runner image
+      # normally ships MinGW gcc; install it only if it's missing.
+      - name: C compiler
+        shell: pwsh
+        run: |
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            choco install mingw --no-progress -y
+            "C:\ProgramData\mingw64\mingw64\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          }
+
+      - name: Show gcc
+        run: gcc --version
+
+      # unsafeptr is off: internal/cfapi reads Cloud Files callback structs
+      # from raw addresses Windows hands us, which that analyzer always flags.
+      - name: Vet
+        run: go vet -unsafeptr=false ./...
+
+      # Live Cloud Files tests skip themselves unless NIMBO_CFAPI_LIVE is set.
+      - name: Test
+        run: go test ./...
+
+      - name: Build CLI
+        run: go build -o bin/nimbo.exe ./cmd/nimbo
+
+      - name: Build GUI
+        env:
+          CGO_ENABLED: "1"
+        run: go build -ldflags "-H windowsgui" -o bin/nimbo-gui.exe ./cmd/nimbo-gui
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cmd/nimbo-gui/frontend/package-lock.json
+
+      - name: Install wails3 (the version go.mod uses)
+        shell: bash
+        run: go install "github.com/wailsapp/wails/v3/cmd/wails3@$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v3)"
+
+      # Fails if the committed bindings or frontend dist don't match the
+      # source: the break that shipped in 0.1.0.97.
+      - name: Generated files are fresh
+        shell: bash
+        run: tools/ci/check-generated.sh
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Everything that builds on Linux; Windows-only packages drop out by
+      # build tag. The GUI is covered by the build step below, not tests.
+      - name: Vet
+        run: go vet -unsafeptr=false ./internal/... ./cmd/nimbo ./mobile
+
+      - name: Test
+        run: go test ./internal/... ./cmd/nimbo ./mobile
+
+      - name: Build CLI
+        env:
+          CGO_ENABLED: "0"
+        run: go build -o bin/nimbo ./cmd/nimbo
+
+      # GTK4 + WebKitGTK 6.0, as packaging/linux/README.md says. A build
+      # check only: the Linux GUI still crashes as its windows load.
+      - name: GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev
+
+      - name: Build GUI
+        env:
+          CGO_ENABLED: "1"
+        run: go build -o bin/nimbo-gui ./cmd/nimbo-gui
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v6
+
+      # The runner image ships the Android SDK and several NDKs.
+      - name: NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Install gomobile (the version go.mod uses)
+        run: |
+          v="$(go list -m -f '{{.Version}}' golang.org/x/mobile)"
+          go install "golang.org/x/mobile/cmd/gomobile@$v" "golang.org/x/mobile/cmd/gobind@$v"
+          gomobile init
+
+      # Same flags as android/scripts/build-core.ps1 — keep the two in step.
+      # arm64 only, like the debug APK.
+      - name: Build the Go core (.aar)
+        run: >-
+          gomobile bind -target android/arm64 -androidapi 26 -javapkg dev.otherworld
+          -ldflags=-extldflags=-Wl,-z,max-page-size=16384
+          -o android/core/nimbo-core.aar ./mobile
+
+      - name: Unit tests and debug build
+        working-directory: android
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug

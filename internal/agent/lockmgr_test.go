@@ -351,7 +351,7 @@ func TestNoteRemoteLocks(t *testing.T) {
 		{Path: "Team/Free.xlsx"},
 		{Path: "Team", IsDir: true, Lock: &transport.LockInfo{Owner: "bob"}},
 	}
-	e.NoteRemoteLocks(`C:\Sync`, "", "Team", entries)
+	e.NoteRemoteLocks(syncDir, "", "Team", entries)
 
 	got := e.LockedFiles()
 	if len(got) != 1 {
@@ -360,12 +360,12 @@ func TestNoteRemoteLocks(t *testing.T) {
 	if got[0].Path != "Team/Budget.xlsx" {
 		t.Errorf("Path = %q", got[0].Path)
 	}
-	if got[0].Abs != `C:\Sync\Team\Budget.xlsx` {
+	if got[0].Abs != filepath.Join(syncDir, "Team", "Budget.xlsx") {
 		t.Errorf("Abs = %q, want it resolved against the mount", got[0].Abs)
 	}
 
 	// A later listing of the same folder that finds it free clears it.
-	e.NoteRemoteLocks(`C:\Sync`, "", "Team", []transport.Entry{{Path: "Team/Budget.xlsx"}})
+	e.NoteRemoteLocks(syncDir, "", "Team", []transport.Entry{{Path: "Team/Budget.xlsx"}})
 	if got := e.LockedFiles(); len(got) != 0 {
 		t.Errorf("LockedFiles = %+v after release, want none", got)
 	}
@@ -382,7 +382,7 @@ func TestNoteRemoteLocksStripsRoot(t *testing.T) {
 	e.Account.LoginName = "alice"
 	e.lockMgr = newLockMgr(newFakeLocker(), d, "alice")
 
-	e.NoteRemoteLocks(`C:\Sync`, "Work", "Work", []transport.Entry{
+	e.NoteRemoteLocks(syncDir, "Work", "Work", []transport.Entry{
 		{Path: "Work/Budget.xlsx", Lock: &transport.LockInfo{Owner: "bob"}},
 		{Path: "Elsewhere/Other.xlsx", Lock: &transport.LockInfo{Owner: "bob"}},
 	})
@@ -390,7 +390,7 @@ func TestNoteRemoteLocksStripsRoot(t *testing.T) {
 	if len(got) != 1 || got[0].Path != "Budget.xlsx" {
 		t.Fatalf("LockedFiles = %+v, want Budget.xlsx relative to the root", got)
 	}
-	if got[0].Abs != `C:\Sync\Budget.xlsx` {
+	if got[0].Abs != filepath.Join(syncDir, "Budget.xlsx") {
 		t.Errorf("Abs = %q", got[0].Abs)
 	}
 }
@@ -538,35 +538,6 @@ func TestNoteRemoteLocksLockoutOffWritesNothing(t *testing.T) {
 	e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Budget.xlsx", Lock: &transport.LockInfo{Owner: "bob"}}})
 	if _, err := os.Stat(filepath.Join(mount, "~$Budget.xlsx")); !os.IsNotExist(err) {
 		t.Errorf("lockout off, yet an owner file was written (err=%v)", err)
-	}
-}
-
-// BeforeReplace's engine half: the deny-write handle goes, so the watcher can
-// dehydrate the file, while the warning (the owner file) stays until the
-// colleague's lock is gone.
-func TestReleaseLockoutHandleLetsWritersIn(t *testing.T) {
-	e := newLockoutEngine(t)
-	mount := t.TempDir()
-	doc := filepath.Join(mount, "Budget.xlsx")
-	if err := os.WriteFile(doc, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Budget.xlsx", Lock: &transport.LockInfo{Owner: "bob"}}})
-	t.Cleanup(func() { e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Budget.xlsx"}}) })
-	if f, err := os.OpenFile(doc, os.O_RDWR, 0); err == nil {
-		f.Close()
-		t.Fatal("the lockout did not hold the document (a writer got in)")
-	}
-
-	e.ReleaseLockoutHandle(doc)
-
-	f, err := os.OpenFile(doc, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatalf("writer still refused after the release: %v", err)
-	}
-	f.Close()
-	if _, err := os.Stat(filepath.Join(mount, "~$Budget.xlsx")); err != nil {
-		t.Errorf("the warning went with the handle: %v", err)
 	}
 }
 

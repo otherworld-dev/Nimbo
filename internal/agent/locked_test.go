@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -133,10 +134,13 @@ func TestLockScanIgnoresOwnLock(t *testing.T) {
 	}
 }
 
+// Sync folders for the pure path tests, spelt for the OS running them.
+var syncDir, otherDir = filepath.FromSlash("/Sync"), filepath.FromSlash("/Other")
+
 func TestLockedFilesAcrossPairs(t *testing.T) {
 	e := &Engine{locked: make(map[string][]LockedFile)}
-	e.reconcileLocked(`C:\Sync`, paths("Team/Budget.xlsx"), []LockedFile{lf("Team/Budget.xlsx", "bob")})
-	e.reconcileLocked(`C:\Other`, paths("a.docx"), []LockedFile{lf("a.docx", "carol")})
+	e.reconcileLocked(syncDir, paths("Team/Budget.xlsx"), []LockedFile{lf("Team/Budget.xlsx", "bob")})
+	e.reconcileLocked(otherDir, paths("a.docx"), []LockedFile{lf("a.docx", "carol")})
 
 	got := e.LockedFiles()
 	if len(got) != 2 {
@@ -146,10 +150,10 @@ func TestLockedFilesAcrossPairs(t *testing.T) {
 	for _, f := range got {
 		byOwner[f.Owner] = f
 	}
-	if f := byOwner["bob"]; f.Abs != `C:\Sync\Team\Budget.xlsx` {
+	if f := byOwner["bob"]; f.Abs != filepath.Join(syncDir, "Team", "Budget.xlsx") {
 		t.Errorf("Abs = %q, want the joined absolute path", f.Abs)
 	}
-	if f := byOwner["carol"]; f.LocalDir != `C:\Other` {
+	if f := byOwner["carol"]; f.LocalDir != otherDir {
 		t.Errorf("LocalDir = %q, want C:\\Other", f.LocalDir)
 	}
 }

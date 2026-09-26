@@ -560,19 +560,33 @@ func RemoveToBin(path string) error {
 
 // clearReadOnlyTree strips the read-only attribute from a path and everything
 // under it, so a RemoveAll of a mirrored read-only subtree succeeds on Windows.
+// It only adds owner bits: setting a flat 0644 took the search bit off every
+// folder on Unix, so the delete it prepares failed with permission denied and
+// left folders nobody could open. Folders get the owner's rwx back, which also
+// frees one an older build left like that.
 func clearReadOnlyTree(root string) {
-	if fi, err := os.Stat(root); err != nil || (!fi.IsDir() && fi.Mode()&0o200 != 0) {
+	if fi, err := os.Stat(root); err != nil || !fi.IsDir() {
 		if err == nil {
-			_ = os.Chmod(root, 0o644)
+			makeWritable(root, fi)
 		}
 		return
 	}
-	_ = filepath.Walk(root, func(p string, _ os.FileInfo, err error) error {
+	_ = filepath.Walk(root, func(p string, fi os.FileInfo, err error) error {
 		if err == nil {
-			_ = os.Chmod(p, 0o644)
+			makeWritable(p, fi)
 		}
 		return nil
 	})
+}
+
+func makeWritable(p string, fi os.FileInfo) {
+	want := fi.Mode().Perm() | 0o200
+	if fi.IsDir() {
+		want |= 0o700
+	}
+	if want != fi.Mode().Perm() {
+		_ = os.Chmod(p, want)
+	}
 }
 
 func (e *Executor) makeLocalDir(rel string) error {

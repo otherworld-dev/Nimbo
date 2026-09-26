@@ -40,6 +40,8 @@ try {
     # .so to be 16 KB page-aligned. Go's default ELF layout is not, so the device
     # shows an "app compatibility" warning at launch and a future Play upload
     # would be rejected — pass the alignment through to the NDK linker.
+    # .github/workflows/ci.yml (job android) runs the same gomobile bind; keep
+    # the flags in both places in step.
     $ldflags = "-extldflags=-Wl,-z,max-page-size=16384"
     gomobile bind -target $Targets -androidapi $AndroidApi -javapkg dev.otherworld -ldflags $ldflags -o $Out ./mobile
     if ($LASTEXITCODE -ne 0) { throw "gomobile bind failed ($LASTEXITCODE)" }

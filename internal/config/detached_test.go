@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"testing"
 )
 
@@ -15,15 +16,15 @@ func TestDetachedRoundTrip(t *testing.T) {
 		t.Fatalf("fresh: got %v, %v; want empty, nil", got, err)
 	}
 
-	team := Detached{LocalDir: `C:\Users\x\Nextcloud`, RemoteRoot: "", Rel: "Team", AtUnix: 100, ParkedAt: `C:\Users\x\Nextcloud - no longer shared\Team`}
+	team := Detached{LocalDir: filepath.FromSlash("/Users/x/Nextcloud"), RemoteRoot: "", Rel: "Team", AtUnix: 100, ParkedAt: filepath.FromSlash("/Users/x/Nextcloud - no longer shared/Team")}
 	if err := d.AddDetached(team); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.AddDetached(Detached{LocalDir: `C:\Users\x\Nextcloud`, Rel: "Projects/Group", AtUnix: 101}); err != nil {
+	if err := d.AddDetached(Detached{LocalDir: filepath.FromSlash("/Users/x/Nextcloud"), Rel: "Projects/Group", AtUnix: 101}); err != nil {
 		t.Fatal(err)
 	}
 	// The same copy again (however the paths are spelled) is a no-op.
-	if err := d.AddDetached(Detached{LocalDir: `c:\users\X\nextcloud\`, Rel: "Team", AtUnix: 999, ParkedAt: `c:\users\X\nextcloud - NO LONGER SHARED\team`}); err != nil {
+	if err := d.AddDetached(Detached{LocalDir: filepath.FromSlash("/users/X/nextcloud/"), Rel: "Team", AtUnix: 999, ParkedAt: filepath.FromSlash("/users/X/nextcloud - NO LONGER SHARED/team")}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -37,22 +38,22 @@ func TestDetachedRoundTrip(t *testing.T) {
 
 	// Entries are addressed by where the copy IS: the parked path for a moved
 	// copy, the sync-folder path for one kept in place.
-	if err := d.RemoveDetached(`c:\users\X\nextcloud - NO LONGER SHARED\team`); err != nil {
+	if err := d.RemoveDetached(filepath.FromSlash("/users/X/nextcloud - NO LONGER SHARED/team")); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = d.LoadDetached()
 	if len(got) != 1 || got[0].Rel != "Projects/Group" {
 		t.Fatalf("after remove = %+v", got)
 	}
-	if got[0].LocalPath() != `C:\Users\x\Nextcloud\Projects\Group` {
+	if got[0].LocalPath() != filepath.FromSlash("/Users/x/Nextcloud/Projects/Group") {
 		t.Errorf("in-place LocalPath = %q", got[0].LocalPath())
 	}
 	// Removing what is not there is not an error.
-	if err := d.RemoveDetached(`C:\elsewhere\Team`); err != nil {
+	if err := d.RemoveDetached(filepath.FromSlash("/elsewhere/Team")); err != nil {
 		t.Fatal(err)
 	}
 	// The same folder unshared AGAIN lands at a new parked path: a second entry.
-	again := Detached{LocalDir: `C:\Users\x\Nextcloud`, Rel: "Team", ParkedAt: `C:\Users\x\Nextcloud - no longer shared\Team (2)`}
+	again := Detached{LocalDir: filepath.FromSlash("/Users/x/Nextcloud"), Rel: "Team", ParkedAt: filepath.FromSlash("/Users/x/Nextcloud - no longer shared/Team (2)")}
 	for i := 0; i < 2; i++ {
 		if err := d.AddDetached(again); err != nil {
 			t.Fatal(err)
