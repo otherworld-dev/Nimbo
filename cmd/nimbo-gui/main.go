@@ -114,6 +114,10 @@ func main() {
 		// need a bound method (and so can't disturb the generated bindings).
 		// Today that's only "open this link in the real browser".
 		RawMessageHandler: svc.handleRawMessage,
+		// Wails' own messages (a WebView2 process rebuilt, a bound method that
+		// panicked) go to Nimbo's log; left alone they go to a stderr the
+		// windowsgui build doesn't have.
+		Logger: wailsLogger(),
 		// Single instance: a second launch (e.g. the Explorer "Share" menu running
 		// `nimbo-gui --share <path>`) forwards its args to the running tray
 		// app and exits, rather than starting a duplicate.
