@@ -9,3 +9,6 @@
 // the wrong icon.
 1 ICON "assets/nimbo.ico"
 3 ICON "assets/nimbo.ico"
+
+// FileDescription, product and version (see versioninfo.rc).
+#include "versioninfo.rc"

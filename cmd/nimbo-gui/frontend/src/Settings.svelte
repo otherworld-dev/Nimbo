@@ -1,17 +1,22 @@
 <script lang="ts">
   import { App } from "../bindings/github.com/otherworld/nimbo/cmd/nimbo-gui";
+  import { ask, tell } from "./dialogs.svelte";
   import { Events } from "@wailsio/runtime";
 
   let brandName = $state("Nimbo");
   let brandCompany = $state("Otherworld Dev Ltd");
   let brandWebsite = $state("https://www.nimbosync.com");
   let brandSupport = $state("contact@otherworld.dev");
+  let brandHelp = $state("");
   (async () => {
     const b = await App.Brand();
     brandName = b.name || brandName; brandCompany = b.company || brandCompany;
     brandWebsite = b.website || brandWebsite; brandSupport = b.support || brandSupport;
+    brandHelp = b.help || "";
   })();
   const hostname = (u: string) => { try { return new URL(u).host.replace(/^www\./, ""); } catch { return u; } };
+  // Help links hide themselves when the brand has no help site (white-label).
+  const helpPage = (slug: string) => brandHelp + slug + ".html";
 
   // Admin policy (managed deployments): some settings may be locked by IT.
   let policy = $state<{ managed: boolean; lockServer: boolean; serverUrl: string; allowSignOut: boolean; lockBandwidth: boolean; lockSyncMode: boolean }>(
@@ -26,6 +31,7 @@
     localDir: string; remoteRoot: string; excludes: string[];
     frozen?: boolean;
     freezeReason?: string; freezeSample?: string[];
+    heldReason?: string; // not syncing: another account uses this folder (#11)
   };
 
   type SettingsTab = "folders" | "sync" | "exclusions" | "appearance" | "general";
@@ -220,7 +226,7 @@
   async function resumeFrozen(p: Pair) {
     resumeBusy = p.localDir;
     const err = await App.SetSyncMode("guard-resume:" + p.localDir);
-    if (err) alert(err);
+    if (err) tell({ title: "Couldn't resume syncing", message: err });
     await loadFolders();
     resumeBusy = "";
   }
@@ -243,11 +249,15 @@
     const sep = newParent.includes("\\") ? "\\" : "/";
     const dest = newParent.replace(/[\\/]+$/, "") + sep + localName(p.localDir);
     if (dest === p.localDir) return; // same place — nothing to do
-    if (!confirm(`Move this sync folder to:\n\n${dest}\n\nNimbo moves your files there itself and keeps syncing — nothing is re-downloaded. Don't move the folder yourself in Explorer while Nimbo is running.`)) return;
+    if (!await ask({
+      title: "Move sync folder?",
+      message: `It moves to:\n${dest}\n\n${brandName} moves your files there itself and keeps syncing, nothing is re-downloaded. Don't move the folder yourself in Explorer while ${brandName} is running.`,
+      ok: "Move",
+    })) return;
     moveBusy = true;
     const err = await App.MoveSyncFolder(p.localDir, dest);
     moveBusy = false;
-    if (err) { alert("Couldn't move the folder:\n\n" + err); return; }
+    if (err) { tell({ title: "Couldn't move the folder", message: err }); return; }
     await loadFolders();
   }
 
@@ -262,7 +272,14 @@
     clearTimeout(savedTimer);
     savedTimer = setTimeout(() => (savedFlash = ""), 1500);
   }
-  const saveBase = () => { App.SetBaseDir(baseDir.trim()); flashSaved("base"); };
+  // SetBaseDir refuses (with its own dialog) a folder another account uses, so
+  // read the folder back rather than assuming it was saved.
+  const saveBase = async () => {
+    const want = baseDir.trim();
+    await App.SetBaseDir(want);
+    baseDir = await App.GetBaseDir();
+    if (baseDir === want) flashSaved("base");
+  };
 
   // Bandwidth
   let up_ = $state(0), down_ = $state(0);
@@ -299,7 +316,11 @@
     await App.RenameBlocked("x" + ext, "//escape");
   }
   async function rmEscape(ext: string) {
-    if (!confirm(`Stop syncing ${ext} files?\n\nTheir disguised copies are removed from the server and the files stay on this device only. Nothing is deleted locally.`)) return;
+    if (!await ask({
+      title: `Stop syncing ${ext} files?`,
+      message: "Their disguised copies are removed from the server and the files stay on this device only. Nothing is deleted locally.",
+      ok: "Stop syncing",
+    })) return;
     removingExt = ext;
     clearTimeout(removeTimer);
     removeTimer = setTimeout(() => { if (removingExt === ext) removingExt = ""; }, 300000);
@@ -367,7 +388,7 @@
   let clearOnSignOut = $state(false);
   async function signOut() {
     const err = await App.SignOut(clearOnSignOut);
-    if (err) { alert(err); return; }
+    if (err) { tell({ title: "Couldn't sign out", message: err }); return; }
     signOutOpen = false;
     // Signing out may hand over to another configured account (multi-account);
     // re-query rather than assuming we're signed out.
@@ -380,7 +401,28 @@
   let accounts = $state<{ id: string; user: string; server: string; active: boolean; status: string }[]>([]);
   let acctBusy = $state(false);
   async function loadAccounts() { accounts = (await App.ListAccounts()) ?? []; }
-  loadAccounts();
+
+  // The folder settings belong to the ACTIVE account, so switching account must
+  // reload them; before this the page kept showing the previous account's
+  // folders (GitHub #11). Background accounts emit "account" on every status
+  // change too, so the list (with those statuses) refreshes each time but the
+  // account's views only reset when the active account really changed, which
+  // keeps an add-folder flow from being thrown away mid-way.
+  let activeId = "";
+  const activeOf = () => accounts.find(a => a.active)?.id ?? "";
+  loadAccounts().then(() => { activeId = activeOf(); });
+  Events.On("account", async () => {
+    await loadAccounts();
+    const now = activeOf();
+    if (now === activeId) return;
+    activeId = now;
+    exitAdding();
+    managing = false; managePair = null; pending = null;
+    account = await App.AccountInfo();
+    await loadFolders();
+    offCur = "";
+    await loadOffline();
+  });
 
   // Local network route (spec 2026-09-13). Test → (Trust) → Use this address.
   // The saved address comes from AccountInfo; live route state rides the 3 s
@@ -400,7 +442,7 @@
     localBusy = true;
     try {
       const err = await App.SaveLocalAddress(localAddr, localPin);
-      if (err) { alert(err); return; }
+      if (err) { tell({ title: "Couldn't save the local address", message: err }); return; }
       localTest = null; localPin = "";
       account = await App.AccountInfo();
       flashSaved("local");
@@ -410,7 +452,7 @@
     localBusy = true;
     try {
       const err = await App.SaveLocalAddress("", "");
-      if (err) { alert(err); return; }
+      if (err) { tell({ title: "Couldn't clear the local address", message: err }); return; }
       localTest = null; localPin = ""; localAddr = "";
       account = await App.AccountInfo();
     } finally { localBusy = false; }
@@ -426,30 +468,30 @@
     acctBusy = true;
     const err = await App.SwitchAccount(id);
     acctBusy = false;
-    if (err) { alert(err); return; }
+    if (err) { tell({ title: "Couldn't switch account", message: err }); return; }
     account = await App.AccountInfo();
     await loadAccounts();
   }
   async function removeAccount(id: string) {
     const err = await App.RemoveAccount(id);
-    if (err) { alert(err); return; }
+    if (err) { tell({ title: "Couldn't remove the account", message: err }); return; }
     await loadAccounts();
   }
 
   let autoSupported = $state(false), auto = $state(false);
   (async () => { autoSupported = await App.AutostartSupported(); auto = await App.AutostartEnabled(); })();
-  async function toggleAuto() { auto = !auto; const err = await App.SetAutostart(auto); if (err) { auto = !auto; alert(err); } }
+  async function toggleAuto() { auto = !auto; const err = await App.SetAutostart(auto); if (err) { auto = !auto; tell({ title: "Couldn't change starting when you log in", message: err }); } }
 
   let shellSupported = $state(false), shellOn = $state(false);
   (async () => { shellSupported = await App.ShellMenuSupported(); shellOn = await App.ShellMenuEnabled(); })();
-  async function toggleShell() { shellOn = !shellOn; const err = await App.SetShellMenu(shellOn); if (err) { shellOn = !shellOn; alert(err); } }
+  async function toggleShell() { shellOn = !shellOn; const err = await App.SetShellMenu(shellOn); if (err) { shellOn = !shellOn; tell({ title: "Couldn't change the Explorer menu", message: err }); } }
 
   let navSupported = $state(false), navOn = $state(false), navBusy = $state(false);
   (async () => { navSupported = await App.SidebarSupported(); navOn = await App.SidebarEnabled(); })();
   // SetSidebar returns once Explorer has been updated (a second or two on a
   // packaged build), so the box is held until then: a second click mid-way
   // used to queue a second change on top of the first.
-  async function toggleNav() { if (navBusy) return; navBusy = true; navOn = !navOn; const err = await App.SetSidebar(navOn); navBusy = false; if (err) { navOn = !navOn; alert(err); } }
+  async function toggleNav() { if (navBusy) return; navBusy = true; navOn = !navOn; const err = await App.SetSidebar(navOn); navBusy = false; if (err) { navOn = !navOn; tell({ title: "Couldn't change the Explorer sidebar", message: err }); } }
 
   let notifyOn = $state(true);
   (async () => { notifyOn = await App.NotificationsEnabled(); })();
@@ -475,7 +517,7 @@
   let syncMode = $state("live");
   let syncModeBusy = $state(false);
 
-  // "Available offline" browser over the virtual root's local placeholder tree.
+  // "Keep on this PC (offline)" browser over the virtual root's local placeholder tree.
   type OffEntry = { name: string; rel: string; pinned: boolean };
   let offCur = $state("");
   let offEntries = $state<OffEntry[]>([]);
@@ -487,7 +529,7 @@
     pinBusy = true;
     const err = await App.SetOfflinePin(e.rel, !e.pinned);
     pinBusy = false;
-    if (err) { alert(err); return; }
+    if (err) { tell({ title: "Couldn't change Keep on this PC", message: err }); return; }
     await loadOffline();
   }
   $effect(() => { if (tab === "folders" && syncMode === "ondemand") loadOffline(); });
@@ -516,7 +558,7 @@
       scanning = false;
       let sum: any = null;
       try { sum = JSON.parse(raw); } catch { sum = null; }
-      if (sum?.error) { alert("File availability: " + sum.error); syncMode = await App.GetSyncMode(); return; }
+      if (sum?.error) { tell({ title: "File availability", message: sum.error }); syncMode = await App.GetSyncMode(); return; }
       if (sum && (sum.hydrated || sum.dehydrated)) { revert = sum; return; }
       // Nothing mounted/nothing to revert — plain switch below.
     }
@@ -528,7 +570,7 @@
       let sum: any = null;
       try { sum = JSON.parse(raw); } catch { sum = null; }
       if (sum?.error) {
-        alert("File availability: " + sum.error);
+        tell({ title: "File availability", message: sum.error });
         syncMode = await App.GetSyncMode(); // the mode didn't change; put the control back
         return;
       }
@@ -538,7 +580,7 @@
     syncModeBusy = true;
     const err = await App.SetSyncMode(syncMode);
     syncModeBusy = false;
-    if (err) alert("File availability: " + err);
+    if (err) tell({ title: "File availability", message: err });
     await refreshModeAndFolders(); // the plain switch restores/clears pairs synchronously
   }
   async function cancelScan() {
@@ -568,7 +610,7 @@
     syncModeBusy = true;
     const err = await App.SetSyncMode("live-revert"); // returns immediately; overlay takes over
     syncModeBusy = false;
-    if (err) { alert("File availability: " + err); }
+    if (err) { tell({ title: "File availability", message: err }); }
     stopRevertPoll();
     // The mode is persisted at the START of the switch but the remembered
     // pairs are restored at its END (after the engine restart), so the first
@@ -611,7 +653,7 @@
     syncModeBusy = true;
     const err = await App.SetSyncMode("live");
     syncModeBusy = false;
-    if (err) alert("File availability: " + err);
+    if (err) tell({ title: "File availability", message: err });
     await refreshModeAndFolders();
   }
   async function confirmAdopt() {
@@ -619,7 +661,7 @@
     syncModeBusy = true;
     const err = await App.SetSyncMode("ondemand-adopt");
     syncModeBusy = false;
-    if (err) alert("File availability: " + err);
+    if (err) tell({ title: "File availability", message: err });
     await refreshModeAndFolders();
   }
   // "Start fresh": switch WITHOUT keeping the local files. A second, explicit
@@ -670,7 +712,7 @@
     freshBusy = true;
     const err = await App.SetSyncMode(cmd);
     freshBusy = false;
-    if (err) alert("File availability: " + err);
+    if (err) tell({ title: "File availability", message: err });
     await refreshModeAndFolders();
   }
   async function cancelAdopt() {
@@ -703,19 +745,19 @@
   let releasingLocks = $state(false);
   async function toggleFileLockout(on: boolean) {
     const err = await App.SetSyncMode(on ? "lockout-enable" : "lockout-disable");
-    if (err) alert(err);
+    if (err) tell({ title: "Couldn't change the file lockout", message: err });
     diag = await App.Diagnostics();
   }
   async function toggleFileLocking(on: boolean) {
     const err = await App.SetSyncMode(on ? "lock-enable" : "lock-disable");
-    if (err) alert(err);
+    if (err) tell({ title: "Couldn't change file locking", message: err });
     diag = await App.Diagnostics();
   }
   async function releaseLocks() {
     releasingLocks = true;
     const err = await App.SetSyncMode("lock-release-all");
     releasingLocks = false;
-    if (err) alert(err);
+    if (err) tell({ title: "Couldn't release the locks", message: err });
     diag = await App.Diagnostics();
   }
 
@@ -853,7 +895,7 @@
       {#if onDemandSupported && (syncMode === "ondemand" || !adding)}
         <div class="field">
           <label>File availability</label>
-          <p class="fhint">Live keeps every file on your disk. Virtual file system shows your whole account as online-only placeholders in your sync folder and downloads each file when you open it. Switching applies to the account and persists across restarts.</p>
+          <p class="fhint">Live keeps every file on your disk. Virtual file system shows your whole account as online-only placeholders in your sync folder and downloads each file when you open it. Switching applies to the account and persists across restarts.{#if brandHelp} <button class="link" onclick={() => App.OpenURL(helpPage("file-modes"))}>Which should I pick?</button>{/if}</p>
           <select bind:value={syncMode} onchange={saveSyncMode} disabled={syncModeBusy || policy.lockSyncMode}>
             <option value="live">Live file system</option>
             <option value="ondemand">Virtual file system</option>
@@ -977,18 +1019,18 @@
         </p>
       {/if}
       {#if syncMode === "ondemand"}
-        <!-- On-demand mode: the whole account is virtual; per-folder sync is off. -->
+        <!-- On-demand mode: the whole account is virtual; the list below pins folders, it doesn't pick what syncs. -->
         <div class="row"><h3>Virtual file system</h3></div>
-        <p class="fhint">Your whole Nextcloud account is available on demand in your sync folder — files stay online-only and download when you open them. Per-folder sync folders aren’t used in this mode. To sync individual folders to disk instead, switch <b>File availability</b> to <b>Live file system</b> above.</p>
+        <p class="fhint">Your whole Nextcloud account is in your sync folder. Files stay online-only and download when you open them. To copy chosen folders to this PC as ordinary files instead, switch <b>File availability</b> to <b>Live file system</b> above.</p>
         <div class="logrow"><button class="primary small" onclick={() => App.OpenSyncFolder()}>Open sync folder</button></div>
 
-        <h3>Available offline</h3>
-        <p class="fhint">Tick a folder to keep it fully on this PC — it downloads now and stays up to date for offline use. Untick to go back to online-only (already-downloaded files stay until you free them: right-click → <b>Free up space</b> in Explorer). Folders appear here as you browse them in Explorer.</p>
+        <h3>Keep on this PC (offline)</h3>
+        <p class="fhint">Tick a folder to keep everything in it on this PC for offline use. It downloads now and stays up to date. This is the same as right-clicking the folder in Explorer and choosing <b>Always keep on this device</b>. Unticked folders stay online-only. Unticking doesn't remove files that are already downloaded; to do that, right-click → <b>Free up space</b> in Explorer. Folders show up here once you've opened them in Explorer.</p>
         <div class="crumb"><button onclick={offUp} disabled={!offCur}>⬆ Up</button><span>/{offCur}</span></div>
         {#if offEntries.length === 0}<p class="empty">(no folders here yet — open the sync folder and browse to populate it)</p>{/if}
         {#each offEntries as e}
           <div class="frow">
-            <label class="cov"><input type="checkbox" checked={e.pinned} disabled={pinBusy} onchange={() => togglePin(e)} /> offline</label>
+            <label class="cov"><input type="checkbox" checked={e.pinned} disabled={pinBusy} onchange={() => togglePin(e)} /> Keep on this PC</label>
             <button class="name" onclick={() => offNav(e.rel)}>📁 {e.name}</button>
           </div>
         {/each}
@@ -999,6 +1041,19 @@
           <p class="empty">No folders synced yet. Click “Add folder” to choose one.</p>
         {:else}
           {#each pairs as p}
+            {#if p.heldReason}
+              <!-- Another account syncs this folder too (GitHub #11). It is
+                   held back so neither account uploads the other's files, and
+                   resumes once one of them uses a different folder. -->
+              <div class="freeze">
+                <div class="freezehead">⚠ Not syncing — another account uses this folder</div>
+                <p class="freezewhy">{p.heldReason}</p>
+                <p class="freezewhat">
+                  Nothing in <b>{localName(p.localDir)}</b> was changed. Give one of the accounts a
+                  different folder (remove this one and add it again elsewhere) and syncing resumes.
+                </p>
+              </div>
+            {/if}
             {#if p.frozen}
               <!-- The damage guard stopped this folder: a pass looked like the
                    server losing files rather than the user changing them.
@@ -1275,6 +1330,7 @@
           {/each}
         </div>
       </div>
+      <p class="fhint">Width is how wide the panel opens. Compact spacing makes the header and rows smaller and fits 8 files into Recent activity instead of 6.</p>
 
       <h3>App dock</h3>
       <label class="check"><input type="checkbox" checked={dockOn} onchange={toggleDock} /> Show the app dock (a strip of your pinned apps along an edge of the menu)</label>
@@ -1418,7 +1474,7 @@ SHA-256: {localTest.fingerprint}</pre>
         <label class="check"><input type="checkbox" checked={navOn} disabled={navBusy} onchange={toggleNav} /> Show {brandName} in the Explorer sidebar (points at your default sync location)</label>
       {/if}
 
-      <h3>Troubleshooting</h3>
+      <div class="row"><h3>Troubleshooting</h3>{#if brandHelp}<button class="link" onclick={() => App.OpenURL(helpPage("troubleshooting"))}>Troubleshooting guide</button>{/if}</div>
       <label class="check"><input type="checkbox" checked={logVerbose} onchange={toggleVerbose} /> Verbose (debug) logging</label>
       <h4 class="dhealth">Connection health</h4>
       {#if diag}
@@ -1429,7 +1485,8 @@ SHA-256: {localTest.fingerprint}</pre>
           <span class="dv">{diag.account || "—"}</span>
           <span class="dk">Real-time push</span>
           <span class="dv">
-            {#if !diag.pushAvailable}<span class="dmuted">not available on this server</span>
+            {#if !diag.pushAvailable}<span class="dmuted">not set up on this server, so {brandName} checks for changes every 30 seconds instead.
+              It needs the Client Push app on the server (restart {brandName} once it is)</span> · <button class="link" onclick={() => App.OpenURL("https://github.com/nextcloud/notify_push#readme")}>Client Push setup</button>
             {:else if diag.pushConnected}<span class="dok">● connected</span>{#if diag.pushUptime} · up {diag.pushUptime}{/if}
             {:else}<span class="dbad">● reconnecting…</span>{/if}
           </span>
@@ -1500,6 +1557,7 @@ SHA-256: {localTest.fingerprint}</pre>
       <p class="aboutco">
         © {new Date().getFullYear()} {brandCompany}
         · <button class="link" onclick={() => App.OpenURL(brandWebsite)}>{hostname(brandWebsite)}</button>
+        {#if brandHelp}· <button class="link" onclick={() => App.OpenURL(brandHelp)}>Help</button>{/if}
         · <button class="link" onclick={() => App.OpenURL("mailto:" + brandSupport)}>{brandSupport}</button>
       </p>
     {/if}

@@ -41,7 +41,7 @@ func Toast(title, message, link string) {
 		slog.Warn("native toast raise failed, falling back", "err", err)
 	}
 	t := toast.Notification{AppID: "Nimbo", Title: title, Message: message}
-	if link != "" {
+	if link != "" && !strings.HasPrefix(link, "action=") { // an action is not a URL
 		t.ActivationType = "protocol"
 		t.ActivationArguments = link
 	}

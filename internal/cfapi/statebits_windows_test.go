@@ -5,6 +5,7 @@ package cfapi
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -14,24 +15,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// pollReadDir re-enumerates dir until it holds at least want entries or a
-// deadline passes, returning whatever it last saw. Population delivery is
-// asynchronous relative to the enumeration that triggers it.
-func pollReadDir(t *testing.T, dir string, want int) []os.DirEntry {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			t.Fatalf("ReadDir(%s): %v", dir, err)
-		}
-		if len(entries) >= want || time.Now().After(deadline) {
-			return entries
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
 // TestStateBitsAcrossLifecycle measures, on the live driver, how the
 // CF_PLACEHOLDER_STATE bits move through a file's and a directory's life. Two
 // production decisions hang on the answers (Deck #576):
@@ -39,10 +22,11 @@ func pollReadDir(t *testing.T, dir string, want int) []os.DirEntry {
 //  1. Does HYDRATION clear a file's in-sync bit? If yes, every opened file
 //     shows the "sync pending" arrows forever and the hydrate path must
 //     re-mark; if no, the file arrows seen in the field have another cause.
-//  2. What distinguishes a POPULATED-but-unmarked directory from an
-//     unpopulated one? Old mounts predate the after-population mark, so a
-//     heal pass needs an on-disk signature to find them safely — marking an
-//     UNpopulated dir in-sync makes it enumerate empty forever.
+//  2. Can the sweep heal the directories older versions left not in sync,
+//     populated AND never-opened ones? Marking a never-opened one in sync
+//     must leave it able to populate on its first open
+//     (TestInSyncDirStillPopulates; the belief that it could not came from
+//     listing from the provider's own process, which never populates).
 //
 // Opt in with NIMBO_CFAPI_LIVE=1.
 func TestStateBitsAcrossLifecycle(t *testing.T) {
@@ -65,8 +49,8 @@ func TestStateBitsAcrossLifecycle(t *testing.T) {
 	var listCalls atomic.Int32
 	list := func(rel string) []PlaceholderInfo {
 		listCalls.Add(1)
-		if rel == "lazydir" {
-			return []PlaceholderInfo{{Name: "kid.txt", Size: 3, ModTime: time.Now(), Identity: []byte("remote/lazydir/kid.txt")}}
+		if rel == "lazydir" || rel == "untouched" {
+			return []PlaceholderInfo{{Name: "kid.txt", Size: 3, ModTime: time.Now(), Identity: []byte("remote/" + rel + "/kid.txt")}}
 		}
 		// The root must return at least one entry, mirroring production, where
 		// Mount seeds the root's top level eagerly. A root whose transfer
@@ -123,21 +107,16 @@ func TestStateBitsAcrossLifecycle(t *testing.T) {
 
 	// --- Question 2: directory states and the sweep ---
 	dBefore := placeholderStateOf(t, dir)
-	t.Logf("lazy dir signature: state=0x%02x (PARTIAL expected)", dBefore)
+	t.Logf("lazy dir signature: state=0x%02x (PARTIAL + IN_SYNC expected)", dBefore)
 	if dBefore&cfPlaceholderStatePartial == 0 {
-		t.Errorf("lazy dir lacks the PARTIAL bit (state=0x%02x) — the sweep's unpopulated-signature is wrong", dBefore)
+		t.Errorf("lazy dir lacks the PARTIAL bit (state=0x%02x)", dBefore)
+	}
+	if dBefore&cfPlaceholderStateInSync == 0 {
+		t.Errorf("lazy dir was not created in sync (state=0x%02x) - Explorer draws the arrows on it", dBefore)
 	}
 
-	// OPEN QUESTION, logged not failed: enumerating this partial dir does not
-	// fire FETCH_PLACEHOLDERS for it in this harness (the parent root's fetch
-	// fires instead, and nothing follows for the subdir). Production populates
-	// subdirs, so something environmental differs; tracked on Deck #569.
-	entries := pollReadDir(t, dir, 1)
-	t.Logf("open question: lazy-dir enumeration returned %d entries (FETCH_PLACEHOLDERS calls=%d)", len(entries), listCalls.Load())
-
-	// For the sweep itself, build the populated-but-unmarked state DIRECTLY:
-	// a dir created population-complete (DISABLE_ON_DEMAND_POPULATION) but NOT
-	// in-sync — exactly what an old mount's opened folders look like.
+	// The two states older versions left directories in, both not in sync:
+	// populated (opened once) and never opened.
 	if err := CreatePlaceholders(root, []PlaceholderInfo{
 		{Name: "popdir", IsDir: true, ModTime: time.Now(), Identity: []byte("remote/popdir")},
 	}); err != nil {
@@ -147,35 +126,33 @@ func TestStateBitsAcrossLifecycle(t *testing.T) {
 	if err := setPopulatedNotInSync(popdir); err != nil {
 		t.Fatalf("setPopulatedNotInSync: %v", err)
 	}
-	dAfter := placeholderStateOf(t, popdir)
-	t.Logf("populated-but-unmarked dir: state=0x%02x", dAfter)
-	if dAfter&cfPlaceholderStatePartial != 0 {
-		t.Fatalf("setup failed: popdir still PARTIAL (state=0x%02x)", dAfter)
+	clearInSync(t, popdir)
+	clearInSync(t, untouched)
+	if s := placeholderStateOf(t, popdir); s&(cfPlaceholderStatePartial|cfPlaceholderStateInSync) != 0 {
+		t.Fatalf("setup failed: popdir state=0x%02x, want populated and not in sync", s)
 	}
-	dir = popdir // the sweep assertions below target the populated dir
 
-	// --- The sweep: marks the populated dir, leaves the unpopulated one alone ---
+	// --- The sweep marks both ---
 	marked := SweepDirsInSync(root, 0)
 	t.Logf("SweepDirsInSync marked %d directorie(s)", marked)
-	if s := placeholderStateOf(t, dir); s&cfPlaceholderStateInSync == 0 {
-		t.Errorf("populated dir not marked in-sync by the sweep (state=0x%02x)", s)
+	for _, d := range []string{popdir, untouched} {
+		if s := placeholderStateOf(t, d); s&cfPlaceholderStateInSync == 0 {
+			t.Errorf("%s not marked in sync by the sweep (state=0x%02x)", filepath.Base(d), s)
+		}
 	}
-	if s := placeholderStateOf(t, untouched); s&cfPlaceholderStateInSync != 0 {
-		t.Errorf("UNPOPULATED dir was marked in-sync by the sweep (state=0x%02x) — it would enumerate empty forever", s)
-	}
-
-	// After the mark, the populated dir must still enumerate (it is empty and
-	// population-complete, so empty is the correct answer — and it must not
-	// hang or refire fetches).
-	if _, err := os.ReadDir(dir); err != nil {
+	if _, err := os.ReadDir(popdir); err != nil {
 		t.Fatalf("ReadDir after mark: %v", err)
 	}
-	// The unpopulated dir must still carry its PARTIAL bit after the sweep —
-	// i.e. the sweep must not have touched its population state. (Whether
-	// enumeration fires its fetch is the open question above, so the on-disk
-	// bit is the assertion here.)
+	// The sweep must not touch population: the never-opened folder is still
+	// lazy, and still fills in on its first open from another process.
 	if s := placeholderStateOf(t, untouched); s&cfPlaceholderStatePartial == 0 {
 		t.Errorf("unpopulated dir lost its PARTIAL bit after the sweep (state=0x%02x)", s)
+	}
+	if out, err := exec.Command("cmd", "/c", "dir", "/b", untouched).CombinedOutput(); err != nil {
+		t.Fatalf("dir: %v: %s", err, out)
+	}
+	if names := listNames(t, untouched); len(names) != 1 || names[0] != "kid.txt" {
+		t.Errorf("the swept never-opened folder lists %v after its first open, want [kid.txt]", names)
 	}
 }
 

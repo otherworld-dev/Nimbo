@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest something Nimbo should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: What would you like Nimbo to do?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why? What are you trying to get done?
+    validations:
+      required: true

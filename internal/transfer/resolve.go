@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path"
@@ -128,10 +129,35 @@ func (e *Executor) classifyConflict(ctx context.Context, a engine.Action) (info 
 		return info, true, e.resolveTypeConflict(rel)
 	}
 
-	// Two files: auto-merge only if byte-identical.
+	// Two files: auto-merge only if byte-identical. A file a program holds open
+	// to write (Outlook and a .pst), or has locked part of, can't be read to
+	// compare: it waits in "In use" like an upload of it, rather than standing
+	// as a conflict nothing can clear (Deck #714).
+	if err := UploadDeferred(localP); err != nil {
+		return info, false, err
+	}
 	localSHA, err := sha1File(localP)
 	if err != nil {
+		if lockedOut(err) {
+			return info, false, &InUseError{Path: localP, Err: err}
+		}
 		return info, false, err
+	}
+	// The server keeps the SHA1 of what was uploaded: compare against that
+	// rather than downloading the whole server copy on every pass the conflict
+	// stands (a 24 GB .pst every ~14 minutes, Deck #714). The download stays
+	// for a server copy without one.
+	if remoteEntry.SHA1 != "" {
+		// A save landing during the hash would be absorbed into the baseline
+		// as identical and never uploaded: only a file that held still counts.
+		cur, serr := os.Stat(localP)
+		still := serr == nil && cur.Size() == localInfo.Size() && cur.ModTime().Equal(localInfo.ModTime())
+		if still && strings.EqualFold(remoteEntry.SHA1, localSHA) {
+			slog.Info("conflict suppressed (identical content)", "path", rel)
+			return info, true, e.rebaselineUnchanged(rel, localSHA)
+		}
+		info.Kind = "edited"
+		return info, false, nil
 	}
 	tmp := localP + ".ncremote.tmp"
 	dres, derr := Download(ctx, e.Client, e.remotePath(rel), tmp)
@@ -145,6 +171,46 @@ func (e *Executor) classifyConflict(ctx context.Context, a engine.Action) (info 
 	}
 	info.Kind = "edited"
 	return info, false, nil
+}
+
+// RecordChoice settles a conflict the user decided without transferring the
+// file itself: it records which side won and the next pass sends it. Doing the
+// transfer inside the click sent a 23 GB .pst with no progress and no error
+// the user could see, and each repeat click started another upload of it
+// (Deck #714). The pass has progress, waits for Outlook, and retries.
+//
+// Keep mine records the server's copy as seen and ours as changed, so the pass
+// uploads; Keep server the reverse, so it downloads. Where only the chosen
+// side has the file, dropping the baseline makes it new there. Deleting the
+// side that lost, and keeping both, are done here with ApplyChoice.
+func (e *Executor) RecordChoice(ctx context.Context, rel string, c Choice) error {
+	if c == ChoiceKeepBoth {
+		return e.ApplyChoice(ctx, rel, c)
+	}
+	fi, lerr := os.Stat(e.localPath(rel))
+	localExists := lerr == nil && !fi.IsDir()
+	ent, remoteExists, err := e.Client.Stat(ctx, e.remotePath(rel))
+	if err != nil {
+		return fmt.Errorf("could not check the server's copy: %w", err)
+	}
+	remoteExists = remoteExists && !ent.IsDir
+	switch {
+	case c == ChoiceKeepLocal && localExists && remoteExists:
+		// Size -1 never matches a file, so ours reads as changed. The server's
+		// checksum stops a metadata-only ETag bump (a lock) reading as an edit.
+		return e.saveFileBaseline(rel, FileResult{
+			ETag: ent.ETag, FileID: ent.FileID, Size: -1, ContentSHA1: ent.ContentSHA1(),
+		})
+	case c == ChoiceKeepRemote && localExists && remoteExists:
+		// No ETag never matches the server's, so its copy reads as changed;
+		// ours as it is now reads as unchanged.
+		return e.saveFileBaseline(rel, FileResult{
+			FileID: ent.FileID, Size: fi.Size(), MTimeNanos: fi.ModTime().UnixNano(),
+		})
+	case c == ChoiceKeepLocal && localExists, c == ChoiceKeepRemote && remoteExists:
+		return e.deleteBaseline(rel)
+	}
+	return e.ApplyChoice(ctx, rel, c)
 }
 
 // ApplyChoice settles a deferred conflict according to the user's choice.

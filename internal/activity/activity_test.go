@@ -49,3 +49,24 @@ func TestRecorder_RingBuffer(t *testing.T) {
 		t.Errorf("Recent len = %d, want %d (capped)", got, maxEvents)
 	}
 }
+
+func TestRecorder_ClearKeepsUnresolvedErrors(t *testing.T) {
+	r := New()
+	r.Add(Event{Local: "/l", Path: "a.txt", Kind: "upload"})
+	r.Add(Event{Local: "/l", Path: "b.txt", Kind: "download", Err: "boom"})
+
+	r.Clear()
+	if got := len(r.Recent()); got != 0 {
+		t.Errorf("Recent after Clear = %d, want 0", got)
+	}
+	// The failure is still unresolved, so it must keep counting as needing
+	// attention even though the history was cleared.
+	if errs := r.Errors(); len(errs) != 1 || errs[0].Path != "b.txt" {
+		t.Errorf("Errors after Clear = %+v, want the one for b.txt", errs)
+	}
+
+	r.Add(Event{Local: "/l", Path: "c.txt", Kind: "upload"})
+	if recent := r.Recent(); len(recent) != 1 || recent[0].Path != "c.txt" {
+		t.Errorf("Recent after a new event = %+v, want only c.txt", recent)
+	}
+}

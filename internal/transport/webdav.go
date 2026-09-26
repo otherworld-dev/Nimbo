@@ -30,6 +30,37 @@ type Entry struct {
 	IsEncrypted  bool      // nc:is-encrypted — an end-to-end encrypted folder (contents are opaque to clients without E2EE keys)
 	Permissions  string    // oc:permissions, e.g. "RGDNVW" (file) / "RMGCK" (dir); empty = unknown
 	Lock         *LockInfo // files_lock state; nil = unlocked OR the server didn't say (see LockInfo)
+	// UploadTime is nc:upload_time (unix seconds): when this version's content
+	// was uploaded. 0 = the server did not say. Unlike the ETag it is left
+	// alone by metadata-only changes — see ContentKey.
+	UploadTime int64
+}
+
+// ContentKey identifies the CONTENT version of a file, for telling a real
+// server edit from a metadata-only ETag bump.
+//
+// Nextcloud changes a file's ETag when files_lock takes or releases a lock (and
+// for tags, comments and favourites) while the bytes stay the same. Measured on
+// a live server, 2026-09-23: a lock and an unlock each changed the ETag and
+// nothing else, while a PUT of new content with the same size changed
+// nc:upload_time. So two listings with the same key hold the same version.
+//
+// "" when the upload time is unknown: then there is nothing to vouch for the
+// content and the caller must go by the ETag alone, as before. mtime is
+// compared in whole seconds, the server's own resolution.
+func ContentKey(size int64, mtime time.Time, uploadTime int64) string {
+	if uploadTime <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d:%d:%d", size, mtime.Unix(), uploadTime)
+}
+
+// ContentKey is the entry's content version key (see the package function).
+func (e Entry) ContentKey() string {
+	if e.IsDir {
+		return ""
+	}
+	return ContentKey(e.Size, e.LastModified, e.UploadTime)
 }
 
 // LockOwnerType identifies who took a lock, from nc:lock-owner-type.
@@ -55,6 +86,10 @@ type LockInfo struct {
 	Token        string        // nc:lock-token
 	Since        time.Time     // nc:lock-time (epoch seconds)
 	Timeout      time.Duration // nc:lock-timeout; zero means the server set no expiry
+	// FileOwner is oc:owner-id, the user who owns the FILE (not the lock). The
+	// owner can clear anyone's lock on it, which is how a stale lock left by
+	// another client gets cleared without an admin (#733). Empty when unknown.
+	FileOwner string
 }
 
 // AppName is the editor holding an app lock, as a human would say it. Empty for
@@ -198,6 +233,8 @@ const entryProps = `    <d:getetag/>
     <nc:lock-time/>
     <nc:lock-timeout/>
     <nc:lock-token/>
+    <nc:upload_time/>
+    <oc:owner-id/>
 `
 
 // propfindBody requests exactly the properties Entry exposes.
@@ -253,6 +290,8 @@ type davProp struct {
 	LockTime         string `xml:"lock-time"`
 	LockTimeout      string `xml:"lock-timeout"`
 	LockToken        string `xml:"lock-token"`
+	UploadTime       string `xml:"upload_time"`
+	OwnerID          string `xml:"owner-id"` // oc:owner-id, the file's owner
 	// Trashbin properties (nc namespace; only populated for trashbin PROPFINDs).
 	TrashFilename string `xml:"trashbin-filename"`
 	TrashOrigLoc  string `xml:"trashbin-original-location"`
@@ -416,6 +455,9 @@ func (c *Client) parseResponse(r davResponse) (Entry, bool, error) {
 	if t, err := http.ParseTime(prop.GetLastModified); err == nil {
 		e.LastModified = t
 	}
+	if n, err := strconv.ParseInt(strings.TrimSpace(prop.UploadTime), 10, 64); err == nil && n > 0 {
+		e.UploadTime = n
+	}
 	// files_lock. Only a positive nc:lock yields a record: an unlocked file
 	// reports it as an EMPTY string, and a server without the app omits it
 	// entirely (it arrives in a 404 propstat we never read). Both mean "not
@@ -426,6 +468,7 @@ func (c *Client) parseResponse(r davResponse) (Entry, bool, error) {
 			OwnerDisplay: strings.TrimSpace(prop.LockOwnerDisplay),
 			OwnerEditor:  strings.TrimSpace(prop.LockOwnerEditor),
 			Token:        strings.TrimSpace(prop.LockToken),
+			FileOwner:    strings.TrimSpace(prop.OwnerID),
 		}
 		if n, err := strconv.Atoi(strings.TrimSpace(prop.LockOwnerType)); err == nil {
 			li.OwnerType = LockOwnerType(n)
@@ -589,7 +632,7 @@ func (c *Client) Put(ctx context.Context, remotePath string, body io.Reader, siz
 // newBody must return a fresh reader of the whole content each call — it backs
 // the request's GetBody so the transport can replay the PUT after a
 // connection-level failure (HTTP/2 GOAWAY, stale reused connection).
-func (c *Client) PutWithChecksum(ctx context.Context, remotePath string, newBody func() (io.Reader, error), size int64, ocChecksum string) (etag, fileID string, err error) {
+func (c *Client) PutWithChecksum(ctx context.Context, remotePath string, newBody func() (io.Reader, error), size int64, ocChecksum string, mtime time.Time) (etag, fileID string, err error) {
 	body, err := newBody()
 	if err != nil {
 		return "", "", err
@@ -616,6 +659,7 @@ func (c *Client) PutWithChecksum(ctx context.Context, remotePath string, newBody
 	if ocChecksum != "" {
 		req.Header.Set("OC-Checksum", ocChecksum)
 	}
+	setMtime(req, mtime)
 	resp, err := c.DoOnce(req)
 	if err != nil {
 		return "", "", err
@@ -626,6 +670,17 @@ func (c *Client) PutWithChecksum(ctx context.Context, remotePath string, newBody
 	}
 	etag, fileID = revisionHeaders(resp.Header)
 	return etag, fileID, nil
+}
+
+// setMtime tells the server the file's own modified time (X-OC-Mtime, whole
+// seconds since the epoch), as Nextcloud's desktop client does on every
+// upload. Without it the server stamps the time the upload arrived, and every
+// other device downloads the file with that date. A zero or pre-1970 time is
+// left out and the server keeps its default.
+func setMtime(req *http.Request, mtime time.Time) {
+	if !mtime.IsZero() && mtime.Unix() > 0 {
+		req.Header.Set("X-OC-Mtime", strconv.FormatInt(mtime.Unix(), 10))
+	}
 }
 
 // revisionHeaders extracts the ETag and OC-FileId from a write response,
@@ -782,7 +837,9 @@ func (c *Client) Lock(ctx context.Context, remotePath string) (LockResult, error
 // Unlock releases a lock WE hold.
 //
 // Only ever call this for a lock in our own registry: releasing somebody else's
-// returns 423 and is not ours to clear. A second UNLOCK of the same path returns
+// returns 423 and is not ours to clear. The one exception is the file's OWNER,
+// who the server lets clear anyone's lock (measured 2026-09-24), and that only
+// through agent.Engine.UnlockStale's checks. A second UNLOCK of the same path returns
 // 412 Precondition Failed — NOT 404 — which simply means the lock is already
 // gone, so it counts as success. The startup sweep hits that routinely, and
 // treating it as an error would log a failure on every boot.

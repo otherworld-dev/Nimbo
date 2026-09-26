@@ -18,6 +18,7 @@ import (
 
 	"github.com/otherworld/nimbo/internal/engine"
 	"github.com/otherworld/nimbo/internal/state"
+	"github.com/otherworld/nimbo/internal/transport"
 )
 
 func TestUploadSendsADocumentAnotherAppHoldsOpen(t *testing.T) {
@@ -226,5 +227,84 @@ func TestALongPathHashesAndUploads(t *testing.T) {
 	defer f.mu.Unlock()
 	if string(f.files["docs/report.docx"]) != "long path content" {
 		t.Fatal("the long-path file was not uploaded")
+	}
+}
+
+// pstFixture is uploadFixture's file renamed to an Outlook data file.
+func pstFixture(t *testing.T, name string) (*fakeNC, *transport.Client, string) {
+	t.Helper()
+	f, c, local := uploadFixture(t, 50)
+	renamed := filepath.Join(filepath.Dir(local), name)
+	if err := os.Rename(local, renamed); err != nil {
+		t.Fatal(err)
+	}
+	return f, c, renamed
+}
+
+// Deck #634. Outlook writes to an attached .pst in bursts, not constantly, so
+// a burst that lands BETWEEN two uploads is never caught mid-read. The file
+// was then never marked as having a busy writer, and every burst sent the
+// whole file again: 3 GB and 24 GB archives, re-uploaded all day while
+// Outlook stayed open. An Outlook data file is held from the very first
+// attempt while any program has it open to write, and uploads once when
+// that program lets go.
+func TestUploadDeferredHoldsAnOutlookDataFileFromTheFirstAttempt(t *testing.T) {
+	for _, name := range []string{"OnlineArchive.pst", "MAILBOX.PST", "cache.ost"} {
+		t.Run(name, func(t *testing.T) {
+			_, _, local := pstFixture(t, name)
+			outlook, err := os.OpenFile(local, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer outlook.Close()
+
+			var inUse *InUseError
+			held := UploadDeferred(local)
+			if !errors.As(held, &inUse) {
+				t.Fatalf("held open by Outlook, never caught changing: err = %v, want an InUseError", held)
+			}
+			if !errors.Is(held, windows.ERROR_SHARING_VIOLATION) {
+				t.Errorf("InUseError must still read as a sharing violation (on-demand mode's busy check): %v", held)
+			}
+			outlook.Close()
+			if err := UploadDeferred(local); err != nil {
+				t.Fatalf("once Outlook has closed it: %v", err)
+			}
+		})
+	}
+}
+
+// And the upload itself is refused before a byte is read or sent.
+func TestUploadDoesNotSendAnOutlookDataFileHeldOpen(t *testing.T) {
+	f, c, local := pstFixture(t, "OnlineArchive.pst")
+	outlook, err := os.OpenFile(local, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outlook.Close()
+
+	var inUse *InUseError
+	if _, err := Upload(context.Background(), c, local, "To Sort/OnlineArchive.pst"); !errors.As(err, &inUse) {
+		t.Fatalf("err = %v, want an InUseError", err)
+	}
+	f.mu.Lock()
+	sent := len(f.files["To Sort/OnlineArchive.pst"]) != 0
+	f.mu.Unlock()
+	if sent {
+		t.Fatal("the archive was uploaded while Outlook had it open")
+	}
+}
+
+// Every other file keeps the old rule: held open is fine, only a file caught
+// changing mid-upload waits (Word and Excel hold documents open to write).
+func TestUploadDeferredStillLetsAnOpenDocumentGo(t *testing.T) {
+	_, _, local := pstFixture(t, "report.docx")
+	word, err := os.OpenFile(local, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer word.Close()
+	if err := UploadDeferred(local); err != nil {
+		t.Fatalf("an open document was held: %v", err)
 	}
 }

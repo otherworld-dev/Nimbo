@@ -447,6 +447,14 @@ export class BrandDTO {
              */
             this["support"] = "";
         }
+        if (!("help" in $$source)) {
+            /**
+             * help home, "" when the brand has none
+             * @member
+             * @type {string}
+             */
+            this["help"] = "";
+        }
         if (!("accentHex" in $$source)) {
             /**
              * @member
@@ -1302,6 +1310,22 @@ export class LockDTO {
              */
             this["account"] = "";
         }
+        if (!("localDir" in $$source)) {
+            /**
+             * the sync folder it is listed under, for UnlockStaleLock
+             * @member
+             * @type {string}
+             */
+            this["localDir"] = "";
+        }
+        if (!("canUnlock" in $$source)) {
+            /**
+             * a stale lock on a file this account owns (#733)
+             * @member
+             * @type {boolean}
+             */
+            this["canUnlock"] = false;
+        }
 
         Object.assign(this, $$source);
     }
@@ -1573,6 +1597,15 @@ export class PairDTO {
              * @type {string[] | undefined}
              */
             this["freezeSample"] = undefined;
+        }
+        if (/** @type {any} */(false)) {
+            /**
+             * HeldReason says why this folder is not syncing because another account
+             * uses it (GitHub #11); "" when it syncs normally.
+             * @member
+             * @type {string | undefined}
+             */
+            this["heldReason"] = undefined;
         }
 
         Object.assign(this, $$source);

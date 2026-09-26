@@ -57,3 +57,19 @@ func TestSanitizeToastTextKeepsOrdinaryText(t *testing.T) {
 		}
 	}
 }
+
+// A toast whose link is one of our own "action=…" strings must activate the
+// app, which routes it through dispatchToastActivation. Raised as a protocol
+// launch, Windows was asked to open "action=inuse" as a URL, so clicking the
+// conflict and file-in-use toasts never reached the tab they were about
+// (Deck #714). A real link still opens as a protocol launch.
+func TestToastActionLinkActivatesTheApp(t *testing.T) {
+	x := buildToastXML("Sync conflict", "a.pst needs your decision", "action=conflicts")
+	if !strings.Contains(x, `activationType="foreground" launch="action=conflicts"`) {
+		t.Errorf("action link not a foreground activation: %s", x)
+	}
+	x = buildToastXML("Talk", "hi", "https://cloud.example.com/call/abc")
+	if !strings.Contains(x, `activationType="protocol" launch="https://cloud.example.com/call/abc"`) {
+		t.Errorf("web link not a protocol launch: %s", x)
+	}
+}

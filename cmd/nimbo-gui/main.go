@@ -7,6 +7,9 @@ import (
 	"embed"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -93,6 +96,7 @@ func main() {
 		if lerr := applog.Setup(d.LogFile(), verbose); lerr != nil {
 			slog.Warn("file logging unavailable, using stderr only", "err", lerr)
 		}
+		setupCrashLog(filepath.Join(filepath.Dir(d.LogFile()), "crash.log"))
 	} else {
 		applog.SetVerbose(verbose)
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: applog.Level()})))
@@ -121,6 +125,16 @@ func main() {
 		},
 	})
 	svc.app = app
+	// Lets work that must go through the main loop wait for it (afterStart).
+	svc.started = make(chan struct{})
+	var startedOnce sync.Once
+	app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
+		startedOnce.Do(func() { close(svc.started) })
+	})
+	// Logged here, not earlier: a second launch (Explorer's Share menu) hands
+	// its arguments to the running app and exits inside application.New, and
+	// must not read as a start that never logged "exiting".
+	slog.Info("starting", "version", version, "pid", os.Getpid())
 
 	// Toast activation: register the COM callback so clicking a toast (or a toast
 	// button) routes to the matching action (sign in, open notifications, run a
@@ -176,6 +190,10 @@ func main() {
 	})
 	tray := app.SystemTray.New()
 	tray.SetIcon(trayIcon("idle", 0, false))
+	// The icon had no tooltip, so hovering it showed nothing. Every later icon
+	// change has to put it back (setTrayIcon). The name in the taskbar settings
+	// comes from the exe's version resource instead (versioninfo.rc, GitHub #9).
+	tray.SetTooltip(brand.Current.Name)
 	tray.AttachWindow(flyout)
 	svc.tray = tray
 
@@ -212,14 +230,33 @@ func main() {
 	// particular, which nothing else ever rewrites. See appshortcuts.go.
 	go svc.repairAppShortcutIcons()
 
-	if hasAccount() {
-		go svc.start(ctx)
-	} else {
+	signedIn := hasAccount()
+	if !signedIn {
 		// First run: show the sign-in window. The engine starts after login.
+		// Set directly, not via setStatus: nothing can hear an event yet.
+		svc.status = "Not signed in"
 		svc.showLogin()
 	}
+	// The right-click menu exists from launch, not only once an engine is up:
+	// with no account the engine never starts, and closing the sign-in window
+	// left a tray icon with no menu at all (GitHub #12). Before Run, SetMenu
+	// only stores the menu; start() rebuilds it once the engine is running.
+	tray.SetMenu(svc.buildTrayMenu())
+	if signedIn {
+		go svc.start(ctx)
+	}
+	// One update check for the life of the process, signed in or not. It used
+	// to start with the engine, so an app waiting for a sign-in never heard
+	// about a release, and the only way to update it was the website (GitHub #11).
+	go svc.updateCheckLoop(ctx)
 
 	err := app.Run()
+	// Every clean way out passes here (tray Quit, an update, Windows ending the
+	// session). A log that stops without this line died another way: see
+	// crash.log, or it was killed.
+	slog.Info("exiting", "err", err)
+	// Give back file locks first: nothing on the server would ever expire them.
+	svc.releaseLocksOnExit(5 * time.Second)
 	// Disconnect WITHOUT unregistering: unregistering makes Windows strip the
 	// cloud state from the whole tree, which is how every app update used to
 	// flatten the mount (placeholders reverted to plain files on each restart).

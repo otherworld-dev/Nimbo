@@ -320,7 +320,14 @@ func showToastXML(xml, aumid string) error {
 func buildToastXML(title, message, link string) string {
 	var b strings.Builder
 	b.WriteString(`<toast`)
-	if link != "" {
+	if strings.HasPrefix(link, "action=") {
+		// One of our own actions ("action=conflicts"): activate the app, which
+		// routes it (dispatchToastActivation). As a protocol launch Windows
+		// tried to open it as a URL and the click went nowhere (Deck #714).
+		b.WriteString(` activationType="foreground" launch="`)
+		b.WriteString(xmlEscapeAttr(link))
+		b.WriteString(`"`)
+	} else if link != "" {
 		b.WriteString(` activationType="protocol" launch="`)
 		b.WriteString(xmlEscapeAttr(link))
 		b.WriteString(`"`)

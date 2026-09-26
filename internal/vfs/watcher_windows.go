@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/otherworld/nimbo/internal/cfapi"
+	"github.com/otherworld/nimbo/internal/transfer"
 	"github.com/otherworld/nimbo/internal/transport"
 )
 
@@ -41,108 +42,34 @@ var (
 	cfShellNotify         = cfapi.ShellNotifyUpdated
 	cfShellCreated        = cfapi.ShellNotifyCreated
 	cfSettlePin           = cfapi.SettlePin
+	cfWantsFreeUp         = cfapi.WantsFreeUp
 	cfExclude             = cfapi.ExcludeFromSync
 	cfPlaceholderIdentity = cfapi.PlaceholderIdentity
 	cfPlaceholderModified = cfapi.PlaceholderModified
 	cfHydrateIfPinned     = cfapi.HydrateIfPinned
 	cfPinnedDehydrated    = cfapi.PinnedDehydrated
 	cfDirPopulated        = cfapi.DirPopulated
+	cfPinned              = cfapi.Pinned
+	cfMarkDirPopulated    = cfapi.MarkDirPopulated
 )
 
-// Ops are the server-side actions the watcher performs (backed by the engine).
-type Ops struct {
-	Upload func(ctx context.Context, localPath, remotePath string) error
-	Mkdir  func(ctx context.Context, remotePath string) error
-	Delete func(ctx context.Context, remotePath string) error
-	Move   func(ctx context.Context, srcRemote, dstRemote string) error
-	// List returns the children of a sync-root-relative directory ("" = root)
-	// as placeholders, for down-sync reconciliation. A non-nil error means the
-	// listing is unknown (e.g. a network failure) and must NOT be treated as an
-	// empty directory.
-	List func(rel string) ([]cfapi.PlaceholderInfo, error)
-	// CheckList lists a server folder for the delete guard, sync-root-relative
-	// like List, but completely and quietly: end-to-end encrypted folders are
-	// included (Encrypted set) rather than skipped, nothing is recorded as a
-	// side effect, and a listing that cannot finish returns an error (a
-	// transport.ErrNotFound one when the folder is not there). Nil makes the
-	// guard use List.
-	CheckList func(rel string) ([]cfapi.PlaceholderInfo, error)
-	// Stat reports whether a RAW server path currently exists — used to tell a
-	// lost MOVE response (the server applied the rename) from a real failure.
-	// Nil disables that detection.
-	Stat func(remote string) (bool, error)
-	// Report surfaces a completed operation for the activity feed / error toasts
-	// (kind e.g. "upload"/"delete-remote"/"move"/"delete-local"; err non-nil on
-	// failure).
-	Report func(kind, remotePath string, err error)
-	// RecordBaseline records the server ETag a placeholder now mirrors (the
-	// conflict baseline), set when we create/refresh an in-sync placeholder.
-	RecordBaseline func(remotePath, etag string)
-	// Baseline returns the recorded ETag for a remote path (ok=false if none).
-	// Down-sync uses it to detect server-side edits reliably (any content change
-	// alters the ETag), rather than relying only on the size/mtime heuristic.
-	Baseline func(remotePath string) (string, bool)
-	// ForgetBaseline drops the recorded ETag for a remote path the server no
-	// longer holds under that name (the source of a MOVE). Nil disables it.
-	ForgetBaseline func(remotePath string)
-	// MoveBaselines carries several baselines across a move at once (pairs of
-	// src, dst RAW server paths): each dst takes src's recorded ETag and src is
-	// dropped. RecordBaselines records several baselines at once.
-	//
-	// Both exist because the store behind these hooks persists its ENTIRE file
-	// per call: a moved directory of 1,000 files cost 2,000 whole-file rewrites
-	// of a multi-megabyte JSON, synchronously, inside the move. Nil falls back
-	// to the one-item hooks above, so a caller wiring only those still works.
-	MoveBaselines   func(pairs [][2]string)
-	RecordBaselines func(etagByRemotePath map[string]string)
-	// RecordFileID / FileID / DropFileID persist the server oc:fileid per remote
-	// path so down-sync can recognise a server rename (old path gone, new path
-	// with the same fileid) and move the placeholder instead of delete+recreate.
-	RecordFileID func(remotePath, fileid string)
-	FileID       func(remotePath string) (string, bool)
-	DropFileID   func(remotePath string)
-	// MountRoot reports whether a RAW server path was, when last listed, the
-	// ROOT of a share received from someone else or of a mount (Deck #557).
-	// Such a path vanishing from a listing means it was detached from the
-	// account, not deleted. Nil disables the distinction: every vanish is a
-	// deletion, as before.
-	MountRoot func(remotePath string) bool
-	// Detached takes over a vanished share's salvaged local copy at localPath
-	// (plain files only by then — see Watcher.salvage), keyed by its RAW server
-	// path: the caller parks it outside the cloud folder and tells the user.
-	// An error leaves the copy where it is for the next pass to retry.
-	Detached func(localPath, remotePath string) error
-	// Forget is told, once a vanished share's copy has left the mount (parked)
-	// or was removed as holding nothing, that whatever is recorded under
-	// remotePath — etag baselines, file ids, the root mark — no longer applies.
-	// Seen live: the stub-only share's stale entries would have let the
-	// mount-state heal read a later folder of the same name as server content,
-	// and its stale root mark would then have parked that folder as "unshared".
-	Forget func(remotePath string)
-	// Encode maps a LOCAL (user-visible) rel path to the RAW path the server
-	// stores it under, for disguised file types: Nextcloud forbids ".htaccess",
-	// so it lives on the server as ".htaccess.nimboesc". Decode is the inverse and
-	// is used only for display. Nil means escaping is off and names pass through.
-	//
-	// Escaping applies to FILE basenames only — directories are never escaped, so
-	// callers must not encode a directory path (see serverFor).
-	//
-	// These are called PER OPERATION and must never be captured by the caller: the
-	// engine swaps its escaper (an atomic pointer) whenever the user toggles a
-	// type in Settings, and a mount outlives that.
-	Encode func(rel string) string
-	Decode func(rel string) string
-	Log    func(format string, args ...any)
-}
+// errPaused is the cause an upload's context is cancelled with when a pause
+// stops it, so the run can tell it from a delete or rename superseding it.
+var errPaused = errors.New("sync is paused")
 
 // Watcher monitors a mount root subtree and pushes user changes to the server.
 type Watcher struct {
-	root       string // local sync-root path
-	remoteRoot string // files-root-relative remote path ("" = account root)
-	ops        Ops
-	handle     windows.Handle
-	ctx        context.Context
-	cancel     context.CancelFunc
+	root string // local sync-root path
+	// blockedNames holds paths whose upload or move is refused because a
+	// neighbour already carries their escaped server name (escapeCollision),
+	// lower-cased; each is reported once, and forgotten when it syncs, is
+	// deleted or is renamed away.
+	blockedNames map[string]bool
+	remoteRoot   string // files-root-relative remote path ("" = account root)
+	ops          Ops
+	handle       windows.Handle
+	ctx          context.Context
+	cancel       context.CancelFunc
 
 	pollEvery time.Duration // safety-net reconcile interval
 
@@ -153,10 +80,13 @@ type Watcher struct {
 	// inflight holds a cancel func per lower-cased path with an upload running
 	// now — a delete/rename event for the path cancels the doomed upload
 	// instead of letting the assembly recreate a deleted file server-side.
-	inflight    map[string]context.CancelFunc
-	again       map[string]bool // changed while in flight — re-arm on completion
-	attempts    map[string]int  // consecutive upload failures per lower-cased path
-	delAttempts map[string]int  // consecutive server-DELETE failures
+	inflight map[string]context.CancelCauseFunc
+	again    map[string]bool // changed while in flight — re-arm on completion
+	// held holds the uploads a pause stopped or kept from starting (lower-
+	// cased path -> path), re-armed when it ends. Created on first use.
+	held        map[string]string
+	attempts    map[string]int // consecutive upload failures per lower-cased path
+	delAttempts map[string]int // consecutive server-DELETE failures
 	// deleting holds the paths whose delete is being judged or sent right now,
 	// and kept the folders the delete guard kept on the server recently (both
 	// lower-cased); guardSem bounds how many guard listings run at once. All
@@ -193,6 +123,11 @@ type Watcher struct {
 	// both guarded by mu like the maps above.
 	hydrateFails map[string]int
 	hydrateNext  map[string]time.Time
+	// pinFilling holds the lower-cased paths of pinned, never-opened folders
+	// being filled in right now (requestPinFill), so the burst of attribute
+	// events a recursive pin raises fills each one once. Guarded by mu,
+	// created on first use.
+	pinFilling map[string]bool
 	// inMove holds lower-cased DESTINATION paths with a server MOVE running
 	// right now. Reconcile's foreign-identity check reads the same evidence a
 	// live move does (an identity naming another server path), so without this
@@ -213,6 +148,12 @@ type Watcher struct {
 	forced map[string]bool
 
 	loopDone chan struct{} // closed when the watch loop exits (Close joins it)
+
+	// work counts the goroutines and timer callbacks the watcher has running
+	// (spawn, after), so they can be waited out; stopped (guarded by mu)
+	// refuses new ones once that wait has begun.
+	work    sync.WaitGroup
+	stopped bool
 
 	lostEvents atomic.Bool // events were lost (overflow/reopen) — next pass sweeps
 
@@ -300,7 +241,7 @@ func New(parent context.Context, root, remoteRoot string, pollEvery time.Duratio
 		handle: h, ctx: ctx, cancel: cancel,
 		upload: map[string]*time.Timer{}, delete: map[string]*time.Timer{},
 		suppress: map[string]time.Time{},
-		inflight: map[string]context.CancelFunc{}, again: map[string]bool{},
+		inflight: map[string]context.CancelCauseFunc{}, again: map[string]bool{},
 		attempts: map[string]int{}, delAttempts: map[string]int{},
 		mvAttempts: map[string]int{}, busyCount: map[string]int{},
 		moved:       map[string]time.Time{},
@@ -315,11 +256,11 @@ func New(parent context.Context, root, remoteRoot string, pollEvery time.Duratio
 		w.ops.Log = func(string, ...any) {}
 	}
 	for i := 0; i < hydrateWorkers; i++ {
-		go w.hydrateLoop()
+		w.spawn(w.hydrateLoop)
 	}
 	go w.loop()
 	if w.ops.List != nil {
-		go w.pollLoop()
+		w.spawn(w.pollLoop)
 		// pollLoop waits a whole interval before its first pass (30s, or five
 		// minutes where push does the work), and nothing else pokes a freshly
 		// mounted watcher — so after every start the shell's own root fetch
@@ -337,7 +278,7 @@ func (w *Watcher) Poke() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.pokeTimer == nil {
-		w.pokeTimer = time.AfterFunc(pokeDebounce, w.Reconcile)
+		w.pokeTimer = w.after(pokeDebounce, w.Reconcile)
 		return
 	}
 	w.pokeTimer.Reset(pokeDebounce)
@@ -353,6 +294,12 @@ func (w *Watcher) pollLoop() {
 		case <-w.ctx.Done():
 			return
 		case <-t.C:
+			// A resume this watcher never heard about (the caller's
+			// notification raced a mount starting up) must not leave uploads
+			// and pinned downloads waiting for a pause that has ended.
+			if !w.paused() {
+				w.releaseHeld()
+			}
 			w.Reconcile()
 		}
 	}
@@ -482,6 +429,16 @@ func (w *Watcher) noteEventLoss() {
 func (w *Watcher) parse(b []byte) {
 	var renameOld string
 	removed := map[string]string{}
+	// Editor lock files are skipped below like every other temporary, but
+	// they are also how a document being opened or closed shows itself, so
+	// they go to the EditorLockFiles hook first. Off the event pump: taking a
+	// lock is a network round trip.
+	var editorLocks []string
+	defer func() {
+		if len(editorLocks) > 0 && w.ops.EditorLockFiles != nil {
+			w.spawn(func() { w.ops.EditorLockFiles(editorLocks) })
+		}
+	}()
 	for off := 0; off+12 <= len(b); {
 		next := *(*uint32)(unsafe.Pointer(&b[off]))
 		action := *(*uint32)(unsafe.Pointer(&b[off+4]))
@@ -492,6 +449,9 @@ func (w *Watcher) parse(b []byte) {
 		}
 		name := windows.UTF16ToString(unsafe.Slice((*uint16)(unsafe.Pointer(&b[nameStart])), nameLen/2))
 		if skipName(name) {
+			if isEditorLockName(name) {
+				editorLocks = append(editorLocks, filepath.Join(w.root, name))
+			}
 			if next == 0 {
 				break
 			}
@@ -528,7 +488,7 @@ func (w *Watcher) parse(b []byte) {
 				old := renameOld
 				renameOld = ""
 				if w.beginRename(old, path) {
-					go w.handleRename(old, path)
+					w.spawn(func() { w.handleRename(old, path) })
 				} else {
 					// The callback (NotifyRenamed) already claimed this pair.
 					// A RENAMED pair proves no REMOVED is coming for old, so
@@ -538,7 +498,7 @@ func (w *Watcher) parse(b []byte) {
 					// item really did end up where the claimant's MOVE was
 					// meant to put it. A redo inside the claim window looks
 					// exactly like a duplicate report and is not one.
-					go w.verifyPlacement(path)
+					w.spawn(func() { w.verifyPlacement(path) })
 				}
 			} else {
 				w.cancelDelete(path)
@@ -699,7 +659,7 @@ func (w *Watcher) scheduleUploadAfter(path string, d time.Duration) {
 		t.Reset(d)
 		return
 	}
-	w.upload[path] = time.AfterFunc(d, func() {
+	w.upload[path] = w.after(d, func() {
 		w.mu.Lock()
 		delete(w.upload, path)
 		w.mu.Unlock()
@@ -714,7 +674,7 @@ func (w *Watcher) scheduleUpload(path string) {
 		t.Reset(uploadDebounce)
 		return
 	}
-	w.upload[path] = time.AfterFunc(uploadDebounce, func() {
+	w.upload[path] = w.after(uploadDebounce, func() {
 		w.mu.Lock()
 		delete(w.upload, path)
 		w.mu.Unlock()
@@ -734,7 +694,7 @@ func (w *Watcher) scheduleUploadIfIdle(path string) {
 	if _, busy := w.inflight[strings.ToLower(path)]; busy {
 		return
 	}
-	w.upload[path] = time.AfterFunc(uploadDebounce, func() {
+	w.upload[path] = w.after(uploadDebounce, func() {
 		w.mu.Lock()
 		delete(w.upload, path)
 		w.mu.Unlock()
@@ -761,8 +721,103 @@ func (w *Watcher) cancelInflight(path string) {
 	delete(w.forced, strings.ToLower(path))
 	w.mu.Unlock()
 	if cancel != nil {
-		cancel()
+		cancel(nil)
 	}
+}
+
+// spawn runs f on its own goroutine as counted watcher work (see work).
+func (w *Watcher) spawn(f func()) {
+	if !w.begin() {
+		return
+	}
+	go func() {
+		defer w.work.Done()
+		f()
+	}()
+}
+
+// after is time.AfterFunc for watcher work: the callback is counted while it
+// runs, and skipped if the watcher has stopped by the time it fires.
+func (w *Watcher) after(d time.Duration, f func()) *time.Timer {
+	return time.AfterFunc(d, func() {
+		if !w.begin() {
+			return
+		}
+		defer w.work.Done()
+		f()
+	})
+}
+
+// begin counts one piece of work in, unless the watcher has stopped. Taking
+// mu for it means every Add happens before stopped is set, so a Wait after
+// that sees them all.
+func (w *Watcher) begin() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		return false
+	}
+	w.work.Add(1)
+	return true
+}
+
+// paused reports whether the user has paused syncing (see Ops.Paused).
+func (w *Watcher) paused() bool { return w.ops.Paused != nil && w.ops.Paused() }
+
+// PauseChanged tells the watcher Ops.Paused may have changed its answer.
+// Pausing stops every upload running now; they wait with the ones the pause
+// kept from starting. Resuming starts them all again, and wakes the pinned
+// downloads. Safe to call from any goroutine, and when nothing changed.
+func (w *Watcher) PauseChanged() {
+	if !w.paused() {
+		w.releaseHeld()
+		return
+	}
+	w.mu.Lock()
+	running := make([]context.CancelCauseFunc, 0, len(w.inflight))
+	for _, cancel := range w.inflight {
+		running = append(running, cancel)
+	}
+	w.mu.Unlock()
+	for _, cancel := range running {
+		cancel(errPaused)
+	}
+}
+
+// hold parks an upload until the pause ends. Its dirty bit stays, so the
+// file keeps Explorer's sync-pending arrows, which is the truth.
+func (w *Watcher) hold(path string, forced bool) {
+	w.reforce(path, forced)
+	key := strings.ToLower(path)
+	w.mu.Lock()
+	if w.held == nil {
+		w.held = map[string]string{}
+	}
+	_, already := w.held[key]
+	w.held[key] = path
+	w.mu.Unlock()
+	if !already {
+		w.ops.Log("vfs upload %s waiting: sync is paused", w.remoteFor(path))
+	}
+	// The pause may have ended between the caller's check and the line
+	// above, and its PauseChanged found nothing held yet. Look again, or
+	// this upload waits for the next pause change.
+	if !w.paused() {
+		w.releaseHeld()
+	}
+}
+
+// releaseHeld re-arms every upload a pause held and wakes the pinned-download
+// workers, which stopped taking work while it lasted.
+func (w *Watcher) releaseHeld() {
+	w.mu.Lock()
+	held := w.held
+	w.held = nil
+	w.mu.Unlock()
+	for _, path := range held {
+		w.scheduleUpload(path)
+	}
+	w.wakeHydrator()
 }
 
 // scheduleDelete debounces a server-side delete so a transient remove (rename
@@ -774,7 +829,7 @@ func (w *Watcher) scheduleDelete(path string) {
 		t.Reset(deleteDebounce)
 		return
 	}
-	w.delete[path] = time.AfterFunc(deleteDebounce, func() {
+	w.delete[path] = w.after(deleteDebounce, func() {
 		// Pending hands over to running under one lock, so a folder waiting
 		// on this path never sees it in neither state. handleDelete counts
 		// its own run; this mark covers only the gap and is released after.
@@ -798,7 +853,7 @@ func (w *Watcher) scheduleDeleteAfter(path string, d time.Duration) {
 		t.Reset(d)
 		return
 	}
-	w.delete[path] = time.AfterFunc(d, func() {
+	w.delete[path] = w.after(d, func() {
 		// Pending hands over to running under one lock, so a folder waiting
 		// on this path never sees it in neither state. handleDelete counts
 		// its own run; this mark covers only the gap and is released after.
@@ -862,10 +917,10 @@ func (w *Watcher) NotifyRenamed(oldPath, newPath string) {
 		// is a redo of the same move inside the claim window, which nobody
 		// has pushed. Both look identical from here, so the placement is
 		// checked once the claimant's MOVE (if there is one) has settled.
-		go w.verifyPlacement(newPath)
+		w.spawn(func() { w.verifyPlacement(newPath) })
 		return
 	}
-	go w.handleRename(oldPath, newPath)
+	w.spawn(func() { w.handleRename(oldPath, newPath) })
 }
 
 // movedKeyTTL returns how long a key in w.moved stays valid. A PAIR key only
@@ -914,7 +969,7 @@ func (w *Watcher) forgetMoved(path string) {
 
 // verifyPlacement answers a rename report the pair claim deduplicated, a
 // moment after the fact: is the item at newPath really where the server keeps
-// it? Meant to be started as `go w.verifyPlacement(newPath)`.
+// it? Meant to be started with w.spawn, off the caller's goroutine.
 //
 // A deduplicated report is usually a genuine duplicate — the RENAMED pair and
 // the filter's rename-completion callback describing ONE move — and the
@@ -1044,6 +1099,17 @@ func (w *Watcher) recentlyMoved(path string) bool {
 // skipName reports whether a change to rel (a sync-root-relative path) should be
 // ignored: the diff engine's download temp files and well-known OS/editor
 // temporaries must never be pushed to the server.
+// isEditorLockName reports whether rel names an editor's lock file: Office's
+// "~$" owner file or LibreOffice's ".~lock.<name>#". Which document it belongs
+// to is the engine's business (officelock); this only picks the events out.
+func isEditorLockName(rel string) bool {
+	base := rel
+	if i := strings.LastIndexAny(rel, `\/`); i >= 0 {
+		base = rel[i+1:]
+	}
+	return strings.HasPrefix(base, "~$") || strings.HasPrefix(strings.ToLower(base), ".~lock.")
+}
+
 func skipName(rel string) bool {
 	base := rel
 	if i := strings.LastIndexAny(rel, `\/`); i >= 0 {
@@ -1178,6 +1244,45 @@ func (w *Watcher) recordBaseline(remotePath, etag string) {
 	}
 }
 
+// contentKey is r's content-version key: "" for a directory, or when the
+// server did not report an upload time (transport.ContentKey).
+func contentKey(r cfapi.PlaceholderInfo) string {
+	if r.IsDir {
+		return ""
+	}
+	return transport.ContentKey(r.Size, r.ModTime, r.UploadTime)
+}
+
+// recordContents notes the content-version key of the server version each
+// placeholder now mirrors, in one write; "" clears a path's key.
+func (w *Watcher) recordContents(rs ...cfapi.PlaceholderInfo) {
+	if w.ops.RecordContent == nil || len(rs) == 0 {
+		return
+	}
+	m := make(map[string]string, len(rs))
+	for _, r := range rs {
+		if !r.IsDir && len(r.Identity) > 0 {
+			m[string(r.Identity)] = contentKey(r)
+		}
+	}
+	if len(m) > 0 {
+		w.ops.RecordContent(m)
+	}
+}
+
+// sameVersionAsBaseline reports whether the server still holds the very
+// version the placeholder was last synced to, although its ETag moved on: the
+// recorded content key matches the listing's. That is a metadata-only bump —
+// files_lock changes the ETag on every lock and unlock (GitHub #7) — and must
+// not be treated as an edit. False whenever either key is unknown.
+func (w *Watcher) sameVersionAsBaseline(r cfapi.PlaceholderInfo) bool {
+	if w.ops.Content == nil {
+		return false
+	}
+	k := contentKey(r)
+	return k != "" && k == w.ops.Content(string(r.Identity))
+}
+
 // baselineFor returns the recorded ETag for a remote path (used for both file
 // change detection and the directory-subtree skip).
 func (w *Watcher) baselineFor(remotePath string) (string, bool) {
@@ -1243,6 +1348,10 @@ func (w *Watcher) moveBaseline(srcRemote, dstRemote string) {
 	if base, ok := w.baselineFor(srcRemote); ok && base != "" {
 		w.recordBaseline(dstRemote, base)
 	}
+	// The content key travels too (an empty one clears whatever dst had).
+	if w.ops.Content != nil && w.ops.RecordContent != nil {
+		w.ops.RecordContent(map[string]string{dstRemote: w.ops.Content(srcRemote), srcRemote: ""})
+	}
 	if w.ops.ForgetBaseline != nil {
 		w.ops.ForgetBaseline(srcRemote)
 	}
@@ -1296,10 +1405,11 @@ func (w *Watcher) pullRename(localDir, oldFull string, y cfapi.PlaceholderInfo, 
 		}
 	}
 	w.recordBaseline(string(y.Identity), y.ETag)
+	w.recordContents(y)
 	w.recordFileID(string(y.Identity), fileid)
 	w.dropFileID(oldRemote)
 	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(y.Identity))
-	w.report("move", string(y.Identity), nil)
+	w.report("move", w.localName(string(y.Identity)), nil) // user-visible name
 	return true
 }
 
@@ -1364,6 +1474,55 @@ func (w *Watcher) localName(remote string) string {
 		return remote
 	}
 	return w.ops.Decode(remote)
+}
+
+// escapeCollision reports the neighbour that already owns the server name a
+// disguised file would be stored under, or "" when there is none. A disguised
+// ".htaccess" is PUT as ".htaccess.nimboesc"; a genuine file called
+// ".htaccess.nimboesc" in the same folder holds that server path already, and
+// uploading or moving over it would replace its content with the other file's.
+// Live sync refuses this in engine.FilterBlocked (its claimed set); the
+// write-back watcher works one file at a time, so the folder on disk is its
+// plan. server is what serverFor gave for path.
+func (w *Watcher) escapeCollision(path, server string) string {
+	if server == "" || server == w.remoteFor(path) {
+		return "" // not disguised: nothing to collide with
+	}
+	neighbour := filepath.Join(filepath.Dir(path), filepath.Base(server))
+	if _, err := os.Lstat(neighbour); err != nil {
+		return ""
+	}
+	return neighbour
+}
+
+// collisionError is the activity-feed entry for a refused upload or move.
+func collisionError(neighbour string) error {
+	return fmt.Errorf("a file called %s is in the same folder, and that is the name the server stores this one under. Rename one of them", filepath.Base(neighbour))
+}
+
+// noteBlocked records that path is refused for a name collision and reports
+// whether that is news: the first refusal of a stretch. The reconcile rescue
+// re-arms a dirty file on every pass, and a report per pass would bury the
+// feed. A stretch ends with clearBlocked, when the path syncs, is deleted or
+// is renamed away.
+func (w *Watcher) noteBlocked(path string) bool {
+	key := strings.ToLower(path)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.blockedNames == nil {
+		w.blockedNames = map[string]bool{}
+	}
+	if w.blockedNames[key] {
+		return false
+	}
+	w.blockedNames[key] = true
+	return true
+}
+
+func (w *Watcher) clearBlocked(path string) {
+	w.mu.Lock()
+	delete(w.blockedNames, strings.ToLower(path))
+	w.mu.Unlock()
 }
 
 // forceChange arms path's Mkdir/Upload branch to run even though it is
@@ -1432,8 +1591,8 @@ func (w *Watcher) handleChange(path string) {
 	// already happened.
 	forced := w.takeForced(path)
 	key := strings.ToLower(path)
-	uctx, ucancel := context.WithCancel(w.ctx)
-	defer ucancel()
+	uctx, ucancel := context.WithCancelCause(w.ctx)
+	defer ucancel(nil)
 	w.mu.Lock()
 	if _, busy := w.inflight[key]; busy {
 		w.again[key] = true
@@ -1522,7 +1681,7 @@ func (w *Watcher) handleChange(path string) {
 		if id, ierr := cfPlaceholderIdentity(path); ierr == nil && len(id) > 0 &&
 			!strings.EqualFold(string(id), w.serverFor(path, false)) {
 			w.ops.Log("vfs %s still names %s: a move owns it; checking where it belongs", w.remoteFor(path), string(id))
-			go w.verifyPlacement(path)
+			w.spawn(func() { w.verifyPlacement(path) })
 			return
 		}
 	}
@@ -1549,15 +1708,12 @@ func (w *Watcher) handleChange(path string) {
 		// all). Put the bit back; a later repoint on top is harmless. Never on
 		// a file with a pending upload: that bit IS the pending upload.
 		//
-		// DIRECTORIES are excluded, and that exclusion is load-bearing, not
-		// tidiness: our directory placeholders are deliberately left NOT
-		// in-sync because that is what makes the shell ask them to populate,
-		// and a directory marked in-sync enumerates EMPTY forever
-		// (cfapi.TestInSyncDirStillPopulates). Folders get FILE_ACTION_MODIFIED
-		// constantly — a move into one delivers MODIFIED for the destination
-		// FOLDER as well as the file — so this branch sees them often.
-		// Marking a populated directory settled is SweepDirsInSync's job,
-		// which knows to wait for the PARTIAL bit to clear.
+		// DIRECTORIES are excluded (cfSetInSync refuses them anyway).
+		// Folders get FILE_ACTION_MODIFIED constantly — a move into one
+		// delivers MODIFIED for the destination FOLDER as well as the file —
+		// and their bit is owned elsewhere: set when they are created, by the
+		// repoint after a move, and by SweepDirsInSync for what older
+		// versions left not in sync.
 		if !ch.IsDir && ch.Placeholder && !ch.InSync && !ch.NeedsUpload {
 			if serr := cfSetInSync(path); serr != nil {
 				w.ops.Log("vfs restore in-sync %s: %v", path, serr)
@@ -1568,6 +1724,9 @@ func (w *Watcher) handleChange(path string) {
 		// Nothing to upload — but the event may be a PIN change: Explorer's
 		// "Free up space" sets UNPINNED and waits for US to dehydrate; until
 		// then the item and its ancestors wear sync-pending arrows.
+		if w.ops.BeforeReplace != nil && cfWantsFreeUp(path) {
+			w.ops.BeforeReplace(path)
+		}
 		if ok, serr := cfSettlePin(path); serr != nil {
 			w.ops.Log("vfs settle pin %s: %v", path, serr)
 		} else if ok {
@@ -1575,6 +1734,11 @@ func (w *Watcher) handleChange(path string) {
 		}
 		if cfPinnedDehydrated(path) {
 			w.requestHydration(path)
+		}
+		// A pinned folder nobody has opened has nothing in it to download
+		// yet: fill it in, so the pin reaches everything below it.
+		if ch.IsDir && ch.Placeholder && cfPinned(path) {
+			w.requestPinFill(path)
 		}
 		return
 	}
@@ -1600,6 +1764,21 @@ func (w *Watcher) handleChange(path string) {
 		}
 		w.report("mkdir-remote", remote, nil)
 	} else {
+		if neighbour := w.escapeCollision(path, server); neighbour != "" {
+			// Refused, not failed: no retry timer (the reconcile rescue re-arms
+			// a dirty file every pass anyway), one report per stretch, and the
+			// file stays dirty so nothing dehydrates it. Only a rename of one
+			// of the two files ends this.
+			w.ops.Log("vfs upload %s refused: %s already holds the server name %s", remote, w.remoteFor(neighbour), server)
+			if w.noteBlocked(path) {
+				w.report("upload", remote, collisionError(neighbour))
+			}
+			return
+		}
+		if w.paused() {
+			w.hold(path, forced)
+			return
+		}
 		if err := w.ops.Upload(uctx, path, server); err != nil {
 			switch {
 			case errors.Is(err, ErrHeldByLock):
@@ -1608,6 +1787,13 @@ func (w *Watcher) handleChange(path string) {
 				// — marking it synced would let a later refresh dehydrate the
 				// edit away.
 				w.ops.Log("vfs upload %s held: someone else has it locked", server)
+				w.reforce(path, forced)
+				w.scheduleUploadAfter(path, heldRetry)
+			case errors.Is(err, transfer.ErrUploadInProgress):
+				// This file is already on its way up (Deck #714). Try again
+				// after it: if that upload settles it, the retry finds nothing
+				// to do; if the file changed since, the retry sends the change.
+				w.ops.Log("vfs upload %s already running, retrying after it", server)
 				w.reforce(path, forced)
 				w.scheduleUploadAfter(path, heldRetry)
 			case isFileBusy(err):
@@ -1627,6 +1813,9 @@ func (w *Watcher) handleChange(path string) {
 				w.scheduleUploadAfter(path, heldRetry)
 			case w.ctx.Err() != nil:
 				// Shutting down — the reconcile rescue re-arms it next start.
+			case errors.Is(context.Cause(uctx), errPaused):
+				// Stopped by a pause: not a failure, and not superseded.
+				w.hold(path, forced)
 			case uctx.Err() != nil:
 				// Cancelled on purpose: a delete or rename superseded this
 				// upload and owns the path now. Drop quietly.
@@ -1641,6 +1830,7 @@ func (w *Watcher) handleChange(path string) {
 		}
 		w.ops.Log("vfs uploaded %s (%d bytes)", server, info.Size())
 		w.report("upload", remote, nil)
+		w.clearBlocked(path)
 	}
 	w.mu.Lock()
 	delete(w.attempts, key)
@@ -1707,6 +1897,51 @@ func (w *Watcher) requestHydration(path string) {
 	w.wakeHydrator()
 }
 
+// requestPinFill fills in a pinned folder the shell has never populated
+// (GitHub #17). "Always keep on this device" sets the pin on every existing
+// placeholder below the folder, but a subfolder nobody has opened has no
+// children yet, and the shell only fetches them when something opens it — so
+// its files were never downloaded. reconcileDir does the fill (see its pinned
+// branch) and recurses into the pinned subfolders it creates; the new files
+// inherit the pin and go to the hydrate queue. Deduplicated per path, since a
+// recursive pin raises an attribute event on every folder in the tree.
+func (w *Watcher) requestPinFill(path string) {
+	if populated, err := cfDirPopulated(path); err != nil || populated {
+		return
+	}
+	rel, err := filepath.Rel(w.root, path)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return
+	}
+	key := strings.ToLower(path)
+	w.mu.Lock()
+	if w.pinFilling[key] {
+		w.mu.Unlock()
+		return
+	}
+	if w.pinFilling == nil {
+		w.pinFilling = map[string]bool{}
+	}
+	w.pinFilling[key] = true
+	w.mu.Unlock()
+	w.spawn(func() {
+		defer func() {
+			w.mu.Lock()
+			delete(w.pinFilling, key)
+			w.mu.Unlock()
+		}()
+		// Serialised with reconcile passes, which walk the same directories.
+		w.reconMu.Lock()
+		if w.ctx.Err() == nil && !w.reconcileDir(filepath.ToSlash(rel), "") {
+			w.ops.Log("vfs keep on device %s: not every folder could be filled in yet; the next pass retries", w.remoteFor(path))
+		}
+		w.reconMu.Unlock()
+		// A push-driven pass that arrived while this held the lock was
+		// dropped (Reconcile only TryLocks); ask for it again.
+		w.Poke()
+	})
+}
+
 // wakeHydrator nudges one sleeping hydrateLoop. The channel holds a single
 // token: if one is already waiting, a worker is about to look at the pending
 // list anyway and will see whatever was just added to it.
@@ -1749,6 +1984,10 @@ func (w *Watcher) hydrateLoop() {
 		for {
 			if w.ctx.Err() != nil {
 				return
+			}
+			// Paused: leave the rest pending. releaseHeld wakes us.
+			if w.paused() {
+				break
 			}
 			path, ok := w.nextHydration()
 			if !ok {
@@ -1836,6 +2075,7 @@ func (w *Watcher) handleDelete(path string) {
 	if w.ctx.Err() != nil {
 		return
 	}
+	w.clearBlocked(path) // a name-collision refusal ends with the file; a new one under this name is news again
 	if w.isSuppressed(path) {
 		return // we removed this ourselves during down-sync; already gone server-side
 	}
@@ -2202,6 +2442,7 @@ func (w *Watcher) handleRename(oldPath, newPath string) {
 	if w.remoteFor(oldPath) == "" || w.remoteFor(newPath) == "" {
 		return
 	}
+	w.clearBlocked(oldPath) // a name-collision refusal ends with the name; a new file under it is news again
 	// A rename cannot change dir-ness, so the destination (which exists) settles
 	// it for both ends. Each end is encoded independently: renaming notes.txt to
 	// .htaccess is a MOVE from the raw name to the escaped one.
@@ -2262,6 +2503,18 @@ func (w *Watcher) moveServer(src, newPath string, isDir bool) moveOutcome {
 		return out
 	}
 	dst := w.serverFor(newPath, isDir)
+	if !isDir {
+		if neighbour := w.escapeCollision(newPath, dst); neighbour != "" {
+			// The MOVE would land on the neighbour's server copy. Refused
+			// before it is sent, reported once, and the move mark released so
+			// reconcile can look at the file again once the user has renamed.
+			w.ops.Log("vfs move %s -> %s refused: %s already holds that server name", src, dst, w.remoteFor(neighbour))
+			if w.noteBlocked(newPath) {
+				w.report("move", w.remoteFor(newPath), collisionError(neighbour))
+			}
+			return done(moveRetrying)
+		}
+	}
 	err := w.ops.Move(w.ctx, src, dst)
 	if err == nil {
 		w.finishRename(src, newPath, dst)
@@ -2330,7 +2583,7 @@ func (w *Watcher) moveServer(src, newPath string, isDir bool) moveOutcome {
 		w.ops.Log("vfs move %s -> %s: giving up after %d attempts", src, dst, n)
 		return done(moveRetrying)
 	}
-	time.AfterFunc(retryDelay(n), func() {
+	w.after(retryDelay(n), func() {
 		if w.ctx.Err() != nil {
 			done(moveRetrying) // nothing will retry this now: release the mark
 			return
@@ -2568,7 +2821,11 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		w.noteCorrupt(localDir, err)
 		return false // can't read locally — don't claim reconciled
 	}
-	if len(entries) == 0 && rel != "" {
+	// pinFill: a pinned directory the shell never populated, which this pass
+	// fills in itself (see below).
+	pinFill := false
+	pinned := rel != "" && cfPinned(localDir)
+	if (len(entries) == 0 || pinned) && rel != "" {
 		// An empty directory is either LAZY — never populated, so the shell
 		// will issue FETCH_PLACEHOLDERS the first time it is opened and
 		// pulling its children here would race that transfer — or genuinely
@@ -2589,7 +2846,16 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 			return false // unknown — don't claim this subtree reconciled
 		}
 		if !populated {
-			return true // lazy: the shell owns its first fetch
+			// Lazy: the shell owns its first fetch — unless the user pinned
+			// it. "Always keep on this device" has to reach folders nobody
+			// has opened, and nothing ever will open them (GitHub #17), so
+			// fill it in here: list it, create its children, then mark it
+			// populated. A pinned lazy folder can already hold some
+			// children (a fill that failed part way), hence `pinned` above.
+			if !pinned {
+				return true
+			}
+			pinFill = true
 		}
 	}
 	remote, err := w.ops.List(rel)
@@ -2827,6 +3093,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 												}
 											}
 											w.recordBaselines(kbase)
+											w.recordContents(remoteKids...)
 										}
 									}
 									if merr := cfMarkInSync(full, r.Identity); merr != nil {
@@ -2904,7 +3171,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 			if id, iderr := cfPlaceholderIdentity(full); iderr == nil && len(id) > 0 &&
 				!strings.EqualFold(string(id), w.serverFor(full, false)) {
 				w.ops.Log("vfs %s still names %s: a move owns it; checking where it belongs", w.remoteFor(full), string(id))
-				go w.verifyPlacement(full)
+				w.spawn(func() { w.verifyPlacement(full) })
 			} else if serr := cfSetInSync(full); serr != nil {
 				w.ops.Log("vfs restore in-sync %s: %v", name, serr)
 			} else {
@@ -2955,9 +3222,19 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		// in-sync (clean), refresh it so a previously-downloaded file isn't stale.
 		// (A dirty local copy is a pending upload / potential conflict — left alone.)
 		if w.remoteChanged(r, fi, string(r.Identity)) {
-			// Same inspect as the rescue above (it is a metadata OPEN now for
-			// anything not in sync, so it is not re-run per branch).
-			if ierr == nil && !ch.NeedsUpload {
+			if w.sameVersionAsBaseline(r) {
+				// Only the ETag moved (a colleague's lock, a tag): keep the
+				// local copy and follow the new ETag. (An edited file never
+				// gets here; its upload makes the same check, see
+				// serverEditedSince.)
+				w.recordBaseline(string(r.Identity), r.ETag)
+				w.ops.Log("vfs %s: server ETag changed but not its content (a lock or other metadata); kept the local copy", w.remoteFor(full))
+			} else if ierr == nil && !ch.NeedsUpload {
+				// Same inspect as the rescue above (it is a metadata OPEN now for
+				// anything not in sync, so it is not re-run per branch).
+				if w.ops.BeforeReplace != nil {
+					w.ops.BeforeReplace(full)
+				}
 				// VERIFY_IN_SYNC closes the race between that inspect and the
 				// refresh: an edit landing in between fails the update (and we
 				// skip) instead of being dehydrated away.
@@ -2970,6 +3247,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 					w.ops.Log("vfs refreshed %s (server changed)", w.remoteFor(full))
 					w.report("download", w.remoteFor(full), nil)
 					w.recordBaseline(string(r.Identity), r.ETag) // now mirrors the new server version
+					w.recordContents(r)
 				}
 			}
 		}
@@ -3028,9 +3306,54 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 				if !r.IsDir {
 					w.recordFileID(string(r.Identity), r.FileID) // enable rename detection later
 				}
-				w.report("download", string(r.Identity), nil) // surface new server files in the activity feed
+				// New server files in the activity feed, by their user-visible
+				// name. Not in a pinned folder: its files are about to be
+				// downloaded, and the download reports itself.
+				if !pinned {
+					w.report("download", w.localName(string(r.Identity)), nil)
+				}
 			}
 			w.recordBaselines(base)
+			w.recordContents(toCreate...)
+			// Children created in a pinned directory inherit the pin
+			// (measured on the live driver). Their files are downloaded now,
+			// not left for a pass that may never walk here again (the subtree
+			// skip), and their folders are walked in this pass, so a pinned
+			// tree is filled all the way down in one go.
+			for _, r := range toCreate {
+				full := filepath.Join(localDir, r.Name)
+				if !r.IsDir {
+					if cfPinnedDehydrated(full) {
+						w.requestHydration(full)
+					}
+					continue
+				}
+				if cfPinned(full) {
+					child := r.Name
+					if rel != "" {
+						child = rel + "/" + r.Name
+					}
+					// No ETag: the pull above just recorded this folder's
+					// ETag as its baseline, so passing it would make the
+					// subtree skip read the walk as "nothing changed" and
+					// stop the fill one level down (seen on the VM). The
+					// folder was created a moment ago; nothing below it
+					// has been reconciled for the skip to vouch for.
+					subdirs = append(subdirs, subdir{rel: child})
+				}
+			}
+		}
+	}
+	// Only once every child is in place: the populated flag is permanent. A
+	// fill that fell short leaves the folder lazy, and the next pass (or the
+	// shell, if the user opens it first) finishes the job.
+	if pinFill && dirOK {
+		if merr := cfMarkDirPopulated(localDir); merr != nil {
+			w.ops.Log("vfs keep on device %q: mark populated: %v", rel, merr)
+			dirOK = false
+		} else {
+			w.ops.Log("vfs filled in pinned folder %q (%d item(s))", rel, len(toCreate))
+			cfShellNotify(localDir)
 		}
 	}
 
@@ -3075,6 +3398,7 @@ func (w *Watcher) healPlainFile(full string, fi os.FileInfo, r cfapi.Placeholder
 	w.ops.Log("vfs healed plain file %s (matches server)", remote)
 	cfShellNotify(full) // or Explorer keeps the stale pending glyph until F5
 	w.recordBaseline(remote, r.ETag)
+	w.recordContents(r)
 	if r.FileID != "" {
 		w.recordFileID(remote, r.FileID)
 	}

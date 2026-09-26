@@ -180,7 +180,12 @@ func (e *Executor) Run(ctx context.Context, actions []engine.Action) (Stats, err
 			info, merged, err := e.classifyConflict(ctx, a)
 			if err != nil {
 				e.report(a, err)
-				slog.Error("conflict classification failed", "path", a.Path, "err", err)
+				var inUse *InUseError
+				if errors.As(err, &inUse) {
+					slog.Info("conflict check waits: the file is in use", "path", a.Path)
+				} else {
+					slog.Error("conflict classification failed", "path", a.Path, "err", err)
+				}
 				stats.Failed++
 				continue
 			}
@@ -262,6 +267,13 @@ func (e *Executor) runTransfers(ctx context.Context, transfers []engine.Action, 
 			}
 			err := e.applyTransfer(ctx, a)
 			e.report(a, err)
+			if errors.Is(err, ErrUploadInProgress) {
+				// Another pass is sending this file right now and reports the
+				// outcome itself; if it fails, the file is still changed and the
+				// next pass sends it. Neither a failure nor an upload here.
+				slog.Debug("upload left to the one already running", "path", a.Path)
+				return
+			}
 			if err != nil {
 				slog.Debug("transfer failed", "kind", a.Kind, "path", a.Path, "err", err) // see recordActionResult for the user-facing log
 				e.mu.Lock()
@@ -375,8 +387,9 @@ func (e *Executor) applyTransfer(ctx context.Context, a engine.Action) error {
 		// same bytes, and on a 24 GB file each try costs minutes.
 		var inUse *InUseError
 		var damaged *ChecksumMismatchError
+		// Another upload of this file running is the same: it is not ours to retry.
 		if err == nil || ctx.Err() != nil || transport.IsLocked(err) || !transport.Retryable(err) ||
-			errors.As(err, &inUse) || errors.As(err, &damaged) {
+			errors.As(err, &inUse) || errors.As(err, &damaged) || errors.Is(err, ErrUploadInProgress) {
 			break
 		}
 	}
@@ -572,7 +585,7 @@ func (e *Executor) makeLocalDir(rel string) error {
 }
 
 func (e *Executor) makeRemoteDir(ctx context.Context, rel string) error {
-	remote := e.remotePath(rel)
+	remote := e.rawRemotePath(rel) // a folder is never escaped
 	if err := e.Client.Mkcol(ctx, remote); err != nil {
 		return err
 	}
@@ -584,9 +597,16 @@ func (e *Executor) makeRemoteDir(ctx context.Context, rel string) error {
 	return e.saveDirBaseline(rel, etag, fileID, false) // our own new folder: never a share root
 }
 
-// remotePath maps a pair-relative path to a files-root-relative path.
+// remotePath maps a pair-relative FILE path to a files-root-relative path,
+// encoding a forbidden name to its stored server name (no-op when inactive).
 func (e *Executor) remotePath(rel string) string {
-	rel = e.Escaper.Encode(rel) // encode a forbidden name to its stored server name; no-op when inactive
+	return e.rawRemotePath(e.Escaper.Encode(rel))
+}
+
+// rawRemotePath is remotePath without the encoding: for a directory, which is
+// never escaped (escaping renames a basename only, and a folder's children keep
+// their own path underneath it).
+func (e *Executor) rawRemotePath(rel string) string {
 	if e.RemoteRoot == "" {
 		return rel
 	}
@@ -606,11 +626,24 @@ func (e *Executor) saveFileBaseline(rel string, res FileResult) error {
 		RemoteETag: res.ETag, RemoteFileID: res.FileID,
 		LocalSize: res.Size, LocalMTimeNanos: res.MTimeNanos,
 		ContentSHA1: res.ContentSHA1,
+		ContentKey:  e.listedContentKey(rel, res.ETag),
 		// A single file shared with the user is a mount root of its own; the
 		// listing said so. A path the listing never saw (a fresh upload) reads
 		// as the zero value, i.e. not one.
 		MountRoot: e.Remote[rel].MountRoot,
 	})
+}
+
+// listedContentKey is the content key of the version the listing showed for
+// rel, but only when etag says that is the version just synced. An upload
+// makes a version the listing never saw, and the old key must not vouch for
+// it: "" then, and the ETag alone decides until the next listing.
+func (e *Executor) listedContentKey(rel, etag string) string {
+	r, ok := e.Remote[rel]
+	if !ok || etag == "" || r.ETag != etag {
+		return ""
+	}
+	return r.ContentKey()
 }
 
 func (e *Executor) saveDirBaseline(rel, etag, fileID string, mountRoot bool) error {

@@ -1,0 +1,288 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/otherworld/nimbo/internal/account"
+	"github.com/otherworld/nimbo/internal/brand"
+	"github.com/otherworld/nimbo/internal/config"
+)
+
+// GitHub #11: two accounts ended up syncing one folder. A folder is refused if
+// it is another account's folder, sits inside it, or contains it.
+func TestFolderClashCatchesEveryOverlap(t *testing.T) {
+	others := []accountFolder{{Account: "bob on cloud.example.com", Dir: `C:\Users\x\Nextcloud`}}
+	for _, dir := range []string{
+		`C:\Users\x\Nextcloud`,
+		`c:\users\X\nextcloud`, // Windows paths are case-insensitive
+		`C:\Users\x\Nextcloud\Work`,
+		`C:\Users\x`,
+	} {
+		if msg := folderClash(dir, others); msg == "" {
+			t.Errorf("%s: not refused", dir)
+		} else if !strings.Contains(msg, "bob on cloud.example.com") {
+			t.Errorf("%s: message doesn't name the account: %q", dir, msg)
+		}
+	}
+	for _, dir := range []string{`C:\Users\x\Nextcloud2`, `C:\Users\x\Work`, `D:\Nextcloud`} {
+		if msg := folderClash(dir, others); msg != "" {
+			t.Errorf("%s: refused but doesn't overlap: %q", dir, msg)
+		}
+	}
+}
+
+func TestOtherAccountFoldersReadsEveryOtherAccount(t *testing.T) {
+	d := config.Dirs{Config: t.TempDir(), Data: t.TempDir()}
+	st := account.Store{Accounts: []account.Account{
+		{ID: "a", ServerURL: "https://one.example.com", LoginName: "amy"},
+		{ID: "b", ServerURL: "https://two.example.com", LoginName: "bob"},
+		{ID: "c", ServerURL: "https://two.example.com/nc", LoginName: "cat"},
+	}}
+	_ = d.WithAccount("a").UpdateAccountState(func(s *config.AccountState) { s.BaseDir = `C:\A` })
+	_ = d.WithAccount("b").UpdateAccountState(func(s *config.AccountState) { s.BaseDir = `C:\B` })
+	_ = d.WithAccount("c").SavePairs([]config.SyncPair{{LocalDir: `C:\C\Photos`, RemoteRoot: "Photos"}})
+	_ = d.WithAccount("c").UpdateAccountState(func(s *config.AccountState) {
+		s.RememberedPairs = []config.SyncPair{{LocalDir: `C:\C\Parked`, RemoteRoot: "P"}}
+	})
+
+	got := otherAccountFolders(d, st, "a")
+
+	dirs := map[string]string{}
+	for _, f := range got {
+		dirs[f.Dir] = f.Account
+	}
+	if _, ok := dirs[`C:\A`]; ok {
+		t.Fatalf("the excluded account's own folder was listed: %v", got)
+	}
+	for _, want := range []string{`C:\B`, `C:\C\Photos`, `C:\C\Parked`} {
+		if _, ok := dirs[want]; !ok {
+			t.Fatalf("%s missing from %v", want, got)
+		}
+	}
+	if dirs[`C:\B`] != "bob on two.example.com" {
+		t.Fatalf("label = %q", dirs[`C:\B`])
+	}
+}
+
+// A new account is offered a folder of its own, never one another account uses.
+func TestSuggestAccountFolderAvoidsOtherAccounts(t *testing.T) {
+	home := `C:\Users\x`
+	if got := suggestAccountFolder(home, "bob", nil, nil); got != filepath.Join(home, "Nextcloud") {
+		t.Fatalf("first account: %q", got)
+	}
+	others := []accountFolder{{Account: "amy", Dir: filepath.Join(home, "Nextcloud")}}
+	want := filepath.Join(home, brand.Current.Name+" - bob")
+	if got := suggestAccountFolder(home, "bob", others, nil); got != want {
+		t.Fatalf("second account: %q, want %q", got, want)
+	}
+	others = append(others, accountFolder{Account: "old bob", Dir: want})
+	if got := suggestAccountFolder(home, "bob", others, nil); got != want+" (2)" {
+		t.Fatalf("both taken: %q", got)
+	}
+}
+
+// When another account's folder contains the home folder (a drive root, the
+// home folder itself) nothing under it is free. The search must give up rather
+// than loop forever, which hung start-up.
+func TestSuggestAccountFolderGivesUpWhenNothingIsFree(t *testing.T) {
+	for _, taken := range []string{`C:\Users\x`, `C:\`} {
+		others := []accountFolder{{Account: "amy", Dir: taken}}
+		if got := suggestAccountFolder(`C:\Users\x`, "bob", others, nil); got != "" {
+			t.Fatalf("%s taken: got %q, want no suggestion", taken, got)
+		}
+	}
+}
+
+// A folder that will be mounted without the user choosing it must be missing
+// or empty, never a folder that already holds someone's files.
+func TestSuggestAccountFolderSkipsUnusableCandidates(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "Nextcloud", "old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := suggestAccountFolder(home, "bob", nil, missingOrEmpty)
+	if want := filepath.Join(home, brand.Current.Name+" - bob"); got != want {
+		t.Fatalf("got %q, want %q (Nextcloud holds files)", got, want)
+	}
+}
+
+// What another account is actually SYNCING is what can collide at run time:
+// its live pairs in live mode, its mounted root in on-demand mode. Parked pairs
+// and a "choose"-mode parent folder sync nothing and must not hold anything back
+// (they did, and two accounts then blocked each other for good).
+func TestActiveAccountFoldersCountsOnlyWhatSyncs(t *testing.T) {
+	d := config.Dirs{Config: t.TempDir(), Data: t.TempDir()}
+	st := account.Store{Accounts: []account.Account{
+		{ID: "a", ServerURL: "https://one.example.com", LoginName: "amy"},
+		{ID: "b", ServerURL: "https://two.example.com", LoginName: "bob"},
+	}}
+	b := d.WithAccount("b")
+	_ = b.SavePairs([]config.SyncPair{{LocalDir: `C:\B\Photos`, RemoteRoot: "Photos"}})
+	_ = b.UpdateAccountState(func(s *config.AccountState) {
+		s.BaseDir = `C:\B`
+		s.RememberedPairs = []config.SyncPair{{LocalDir: `C:\Parked`, RemoteRoot: "P"}}
+	})
+
+	dirs := func(fs []accountFolder) map[string]bool {
+		m := map[string]bool{}
+		for _, f := range fs {
+			m[f.Dir] = true
+		}
+		return m
+	}
+	live := dirs(activeAccountFolders(d, st, "a", "live"))
+	if !live[`C:\B\Photos`] || live[`C:\B`] || live[`C:\Parked`] {
+		t.Fatalf("live mode: %v", live)
+	}
+	od := dirs(activeAccountFolders(d, st, "a", "ondemand"))
+	if !od[`C:\B`] || od[`C:\B\Photos`] || od[`C:\Parked`] {
+		t.Fatalf("on-demand mode: %v", od)
+	}
+}
+
+// Clearing an account's data (sign out and clear, or removing the account)
+// takes its folder record too, and nothing of any other account's.
+func TestClearSyncDataRemovesTheAccountFolderRecord(t *testing.T) {
+	d := config.Dirs{Config: t.TempDir(), Data: t.TempDir()}
+	gone, kept := d.WithAccount("gone"), d.WithAccount("kept")
+	for _, ad := range []config.Dirs{gone, kept} {
+		if err := ad.UpdateAccountState(func(s *config.AccountState) { s.BaseDir = `C:\X` }); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	(&App{}).clearSyncData(gone, "gone")
+
+	if _, err := os.Stat(gone.AccountStateFile()); !os.IsNotExist(err) {
+		t.Fatalf("the cleared account's folder record survived: %v", err)
+	}
+	if s, _ := kept.LoadAccountState(); s.BaseDir != `C:\X` {
+		t.Fatalf("another account's folder record was touched: %+v", s)
+	}
+}
+
+type heldStub map[string]string
+
+func (h heldStub) HeldReason(dir string) string { return h[dir] }
+
+// A held-back folder is also another account's folder, so deleting its local
+// files would delete that account's files too (and push the deletions to its
+// server once it resumes). Removing or deselecting it without deleting is fine.
+func TestLocalDeleteBlockedOnHeldFolders(t *testing.T) {
+	held := heldStub{`C:\Shared`: "used by bob"}
+	if msg := localDeleteBlocked(held, `C:\Shared`, true); msg == "" {
+		t.Fatal("deleting a held folder's files was allowed")
+	}
+	if msg := localDeleteBlocked(held, `C:\Shared`, false); msg != "" {
+		t.Fatalf("keeping the files was refused: %q", msg)
+	}
+	if msg := localDeleteBlocked(held, `C:\Mine`, true); msg != "" {
+		t.Fatalf("an ordinary folder was refused: %q", msg)
+	}
+}
+
+
+// In on-demand mode the folder an account last mounted is what it syncs, even
+// when its account folder or pairs say otherwise.
+func TestActiveAccountFoldersPrefersTheMountedRoot(t *testing.T) {
+	d := config.Dirs{Config: t.TempDir(), Data: t.TempDir()}
+	st := account.Store{Accounts: []account.Account{{ID: "a"}, {ID: "b", LoginName: "bob"}}}
+	_ = d.WithAccount("b").UpdateAccountState(func(s *config.AccountState) {
+		s.BaseDir = `C:\Old`
+		s.OnDemandRoot = `C:\Mounted`
+	})
+	got := activeAccountFolders(d, st, "a", "ondemand")
+	if len(got) != 1 || got[0].Dir != `C:\Mounted` {
+		t.Fatalf("got %v", got)
+	}
+	if claims := otherAccountFolders(d, st, "a"); folderClash(`C:\Mounted`, claims) == "" {
+		t.Fatalf("the mounted root is not counted as claimed: %v", claims)
+	}
+}
+
+// Re-applying virtual files keeps every account's registration; only a root
+// that nothing mounts or claims any more (e.g. the folder a new account was
+// given before its setup chose another) is unregistered.
+func TestAbandonedRoots(t *testing.T) {
+	before := []string{`C:\Kept`, `C:\Claimed`, `C:\Dropped`}
+	mounted := map[string]bool{`C:\Kept`: true}
+	claimed := []string{`c:\claimed`}
+	got := abandonedRoots(before, mounted, claimed)
+	if len(got) != 1 || got[0] != `C:\Dropped` {
+		t.Fatalf("got %v", got)
+	}
+}
+
+// GitHub #11 follow-up: the first account on a fresh install was mounted on a
+// guessed folder before its setup had run, and a reporter was left with the
+// guess registered beside the folder they chose. Only an account whose setup
+// isn't open, and that is the only one, may be mounted on a folder nobody chose.
+func TestUnchosenMountWaitsForSetup(t *testing.T) {
+	for _, c := range []struct {
+		accounts int
+		pending  bool
+		want     bool
+	}{
+		{1, false, true},  // an older install with no folder recorded
+		{1, true, false},  // the first account, its setup still open
+		{2, false, false}, // a new account beside others
+		{2, true, false},
+	} {
+		if got := mayMountUnchosen(c.accounts, c.pending); got != c.want {
+			t.Errorf("accounts=%d pending=%v: got %v, want %v", c.accounts, c.pending, got, c.want)
+		}
+	}
+}
+
+// Setup stays pending from sign-in until it is completed or abandoned, and
+// ending it reports whether it was still pending exactly once, so an abandoned
+// setup falls back to the default folder once and a completed one never does.
+func TestSetupPendingEndsOnce(t *testing.T) {
+	a := &App{}
+	if a.setupPending("acct") {
+		t.Fatal("pending before sign-in")
+	}
+	a.beginSetup("acct")
+	if !a.setupPending("acct") {
+		t.Fatal("not pending after sign-in")
+	}
+	if a.setupPending("other") {
+		t.Fatal("another account reads as pending")
+	}
+	if !a.endSetup("acct") {
+		t.Fatal("first end didn't report pending")
+	}
+	if a.setupPending("acct") || a.endSetup("acct") {
+		t.Fatal("still pending after it ended")
+	}
+}
+
+// A folder setup records before asking whether to keep the files already in
+// it is only provisional: cancelling that question, or closing setup on it,
+// must put back the folder the account had before, so skipping afterwards
+// still uses the default instead of leaving the account with nothing mounted.
+// The previous setup is handed back exactly once.
+func TestSetupFolderHandedBackOnce(t *testing.T) {
+	a := &App{}
+	if _, ok := a.takeSetupFolder("acct"); ok {
+		t.Fatal("a folder held before any setup asked")
+	}
+	a.holdSetupFolder("acct", setupFolder{baseDir: `C:\Old`, root: `C:\Old`})
+	got, ok := a.takeSetupFolder("acct")
+	if !ok || got.baseDir != `C:\Old` || got.root != `C:\Old` {
+		t.Fatalf("got %+v, %v; want the held folder", got, ok)
+	}
+	if _, ok := a.takeSetupFolder("acct"); ok {
+		t.Fatal("handed back twice")
+	}
+	a.holdSetupFolder("acct", setupFolder{})
+	if _, ok := a.takeSetupFolder("other"); ok {
+		t.Fatal("another account's folder handed back")
+	}
+	if got, ok := a.takeSetupFolder("acct"); !ok || got.baseDir != "" {
+		t.Fatalf("an empty previous folder must still be handed back: %+v, %v", got, ok)
+	}
+}

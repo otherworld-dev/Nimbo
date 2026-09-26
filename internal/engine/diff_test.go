@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"github.com/otherworld/nimbo/internal/transport"
 	"sort"
 	"testing"
 	"time"
@@ -288,5 +289,59 @@ func TestDiffStillConflictsOnRealChange(t *testing.T) {
 	}
 	if len(kinds) != 1 || kinds[0] != ActConflict {
 		t.Errorf("got %v, want a conflict", kinds)
+	}
+}
+
+// Most files carry no oc:checksums (anything uploaded through the browser, for
+// one), so the SHA1 rule above cannot see a files_lock bump on them. The
+// content key can: a lock and an unlock leave size, mtime and nc:upload_time
+// alone (GitHub #7).
+func TestDiffIgnoresLockBumpByContentKey(t *testing.T) {
+	mt := time.Unix(1790160000, 0)
+	key := transport.ContentKey(5, mt, 1790160705)
+	base := map[string]BaselineState{
+		"a.xlsx": {Path: "a.xlsx", RemoteETag: "old", ContentKey: key, LocalSize: 5, LocalMTimeNanos: 1000},
+	}
+	remote := map[string]RemoteState{
+		"a.xlsx": {Path: "a.xlsx", ETag: "new-after-lock", Size: 5, LastModified: mt, UploadTime: 1790160705},
+	}
+	local := map[string]LocalState{"a.xlsx": {Path: "a.xlsx", Size: 5, MTime: time.Unix(0, 1000)}}
+	for _, a := range Diff(base, remote, local) {
+		if a.Kind != ActNoop {
+			t.Errorf("unchanged file produced %v (%s); want nothing", a.Kind, a.Reason)
+		}
+	}
+
+	local["a.xlsx"] = LocalState{Path: "a.xlsx", Size: 9, MTime: time.Unix(0, 2000)}
+	var kinds []ActionKind
+	for _, a := range Diff(base, remote, local) {
+		if a.Kind != ActNoop {
+			kinds = append(kinds, a.Kind)
+		}
+	}
+	if len(kinds) != 1 || kinds[0] != ActUpload {
+		t.Errorf("got %v, want a single upload, the server's version never changed", kinds)
+	}
+}
+
+// A new upload of the same size and mtime has a new upload time, so the key
+// does not hide it.
+func TestDiffContentKeyStillSeesReupload(t *testing.T) {
+	mt := time.Unix(1790160000, 0)
+	base := map[string]BaselineState{
+		"a.xlsx": {Path: "a.xlsx", RemoteETag: "old", ContentKey: transport.ContentKey(5, mt, 1790160705), LocalSize: 5, LocalMTimeNanos: 1000},
+	}
+	remote := map[string]RemoteState{
+		"a.xlsx": {Path: "a.xlsx", ETag: "new", Size: 5, LastModified: mt, UploadTime: 1790160846},
+	}
+	local := map[string]LocalState{"a.xlsx": {Path: "a.xlsx", Size: 5, MTime: time.Unix(0, 1000)}}
+	var kinds []ActionKind
+	for _, a := range Diff(base, remote, local) {
+		if a.Kind != ActNoop {
+			kinds = append(kinds, a.Kind)
+		}
+	}
+	if len(kinds) != 1 || kinds[0] != ActDownload {
+		t.Errorf("got %v, want a download", kinds)
 	}
 }

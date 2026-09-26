@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/otherworld/nimbo/internal/cfapi"
-	"github.com/otherworld/nimbo/internal/config"
 )
 
 // "Start from scratch" mode switches: the user chose NOT to keep the files in
@@ -98,13 +97,11 @@ func (a *App) forgetAllPairs() {
 // forgetRememberedPairs drops the switch-back restore list, so leaving
 // virtual files later does not resurrect the pre-fresh folder setup.
 func (a *App) forgetRememberedPairs() {
-	if d, err := config.Resolve(); err == nil {
-		_ = d.UpdateSettings(func(s *config.Settings) {
-			if len(s.RememberedPairs) > 0 {
-				slog.Info("start fresh: remembered folder setup cleared", "pairs", len(s.RememberedPairs))
-			}
-			s.RememberedPairs = nil
-		})
+	if a.eng == nil {
+		return
+	}
+	if dropped := a.eng.TakeRememberedPairs(); len(dropped) > 0 {
+		slog.Info("start fresh: remembered folder setup cleared", "pairs", len(dropped))
 	}
 }
 
@@ -119,12 +116,8 @@ func (a *App) resetPairStatesUnder(dir string) error {
 			all = append(all, struct{ local, remote string }{p.LocalDir, p.RemoteRoot})
 		}
 	}
-	if d, err := config.Resolve(); err == nil {
-		if set, e := d.LoadSettings(); e == nil {
-			for _, p := range set.RememberedPairs {
-				all = append(all, struct{ local, remote string }{p.LocalDir, p.RemoteRoot})
-			}
-		}
+	for _, p := range a.eng.RememberedPairs() {
+		all = append(all, struct{ local, remote string }{p.LocalDir, p.RemoteRoot})
 	}
 	for _, p := range all {
 		if !pathWithin(p.local, dir) {

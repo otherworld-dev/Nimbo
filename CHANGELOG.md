@@ -3,6 +3,155 @@
 All notable changes to Nimbo are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-09-26
+
+### Added
+
+- In on-demand mode, opening a document in Word or LibreOffice now locks it on the
+  server the way live mode does, and a downloaded document a colleague has locked
+  opens read-only with their name on it (#7).
+- Hovering the tray icon shows what Nimbo is doing ("Syncing…", "Up to date",
+  "Paused"), and the icon now has a name in Windows' taskbar settings so it can be
+  set to always show (#9).
+- While signed out, the flyout can check for updates and turn on beta releases, and
+  the tray menu can check for updates too. Before, the only way to update without
+  an account was to download the new version from GitHub (#11).
+- A crash now leaves a crash.log beside nimbo.log, and it is included in the
+  problem report.
+- When real-time push isn't available, Settings → Troubleshooting now says it needs
+  the Client Push app on the server, links to its setup notes, and says Nimbo checks
+  for changes every 30 seconds in the meantime (#13).
+- Help pages at nimbosync.com/help, linked from a Help item in the tray menu and
+  from Settings, and Report a problem now opens the bug report form directly.
+- A lock someone else has left on one of your own files can now be cleared from
+  Sync status → In use. The Unlock button only shows for a person's lock that has
+  been there for over an hour, and Nimbo checks it is still the same lock before
+  clearing it. This helps on hosted servers where occ isn't available and the
+  official client has left a lock behind (#7).
+
+### Changed
+
+- Picking Online, Away, Busy or Invisible in the flyout now closes the status
+  menu, it only stays open while you are typing a custom status (#7).
+- The flyout's recent activity list now scrolls through everything since Nimbo
+  started instead of stopping at six items, and has a Clear button. Clearing it
+  empties Sync status → Activity as well, anything that still failed stays under
+  needs attention (#7).
+- Questions and error messages in Settings and Sync status now open in the app's
+  own dialog with a proper title, instead of a browser box titled
+  "wails.localhost says". They also follow the light or dark theme.
+
+### Fixed
+
+- Files a colleague has open show under In use as soon as Nimbo starts. Before,
+  after a restart a lock only reappeared once something else in its folder
+  changed, which could take a long time (#7).
+- A file someone else had locked no longer stays under In use after its folder
+  is deleted on the server. Before, it stayed listed until Nimbo was restarted.
+- Two accounts can no longer sync the same folder. A second account was offered the
+  first account's folder, and each then uploaded the other's files to its own
+  server. Every account now has a folder of its own, and an install already set up
+  that way holds the shared folder back, with a notification, until one of the
+  accounts is given a different folder (#11).
+- Adding an account in on-demand mode no longer turns the other accounts' folders
+  into plain copies, and signing out of or removing an account only disconnects
+  that account's folder (#11).
+- Signing in for the first time in on-demand mode no longer sets up the default
+  folder before the setup screen has asked where your files should go. The folder
+  you choose is the only one set up, and skipping setup still uses the default
+  (#11).
+- Leftover Nimbo entries in the Explorer sidebar, from accounts that were switched,
+  removed or moved, are cleared up at launch. A synced folder that has been renamed
+  or moved is now waited for instead of being created again empty, and a folder on
+  a drive that isn't connected is waited for however long it takes (#10).
+- The "Show Nimbo in the Explorer sidebar" setting now works in on-demand mode, the
+  entry stayed whatever the box said (#7).
+- A colleague opening or closing a document no longer makes everyone else download
+  it again, or turns an edit made while it was locked into a conflicted copy.
+  Locking a file changes its tag on the server without changing its content, and
+  both modes now tell the two apart (#7).
+- A document open when Nimbo quits, updates or Windows shuts down is now unlocked,
+  it used to stay locked for everyone until Nimbo next started. It is locked again
+  when Nimbo starts if it is still open, and an unlock that fails is retried every
+  30 seconds. Opening one document also sends one lock rather than several, which
+  could leave it locked after it was closed.
+- Pausing, including "pause for" and quiet hours, now works in on-demand mode.
+  Uploads and "Always keep on this device" downloads used to carry on while the app
+  said it was paused. Opening a file still downloads it.
+- With more than one account, pausing and quiet hours now reach every account
+  rather than only the one shown.
+- Closing the sign-in window on a fresh install no longer leaves an empty flyout and
+  a tray menu that does nothing, both now offer Sign in and Quit (#12).
+- An app password the server refuses at launch now asks you to sign in again,
+  instead of showing "Can't reach your server" and trying again every 15 seconds
+  (#12).
+- An Outlook .pst or .ost file is held from the start while Outlook has it open, and
+  uploaded once when Outlook lets go of it. Outlook writes to it in bursts that fell
+  between uploads, so the whole file was sent again after each one. The flyout
+  lists it as waiting rather than as a failed upload.
+- Two uploads of the same file no longer run at the same time. They shared one
+  upload session on the server and failed with "Chunks on server do not sum up".
+- Keep mine and Keep server on a conflict now sync the file with progress and
+  retries, instead of doing the whole transfer inside the click with any error only
+  in the log. Checking a conflict also uses the server's checksum rather than
+  downloading the server copy on every pass.
+- Clicking the "Sync conflict" notification opens the Conflicts tab, and the
+  "File in use" notification's link works.
+- Uploads keep the file's own modified date. The server stamped each file with the
+  time it arrived, so other computers downloaded it with the wrong date.
+- Switching a live folder to on-demand no longer lists the whole server again when
+  the existing sync already knows the folders, and a switch interrupted by closing
+  the app finishes its remaining files the next time it starts.
+- In on-demand mode, a kept-on-this-device file whose download stalls is retried
+  after 90 seconds instead of waiting for good, and a failed download is reported
+  once in the activity feed rather than twice.
+- A folder with a name the server doesn't allow (such as .htaccess) is now blocked
+  like a file would be. Live mode uploaded the folder under a changed name while the
+  files inside it still went up under the original one.
+- In on-demand mode, a file whose name the server doesn't allow is no longer
+  uploaded over a file that already carries its renamed form, and a failed download
+  of such a file no longer stays in the Status window after it has synced.
+- An account change saved at the same moment as another one (signing in, removing
+  an account, changing the default) is no longer lost. Each change read the whole
+  account list, edited its own copy and wrote it back, so whichever finished second
+  quietly undid the first (#693).
+- The flyout names the account it is showing, with its server, on a line of its own
+  above the buttons. In Compact width the name used to be cut down to a few letters.
+  With more than one account, clicking it lists the accounts to switch to (#14).
+- Compact spacing in Settings → Appearance now makes a visible difference: a smaller
+  header and rows, and 8 files in Recent activity instead of 6. Before, it changed a
+  few pixels of padding. Settings also says what Width and Spacing do (#14).
+- In on-demand mode, Settings → Folders no longer says folders aren't used right
+  before a list of folders with tick boxes. The list is now called "Keep on this PC
+  (offline)", each box says "Keep on this PC", and it explains that ticking a folder
+  is the same as Explorer's "Always keep on this device" (#15).
+- A large upload or download (64 MB or more) no longer holds up the rest of the
+  sync. It now runs alongside the next sync passes, two at a time per account, so a
+  new or changed small file goes up without waiting for it to finish. Pausing stops
+  them too, and they carry on when the sync resumes (#702).
+- Pinned app icons in the dock now load, and apps open on the right page, when
+  Nextcloud is installed at a subpath (such as example.com/nextcloud). The subpath
+  was being added twice. An icon that still can't load shows the plain app glyph
+  instead of a broken image (#16).
+- The Start button in the Pin apps editor, and opening an app in its own window,
+  now put the app in the Start menu under Nimbo Apps on a new install. Windows was
+  keeping the shortcuts in Nimbo's private copy of AppData, where the Start menu
+  can't see them. An app already added this way shows as not added, click Start
+  again or open the app to add it properly (#16).
+- An app's own icon in the Start menu and taskbar is no longer sometimes replaced by
+  the Nimbo icon. Two downloads of the same icon could run at once, and the one that
+  lost was treated as a failed download (#743).
+- In on-demand mode, "Always keep on this device" on a folder now downloads
+  everything under it, including subfolders that have never been opened in
+  Explorer. Before, only folders that had already been browsed were reached, and
+  new files added on the server to a kept folder waited until the next restart to
+  download (#17).
+- Folders in on-demand mode no longer show the "sync pending" arrows when there is
+  nothing waiting to sync. Folders that had never been opened kept them for good,
+  and opened folders kept them for up to six hours. Folders now show the cloud
+  until their files are downloaded, and ones set up by an earlier version are put
+  right a couple of minutes after Nimbo starts (#17).
+
 ## [0.1.8] - 2026-09-20
 
 Mostly about deletions, and the ways a folder could be removed when it should not

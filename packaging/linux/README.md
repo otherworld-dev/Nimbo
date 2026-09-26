@@ -16,7 +16,7 @@ now — handled by no-op stubs so everything still builds and runs.
 | Desktop notifications | ✅ | `beeep` → `notify-send`. |
 | Autostart at login | ✅ | `~/.config/autostart/nimbo.desktop` (`autostart_linux.go`). |
 | CLI (`nimbo`) | ✅ | Login, sync, watch, ls/get/put/rm, repair, share, ignore, … |
-| GUI (`nimbo-gui`) | 🟡 | Builds with Wails v3 + GTK3/WebKit2GTK; tray via libayatana-appindicator. Needs real-world testing. |
+| GUI (`nimbo-gui`) | 🟡 | Builds with Wails v3 + GTK4/WebKitGTK 6.0 (checked on Debian 13). Does not run yet, WebKit crashes as the windows load (see below). |
 | On-demand / virtual files | ❌ | Windows Cloud Files API only. Linux would need a FUSE/`kio`/`gvfs` approach (future). |
 | Explorer overlays + context menu | ❌ | Windows shell extensions. Linux: Nautilus/Dolphin extensions (future). |
 | In-place auto-update | ❌→🟡 | The App Installer feed is Windows-only. On Linux use the package manager, AppImage update, or the in-app GitHub check. |
@@ -33,32 +33,42 @@ CGO_ENABLED=0 go build -o bin/nimbo ./cmd/nimbo
 
 ## Building the GUI
 
-Wails v3 uses GTK3 + WebKit2GTK via cgo, so build **on Linux** (no cross-compile
+Wails v3 uses GTK4 + WebKitGTK 6.0 via cgo, so build **on Linux** (no cross-compile
 from Windows). Install the native deps first.
 
-**Debian/Ubuntu:**
+**Debian 13 / Ubuntu 24.04+:**
 ```bash
-sudo apt install -y build-essential pkg-config \
-  libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
+sudo apt install -y build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev
 ```
 **Fedora:**
 ```bash
-sudo dnf install -y gtk3-devel webkit2gtk4.1-devel libappindicator-gtk3-devel
+sudo dnf install -y gtk4-devel webkitgtk6.0-devel
 ```
 **Arch:**
 ```bash
-sudo pacman -S gtk3 webkit2gtk-4.1 libayatana-appindicator
+sudo pacman -S gtk4 webkitgtk-6.0
 ```
 
-Plus Go (1.22+) and Node (18+). Then:
+Plus Go (1.26+, see `go.mod`) and Node (18+). Then:
 
 ```bash
 packaging/linux/build.sh      # CLI + frontend + GUI -> bin/
 ./bin/nimbo-gui
 ```
 
-(If `webkit2gtk-4.1` isn't available, the 4.0 series works too — adjust the dev
-package name. Wails v3's required versions are in its docs.)
+Older distros without WebKitGTK 6.0 can build against GTK3 + WebKit2GTK 4.1
+instead (`libgtk-3-dev libwebkit2gtk-4.1-dev`) by adding `-tags gtk3` to the GUI's
+`go build`. The tray talks to the StatusNotifier service over D-Bus, so no
+appindicator library is needed to build.
+
+**It builds but does not run yet.** With Wails v3.0.0-alpha.96 both builds crash
+in WebKit while the app's windows load their pages: the GTK4 build in
+`soup_message_headers_iter_next` (the response headers of the first request),
+the GTK3 build in `webkit_uri_scheme_request_get_http_body` or
+`soup_message_headers_new` as a second window loads (also on a real Ubuntu 22.04
+desktop, not only in a container). Nimbo serves its
+frontend with Wails' stock `AssetFileServerFS`, so this looks like a Wails/WebKit
+problem, but it has not been tried with a bare Wails app yet.
 
 ## Known Linux work items
 

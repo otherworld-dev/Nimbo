@@ -50,13 +50,18 @@ type fakeCf struct {
 	// again). Default false, like a freshly created lazy directory; a PLAIN
 	// directory is always populated and is answered from plain, not here.
 	populated     map[string]bool
-	notified      []string         // paths passed to the shell change-notify seam
-	createdNote   []string         // paths passed to the shell "item created" seam
-	settleChecked []string         // paths offered to the pin-settle seam
-	excluded      []string         // paths passed to the exclude-from-sync seam
-	reverted      []string         // paths passed to RevertPlaceholder (they become plain)
-	dehydrated    map[string]bool  // paths that are online-only stubs (no bytes)
-	pinned        map[string]bool  // paths that read as pinned, online-only placeholders
+	notified      []string        // paths passed to the shell change-notify seam
+	createdNote   []string        // paths passed to the shell "item created" seam
+	settleChecked []string        // paths offered to the pin-settle seam
+	excluded      []string        // paths passed to the exclude-from-sync seam
+	reverted      []string        // paths passed to RevertPlaceholder (they become plain)
+	dehydrated    map[string]bool // paths that are online-only stubs (no bytes)
+	pinned        map[string]bool // paths that read as pinned, online-only placeholders
+	// pinnedDirs holds directories carrying "always keep on this device".
+	// Children created in one inherit the pin, as on the live driver: files
+	// land in pinned, folders here. Keyed like populated.
+	pinnedDirs    map[string]bool
+	filled        []string         // directories passed to the mark-populated seam
 	hydrated      []string         // paths passed to the hydrate-if-pinned seam
 	hydrateGate   chan struct{}    // when non-nil, hydration blocks until it closes
 	hydrateCalls  map[string]int   // per-path invocation count of the hydrate-if-pinned seam
@@ -79,16 +84,37 @@ func (f *fakeCf) createdNames() []string {
 
 func installFakeCf(t *testing.T) *fakeCf {
 	t.Helper()
-	f := &fakeCf{dirty: map[string]bool{}, modified: map[string]bool{}, identities: map[string]string{}, plain: map[string]bool{}, corrupt: map[string]bool{}, populated: map[string]bool{}, dehydrated: map[string]bool{}, pinned: map[string]bool{}, hydrateCalls: map[string]int{}, hydrateErr: map[string]error{}}
+	stopFinishedWatchers(t) // an earlier test's watcher may still be using the seams
+	f := &fakeCf{dirty: map[string]bool{}, modified: map[string]bool{}, identities: map[string]string{}, plain: map[string]bool{}, corrupt: map[string]bool{}, populated: map[string]bool{}, dehydrated: map[string]bool{}, pinned: map[string]bool{}, pinnedDirs: map[string]bool{}, hydrateCalls: map[string]int{}, hydrateErr: map[string]error{}}
+	opn, omp := cfPinned, cfMarkDirPopulated
+	t.Cleanup(func() { stopTestWatchers(t); cfPinned, cfMarkDirPopulated = opn, omp })
+	cfPinned = func(path string) bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.pinnedDirs[strings.ToLower(filepath.ToSlash(path))]
+	}
+	cfMarkDirPopulated = func(path string) error {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.filled = append(f.filled, path)
+		f.populated[strings.ToLower(filepath.ToSlash(path))] = true
+		return nil
+	}
 	oi, oc, or, ou, om, op, on, os2, ox := cfInspect, cfCreatePlaceholders, cfRefreshPlaceholder, cfUpdateIdentity, cfMarkInSync, cfIsPlaceholder, cfShellNotify, cfSettlePin, cfExclude
 	ov, orv, od := cfRefreshIfInSync, cfRevertPlaceholder, cfIsDehydrated
 	opi := cfPlaceholderIdentity
 	opm := cfPlaceholderModified
 	ouk := cfUpdateIdentityKeep
 	opd, ohp := cfPinnedDehydrated, cfHydrateIfPinned
+	owf := cfWantsFreeUp
+	t.Cleanup(func() { stopTestWatchers(t); cfWantsFreeUp = owf })
+	cfWantsFreeUp = func(string) bool { return false }
 	osi := cfSetInSync
 	odp := cfDirPopulated
 	t.Cleanup(func() {
+		// Anything a watcher still has running would read these seams as
+		// they are put back.
+		stopTestWatchers(t)
 		cfSetInSync = osi
 		cfDirPopulated = odp
 		cfInspect, cfCreatePlaceholders, cfRefreshPlaceholder, cfUpdateIdentity, cfMarkInSync, cfIsPlaceholder, cfShellNotify, cfSettlePin, cfExclude = oi, oc, or, ou, om, op, on, os2, ox
@@ -171,7 +197,7 @@ func installFakeCf(t *testing.T) *fakeCf {
 		f.notified = append(f.notified, path)
 	}
 	osc := cfShellCreated
-	t.Cleanup(func() { cfShellCreated = osc })
+	t.Cleanup(func() { stopTestWatchers(t); cfShellCreated = osc })
 	cfShellCreated = func(path string, _ bool) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -222,12 +248,21 @@ func installFakeCf(t *testing.T) *fakeCf {
 	}
 	cfCreatePlaceholders = func(baseDir string, items []cfapi.PlaceholderInfo) error {
 		f.mu.Lock()
+		parentPinned := f.pinnedDirs[strings.ToLower(filepath.ToSlash(baseDir))]
 		for _, it := range items {
 			f.created = append(f.created, it.Name)
 			// What it says on the tin: whatever was at that path, there is a
 			// PLACEHOLDER there now (and a directory placeholder starts out
 			// lazy - nothing has populated it yet).
-			delete(f.plain, strings.ToLower(filepath.ToSlash(filepath.Join(baseDir, it.Name))))
+			p := filepath.Join(baseDir, it.Name)
+			delete(f.plain, strings.ToLower(filepath.ToSlash(p)))
+			if parentPinned {
+				if it.IsDir {
+					f.pinnedDirs[strings.ToLower(filepath.ToSlash(p))] = true
+				} else {
+					f.pinned[strings.ToLower(p)] = true
+				}
+			}
 		}
 		f.mu.Unlock()
 		for _, it := range items {
@@ -450,6 +485,20 @@ func (f *fakeCf) markPinned(path string) {
 	f.pinned[strings.ToLower(path)] = true
 }
 
+// markPinnedDir gives a directory the "always keep on this device" pin.
+func (f *fakeCf) markPinnedDir(dir string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pinnedDirs[strings.ToLower(filepath.ToSlash(dir))] = true
+}
+
+// filledDirs returns the directories marked populated by the provider itself.
+func (f *fakeCf) filledDirs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.filled...)
+}
+
 // hydrateCompleted counts the downloads that ran to completion — hydratedPaths
 // records a path as the seam STARTS it, gate and all.
 func (f *fakeCf) hydrateCompleted() int {
@@ -508,6 +557,7 @@ type recorder struct {
 	deletes   []string
 	moves     [][2]string
 	baselines map[string]string
+	contents  map[string]string // Ops.RecordContent: content-version key per remote path
 	fileids   map[string]string
 	listCalls map[string]int
 	listing   map[string][]cfapi.PlaceholderInfo
@@ -595,7 +645,7 @@ type reportRec struct {
 
 func newRecorder() *recorder {
 	return &recorder{
-		baselines: map[string]string{}, fileids: map[string]string{},
+		baselines: map[string]string{}, contents: map[string]string{}, fileids: map[string]string{},
 		listCalls: map[string]int{}, listing: map[string][]cfapi.PlaceholderInfo{},
 		uploadSawBase: map[string]string{},
 		uploaded:      make(chan string, 16), deleted: make(chan string, 16), moved: make(chan [2]string, 16),
@@ -752,6 +802,22 @@ func (r *recorder) ops() Ops {
 			e, ok := r.baselines[remote]
 			return e, ok
 		},
+		RecordContent: func(m map[string]string) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			for remote, key := range m {
+				if key == "" {
+					delete(r.contents, remote)
+				} else {
+					r.contents[remote] = key
+				}
+			}
+		},
+		Content: func(remote string) string {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			return r.contents[remote]
+		},
 		ForgetBaseline: func(remote string) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
@@ -817,7 +883,7 @@ func bareWatcher(root string, ops Ops) *Watcher {
 		root: root, remoteRoot: "", ops: ops, ctx: ctx, cancel: cancel,
 		upload: map[string]*time.Timer{}, delete: map[string]*time.Timer{},
 		suppress: map[string]time.Time{},
-		inflight: map[string]context.CancelFunc{}, again: map[string]bool{},
+		inflight: map[string]context.CancelCauseFunc{}, again: map[string]bool{},
 		attempts: map[string]int{}, delAttempts: map[string]int{},
 		mvAttempts: map[string]int{}, busyCount: map[string]int{},
 		moved:       map[string]time.Time{},
@@ -831,9 +897,85 @@ func bareWatcher(root string, ops Ops) *Watcher {
 		w.ops.Log = func(string, ...any) {}
 	}
 	for i := 0; i < hydrateWorkers; i++ {
-		go w.hydrateLoop() // New starts these too; they exit with w.cancel()
+		w.spawn(w.hydrateLoop) // New starts these too; they exit with w.cancel()
 	}
+	testWatchers.Lock()
+	testWatchers.ws = append(testWatchers.ws, w)
+	testWatchers.Unlock()
 	return w
+}
+
+// testWatchers are the watchers bareWatcher has built and not yet stopped.
+var testWatchers struct {
+	sync.Mutex
+	ws []*Watcher
+}
+
+// setForTest sets a package variable (a seam or a tuning knob) for the rest
+// of the test. A watcher's goroutines read these variables and a write under
+// them is a data race, so it waits out earlier tests' watchers first, and
+// every watcher before putting the old value back.
+func setForTest[T any](t *testing.T, p *T, v T) {
+	t.Helper()
+	stopFinishedWatchers(t)
+	old := *p
+	*p = v
+	t.Cleanup(func() {
+		stopTestWatchers(t)
+		*p = old
+	})
+}
+
+// stopTestWatchers stops every watcher bareWatcher built and waits for the
+// goroutines and timer callbacks they started. installFakeCf's cleanup runs
+// it before putting the real cfapi functions back: a debounced upload or a
+// rename check still running at that point read the seams while they were
+// being written, which is what failed the package under -race.
+func stopTestWatchers(t *testing.T) {
+	testWatchers.Lock()
+	ws := testWatchers.ws
+	testWatchers.ws = nil
+	testWatchers.Unlock()
+	stopWatchers(t, ws)
+}
+
+// stopFinishedWatchers is stopTestWatchers for the watchers already cancelled,
+// which are the ones earlier tests left behind. It runs before a test writes
+// a seam, when the test's own watcher may already be built and must keep
+// running.
+func stopFinishedWatchers(t *testing.T) {
+	testWatchers.Lock()
+	var done, live []*Watcher
+	for _, w := range testWatchers.ws {
+		if w.ctx.Err() != nil {
+			done = append(done, w)
+		} else {
+			live = append(live, w)
+		}
+	}
+	testWatchers.ws = live
+	testWatchers.Unlock()
+	stopWatchers(t, done)
+}
+
+// stopWatchers stops each watcher and waits for its work to finish.
+func stopWatchers(t *testing.T, ws []*Watcher) {
+	for _, w := range ws {
+		w.cancel()
+		w.mu.Lock()
+		w.stopped = true
+		w.mu.Unlock()
+		done := make(chan struct{})
+		go func() {
+			w.work.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("watcher for %s still busy 10s after the test ended", w.root)
+		}
+	}
 }
 
 func ph(name string, dir bool, etag, fileid string) cfapi.PlaceholderInfo {
@@ -876,6 +1018,7 @@ func TestSkipName(t *testing.T) {
 
 func TestRemoteFor(t *testing.T) {
 	w := bareWatcher(`C:\root`, Ops{})
+	defer w.cancel()
 	w.remoteRoot = "Photos"
 	if got := w.remoteFor(`C:\root\sub\a.txt`); got != "Photos/sub/a.txt" {
 		t.Errorf("remoteFor nested = %q", got)
@@ -916,6 +1059,7 @@ func TestRemoteChangedPrefersETag(t *testing.T) {
 	fi, _ := os.Stat(p)
 	rec := newRecorder()
 	w := bareWatcher(dir, rec.ops())
+	defer w.cancel()
 	rec.baselines["f.txt"] = "etag-1"
 	// Same size/mtime (the heuristic would say unchanged) but a new ETag → changed.
 	r := cfapi.PlaceholderInfo{Size: fi.Size(), ModTime: fi.ModTime(), ETag: "etag-2"}
@@ -930,6 +1074,7 @@ func TestRemoteChangedPrefersETag(t *testing.T) {
 
 func TestSuppress(t *testing.T) {
 	w := bareWatcher(`C:\root`, Ops{})
+	defer w.cancel()
 	w.suppressDelete(`C:\root\Sub`)
 	if !w.isSuppressed(`C:\root\sub`) {
 		t.Error("case-insensitive match failed")
@@ -1008,6 +1153,45 @@ func TestParseDispatch(t *testing.T) {
 	}
 	if skipped {
 		t.Error("temp file (.tmp) was not filtered")
+	}
+}
+
+// An editor's lock file is never synced, but its appearing and vanishing is
+// how on-demand mode learns a document was opened or closed (GitHub #7, Deck
+// #721): parse hands those raw events to the EditorLockFiles hook, and only
+// those. Other skipped names (temp files, Thumbs.db) never reach it.
+func TestParseHandsEditorLockFilesToTheHook(t *testing.T) {
+	got := make(chan []string, 4)
+	ops := newRecorder().ops()
+	ops.EditorLockFiles = func(paths []string) { got <- paths }
+	w := bareWatcher(`C:oot`, ops)
+	defer w.cancel()
+
+	w.parse(notifyBuf(t, []struct {
+		action uint32
+		name   string
+	}{
+		{fileActionAdded, `~$report.docx`},
+		{fileActionAdded, `sub\.~lock.plan.odt#`},
+		{fileActionAdded, `Thumbs.db`},
+		{fileActionAdded, `save.tmp`},
+		{fileActionRemoved, `~$budget.xlsx`},
+	}))
+
+	select {
+	case paths := <-got:
+		want := []string{`C:oot\~$report.docx`, `C:oot\sub\.~lock.plan.odt#`, `C:oot\~$budget.xlsx`}
+		if strings.Join(paths, "|") != strings.Join(want, "|") {
+			t.Errorf("hook got %q, want %q", paths, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EditorLockFiles hook never called")
+	}
+	w.mu.Lock()
+	_, uploaded := w.upload[`C:oot\~$report.docx`]
+	w.mu.Unlock()
+	if uploaded {
+		t.Error("an editor lock file was scheduled for upload")
 	}
 }
 
@@ -1421,6 +1605,97 @@ func TestReconcileRefreshesChangedFile(t *testing.T) {
 	}
 }
 
+// A files_lock lock or unlock changes the ETag and nothing else. When the
+// recorded content key says the server still holds the version this clean
+// placeholder mirrors, the ETag change is metadata: the local copy must stay
+// (GitHub #7 — every colleague opening a document dehydrated everyone else's
+// downloaded copy, and a pinned one downloaded twice) and the baseline must
+// move on to the new ETag.
+func TestReconcileKeepsLocalCopyOnMetadataOnlyETagBump(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	doc := filepath.Join(root, "doc.txt")
+	if err := os.WriteFile(doc, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(doc)
+	rec := newRecorder()
+	rec.baselines["doc.txt"] = "etag-v1"
+	rec.contents["doc.txt"] = transport.ContentKey(fi.Size(), fi.ModTime(), 1790160705)
+	r := ph("doc.txt", false, "etag-locked", "fid")
+	r.Size, r.ModTime, r.UploadTime = fi.Size(), fi.ModTime(), 1790160705 // same version, new ETag
+	rec.listing[""] = []cfapi.PlaceholderInfo{r}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	f.mu.Lock()
+	refreshed := len(f.refreshed)
+	f.mu.Unlock()
+	if refreshed != 0 {
+		t.Fatal("a lock's ETag bump dehydrated an unchanged local copy")
+	}
+	if rec.baselines["doc.txt"] != "etag-locked" {
+		t.Errorf("baseline = %q, want it moved on to etag-locked", rec.baselines["doc.txt"])
+	}
+}
+
+// The content key must not hide a real edit: a new upload of the same size and
+// mtime has a new upload time, so it is still refreshed.
+func TestReconcileRefreshesSameSizeUploadDespiteContentKey(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	doc := filepath.Join(root, "doc.txt")
+	if err := os.WriteFile(doc, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(doc)
+	rec := newRecorder()
+	rec.baselines["doc.txt"] = "etag-v1"
+	rec.contents["doc.txt"] = transport.ContentKey(fi.Size(), fi.ModTime(), 1790160705)
+	r := ph("doc.txt", false, "etag-v2", "fid")
+	r.Size, r.ModTime, r.UploadTime = fi.Size(), fi.ModTime(), 1790160846 // re-uploaded
+	rec.listing[""] = []cfapi.PlaceholderInfo{r}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	f.mu.Lock()
+	refreshed := len(f.refreshed)
+	f.mu.Unlock()
+	if refreshed != 1 {
+		t.Fatalf("same-size re-upload refreshed %d times, want 1 (stale local copy)", refreshed)
+	}
+	if want := transport.ContentKey(r.Size, r.ModTime, r.UploadTime); rec.contents["doc.txt"] != want {
+		t.Errorf("content key after refresh = %q, want %q", rec.contents["doc.txt"], want)
+	}
+}
+
+// A placeholder created by reconcile mirrors the listed version, so its content
+// key is recorded with its ETag — or the first lock on a file that arrived
+// after its folder was populated would still read as an edit.
+func TestReconcilePullRecordsContentKeys(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	rec := newRecorder()
+	r := ph("new.txt", false, "etag-n", "fid-n")
+	r.Size, r.UploadTime = 5, 1790160705
+	rec.listing[""] = []cfapi.PlaceholderInfo{r, ph("sub", true, "etag-sub", "")}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	if want := transport.ContentKey(5, r.ModTime, 1790160705); rec.contents["new.txt"] != want {
+		t.Errorf("content key = %q, want %q", rec.contents["new.txt"], want)
+	}
+	if _, ok := rec.contents["sub"]; ok {
+		t.Error("a directory got a content key")
+	}
+}
+
 func TestReconcileETagSubtreeSkip(t *testing.T) {
 	installFakeCf(t)
 	root := t.TempDir()
@@ -1705,6 +1980,73 @@ func TestChangeEventSettlesPendingUnpin(t *testing.T) {
 	}
 }
 
+// The lockout (a colleague has the file open) holds a deny-write handle on a
+// downloaded file, and while it is held "Free up space" cannot dehydrate it:
+// measured on the VM 2026-09-23, the file is left UNPINNED and still
+// downloaded, wearing pending arrows. So when a file is waiting to be freed,
+// BeforeReplace must run first to drop the handle (Deck #721) — and only then,
+// or every change event would undo the lockout.
+func TestFreeUpReleasesTheLockoutHandleFirst(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	doc := filepath.Join(root, "doc.txt")
+	if err := os.WriteFile(doc, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var order []string
+	note := func(s string) { mu.Lock(); order = append(order, s); mu.Unlock() }
+	cfSettlePin = func(path string) (bool, error) { note("settle"); return false, nil }
+	wants := false
+	cfWantsFreeUp = func(path string) bool { return wants }
+	ops := newRecorder().ops()
+	ops.BeforeReplace = func(path string) { note("release:" + filepath.Base(path)) }
+	w := bareWatcher(root, ops)
+	defer w.cancel()
+
+	w.handleChange(doc) // an ordinary change event: the handle stays
+	wants = true
+	w.handleChange(doc) // a pending "Free up space": drop it, then dehydrate
+
+	mu.Lock()
+	got := strings.Join(order, ",")
+	mu.Unlock()
+	if got != "settle,release:doc.txt,settle" {
+		t.Errorf("order = %s, want settle,release:doc.txt,settle", got)
+	}
+}
+
+// A refresh dehydrates the file too, so it also drops the handle first.
+func TestRefreshReleasesTheLockoutHandleFirst(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	doc := filepath.Join(root, "doc.txt")
+	if err := os.WriteFile(doc, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := newRecorder()
+	rec.baselines["doc.txt"] = "etag-v1"
+	r := ph("doc.txt", false, "etag-v2", "fid")
+	rec.listing[""] = []cfapi.PlaceholderInfo{r}
+	ops := rec.ops()
+	ops.BeforeReplace = func(path string) {
+		f.mu.Lock()
+		f.events = append(f.events, "release:"+path)
+		f.mu.Unlock()
+	}
+	w := bareWatcher(root, ops)
+	defer w.cancel()
+
+	w.Reconcile()
+
+	f.mu.Lock()
+	got := strings.Join(f.events, ",")
+	f.mu.Unlock()
+	if want := "release:" + doc + ",refresh:" + doc; got != want {
+		t.Errorf("events = %s, want %s", got, want)
+	}
+}
+
 // --- pin hydration (issue #7) -----------------------------------------------
 
 // Explorer's "Always keep on this device" (and Nimbo's own menu entry) only
@@ -1969,9 +2311,7 @@ func TestHydrateFailureBacksOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.markHydrateErr(p, errors.New("boom"))
-	origBase := retryBase
-	retryBase = 200 * time.Millisecond
-	t.Cleanup(func() { retryBase = origBase })
+	setForTest(t, &retryBase, 200*time.Millisecond)
 	rec := newRecorder()
 	w := bareWatcher(root, rec.ops())
 	defer w.cancel()
@@ -2118,9 +2458,8 @@ func TestReconcileConvertsPopulatedPlainDir(t *testing.T) {
 // file specifically is now ignored. Previous failure and no retry mechanism?"
 // — GitHub issue #1).
 func TestUploadFailureRetriedWithBackoff(t *testing.T) {
-	ob, om := retryBase, retryMax
-	retryBase, retryMax = 20*time.Millisecond, 100*time.Millisecond
-	t.Cleanup(func() { retryBase, retryMax = ob, om })
+	setForTest(t, &retryBase, 20*time.Millisecond)
+	setForTest(t, &retryMax, 100*time.Millisecond)
 
 	f := installFakeCf(t)
 	root := t.TempDir()
@@ -2251,6 +2590,54 @@ func TestReconcileReschedulesDirtyLocalOnlyFile(t *testing.T) {
 	}
 }
 
+// An EMPTY local-only folder must reach the server too. Adopt only classifies
+// files, so a folder with nothing in it is left out of the plan (Deck #500 item
+// 4); nothing else fires for it either, since it existed before the watcher
+// started. Reconcile's local-only rescue is what creates it: a plain folder
+// needs upload, and a folder's upload is a MKCOL. It must never be read as a
+// server-side delete and removed.
+func TestReconcileCreatesEmptyLocalOnlyDir(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "Empty")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.markPlain(dir)
+	rec := newRecorder()
+	rec.listing[""] = nil // server doesn't have it
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rec.mu.Lock()
+		mkdirs := append([]string(nil), rec.mkdirs...)
+		rec.mu.Unlock()
+		if len(mkdirs) > 0 {
+			if len(mkdirs) != 1 || mkdirs[0] != "Empty" {
+				t.Fatalf("MKCOLs = %v, want exactly [Empty]", mkdirs)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("empty local-only folder never created on the server")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("empty local-only folder removed locally: %v", err)
+	}
+	rec.mu.Lock()
+	dels := len(rec.deletes)
+	rec.mu.Unlock()
+	if dels != 0 {
+		t.Fatalf("server deletes = %d, want none", dels)
+	}
+}
+
 // The first reconcile pass after start must also rescue a dirty file that
 // exists on BOTH sides (an edit whose upload failed before a restart).
 func TestReconcileFirstPassRescuesDirtyInBothFile(t *testing.T) {
@@ -2378,9 +2765,7 @@ func TestUploadDoesNotMarkInSyncOverMidUploadEdit(t *testing.T) {
 // A transiently-failed server DELETE must retry — dropping it resurrects the
 // deleted files at the next reconcile.
 func TestDeleteRetriedOnTransientFailure(t *testing.T) {
-	ob := retryBase
-	retryBase = 20 * time.Millisecond
-	t.Cleanup(func() { retryBase = ob })
+	setForTest(t, &retryBase, 20*time.Millisecond)
 	installFakeCf(t)
 	root := t.TempDir()
 	rec := newRecorder()
@@ -2405,9 +2790,7 @@ func TestDeleteRetriedOnTransientFailure(t *testing.T) {
 // fallback re-uploaded the file under its new name and left the old server
 // copy behind (double storage, then a resurrect on reconcile).
 func TestRenameMoveTransientFailureRetriesMove(t *testing.T) {
-	ob := retryBase
-	retryBase = 20 * time.Millisecond
-	t.Cleanup(func() { retryBase = ob })
+	setForTest(t, &retryBase, 20*time.Millisecond)
 	installFakeCf(t)
 	root := t.TempDir()
 	newp := filepath.Join(root, "new.txt")
@@ -3575,9 +3958,7 @@ func TestReconcileLeavesAPathWithAMoveInFlightAlone(t *testing.T) {
 // file. Whichever lands second 404s: a bogus "X is missing on the server" for
 // an online-only file, or a redundant full re-upload for a hydrated one.
 func TestReconcileInAMoveRetryGapIssuesNoSecondMove(t *testing.T) {
-	ob := retryBase
-	retryBase = 1500 * time.Millisecond // long enough to reconcile inside the gap
-	t.Cleanup(func() { retryBase = ob })
+	setForTest(t, &retryBase, 1500*time.Millisecond) // long enough to reconcile inside the gap
 	f := installFakeCf(t)
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "b"), 0o755); err != nil {
@@ -4200,13 +4581,11 @@ func TestReconcileStillRescuesAnEditedInBothFile(t *testing.T) {
 	}
 }
 
-// A directory placeholder is deliberately NOT in sync — that is what makes the
-// shell ask it to populate — and marking one in-sync leaves it enumerating
-// EMPTY forever (cfapi.TestInSyncDirStillPopulates pins the driver behaviour).
-// Folders get FILE_ACTION_MODIFIED constantly, including for every move made
-// INTO them (the live trace shows MODIFIED for the destination folder next to
-// MODIFIED for the file), so the in-sync heal meets directories all day and
-// must leave every one of them alone.
+// The in-sync heal is for files. Folders get FILE_ACTION_MODIFIED constantly,
+// including for every move made INTO them (the live trace shows MODIFIED for
+// the destination folder next to MODIFIED for the file), so the heal meets
+// directories all day and must leave every one of them alone: a folder's bit
+// is set at creation, by its repoint, and by cfapi.SweepDirsInSync.
 func TestModifiedEventOnADirectoryNeverMarksItInSync(t *testing.T) {
 	f := installFakeCf(t)
 	root := t.TempDir()
@@ -4223,7 +4602,7 @@ func TestModifiedEventOnADirectoryNeverMarksItInSync(t *testing.T) {
 	modifiedEvent(t, w, "sub")
 
 	if got := f.inSyncedPaths(); len(got) != 0 {
-		t.Errorf("in-sync restored for %v — a directory marked in-sync never populates again", got)
+		t.Errorf("in-sync restored for %v — the file heal reached a directory", got)
 	}
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
@@ -4260,9 +4639,7 @@ func movePlaceholder(t *testing.T, f *fakeCf, from, to string) {
 // rather than the second it waits in production.
 func shortenRenameVerify(t *testing.T) {
 	t.Helper()
-	old := renameVerifyDelay
-	renameVerifyDelay = 50 * time.Millisecond
-	t.Cleanup(func() { renameVerifyDelay = old })
+	setForTest(t, &renameVerifyDelay, 50*time.Millisecond)
 }
 
 // waitForMoveSettled blocks until no server MOVE onto path is running any
@@ -4525,9 +4902,7 @@ func TestVerifyPlacementStopsIfTheItemIsSuppressedWhileItWaits(t *testing.T) {
 // so that what happens before the check fires can be asserted on its own).
 func setRenameVerifyDelay(t *testing.T, d time.Duration) {
 	t.Helper()
-	old := renameVerifyDelay
-	renameVerifyDelay = d
-	t.Cleanup(func() { renameVerifyDelay = old })
+	setForTest(t, &renameVerifyDelay, d)
 }
 
 // The route the ratified truncate-to-zero tie-break leaves open: a HYDRATED,
@@ -5165,9 +5540,8 @@ func TestCancelInflightDropsTheForcedFlag(t *testing.T) {
 // folder the 404 fallback asked for waits for the next full sweep while every
 // upload into it 409s.
 func TestForcedMkdirReArmStaysForced(t *testing.T) {
-	ob, om := retryBase, retryMax
-	retryBase, retryMax = 20*time.Millisecond, 100*time.Millisecond
-	t.Cleanup(func() { retryBase, retryMax = ob, om })
+	setForTest(t, &retryBase, 20*time.Millisecond)
+	setForTest(t, &retryMax, 100*time.Millisecond)
 
 	installFakeCf(t)
 	root := t.TempDir()
@@ -6068,5 +6442,201 @@ func TestACorruptSyncRootIsNamedNotRenderedAsADot(t *testing.T) {
 	}
 	if !strings.Contains(rec.reports[0].err.Error(), root) {
 		t.Errorf("the recovery does not name the root's full path: %v", rec.reports[0].err)
+	}
+}
+
+// --- keep on device reaches folders nobody opened (GitHub #17) ---------------
+
+// waitHydrated waits for the hydrate workers to have started every one of want.
+func waitHydrated(t *testing.T, f *fakeCf, want ...string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got := map[string]bool{}
+		for _, p := range f.hydratedPaths() {
+			got[strings.ToLower(p)] = true
+		}
+		missing := []string{}
+		for _, p := range want {
+			if !got[strings.ToLower(p)] {
+				missing = append(missing, p)
+			}
+		}
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never downloaded %v (downloaded %v)", missing, f.hydratedPaths())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The reporter's case: "Always keep on this device" on a folder whose
+// subfolders were never opened. The pin lands on the lazy folder itself, but
+// it has no children to download and the shell will only fetch them when
+// something opens it. Reconcile has to fill it in, all the way down, and hand
+// every file to the downloader.
+func TestReconcileFillsAPinnedNeverOpenedFolder(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	photos := filepath.Join(root, "Photos")
+	if err := os.MkdirAll(photos, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.markPinnedDir(photos) // pinned, never populated
+
+	rec := newRecorder()
+	rec.listing[""] = []cfapi.PlaceholderInfo{ph("Photos", true, "e-photos", "")}
+	rec.listing["Photos"] = []cfapi.PlaceholderInfo{ph("a.jpg", false, "e-a", "fa"), ph("2024", true, "e-2024", "")}
+	rec.listing["Photos/2024"] = []cfapi.PlaceholderInfo{ph("b.jpg", false, "e-b", "fb"), ph("deep", true, "e-deep", "")}
+	rec.listing["Photos/2024/deep"] = []cfapi.PlaceholderInfo{ph("c.jpg", false, "e-c", "fc")}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	rec.mu.Lock()
+	for _, rel := range []string{"Photos", "Photos/2024", "Photos/2024/deep"} {
+		if rec.listCalls[rel] == 0 {
+			t.Errorf("%s was never listed", rel)
+		}
+	}
+	rec.mu.Unlock()
+	filled := map[string]bool{}
+	for _, d := range f.filledDirs() {
+		filled[strings.ToLower(d)] = true
+	}
+	for _, d := range []string{photos, filepath.Join(photos, "2024"), filepath.Join(photos, "2024", "deep")} {
+		if !filled[strings.ToLower(d)] {
+			t.Errorf("%s was not marked populated (marked: %v)", d, f.filledDirs())
+		}
+	}
+	waitHydrated(t, f,
+		filepath.Join(photos, "a.jpg"),
+		filepath.Join(photos, "2024", "b.jpg"),
+		filepath.Join(photos, "2024", "deep", "c.jpg"))
+}
+
+// The fill must not claim a folder it could not list: the populated flag is
+// permanent, so a folder marked after a failed listing would stay empty.
+func TestPinFillLeavesTheFolderLazyWhenTheListingFails(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	photos := filepath.Join(root, "Photos")
+	if err := os.MkdirAll(photos, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.markPinnedDir(photos)
+
+	rec := newRecorder()
+	rec.listErr = os.ErrDeadlineExceeded
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	if w.reconcileDir("Photos", "") {
+		t.Error("reconcileDir reported success for a folder it could not list")
+	}
+	if got := f.filledDirs(); len(got) != 0 {
+		t.Errorf("marked %v populated after a failed listing", got)
+	}
+}
+
+// A pinned folder that already holds some of its children (a fill that
+// failed part way) is still finished off: it has entries, so the empty-folder
+// test alone would never have looked at its population state.
+func TestPinFillFinishesAPartlyFilledFolder(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	photos := filepath.Join(root, "Photos")
+	if err := os.MkdirAll(photos, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(photos, "a.jpg"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.markPinnedDir(photos)
+
+	rec := newRecorder()
+	rec.listing[""] = []cfapi.PlaceholderInfo{ph("Photos", true, "e-photos", "")}
+	rec.listing["Photos"] = []cfapi.PlaceholderInfo{ph("a.jpg", false, "e-a", "fa"), ph("b.jpg", false, "e-b", "fb")}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.Reconcile()
+
+	if got := f.createdNames(); len(got) != 1 || got[0] != "b.jpg" {
+		t.Errorf("created %v, want exactly [b.jpg]", got)
+	}
+	if got := f.filledDirs(); len(got) != 1 || !strings.EqualFold(got[0], photos) {
+		t.Errorf("marked populated %v, want [%s]", got, photos)
+	}
+}
+
+// Pinning while Nimbo runs: the recursive pin raises an attribute event on
+// the never-opened folder, and that event alone must fill it in, all the way
+// down — a pin is a local change, so no server ETag moves and no reconcile
+// pass would get there. This runs after the first (skip-free) pass, as it
+// does in real use: on the VM the fill stopped one level down, because each
+// new subfolder's ETag was recorded as its baseline as it was created, and
+// the subtree skip then read the walk into it as "nothing changed".
+func TestPinnedFolderEventFillsIt(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	photos := filepath.Join(root, "Photos")
+	if err := os.MkdirAll(photos, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.markPinnedDir(photos)
+
+	rec := newRecorder()
+	rec.listing[""] = []cfapi.PlaceholderInfo{ph("Photos", true, "e-photos", "")}
+	// Identities are full server paths, as the real listing has them: that is
+	// what the baselines are keyed by, and what the subtree skip looks up.
+	at := func(dir string, p cfapi.PlaceholderInfo) cfapi.PlaceholderInfo {
+		p.Identity = []byte(dir + "/" + p.Name)
+		return p
+	}
+	rec.listing["Photos"] = []cfapi.PlaceholderInfo{at("Photos", ph("a.jpg", false, "e-a", "fa")), at("Photos", ph("2024", true, "e-2024", ""))}
+	rec.listing["Photos/2024"] = []cfapi.PlaceholderInfo{at("Photos/2024", ph("b.jpg", false, "e-b", "fb")), at("Photos/2024", ph("deep", true, "e-deep", ""))}
+	rec.listing["Photos/2024/deep"] = []cfapi.PlaceholderInfo{at("Photos/2024/deep", ph("c.jpg", false, "e-c", "fc"))}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+	w.firstPassDone = true // steady state: the subtree skip is live
+
+	w.handleChange(photos) // what the debounced ATTRIBUTES event runs
+
+	waitHydrated(t, f,
+		filepath.Join(photos, "a.jpg"),
+		filepath.Join(photos, "2024", "b.jpg"),
+		filepath.Join(photos, "2024", "deep", "c.jpg"))
+	if got := f.filledDirs(); len(got) != 3 {
+		t.Errorf("marked populated %v, want Photos, Photos\\2024 and Photos\\2024\\deep", got)
+	}
+}
+
+// An unpinned folder's event changes nothing: filling it would race the
+// shell's own first fetch for a folder the user never asked to keep.
+func TestUnpinnedFolderEventDoesNotFillIt(t *testing.T) {
+	f := installFakeCf(t)
+	root := t.TempDir()
+	photos := filepath.Join(root, "Photos")
+	if err := os.MkdirAll(photos, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := newRecorder()
+	rec.listing["Photos"] = []cfapi.PlaceholderInfo{ph("a.jpg", false, "e-a", "fa")}
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.handleChange(photos)
+	time.Sleep(200 * time.Millisecond)
+
+	rec.mu.Lock()
+	listed := rec.listCalls["Photos"]
+	rec.mu.Unlock()
+	if listed != 0 || len(f.filledDirs()) != 0 {
+		t.Errorf("listed %d time(s), marked %v: an unpinned folder was filled in", listed, f.filledDirs())
 	}
 }

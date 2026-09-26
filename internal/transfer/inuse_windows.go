@@ -34,6 +34,13 @@ func writerPresent(path string) error {
 	return nil
 }
 
+// lockedOut reports whether err is Windows refusing access because another
+// program holds the file (a sharing violation) or has locked part of it (a lock
+// violation, which is how Outlook guards a .pst it has open).
+func lockedOut(err error) bool {
+	return errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_LOCK_VIOLATION)
+}
+
 // extendedPath gives CreateFile the \\?\ form of a long absolute path, which
 // the os package does for itself but a raw CreateFile call does not.
 func extendedPath(path string) string {

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Events } from "@wailsio/runtime";
   import { App } from "../bindings/github.com/otherworld/nimbo/cmd/nimbo-gui";
+  import { ask, tell, askText } from "./dialogs.svelte";
 
   type Activity = { time: string; kind: string; path: string; err: string; account: string };
   type OtherAttention = { id: string; user: string; conflicts: number; blocked: number };
@@ -11,7 +12,8 @@
   };
   type Notif = { id: number; app: string; subject: string; message: string; link: string; actions: { label: string }[] };
   type Blocked = { abs: string; path: string; reason: string; ext: string; escapable: boolean; escaping: boolean };
-  type Lock = { path: string; owner: string; summary: string; ownerType: number; since: string; account: string };
+  type Lock = { path: string; owner: string; summary: string; ownerType: number; since: string; account: string;
+                localDir: string; canUnlock: boolean };
   type Trash = { href: string; name: string; originalLocation: string; deletedAt: string; size: number; isDir: boolean };
   // A folder that stopped being shared with the user (or whose storage was
   // unmounted): the local copy was kept and parked, and awaits a decision.
@@ -37,7 +39,7 @@
   }
   async function showAccount(id: string) {
     const err = await App.SwitchAccount(id);
-    if (err) { alert(err); return; }
+    if (err) { await tell({ title: "Couldn't switch account", message: err }); return; }
     loadAll();
   }
   async function loadNotifs() { notifs = (await App.NotificationList()) ?? []; }
@@ -50,6 +52,23 @@
     const d = (await App.Diagnostics()) as any;
     locks = (d?.observedLocks ?? []) as Lock[];
     lockingAvailable = !!d?.lockingAvailable;
+  }
+  // Clears someone's stale lock on a file you own (#733). Only offered once the
+  // lock is over an hour old; the engine checks it is still that same lock.
+  let unlocking = $state("");
+  const lockKey = (l: Lock) => l.localDir + "|" + l.path;
+  async function unlockStale(l: Lock) {
+    const since = new Date(l.since).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+    if (!await ask({
+      title: "Unlock file?",
+      message: `${l.path}\n\n${l.owner} has had it locked since ${since}. Only do this if they have finished with it, anything they have not saved yet may end up as a conflicted copy.`,
+      ok: "Unlock",
+    })) return;
+    unlocking = lockKey(l);
+    const err = await App.UnlockStaleLock(l.account, l.localDir, l.path);
+    unlocking = "";
+    if (err) await tell({ title: "Couldn't unlock the file", message: err });
+    loadLocks();
   }
   async function loadTrash() { trashBusy = true; trash = (await App.TrashList()) ?? []; trashBusy = false; }
   async function loadDetached() { detached = (await App.DetachedFolders()) ?? []; }
@@ -68,7 +87,7 @@
     detachedBusy = dkey(d);
     const err = await App.ResolveDetached(d.localPath, choice, dest);
     detachedBusy = "";
-    if (err) { alert(err); return; }
+    if (err) { await tell({ title: "Couldn't sort out the folder", message: err }); return; }
     await loadDetached();
   }
 
@@ -121,7 +140,22 @@
     : k === "type" ? "Changed to a different type on each side."
     : "Edited on both sides since the last sync.";
 
-  const resolve = (c: Conflict, choice: string) => App.ResolveConflict(c.localDir, c.path, choice);
+  // A choice is recorded at once and the sync does the transfer, except keep
+  // both, which moves files while you wait. Either way the buttons stay off
+  // until it answers, and a refusal shows on the card instead of vanishing.
+  let resolving = $state<Record<string, string>>({});
+  let resolveErr = $state<Record<string, string>>({});
+  async function resolve(c: Conflict, choice: string) {
+    const k = ckey(c);
+    if (resolving[k]) return;
+    resolving[k] = choice;
+    resolveErr[k] = "";
+    try {
+      resolveErr[k] = await App.ResolveConflict(c.localDir, c.path, choice);
+    } finally {
+      delete resolving[k];
+    }
+  }
 
   // Content preview, lazily fetched when a conflict is expanded.
   type Side = { exists: boolean; size: number; isText: boolean; preview: string; truncated: boolean; note: string };
@@ -147,19 +181,27 @@
   const newer = (c: Conflict): "local" | "remote" | "" =>
     !c.localMTime || !c.remoteMTime ? "" : c.localMTime > c.remoteMTime ? "local" : c.remoteMTime > c.localMTime ? "remote" : "";
 
-  function rename(b: Blocked) {
+  async function rename(b: Blocked) {
     const base = b.abs.split(/[\\/]/).pop() ?? b.path;
-    const name = prompt("Rename to a name the server allows:", base);
-    if (name) App.RenameBlocked(b.abs, name);
+    const name = await askText({ title: "Rename file", message: "Pick a name the server allows.", value: base, ok: "Rename" });
+    if (name && name !== base) App.RenameBlocked(b.abs, name);
   }
-  function deleteBlocked(b: Blocked) {
-    if (confirm(`Delete "${b.path}"?\n\nIt can't sync because of its name and isn't on the server, so this just removes it from this device.`)) {
+  async function deleteBlocked(b: Blocked) {
+    if (await ask({
+      title: "Delete file?",
+      message: `${b.path}\n\nIt can't sync because of its name and isn't on the server, so this just removes it from this device.`,
+      ok: "Delete", danger: true,
+    })) {
       App.DeleteBlocked(b.abs);
     }
   }
   async function deleteAllBlocked() {
     const n = realBlocked.length;
-    if (confirm(`Delete all ${n} can't-sync file${n === 1 ? "" : "s"} from this device?\n\nThey can't sync because of their names and aren't on the server, so this only removes them locally.`)) {
+    if (await ask({
+      title: `Delete ${n} file${n === 1 ? "" : "s"}?`,
+      message: `This deletes all ${n} can't-sync file${n === 1 ? "" : "s"} from this device. They can't sync because of their names and aren't on the server, so this only removes them locally.`,
+      ok: "Delete all", danger: true,
+    })) {
       await App.DeleteAllBlocked();
       loadBlocked();
     }
@@ -172,8 +214,12 @@
     loadBlocked();
   }
   // Stop escaping a type: removes the renamed server copies; files go device-only.
-  function stopEscape(b: Blocked) {
-    if (confirm(`Stop syncing ${b.ext} files?\n\nTheir renamed copies are removed from the server and the files stay on this device only — the server forbids their real names. Nothing is deleted locally.`)) {
+  async function stopEscape(b: Blocked) {
+    if (await ask({
+      title: `Stop syncing ${b.ext} files?`,
+      message: "Their renamed copies are removed from the server and the files stay on this device only, as the server forbids their real names. Nothing is deleted locally.",
+      ok: "Stop syncing",
+    })) {
       App.RenameBlocked("", "//unescape:" + b.ext);
     }
   }
@@ -261,10 +307,11 @@
             {/if}
           {/if}
           <div class="btns">
-            <button class="primary" onclick={() => resolve(c, "local")}>Keep mine</button>
-            <button onclick={() => resolve(c, "remote")}>Keep server</button>
-            <button onclick={() => resolve(c, "both")}>Keep both</button>
+            <button class="primary" disabled={!!resolving[ckey(c)]} onclick={() => resolve(c, "local")}>Keep mine</button>
+            <button disabled={!!resolving[ckey(c)]} onclick={() => resolve(c, "remote")}>Keep server</button>
+            <button disabled={!!resolving[ckey(c)]} onclick={() => resolve(c, "both")}>{resolving[ckey(c)] === "both" ? "Keeping both…" : "Keep both"}</button>
           </div>
+          {#if resolveErr[ckey(c)]}<div class="resolveerr">⚠ {resolveErr[ckey(c)]}</div>{/if}
         </div>
       {/each}
 
@@ -352,6 +399,12 @@
             {#if l.since}
               <div class="locksub">Open since {new Date(l.since).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</div>
             {/if}
+            {#if l.canUnlock}
+              <div class="btns lockbtns">
+                <button onclick={() => unlockStale(l)} disabled={unlocking === lockKey(l)}
+                        title="You own this file, so you can clear a lock that has been left behind">Unlock</button>
+              </div>
+            {/if}
           </div>
         {/each}
       {/if}
@@ -393,6 +446,7 @@
   .line .k { color: var(--accent); min-width: 86px; }
   .line .p { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .line .err { color: #e06b6b; }
+  .resolveerr { margin-top: 8px; font-size: 12.5px; color: #e06b6b; }
   /* Deep-link flash: briefly tint + outline the row the flyout pointed at. */
   .hl { animation: hlflash 3.4s ease-out both; border-radius: 6px; }
   @keyframes hlflash {
@@ -403,6 +457,7 @@
   .card .title { font-weight: 600; font-size: 13px; }
   .card .desc { color: var(--fg2); font-size: 12px; margin: 4px 0 10px; }
   .locksub { font-size: 11.5px; color: var(--muted); }
+  .lockbtns { margin-top: 8px; }
   .versions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 12px; }
   .ver { border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; background: var(--panel); }
   .ver.newest { border-color: var(--accent); background: var(--tint); }
@@ -429,6 +484,7 @@
   .btns button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   .btns button.danger { color: #c0392b; border-color: #e6b8b2; }
   .btns button.danger:hover { background: #fdeceb; }
+  .btns button:disabled { opacity: .55; cursor: default; }
   .bulkrow { display: flex; align-items: center; justify-content: space-between; gap: 10px;
              padding: 8px 10px; margin-bottom: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
   .bulkcount { font-size: 12.5px; color: var(--fg2); }

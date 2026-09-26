@@ -143,6 +143,7 @@ func TestParseResponseLock(t *testing.T) {
       <nc:lock-time>1786228737</nc:lock-time>
       <nc:lock-timeout>1800</nc:lock-timeout>
       <nc:lock-token>files_lock/c1339370-96d3-4151-a2a3-5f193a1cd67b</nc:lock-token>
+      <oc:owner-id>alice</oc:owner-id>
     </d:prop></d:propstat>
   </d:response>
   <d:response>
@@ -207,6 +208,10 @@ func TestParseResponseLock(t *testing.T) {
 	}
 	if !locked.Lock.Since.Equal(time.Unix(1786228737, 0)) {
 		t.Errorf("Since = %v, want the epoch-seconds value", locked.Lock.Since)
+	}
+	// Who owns the FILE, not the lock: the owner may clear a stale lock (#733).
+	if locked.Lock.FileOwner != "alice" {
+		t.Errorf("FileOwner = %q, want alice (oc:owner-id)", locked.Lock.FileOwner)
 	}
 
 	// Explicitly unlocked, and "the server never answered", must BOTH be nil: the
@@ -477,5 +482,75 @@ func TestStatReportsAbsentOnlyForA404(t *testing.T) {
 	}
 	if _, found, err := c.Stat(context.Background(), "Items not found.xlsx"); err == nil {
 		t.Fatalf("403 on a file named 'not found': found=%v, want an error, not absent", found)
+	}
+}
+
+// TestParseResponseUploadTime covers nc:upload_time: the one property a live
+// Nextcloud 34 changes on every content upload but leaves alone when files_lock
+// takes or releases a lock (measured 2026-09-23 — the lock bumps the ETag and
+// nothing else).
+func TestParseResponseUploadTime(t *testing.T) {
+	const body = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns" xmlns:oc="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/a.txt</d:href>
+    <d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop>
+      <d:getetag>&quot;e1&quot;</d:getetag>
+      <d:getcontentlength>33</d:getcontentlength>
+      <nc:upload_time>1790160705</nc:upload_time>
+    </d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/old.txt</d:href>
+    <d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop>
+      <d:getetag>&quot;e2&quot;</d:getetag>
+      <nc:upload_time>0</nc:upload_time>
+    </d:prop></d:propstat>
+  </d:response>
+</d:multistatus>`
+	var ms multistatus
+	if err := xml.Unmarshal([]byte(body), &ms); err != nil {
+		t.Fatal(err)
+	}
+	c := New("https://cloud.example.com", "alice", "pw")
+	got := map[string]int64{}
+	for _, r := range ms.Responses {
+		e, ok, err := c.parseResponse(r)
+		if err != nil || !ok {
+			t.Fatalf("parse: ok=%v err=%v", ok, err)
+		}
+		got[e.Path] = e.UploadTime
+	}
+	if got["a.txt"] != 1790160705 {
+		t.Errorf("a.txt UploadTime = %d, want 1790160705", got["a.txt"])
+	}
+	if got["old.txt"] != 0 {
+		t.Errorf("old.txt UploadTime = %d, want 0 (server does not know it)", got["old.txt"])
+	}
+}
+
+func TestContentKey(t *testing.T) {
+	mt := time.Unix(1790160705, 0)
+	if k := ContentKey(33, mt, 0); k != "" {
+		t.Errorf("unknown upload time gave key %q, want empty (nothing to vouch for)", k)
+	}
+	a := ContentKey(33, mt, 1790160705)
+	if a == "" {
+		t.Fatal("key empty with a known upload time")
+	}
+	// Sub-second mtime noise (NTFS keeps 100ns, the server whole seconds) must
+	// not make the same version look different.
+	if b := ContentKey(33, mt.Add(400*time.Millisecond), 1790160705); b != a {
+		t.Errorf("sub-second mtime changed the key: %q vs %q", b, a)
+	}
+	// A new upload of the same size and mtime is still a different version.
+	if b := ContentKey(33, mt, 1790160846); b == a {
+		t.Error("a later upload with the same size and mtime produced the same key")
+	}
+	if b := ContentKey(34, mt, 1790160705); b == a {
+		t.Error("a size change produced the same key")
+	}
+	if b := ContentKey(33, mt.Add(time.Minute), 1790160705); b == a {
+		t.Error("an mtime change produced the same key")
 	}
 }

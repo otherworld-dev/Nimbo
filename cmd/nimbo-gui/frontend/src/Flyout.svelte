@@ -55,6 +55,13 @@
   let acctBusy = $state(false);
   const hostOf = (s: string) => { try { return new URL(s).host; } catch { return s; } };
   async function loadAccounts() { accounts = (await App.ListAccounts()) ?? []; }
+  // The header names the shown account on a strip of its own: in Compact width
+  // the name beside the tool buttons only had room for a few letters, which
+  // didn't say which account it was (GitHub #14). With more than one account the
+  // strip is a button that opens the account list.
+  let shownAcct = $derived(accounts.find(a => a.active) ?? { user: header.user, server: header.server });
+  let multiAcct = $derived(accounts.length > 1);
+  function toggleMore() { moreMenu = !moreMenu; pauseMenu = false; if (moreMenu) loadAccounts(); }
   // Errors render inline — a raw alert() in the flyout draws the browser's
   // "wails.localhost says" dialog over the panel, which looks broken.
   let acctError = $state("");
@@ -82,7 +89,69 @@
   let appearance = $state<{ dockIconSize: string; panelWidth: string; density: string; sections: string[] }>(
     { dockIconSize: "medium", panelWidth: "standard", density: "comfortable", sections: ["search", "activity", "storage"] });
 
+  // Waiting for a sign-in (no account yet, the last one signed out, or its
+  // credentials turned down): the panel shows a sign-in card instead of an
+  // empty activity list with nothing to click (GitHub #12). signInHost names
+  // the server when an account exists and only needs signing in again.
+  let needsLogin = $state(false);
+  let signInHost = $state("");
+
+  // Updates while signed out. Settings is where they normally live, and it
+  // can't open without an account, so the sign-in card carries the check and
+  // the beta opt-in itself (GitHub #11). Same calls and wording as Settings →
+  // General; gated on canApply, which is false on Store and loose dev builds.
+  let version = $state("");
+  let canApply = $state(false);
+  let beta = $state(false);
+  let betaConfirm = $state(false);
+  let updateMsg = $state("");
+  let updateAvail = $state(false);
+  let updateBusy = $state(false);
+  (async () => {
+    version = await App.Version();
+    canApply = await App.CanApplyUpdate();
+    beta = await App.BetaUpdates();
+  })();
+  async function toggleBeta(e: Event) {
+    if (!beta) {
+      // Turning betas on needs the same eyes-open consent as in Settings.
+      (e.currentTarget as HTMLInputElement).checked = false;
+      betaConfirm = true;
+      return;
+    }
+    beta = false;
+    await App.SetBetaUpdates(false);
+    updateMsg = ""; updateAvail = false;
+  }
+  async function confirmBeta() {
+    betaConfirm = false;
+    beta = true;
+    await App.SetBetaUpdates(true);
+    updateMsg = ""; updateAvail = false;
+  }
+  async function checkUpdate() {
+    updateBusy = true; updateMsg = "Checking…"; updateAvail = false;
+    const u = await App.CheckForUpdate();
+    updateBusy = false;
+    if (u.err) { updateMsg = "Couldn't check: " + u.err; return; }
+    if (u.available) { updateMsg = "Update available: " + u.latest; updateAvail = true; }
+    else if (u.ahead) { updateMsg = "You're on a newer build than the current release"; }
+    else { updateMsg = "You're up to date"; }
+  }
+  async function applyUpdate() {
+    updateBusy = true; updateMsg = `Updating… ${brandName} will restart.`;
+    const err = await App.ApplyUpdate();
+    if (err) { updateBusy = false; updateMsg = "Update failed: " + err; }
+  }
+
   async function refresh() {
+    needsLogin = await App.NeedsLogin();
+    if (needsLogin) {
+      const accts = (await App.ListAccounts()) ?? [];
+      const cur = accts.find(a => a.active) ?? accts[0];
+      signInHost = cur ? hostOf(cur.server) : "";
+      editStatus = false; moreMenu = false; pauseMenu = false; editApps = false;
+    }
     status = await App.Status();
     pauseInfo = await App.PauseInfo();
     paused = pauseInfo.paused;
@@ -91,13 +160,17 @@
     const a = (await App.Apps()) ?? [];
     if (a.length || !apps.length) apps = a; // don't blank a populated rail on a transient empty fetch
     const h = await App.Header();
-    if (h.user || !header.user) header = h; // don't flap the identity to "logged out"
+    // Don't flap the identity to "logged out" on a transient empty fetch — but
+    // when a sign-in really is needed, the old identity has to go.
+    if (needsLogin) header = h;
+    else if (h.user || !header.user) header = h;
     attention = await fetchAttention();
     notifCount = await App.NotificationCount();
     showDock = await App.ShowAppDock();
     dockSide = await App.AppDockSide();
     showSearch = await App.ShowSearch();
     appearance = await App.FlyoutAppearance();
+    if (!needsLogin) await loadAccounts();
     msgInput = header.statusMsg;
   }
 
@@ -136,20 +209,34 @@
   const kindIcon = (k: string) =>
     ({ download: "↓", upload: "↑", "delete-local": "🗑", "delete-remote": "🗑",
        "move-local": "↪", "move-remote": "↪", "mkdir-local": "📁", "mkdir-remote": "📁",
-       conflict: "⚠", unshared: "🔗", "delete-kept": "↺" } as Record<string, string>)[k] ?? "•";
+       conflict: "⚠", unshared: "🔗", "delete-kept": "↺", waiting: "⏸" } as Record<string, string>)[k] ?? "•";
   const kindLabel = (k: string) =>
     ({ download: "Downloaded", upload: "Uploaded", "delete-local": "Deleted locally",
        "delete-remote": "Deleted on server", "move-local": "Moved", "move-remote": "Moved",
        "mkdir-local": "New folder", "mkdir-remote": "New folder", conflict: "Conflict",
        unshared: "No longer shared with you — copy kept",
        "delete-kept": "Kept on server (not deleted)",
+       waiting: "Waiting — open in another program",
        "unshared-empty": "No longer shared with you — nothing was downloaded" } as Record<string, string>)[k] ?? k;
   refresh();
-  Events.On("status", (e: any) => {
+  Events.On("status", async (e: any) => {
     status = e.data;
     // The engine starts asynchronously; the first refresh() at mount may run
     // before it's ready (empty header/folders/apps). Re-fetch once it comes up.
-    if (!header.user) refresh();
+    // Signing out or losing the sign-in leaves the identity on screen, so ask
+    // whether that's what this status change was.
+    if (!header.user || (await App.NeedsLogin()) !== needsLogin) refresh();
+  });
+  // Signing out of the shown account while another one takes over changes
+  // neither of the things the status handler watches, so the old identity
+  // stayed on screen. "account" also fires on every background account's
+  // status line, so the header is only re-fetched when the shown account
+  // really changed.
+  Events.On("account", async () => {
+    const list = (await App.ListAccounts()) ?? [];
+    accounts = list;
+    const cur = list.find(a => a.active);
+    if (!needsLogin && cur && (cur.user !== header.user || cur.server !== header.server)) refresh();
   });
   Events.On("progress", (e: any) => { progress = e.data; });
   // Activity fires per file — hundreds/sec during a big sync. Coalesce into a
@@ -179,7 +266,13 @@
     s === "online" ? "Online" : s === "away" ? "Away" : s === "dnd" ? "Do not disturb"
     : s === "invisible" ? "Invisible" : "Offline";
 
-  async function setType(t: string) { await App.SetStatusType(t); await refresh(); }
+  // A preset is a single click, so it closes the editor; typing a custom
+  // message is the only reason to keep it open (GitHub #7).
+  // Clears every account's history (the Status window's Activity tab too); the
+  // "activity" event it emits refreshes both.
+  async function clearActivity() { recent = []; await App.ClearActivity(); }
+
+  async function setType(t: string) { editStatus = false; await App.SetStatusType(t); await refresh(); }
   async function setMsg() { await App.SetStatusMessage(msgInput.trim()); await refresh(); }
   async function clearMsg() { await App.ClearStatusMessage(); msgInput = ""; await refresh(); }
 
@@ -193,6 +286,11 @@
     apps = (await App.Apps()) ?? [];
   };
   const hasShortcut = (a: AppInfo) => (a as any).shortcut === true;
+  // Icons that failed to load, by URL, so the dock shows the generic glyph
+  // instead of a broken image with its alt text squashed into the box. Keyed
+  // by URL, so an icon whose address changes gets another try.
+  let badIcons = $state<Record<string, boolean>>({});
+  const showIcon = (a: AppInfo) => !!a.icon && !badIcons[a.icon];
   // Clicking a recent-activity row shows the file in its folder (selected in
   // Explorer; a deleted file opens the folder it was in). A row with no local
   // folder to show — or one whose folder tree has since gone — falls back to
@@ -258,17 +356,28 @@
 </script>
 
 <div class="panel" class:dock-left={showDock && dockSide === "left"} class:dock-bottom={showDock && dockSide === "bottom"}
-     class:dense={appearance.density === "compact"} class:icons-sm={appearance.dockIconSize === "small"} class:icons-lg={appearance.dockIconSize === "large"}>
+     class:dense={appearance.density === "compact"} class:narrow={appearance.panelWidth === "compact"} class:icons-sm={appearance.dockIconSize === "small"} class:icons-lg={appearance.dockIconSize === "large"}>
   <div class="main">
   <header>
+    {#if header.user}
+      {#if multiAcct}
+        <button class="acctstrip multi" class:on={moreMenu} onclick={toggleMore}
+                title="{shownAcct.user} on {hostOf(shownAcct.server)} · switch account">
+          <span class="asname">{shownAcct.user} <span class="ashost">· {hostOf(shownAcct.server)}</span></span>
+          <span class="caret">{moreMenu ? "▴" : "▾"}</span>
+        </button>
+      {:else}
+        <div class="acctstrip" title="{shownAcct.user} on {hostOf(shownAcct.server)}">
+          <span class="asname">{shownAcct.user} <span class="ashost">· {hostOf(shownAcct.server)}</span></span>
+        </div>
+      {/if}
+    {/if}
     <div class="idrow">
       {#if header.user}
-        <button class="user" onclick={() => (editStatus = !editStatus)} title="Set status">
+        <button class="user" onclick={() => (editStatus = !editStatus)}
+                title="Set status · {header.statusMsg || presenceLabel(header.statusType)}">
           <span class="presence {header.statusType || 'offline'}"></span>
-          <span class="idtext">
-            <span class="uname">{header.user}</span>
-            <span class="ustatus">{header.statusIcon} {header.statusMsg || presenceLabel(header.statusType)}</span>
-          </span>
+          <span class="ustatus">{header.statusIcon} {header.statusMsg || presenceLabel(header.statusType)}</span>
           <span class="caret">{editStatus ? "▴" : "▾"}</span>
         </button>
       {:else}
@@ -287,7 +396,7 @@
           {:else}
             <button class="tool" class:on={pauseMenu} onclick={() => { pauseMenu = !pauseMenu; moreMenu = false; }} title="Pause syncing">❚❚</button>
           {/if}
-          <button class="tool" class:on={moreMenu} onclick={() => { moreMenu = !moreMenu; pauseMenu = false; if (moreMenu) loadAccounts(); }} title="More">⋯</button>
+          <button class="tool" class:on={moreMenu} onclick={toggleMore} title="More">⋯</button>
         </div>
       {/if}
     </div>
@@ -342,6 +451,42 @@
     {/if}
   </header>
 
+  {#if needsLogin}
+    <div class="signin">
+      {#if signInHost}
+        <h3>Sign in again</h3>
+        <p>{brandName} can’t sign in to {signInHost} any more. Sign in again to carry on syncing.</p>
+      {:else}
+        <h3>You’re not signed in</h3>
+        <p>Sign in to your Nextcloud to start syncing your files.</p>
+      {/if}
+      <button class="signbtn" onclick={() => App.AddAccount()}>Sign in</button>
+      <button class="link" onclick={() => App.Quit()}>Quit {brandName}</button>
+      {#if canApply}
+        <div class="signupd">
+          {#if betaConfirm}
+            <p class="betawarn">Beta builds come straight from active development: they change often, are less tested, and may contain bugs, including ones that could affect the files being synced. They are provided as-is, without warranty of any kind, and the developer accepts no liability for any loss or damage arising from their use. Keep a backup of anything you can't afford to lose.</p>
+            <div class="uprow">
+              <button class="link" onclick={confirmBeta}>I understand, enable betas</button>
+              <button class="link" onclick={() => (betaConfirm = false)}>Cancel</button>
+            </div>
+          {:else}
+            <div class="uprow">
+              <span class="ver">{brandName} {version}</span>
+              <button class="link" onclick={checkUpdate} disabled={updateBusy}>Check for updates</button>
+            </div>
+            {#if updateMsg}
+              <div class="uprow">
+                <span class="upmsg">{updateMsg}</span>
+                {#if updateAvail}<button class="link" onclick={applyUpdate} disabled={updateBusy}>Update now</button>{/if}
+              </div>
+            {/if}
+            <label class="betachk"><input type="checkbox" checked={beta} onchange={toggleBeta} /> Get beta releases early</label>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {:else}
   {#if attentionTotal > 0}
     <button class="alert" onclick={() => App.OpenStatusTab(attentionTab)}>
       <span class="warn">⚠</span>
@@ -401,6 +546,9 @@
   <div class="acthead">
     <div class="acttop">
       <h2>Recent activity</h2>
+      {#if recent.length > 0}
+        <button class="actclear" onclick={clearActivity} title="Clear the recent activity list">Clear</button>
+      {/if}
       <!-- The status text truncates hard in this narrow row, and the scan's live
            count sits at the END of it — so expose the full string on hover. -->
       <div class="syncstat" title={progress.active && !paused ? progress.current : status}>
@@ -447,7 +595,7 @@
       <p class="empty">Nothing synced recently.</p>
     {:else}
       <div class="activity">
-        {#each recent.slice(0, 6) as r}
+        {#each recent as r}
           <button class="act" class:err={r.err} onclick={() => openActivity(r)}
                   oncontextmenu={(e) => { e.preventDefault(); openInStatus(r); }}
                   title={activityTitle(r)}>
@@ -486,6 +634,7 @@
     {:else if key === "storage"}{@render storageSection()}
     {/if}
   {/each}
+  {/if}
 
   {#if editApps}
     <div class="appmanage">
@@ -500,7 +649,7 @@
           {#each apps as a}
             <div class="amrow" class:pinned={a.pinned}>
               <button class="amhit" onclick={() => togglePin(a)} title={a.pinned ? "Unpin from dock" : "Pin to dock"}>
-                <span class="ic">{#if a.icon}<img src={a.icon} alt="" />{:else}🗂{/if}</span>
+                <span class="ic">{#if showIcon(a)}<img src={a.icon} alt="" onerror={() => (badIcons[a.icon] = true)} />{:else}🗂{/if}</span>
                 <span class="amname">{a.name}</span>
                 <span class="ampin">{a.pinned ? "★" : "☆"}</span>
               </button>
@@ -523,7 +672,7 @@
           <button class="railapp" onclick={() => openApp(a)}
                   oncontextmenu={(e) => { e.preventDefault(); openAppInBrowser(a); }}
                   title={`${a.name} — opens in its own window (right-click for browser)`}>
-            {#if a.icon}<img src={a.icon} alt={a.name} />{:else}<span class="railglyph">🗂</span>{/if}
+            {#if showIcon(a)}<img src={a.icon} alt={a.name} onerror={() => (badIcons[a.icon] = true)} />{:else}<span class="railglyph">🗂</span>{/if}
           </button>
         {/each}
       </div>
@@ -544,12 +693,19 @@
   .user { flex: 1; min-width: 0; display: flex; align-items: center; gap: 9px; background: none; border: none;
           padding: 3px; margin: -3px; border-radius: 8px; cursor: pointer; text-align: left; }
   .user:hover { background: var(--hover); }
-  .user:hover .uname { color: var(--accent); }
-  .idtext { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-  .uname { font-weight: 700; font-size: 16px; color: var(--fg); text-transform: capitalize; line-height: 1.25;
-           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ustatus { color: var(--fg2); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .user:hover .ustatus { color: var(--accent); }
+  /* The account is named on the strip above, so the button is just the status. */
+  .ustatus { flex: 1; min-width: 0; color: var(--fg); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .caret { color: var(--muted); font-size: 11px; flex: 0 0 auto; }
+  /* The shown account, on its own line above the status and tool buttons. A
+     button (opens the account list) only when there is more than one account. */
+  .acctstrip { display: flex; align-items: baseline; gap: 6px; width: 100%; box-sizing: border-box; margin: 0 0 8px;
+               padding: 4px 7px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel);
+               color: var(--fg); text-align: left; font-size: 13px; }
+  .acctstrip.multi { cursor: pointer; }
+  .acctstrip.multi:hover, .acctstrip.on { background: var(--tint); border-color: var(--accent); }
+  .asname { flex: 1; min-width: 0; font-weight: 600; text-transform: capitalize; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ashost { color: var(--muted); font-weight: 400; text-transform: none; }
   .presence { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
   .tools { flex: 0 0 auto; display: flex; gap: 5px; }
   .tool { width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center;
@@ -615,11 +771,12 @@
   .moremenu .quit { color: #c0392b; }
   .moremenu .quit:hover { background: #fdeceb; border-color: #f0c0bb; }
   /* Account rows in the ⋯ menu: full-width, name left + live status right. */
-  .moremenu .acctitem { flex: 1 1 100%; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; text-align: left; }
+  /* A status too long to sit beside the name wraps onto its own line below it. */
+  .moremenu .acctitem { flex: 1 1 100%; min-width: 0; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 8px; text-align: left; }
   .moremenu .acctitem.cur { font-weight: 600; cursor: default; }
-  .moremenu .acctmain { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .moremenu .acctmain { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .moremenu .accthost { color: var(--muted, #888); font-weight: 400; }
-  .moremenu .acctstat { color: var(--muted, #888); font-size: 11px; white-space: nowrap; max-width: 40%; overflow: hidden; text-overflow: ellipsis; }
+  .moremenu .acctstat { color: var(--muted, #888); font-size: 11px; min-width: 0; overflow-wrap: anywhere; }
   .accterror { margin-top: 8px; padding: 6px 10px; border: 1px solid #e6b8b2; border-radius: 6px;
                color: #c0392b; font-size: 12px; }
   .search { padding: 8px 16px 4px; position: relative; }
@@ -646,6 +803,9 @@
   .acthead { flex: 0 0 auto; padding: 12px 16px 8px; }
   .acttop { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
   .acthead h2 { margin: 0; }
+  .actclear { flex: 0 0 auto; margin-right: auto; padding: 0 4px; border: 0; background: none;
+              color: var(--fg2); font-size: 12px; cursor: pointer; }
+  .actclear:hover { color: var(--accent); text-decoration: underline; }
   .acttop h2 { flex: 0 0 auto; white-space: nowrap; }   /* never wrap "Recent activity" */
   .acthead .syncbar { margin-top: 8px; }
   .syncmeta { margin-top: 4px; font-size: 11px; color: var(--muted); }
@@ -725,17 +885,40 @@
   .link { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 12px; padding: 2px 4px; }
   .link:hover { text-decoration: underline; }
   .empty { color: var(--muted); font-size: 13px; }
+  .signin { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+            gap: 10px; padding: 24px 28px; text-align: center; }
+  .signin h3 { margin: 0; font-size: 16px; color: var(--fg); }
+  .signin p { margin: 0 0 6px; font-size: 13px; line-height: 1.45; color: var(--fg2); }
+  .signbtn { min-width: 140px; padding: 8px 18px; border: 1px solid var(--accent); border-radius: 8px;
+             background: var(--accent); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .signbtn:hover { background: var(--accent-dark); border-color: var(--accent-dark); }
+  .signupd { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); width: 100%;
+             display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .signupd .uprow { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 6px; }
+  .signupd .upmsg { color: var(--fg2); }
+  .signupd .betachk { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .signupd .betawarn { margin: 0; font-size: 11.5px; line-height: 1.4; color: var(--fg2); text-align: left; }
 
-  /* Appearance customisation. Density "compact" tightens spacing/fonts; icon size
-     scales the dock icons. Panel width is handled by resizing the window (Go). */
-  .panel.dense header { padding: 8px 12px; }
-  .panel.dense .search { padding: 6px 12px 3px; }
-  .panel.dense .acthead { padding: 8px 12px 5px; }
+  /* Appearance customisation. Density "compact" tightens spacing/fonts so more
+     Recent activity rows fit before the list scrolls; icon size scales the dock icons. Panel
+     width is handled by resizing the window (Go). It used to change only 1-4px
+     here, too little to see (GitHub #14), so it now shrinks the header too. */
+  .panel.dense header { padding: 7px 12px; }
+  .panel.dense .acctstrip { padding: 3px 6px; margin-bottom: 6px; font-size: 12.5px; }
+  .panel.dense .tool { width: 28px; height: 28px; font-size: 13px; }
+  .panel.dense .search { padding: 6px 12px 2px; }
+  .panel.dense .searchbar { padding: 4px 8px; }
+  .panel.dense .acthead { padding: 6px 12px 4px; }
+  .panel.dense h2 { margin: 8px 0 5px; }
   .panel.dense .scroll { padding: 0 12px 5px; }
-  .panel.dense .act { padding: 4px 4px; }
+  .panel.dense .act { padding: 3px 4px; gap: 8px; }
+  .panel.dense .aicon { width: 18px; height: 18px; font-size: 10px; }
   .panel.dense .apath { font-size: 12px; }
   .panel.dense .akind, .panel.dense .atime { font-size: 10px; }
   .panel.dense .storage { padding: 5px 12px; }
+  /* Compact width: slimmer tool buttons leave the name/status some room. */
+  .panel.narrow .tools { gap: 4px; }
+  .panel.narrow .tool { width: 28px; height: 28px; font-size: 13px; }
   .panel.icons-sm .railapp { width: 30px; height: 30px; }
   .panel.icons-sm .railapp img { width: 16px; height: 16px; }
   .panel.icons-lg .railapp { width: 44px; height: 44px; }

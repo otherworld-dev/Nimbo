@@ -12,8 +12,9 @@ type Settings struct {
 	// Bandwidth caps in KiB/s; 0 means unlimited.
 	UploadKBps   int `json:"uploadKBps"`
 	DownloadKBps int `json:"downloadKBps"`
-	// BaseDir is the local root under which newly-synced account folders are
-	// placed (a remote folder "Photos" syncs to <BaseDir>/Photos).
+	// BaseDir is LEGACY: the account folder is per account now
+	// (AccountState.BaseDir). Kept only so MigrateAccountFolder can move an
+	// older install's value to the account it belonged to; nothing else reads it.
 	BaseDir string `json:"baseDir"`
 	// PinnedApps holds the IDs of Nextcloud apps pinned to the flyout.
 	PinnedApps []string `json:"pinnedApps"`
@@ -73,9 +74,8 @@ type Settings struct {
 	// remote path each mirrors, so they can be reconnected on the next launch
 	// (and any sync root left registered after a hard exit can be healed).
 	OnDemandMounts []OnDemandMount `json:"onDemandMounts"`
-	// RememberedPairs are the live sync pairs cleared when entering on-demand
-	// mode, restored automatically when the user switches back to live — a mode
-	// round-trip must not cost the user their folder setup.
+	// RememberedPairs is LEGACY, like BaseDir: the parked live pairs are per
+	// account now (AccountState.RememberedPairs). Kept for MigrateAccountFolder.
 	RememberedPairs []SyncPair `json:"rememberedPairs,omitempty"`
 	// DevIgnoresSeeded records that dependency/VCS dir patterns (node_modules,
 	// .git, …) were seeded into the user-editable global ignore list, so the

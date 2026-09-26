@@ -370,6 +370,38 @@ func ShellSyncRootRegistered(path string) bool {
 	return false
 }
 
+// ShellSyncRootNamespaceCLSID returns the CLSID of the navigation-pane node
+// Windows created for path's cloud sync root, or "" when path is not a
+// registered root or Windows gave it no node. The registration records it as
+// NamespaceCLSID on the root's SyncRootManager key (seen on Windows 11 26200;
+// the node itself is an HKCU\Software\Classes\CLSID delegate folder pinned
+// into the pane — the same shape as our own entry in internal/shellns).
+func ShellSyncRootNamespaceCLSID(path string) string {
+	id, err := shellRootID(path)
+	if err != nil {
+		return ""
+	}
+	for _, hive := range []registry.Key{registry.LOCAL_MACHINE, registry.CURRENT_USER} {
+		if s := namespaceCLSIDAt(hive, syncRootManager+`\`+id); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func namespaceCLSIDAt(hive registry.Key, keyPath string) string {
+	k, err := registry.OpenKey(hive, keyPath, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	s, _, err := k.GetStringValue("NamespaceCLSID")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(s)
+}
+
 func removeLegacyHKCUEntry(id string) {
 	base := syncRootManager + `\` + id
 	_ = registry.DeleteKey(registry.CURRENT_USER, base+`\UserSyncRoots`)
@@ -700,7 +732,11 @@ type PlaceholderInfo struct {
 	ModTime  time.Time
 	Identity []byte // opaque per-file blob (we use the UTF-8 remote path)
 	ETag     string // server ETag (carried for the write-back conflict baseline; not stored in the placeholder)
-	FileID   string // server oc:fileid — stable across renames; used for down-sync rename detection
+	// UploadTime is the server's nc:upload_time for this version (0 = not
+	// reported); with Size and ModTime it tells a metadata-only ETag bump
+	// from a real edit (transport.ContentKey). Not stored in the placeholder.
+	UploadTime int64
+	FileID     string // server oc:fileid — stable across renames; used for down-sync rename detection
 	// MountRoot marks the top of a share received from someone else or of a
 	// mount: the one entry whose later disappearance from a listing means
 	// "detached from this account", not "deleted" (Deck #557).
@@ -754,9 +790,19 @@ func toFiletime(t time.Time) int64 {
 
 // buildPlaceholders turns items into the CF_PLACEHOLDER_CREATE_INFO array that
 // both CfCreatePlaceholders and CfExecute(TRANSFER_PLACEHOLDERS) consume. The
-// returned names/ids slices must be kept alive until the call completes. Entries
-// are marked in-sync only — directories are NOT flagged DisableOnDemandPopulation
-// so opening them triggers their own FETCH_PLACEHOLDERS (lazy population).
+// returned names/ids slices must be kept alive until the call completes. Every
+// entry is created in sync. Directories are NOT flagged
+// DisableOnDemandPopulation, so opening them still triggers their own
+// FETCH_PLACEHOLDERS (lazy population).
+//
+// Directories used to be created NOT in sync, on the belief that an in-sync
+// directory never asks to be populated. That belief came from a test that
+// listed the folder from the provider's own process, which never populates
+// anything whatever its state (TestDirPopulatedReadsTheDirectoryPlaceholderState).
+// Listed from another process, the way Explorer lists it, an in-sync lazy
+// directory populates normally and stays in sync
+// (TestInSyncDirStillPopulates, 2026-09-25). The cost of the old way was the
+// "sync pending" arrows on every folder nobody had opened (GitHub #17).
 func buildPlaceholders(items []PlaceholderInfo) (arr []placeholderCreateInfo, names [][]uint16, ids [][]byte, err error) {
 	arr = make([]placeholderCreateInfo, len(items))
 	names = make([][]uint16, len(items))
@@ -773,9 +819,6 @@ func buildPlaceholders(items []PlaceholderInfo) (arr []placeholderCreateInfo, na
 		flags := uint32(cfPlaceholderCreateFlagMarkInSync)
 		if it.IsDir {
 			attr = fileAttrDirectory
-			// A not-in-sync directory is treated as not-yet-populated, so the
-			// shell issues FETCH_PLACEHOLDERS when it's first opened.
-			flags = cfCreateFlagNone
 		}
 		arr[i] = placeholderCreateInfo{
 			RelativeFileName: &nameW[0],
@@ -938,6 +981,37 @@ const cfTransferAlign = 4096
 // leaving a fast link's full 4 MiB pieces untouched.
 const cfPieceFlushAfter = 15 * time.Second
 
+// cfReadStallLimit is how long a hydration stream may deliver nothing at all
+// before the request is failed. The filter withdraws a request that goes ~60s
+// without progress, but only when another process is waiting on it; Nimbo's
+// own hydrations (keeping a pinned file on this device) are never withdrawn,
+// so a link that stayed up but stopped sending held the read, the request
+// and the pin for good. Longer than the filter's 60s on purpose, so that for
+// every other request its withdrawal still comes first and nothing changes.
+const cfReadStallLimit = 90 * time.Second
+
+// testReadStallLimit overrides cfReadStallLimit when non-zero. Set only by
+// tests.
+var testReadStallLimit time.Duration
+
+func readStallLimit() time.Duration {
+	if testReadStallLimit > 0 {
+		return testReadStallLimit
+	}
+	return cfReadStallLimit
+}
+
+// errReadStalled is the cause streamFetch cancels its stream with when the
+// watchdog fires.
+var errReadStalled = errors.New("the hydration stream delivered nothing for too long")
+
+// execTransfer and execTransferFail are the CfExecute calls streamFetch
+// makes, as variables so its tests can run without a sync root.
+var (
+	execTransfer     = cfTransfer
+	execTransferFail = cfTransferFail
+)
+
 // testPieceFlushAfter overrides cfPieceFlushAfter when non-zero. Set ONLY by
 // the slow-link test, which would otherwise have to run for a minute to
 // observe a timed flush at all.
@@ -1079,9 +1153,28 @@ func fetchDataCallback(info, params uintptr) uintptr {
 // Whatever happens, the request is COMPLETED: fully transferred, or failed for
 // the part that could not be served. Returning without doing either is the
 // defect this replaces — the caller's open then hangs on the filter's time-out.
+// The one exception is a request the filter WITHDREW (ctx cancelled from
+// outside): its transfer key is dead and there is nothing left to complete.
+//
+// A stream that delivers nothing for readStallLimit, opening included, is
+// cancelled here and the request failed (see cfReadStallLimit).
 func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, connKey, transferKey int64, idStr string, identity []byte, reqOffset, reqLength int64) {
+	ctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+	limit := readStallLimit()
+	watchdog := time.AfterFunc(limit, func() { stop(errReadStalled) })
+	defer watchdog.Stop()
+	// stalled tells the watchdog's cancel apart from a withdrawal: only the
+	// first leaves a live transfer key that must still be answered.
+	stalled := func() bool { return errors.Is(context.Cause(ctx), errReadStalled) }
+
 	rc, err := stream(ctx, identity, reqOffset, reqLength)
 	if err != nil {
+		if stalled() {
+			dbg("FETCH_DATA %q: the stream did not open within %v, failing the request", idStr, limit)
+			execTransferFail(connKey, transferKey, reqOffset, reqLength)
+			return
+		}
 		if ctx.Err() != nil {
 			// The request was withdrawn while the stream was being opened —
 			// err is that cancellation, not a download failure, and the
@@ -1090,7 +1183,7 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 			return
 		}
 		dbg("FETCH_DATA %q: open stream: %v", idStr, err)
-		cfTransferFail(connKey, transferKey, reqOffset, reqLength)
+		execTransferFail(connKey, transferKey, reqOffset, reqLength)
 		return
 	}
 	if rc == nil {
@@ -1098,7 +1191,7 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 		// request still has to be answered, and a nil-interface Close would
 		// panic on a callback goroutine and take the process with it.
 		dbg("FETCH_DATA %q: the stream func returned no reader and no error", idStr)
-		cfTransferFail(connKey, transferKey, reqOffset, reqLength)
+		execTransferFail(connKey, transferKey, reqOffset, reqLength)
 		return
 	}
 	defer rc.Close()
@@ -1108,8 +1201,8 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 	off, remaining := reqOffset, reqLength
 	held := 0 // bytes at the front of buf: a previous piece's unaligned tail
 	for remaining > 0 {
-		if ctx.Err() != nil {
-			// Cancelled: the transfer key is dead, so there is nothing to
+		if ctx.Err() != nil && !stalled() {
+			// Withdrawn: the transfer key is dead, so there is nothing to
 			// complete — the filter has already failed the caller's I/O.
 			dbg("FETCH_DATA %q: cancelled with %d bytes left", idStr, remaining)
 			return
@@ -1127,6 +1220,9 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 		var rerr error
 		for n < want {
 			rn, err := rc.Read(buf[n:want])
+			if rn > 0 {
+				watchdog.Reset(limit) // the limit is on silence, not on the whole download
+			}
 			n += rn
 			if n >= want {
 				break // piece full; any error travels with the next read
@@ -1147,9 +1243,12 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 			// deliberately DROPPED: they would buy the caller nothing, and a
 			// partial piece is the one shape that can land off a sector
 			// boundary.
-			if ctx.Err() == nil {
+			if stalled() {
+				dbg("FETCH_DATA %q: nothing received for %v with %d bytes left (%d in hand, dropped), failing the request", idStr, limit, remaining, n)
+				execTransferFail(connKey, transferKey, off, remaining)
+			} else if ctx.Err() == nil {
 				dbg("FETCH_DATA %q: stream ended %d bytes short (%d in hand, dropped): %v", idStr, remaining, n, rerr)
-				cfTransferFail(connKey, transferKey, off, remaining)
+				execTransferFail(connKey, transferKey, off, remaining)
 			} else {
 				dbg("FETCH_DATA %q: cancelled with %d bytes left", idStr, remaining)
 			}
@@ -1157,8 +1256,11 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 		}
 		// Re-check: reading is where a download waits, so this is the one
 		// place a cancel can land mid-piece. Without it, a withdrawn request
-		// still pushes a piece at a dead transfer key.
-		if ctx.Err() != nil {
+		// still pushes a piece at a dead transfer key. (A stall cannot land
+		// here with a full piece in hand: the read that filled it reset the
+		// watchdog, so the piece is still worth sending and the next read
+		// meets the stall.)
+		if ctx.Err() != nil && !stalled() {
 			dbg("FETCH_DATA %q: cancelled with %d bytes left", idStr, remaining)
 			return
 		}
@@ -1175,13 +1277,13 @@ func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, co
 			// than spin on a piece that cannot grow or hand CfExecute an
 			// empty buffer (which would panic on a callback goroutine).
 			dbg("FETCH_DATA %q: nothing sendable from %d bytes with %d left", idStr, n, remaining)
-			cfTransferFail(connKey, transferKey, off, remaining)
+			execTransferFail(connKey, transferKey, off, remaining)
 			return
 		}
-		if !cfTransfer(connKey, transferKey, off, buf[:send]) {
+		if !execTransfer(connKey, transferKey, off, buf[:send]) {
 			// The filter refused the piece; fail the rest from here so it
 			// never waits for a gap we are not going to fill.
-			cfTransferFail(connKey, transferKey, off, remaining)
+			execTransferFail(connKey, transferKey, off, remaining)
 			return
 		}
 		off += int64(send)
@@ -1389,13 +1491,15 @@ func fetchPlaceholdersCallback(info, params uintptr) uintptr {
 		defer close(syncDone)
 		items := p.list(rel)
 		dbg("FETCH_PLACEHOLDERS rel=%q -> %d entries", rel, len(items))
-		cfTransferPlaceholders(connKey, transferKey, filepath.Join(p.path, filepath.FromSlash(rel)), items)
-		// Deliberately NOT marked in-sync here. Marking the directory while the
-		// enumeration that triggered this fetch is still in flight makes that
-		// enumeration return EMPTY (measured on the live driver — the first
-		// attempt at Deck #576 did exactly this and TestStateBitsAcrossLifecycle
-		// caught it). SweepDirsInSync gives populated directories their in-sync
-		// state later, once they have been quiet for a while.
+		dir := filepath.Join(p.path, filepath.FromSlash(rel))
+		ok := cfTransferPlaceholders(connKey, transferKey, dir, items)
+		// A directory created by an older version is not in sync; mark it a
+		// minute from now (dirSettleDelay). SweepDirsInSync covers anything
+		// that timer misses (a disconnect in between). The root is never
+		// marked, as in the sweep.
+		if ok && items != nil && rel != "" {
+			settleLater(connKey, dir)
+		}
 	}()
 	if experimentSyncFetch {
 		<-syncDone // EXPERIMENT: complete before the callback returns
@@ -1760,12 +1864,9 @@ func cfTransferPlaceholders(connKey, transferKey int64, dir string, items []Plac
 		}
 	}
 	// A failed entry leaves the directory partially populated with the shell
-	// re-requesting it, and a directory in that state must NOT be marked
-	// in-sync (an in-sync directory is never asked to populate — see
-	// TestInSyncDirStillPopulates). Nothing does that on this path today, so
-	// say the long-alone failure out loud: it is the one outcome the
-	// per-entry results above cannot show, since such an entry was never in
-	// the array.
+	// re-requesting it. Say the long-alone failure out loud: it is the one
+	// outcome the per-entry results above cannot show, since such an entry
+	// was never in the array.
 	if !longOK {
 		dbg("TRANSFER_PLACEHOLDERS: transfer incomplete: a long-identity entry failed; the shell may re-ask")
 	}
@@ -1854,10 +1955,10 @@ func Inspect(path string) (Change, error) {
 	ch := Change{IsDir: isDir, Placeholder: isPlaceholder, InSync: inSync}
 	switch {
 	case isDir:
-		// Our directory placeholders are deliberately NOT in-sync (that's how
-		// lazy FETCH_PLACEHOLDERS population is triggered), so "not in sync" must
-		// NOT be read as a change. Only a non-placeholder dir is a folder the
-		// user just created and needs MKCOL.
+		// A directory placeholder's in-sync bit says nothing about local
+		// changes (older versions created them all not in sync, and a move
+		// clears it), so "not in sync" must NOT be read as a change. Only a
+		// non-placeholder dir is a folder the user just created and needs MKCOL.
 		ch.NeedsUpload = !isPlaceholder
 	case !isPlaceholder:
 		ch.NeedsUpload = true // never uploaded: all of it is local-only content
@@ -1936,29 +2037,18 @@ func MarkInSync(path string, identity []byte) error {
 // present: for a directory, "not yet populated".
 const cfPlaceholderStatePartial = 0x00000010
 
-// SweepDirsInSync walks an on-demand mount and gives every POPULATED directory
-// its in-sync state, so Explorer stops showing the perpetual "sync pending"
-// arrows on folders. Returns how many directories it marked.
+// SweepDirsInSync walks an on-demand mount and gives every directory
+// placeholder that is not in sync its in-sync state, so Explorer stops showing
+// the "sync pending" arrows on folders. Returns how many directories it
+// marked.
 //
-// Why this is a sweep and not part of population — all measured on the live
-// driver and pinned by tests in this package:
-//   - A directory placeholder cannot be created in-sync: the filter then never
-//     asks it to populate at all, and it enumerates empty forever
-//     (TestInSyncDirStillPopulates).
-//   - It cannot be marked immediately after its population transfer either:
-//     that poisons the very enumeration that triggered the fetch, which then
-//     returns empty once (TestStateBitsAcrossLifecycle caught this).
-//
-// So populated directories are marked LATER, from here. Safety rules:
-//   - Only directories whose PARTIAL bit is clear (population complete —
-//     a failed listing leaves the bit set, so those are skipped and the shell
-//     keeps retrying them).
-//   - Only after quiesce of write inactivity, so a directory whose triggering
-//     enumeration might still be draining is left for the next pass.
-//
-// The sweep also HEALS mounts created before this existed: every directory a
-// user ever opened is populated-but-unmarked on those, permanently, because
-// population never fires twice.
+// Directories are created in sync now (see buildPlaceholders), so this is a
+// HEAL for what older versions left behind: every folder they created was not
+// in sync, opened or not, and nothing else ever marks one that nobody opens.
+// Unopened (lazy) ones are marked too: an in-sync lazy directory still
+// populates when it is first opened (TestInSyncDirStillPopulates). It also
+// catches a directory whose bit a move cleared. Directories written to within
+// quiesce are left for the next pass.
 func SweepDirsInSync(root string, quiesce time.Duration) int {
 	marked := 0
 	cutoff := time.Now().Add(-quiesce)
@@ -1966,33 +2056,63 @@ func SweepDirsInSync(root string, quiesce time.Duration) int {
 		if err != nil || !d.IsDir() || path == root {
 			return nil
 		}
-		attrs, tag, ferr := findAttrTag(path)
-		if ferr != nil {
-			return nil
-		}
-		r1, _, _ := procCfGetPlaceholderStateFromAttrTag.Call(uintptr(attrs), uintptr(tag))
-		state := uint32(r1)
-		if state == cfPlaceholderStateInvalid {
-			return nil
-		}
-		if state&cfPlaceholderStatePlaceholder == 0 || state&cfPlaceholderStateInSync != 0 {
-			return nil // not ours, or already correct
-		}
-		if state&cfPlaceholderStatePartial != 0 {
-			return nil // not (successfully) populated yet — marking would freeze it empty
-		}
 		if info, ierr := d.Info(); ierr == nil && info.ModTime().After(cutoff) {
 			return nil // recently active; let it settle until the next sweep
 		}
-		if merr := MarkInSync(path, nil); merr == nil {
-			ShellNotifyUpdated(path) // redraw the folder glyph without a manual refresh
+		if settleDir(path) {
 			marked++
-		} else {
-			dbg("SweepDirsInSync %q: %v", path, merr)
 		}
 		return nil
 	})
 	return marked
+}
+
+// settleDir gives one not-yet-in-sync directory placeholder its in-sync state
+// and redraws it. Returns true when it marked it. A plain directory, or one
+// already in sync, is left alone. Timing is the caller's job: see
+// SweepDirsInSync and settleLater.
+func settleDir(path string) bool {
+	attrs, tag, ferr := findAttrTag(path)
+	if ferr != nil || attrs&fileAttrDirectory == 0 {
+		return false
+	}
+	r1, _, _ := procCfGetPlaceholderStateFromAttrTag.Call(uintptr(attrs), uintptr(tag))
+	state := uint32(r1)
+	if state == cfPlaceholderStateInvalid {
+		return false
+	}
+	if state&cfPlaceholderStatePlaceholder == 0 || state&cfPlaceholderStateInSync != 0 {
+		return false // not ours, or already correct
+	}
+	if merr := MarkInSync(path, nil); merr != nil {
+		dbg("settleDir %q: %v", path, merr)
+		return false
+	}
+	ShellNotifyUpdated(path) // redraw the folder glyph without a manual refresh
+	return true
+}
+
+// dirSettleDelay is how long after the shell populates a directory we give it
+// its in-sync state, when it has not got it already: a folder created by an
+// older version (not in sync) that the user opens now. Waiting for
+// SweepDirsInSync instead left such a folder wearing the "sync pending"
+// arrows for up to six hours (GitHub #17). The minute is a margin, not a
+// measured need: the claim that marking during the transfer spoils the
+// listing came from the same provider-process harness that misread in-sync
+// directories (see buildPlaceholders), and folders now spend their whole
+// population in sync. A var so a test need not sleep through it.
+var dirSettleDelay = time.Minute
+
+// settleLater marks dir in sync dirSettleDelay from now, if the provider that
+// populated it is still connected then. A directory the shell re-asks about
+// only gets another timer, and settleDir is a no-op on one already marked.
+func settleLater(connKey int64, dir string) {
+	time.AfterFunc(dirSettleDelay, func() {
+		if _, ok := providers.Load(connKey); !ok {
+			return // disconnected: the next mount's SweepDirsInSync catches it
+		}
+		settleDir(dir)
+	})
 }
 
 // SettlePin completes a pending free-up-space request on one FILE: Explorer's
@@ -2006,6 +2126,17 @@ func SweepDirsInSync(root string, quiesce time.Duration) int {
 // (the platform refuses that anyway — ERROR_CLOUD_FILE_NOT_IN_SYNC — but we
 // don't rely on it). Directories carry the unpinned attribute purely as the
 // recursive preference marker and are never touched.
+// WantsFreeUp reports whether path is a file Explorer has asked to free up
+// (UNPINNED) that still holds its data — the state SettlePin acts on. An
+// attributes-only query: it never opens the file, so it cannot hydrate it.
+func WantsFreeUp(path string) bool {
+	attrs, _, err := findAttrTag(path)
+	if err != nil {
+		return false
+	}
+	return attrs&fileAttrDirectory == 0 && attrs&fileAttrUnpinned != 0 && attrs&0x400000 == 0
+}
+
 func SettlePin(path string) (bool, error) {
 	attrs, tag, err := findAttrTag(path)
 	if err != nil {
@@ -2179,10 +2310,7 @@ type placeholderStandardInfo struct {
 var ErrNotPlaceholder = errors.New("not a cloud placeholder")
 
 // ErrIsDirectory reports that a call refused a DIRECTORY placeholder. Only
-// SetInSync returns it: the filter couples a directory's in-sync state to its
-// population, so a directory marked in-sync enumerates EMPTY forever
-// (measured live — TestInSyncDirStillPopulates), which is why ours are
-// created not in sync in the first place.
+// SetInSync returns it (see there).
 var ErrIsDirectory = errors.New("cloud placeholder is a directory")
 
 const (
@@ -2307,11 +2435,11 @@ func SetInSync(path string) error {
 	if err != nil {
 		return err
 	}
-	// A DIRECTORY never gets the bit from here. The filter couples a
-	// directory's in-sync state to its population, so one marked in-sync
-	// enumerates EMPTY forever (TestInSyncDirStillPopulates) — the reason our
-	// directory placeholders are created not in sync at all. Refusing it in
-	// the call means no future caller has to remember.
+	// A DIRECTORY never gets the bit from here. This is the heal for a FILE
+	// whose bit a rename cleared; a directory's bit is set when it is created,
+	// by its repoint after a move, and by SweepDirsInSync. (This refusal used
+	// to rest on the belief that an in-sync directory never populates; it
+	// does, see buildPlaceholders. The call stays file-only regardless.)
 	if attrs&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
 		return ErrIsDirectory
 	}
@@ -2540,6 +2668,51 @@ func DirPopulated(path string) (bool, error) {
 	}
 	return attrs&fileAttrRecallOnDataAccess == 0, nil
 }
+
+// CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION is 0x10 (cfapi.h 10.0.26100).
+// Not 0x20: that is REMOVE_FILE_IDENTITY, which is refused on a directory
+// with 0x8007017C and once led us to believe this call only works inside the
+// population callback. It works from anywhere (measured 2026-09-25).
+const cfUpdateFlagDisableOnDemandPopulation = 0x00000010
+
+// MarkDirPopulated records that the provider has itself created every child of
+// a directory placeholder, the way a FETCH_PLACEHOLDERS transfer would have:
+// the directory stops being "not fetched yet" (RECALL_ON_DATA_ACCESS and
+// PARTIAL clear, so the shell never asks for it) and is marked in sync, which
+// is what takes the "sync pending" arrows off it (a folder an older version
+// created is not in sync yet). Measured on the live driver: it works outside
+// the callback, the
+// bits survive a child being created or hydrated afterwards, and children
+// created in a pinned directory inherit the pin.
+//
+// Call it only once every child is in place. The flag is permanent: a
+// directory marked with entries missing is never asked for them again, and
+// only reconcile's listing would bring them in.
+func MarkDirPopulated(path string) error {
+	h, err := openForCloud(path)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	var usn int64
+	hr, _, _ := procCfUpdatePlaceholder.Call(
+		uintptr(h),
+		0,    // FsMetadata (unchanged)
+		0, 0, // identity (unchanged)
+		0, 0, // no dehydrate ranges
+		uintptr(cfUpdateFlagDisableOnDemandPopulation|cfUpdateFlagMarkInSync),
+		uintptr(unsafe.Pointer(&usn)),
+		0, // Overlapped
+	)
+	if int32(hr) < 0 {
+		return fmt.Errorf("CfUpdatePlaceholder(populated): 0x%08x", uint32(hr))
+	}
+	return nil
+}
+
+// Pinned reports whether path carries the user's "always keep on this device"
+// preference. Attributes only, like PinStateOf.
+func Pinned(path string) bool { return PinStateOf(path) == "pinned" }
 
 // HydrateIfPinned completes the pin contract for one file: Explorer's own
 // verb hydrates as it pins, but Nimbo's context-menu entry and pins applied

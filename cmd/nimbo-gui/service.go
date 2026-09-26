@@ -58,6 +58,8 @@ type App struct {
 	settingsWin     *application.WebviewWindow
 	loginWin        *application.WebviewWindow
 	loginMu         sync.Mutex         // guards loginCancel
+	setupMu         sync.Mutex         // guards setupOpen
+	setupOpen       map[string]bool    // accounts whose setup is still choosing a folder (GitHub #11)
 	loginCancel     context.CancelFunc // cancels the in-flight login-flow poll (nil when none)
 	shareWin        *application.WebviewWindow
 	sharePath       string
@@ -74,6 +76,8 @@ type App struct {
 	appOpening      map[string]bool                       // opens in flight (coalesces double-clicks during the slow app-list fetch)
 	pendingApp      string                                // app id to open once the engine is ready (--app launch)
 	startRetrying   atomic.Bool                           // one engine-start retry loop at a time
+	authLost        atomic.Bool                           // the server turned our credentials down; cleared once an engine starts
+	started         chan struct{}                         // closed once the Wails main loop runs (see afterStart); nil = assume running
 	overlayServe    sync.Once                             // the status pipe is process-global; serve it once
 	appsCacheMu     sync.Mutex
 	appsCache       []transport.App // last-fetched navigation apps (flyout refreshes keep it warm)
@@ -87,6 +91,14 @@ type App struct {
 	// between registering the sync root and starting the write-back watcher —
 	// the watcher must never see adopt's local mutations as user actions.
 	pendingAdopt  *adoptPending
+	// mountRefused is why the last account-folder mount was refused (it overlaps
+	// another account's folder), so a mode switch can say so; "" otherwise.
+	mountRefused string
+	// setupPrev holds an account's folder setup while its setup asks whether
+	// to keep the files in a folder it recorded provisionally (guarded by setupMu).
+	setupPrev map[string]setupFolder
+	// leftoversSwept: the once-per-launch clean-up of leftover roots has run.
+	leftoversSwept atomic.Bool
 	preMountAdopt *adoptPending
 	// adoptScanDirs is the live directory count of an in-flight adopt scan
 	// (0 = none), surfaced via Diagnostics so the scanning overlay has a moving
@@ -155,13 +167,15 @@ func (a *App) start(ctx context.Context) {
 		// until a manual relaunch (bit the VM on 2026-08-21, twice). Say what is
 		// actually happening and keep retrying.
 		//
-		// EXCEPT a missing app password: the account exists but its secret is
-		// gone from the keychain (store wiped, profile trouble). No amount of
-		// retrying brings a credential back — that spun "trying to connect"
-		// forever on the VM. It is the auth-lost case: ask for a sign-in.
+		// EXCEPT a missing or rejected app password: the account exists but its
+		// secret is gone from the keychain (store wiped, profile trouble), or the
+		// server refuses it (revoked in the web UI). No amount of retrying brings
+		// a credential back — the missing one spun "trying to connect" forever on
+		// the VM, and the rejected one sent the server a failed login every 15 s
+		// (GitHub #12 testing). It is the auth-lost case: ask for a sign-in.
 		if a.hasConfiguredAccount() {
-			if errors.Is(err, account.ErrNoSecret) {
-				a.onAuthLost()
+			if errors.Is(err, account.ErrNoSecret) || errors.Is(err, transport.ErrUnauthorized) {
+				a.afterStart(a.onAuthLost)
 				return
 			}
 			a.setStatus("Can't reach your server — retrying")
@@ -176,6 +190,7 @@ func (a *App) start(ctx context.Context) {
 		return
 	}
 	a.eng = eng
+	a.authLost.Store(false)
 	a.appsCacheMu.Lock()
 	a.appsCache, a.appsCacheAt = nil, time.Time{} // stale across engine/account changes
 	a.appsCacheMu.Unlock()
@@ -232,7 +247,7 @@ func (a *App) start(ctx context.Context) {
 			eng.SetPauseSchedule(agent.PauseSchedule{Enabled: s.PauseScheduleEnabled, FromMin: s.PauseFromMin, ToMin: s.PauseToMin})
 		}
 	}
-	eng.SetPauseChangeFunc(func() { a.emit("activity"); a.rebuildTrayMenu() })
+	eng.SetPauseChangeFunc(func() { a.emit("activity"); a.rebuildTrayMenu(); a.pauseChangedOnDemand() })
 	// notify_push file changes → reconcile on-demand placeholders immediately.
 	eng.SetFilesChangedFunc(a.pokeOnDemand)
 
@@ -255,8 +270,6 @@ func (a *App) start(ctx context.Context) {
 	forwardEvents(runCtx, eng.SubscribeLocked(), func() { a.emit("locks") })
 	forwardEvents(runCtx, eng.SubscribeDetached(), func() { a.emit("detached") })
 
-	go a.updateCheckLoop(runCtx) // periodic background "update available" toast
-
 	var pairs []config.SyncPair
 	if a.GetSyncMode() == "ondemand" {
 		// On-demand mode is exclusive: the Cloud Files provider owns the files,
@@ -264,7 +277,9 @@ func (a *App) start(ctx context.Context) {
 		a.clearLivePairs()       // files kept; leftovers can't reactivate
 		a.mountAccountOnDemand() // mount the account folder (BaseDir) as virtual files
 	} else {
-		pairs, _ = eng.Pairs()
+		// Restores pairs parked by an earlier on-demand spell and holds back
+		// any that overlap another account's folder (GitHub #11).
+		pairs = a.prepareLivePairs(eng)
 		a.cleanupStatusRoots() // live pairs carry badges, never a sync root
 	}
 
@@ -309,6 +324,16 @@ func (a *App) start(ctx context.Context) {
 	// Side-by-side accounts: every other configured account syncs concurrently
 	// in the background.
 	a.startSecondaries(ctx)
+
+	// Once per launch, with every account mounted: clear roots and sidebar
+	// entries older versions left behind (GitHub #10).
+	if a.leftoversSwept.CompareAndSwap(false, true) {
+		mounted := map[string]bool{}
+		for dir := range a.onDemandMounts {
+			mounted[filepath.Clean(dir)] = true
+		}
+		go a.sweepLeftovers(mounted)
+	}
 }
 
 // recordAcctStatus stores an engine's latest status line for the per-account
@@ -372,6 +397,9 @@ func (a *App) startSecondaries(ctx context.Context) {
 			eng.SetConflictPolicy(conflictPolicy(s.ConflictPolicy))
 			eng.SetPauseSchedule(agent.PauseSchedule{Enabled: s.PauseScheduleEnabled, FromMin: s.PauseFromMin, ToMin: s.PauseToMin})
 		}
+		// Started while the app is paused (an account added, or brought back
+		// after a sign-in), it starts paused like the rest.
+		eng.CopyPauseFrom(a.eng)
 		eng.SetFilesChangedFunc(a.pokeOnDemand) // push events reconcile this account's mounts too
 		var pairs []config.SyncPair
 		if a.GetSyncMode() == "ondemand" && cfapi.Supported() {
@@ -380,7 +408,7 @@ func (a *App) startSecondaries(ctx context.Context) {
 			// browsable on demand instead of silently live-syncing.
 			a.mountSecondaryOnDemand(eng)
 		} else {
-			pairs, _ = eng.Pairs()
+			pairs = a.prepareLivePairs(eng)
 		}
 		a.secondaries[id] = &secondaryEngine{eng: eng, cancel: cancel}
 		slog.Info("secondary account syncing", "account", ac.LoginName, "server", ac.ServerURL, "pairs", len(pairs))
@@ -392,24 +420,48 @@ func (a *App) startSecondaries(ctx context.Context) {
 
 // mountSecondaryOnDemand mounts a background account's whole-account virtual
 // root. The root is the account's own whole-account pair directory when it has
-// one (e.g. from when it was the shown account); otherwise a "Nimbo - <user>"
-// sibling of the primary root is created and recorded as that pair, so the
-// location is stable across launches and reused by live mode later.
+// one, else the account's own folder (the one it used while it was the shown
+// account); only a brand-new account gets a fresh "Nimbo - <user>" folder, which
+// is recorded as that pair so the location is stable across launches and
+// reused by live mode later. Before the account folder was per account, this
+// fell straight through to a fresh folder, so every account switch moved the
+// account to a different folder and left the old sync root behind (#10, #11).
 func (a *App) mountSecondaryOnDemand(eng *agent.Engine) {
-	root := ""
-	if pairs, err := eng.Pairs(); err == nil {
-		for _, p := range pairs {
-			if strings.Trim(p.RemoteRoot, "/") == "" {
-				root = p.LocalDir
-				break
-			}
-		}
+	// The same order as the shown account (onDemandRootOrder). The account
+	// folder only counts once it has been mounted: in "choose" mode it is the
+	// PARENT of the account's live folders, and mounting that would lay
+	// placeholders over them.
+	base := eng.StoredBaseDir()
+	if base != "" && !cfapi.ShellSyncRootRegistered(base) {
+		base = ""
 	}
+	root := onDemandRootOrder(wholeAccountPair(eng), eng.OnDemandRoot(), base)
 	if root == "" {
-		root = filepath.Join(filepath.Dir(a.GetBaseDir()), brand.Current.Name+" - "+eng.Account.LoginName)
+		// A fresh folder nobody chose: never one that already holds files,
+		// which would be taken for this account's own and uploaded.
+		home, _ := os.UserHomeDir()
+		var claimed []accountFolder
+		if d, st, ok := accountsAndDirs(); ok {
+			claimed = otherAccountFolders(d, st, eng.Account.ID)
+		}
+		usable := unchosenUsable(cfapi.ShellSyncRootRegistered, accountCount() <= 1)
+		root = suggestAccountFolder(home, eng.Account.LoginName, claimed, usable)
+		if root == "" {
+			a.warnNoFolder(eng)
+			return
+		}
 		if err := eng.AddSyncPair(root, ""); err != nil {
 			slog.Warn("secondary on-demand: could not record account root", "account", eng.Account.LoginName, "err", err)
 		}
+	} else if !a.rootReady(eng, root) {
+		return // renamed or moved away: wait for it rather than re-create it
+	}
+	if msg := a.syncClashFor(eng.Account.ID, root); msg != "" {
+		a.warnFolderClash(eng, root, msg)
+		return
+	}
+	if eng.StoredBaseDir() == "" {
+		_ = eng.SetBaseDir(root)
 	}
 	etags, fileids, mountroots := a.vfsStoresFor(eng.Account.ID)
 	if err := a.mountOnDemandWith(eng, etags, fileids, mountroots, root, ""); err != nil {
@@ -517,6 +569,7 @@ type BrandDTO struct {
 	Company   string `json:"company"`
 	Website   string `json:"website"`
 	Support   string `json:"support"`
+	Help      string `json:"help"` // help home, "" when the brand has none
 	AccentHex string `json:"accentHex"`
 }
 
@@ -525,6 +578,7 @@ func (a *App) Brand() BrandDTO {
 	return BrandDTO{
 		Name: brand.Current.Name, Company: brand.Current.Company,
 		Website: brand.Current.Website, Support: brand.Current.SupportEmail,
+		Help:      brand.Current.HelpPage(""),
 		AccentHex: brand.Current.AccentHex,
 	}
 }
@@ -708,6 +762,26 @@ func (a *App) updateCheckLoop(ctx context.Context) {
 	}
 }
 
+// checkForUpdateToast runs an update check and reports the result in a toast,
+// with "Update now" when there is one. It is the signed-out tray menu's check,
+// where there is no Settings window to show the answer in.
+func (a *App) checkForUpdateToast() {
+	u := a.CheckForUpdate()
+	title := brand.Current.Name + " update"
+	switch {
+	case u.Err != "":
+		notify.Toast(title, "Couldn't check for updates: "+u.Err, "")
+	case u.Available:
+		notify.RaiseActionable(brand.Current.Name+" update available",
+			u.Latest+" is ready to install.", "action=settings",
+			[]notify.ToastButton{{Label: "Update now", Args: "action=update"}})
+	case u.Ahead:
+		notify.Toast(title, "You're on a newer build than the current release ("+u.Latest+").", "")
+	default:
+		notify.Toast(title, "You're up to date ("+version+").", "")
+	}
+}
+
 // CanApplyUpdate reports whether Nimbo can update itself in place (a packaged
 // install on Windows). The frontend offers "Update now" only when true; loose
 // dev builds fall back to opening the release page.
@@ -751,7 +825,7 @@ func (a *App) ApplyUpdate() string {
 	// "Updating…" before the window goes.
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
-		a.Quit()
+		a.quit("installing update")
 	}()
 	return ""
 }
@@ -843,6 +917,11 @@ func (a *App) SetSyncMode(mode string) string {
 			a.adoptScanCancel()
 		}
 		a.adoptScanMu.Unlock()
+		// Setup asked about a folder it had recorded provisionally; the answer
+		// is no, so the account goes back to the folder it had before.
+		if a.eng != nil {
+			a.restoreSetupFolder(a.eng)
+		}
 		return ""
 	case "badges-enable":
 		// One UAC consent registers the Explorer corner badges — the piece an
@@ -891,13 +970,26 @@ func (a *App) SetSyncMode(mode string) string {
 	// Every step logs before it runs: this sequence once hung permanently on a
 	// live install with the log silent, leaving nothing to diagnose from. The
 	// last breadcrumb printed names the step that never returned.
-	slog.Info("sync mode switch: unmounting on-demand roots", "to", mode)
-	a.unmountAllOnDemand()
+	// Only leaving virtual files unregisters the roots (the revert that comes
+	// with it is the point). Re-applying virtual files, which account setup
+	// does, keeps every registration: unregistering here flattened every
+	// account's folder whenever an account was added (GitHub #11).
+	before := a.mountedRoots()
+	if mode == "ondemand" {
+		slog.Info("sync mode switch: disconnecting on-demand roots (registrations kept)", "to", mode)
+		a.disconnectAllOnDemand()
+	} else {
+		slog.Info("sync mode switch: unmounting on-demand roots", "to", mode)
+		a.unmountAllOnDemand()
+	}
 	slog.Info("sync mode switch: stopping engine")
 	a.stopEngine()
 	slog.Info("sync mode switch: restarting stack")
 	a.start(a.ctx)
 	slog.Info("sync mode switch: stack restarted")
+	if mode == "ondemand" {
+		a.unregisterAbandonedRoots(before)
+	}
 	if a.eng == nil {
 		return "couldn't restart syncing — check the logs"
 	}
@@ -909,31 +1001,20 @@ func (a *App) SetSyncMode(mode string) string {
 		if !cfapi.Supported() {
 			return "Virtual files aren't supported on this system."
 		}
-		if _, ok := a.onDemandMounts[a.GetBaseDir()]; !ok {
+		if !a.shownAccountMounted() {
+			if a.mountRefused != "" {
+				return a.mountRefused
+			}
 			return "Couldn't take over the folder for virtual files. If another sync app (like the official Nextcloud client or OneDrive) is still syncing this folder, sign out of it or uninstall it first, then switch again."
 		}
 	}
 	if mode == "live" {
 		a.maybeOfferBadges()
-		// Restore the pairs the on-demand switch cleared: a mode round-trip
-		// must hand the user back their folder setup. Takeover re-adopts the
-		// (now plain) files against the surviving baseline — no re-download.
-		if d, err := config.Resolve(); err == nil {
-			// Take and clear in one locked step, so the pairs can't be restored
-			// twice or dropped by a settings write landing in between.
-			var remembered []config.SyncPair
-			_ = d.UpdateSettings(func(s *config.Settings) {
-				remembered, s.RememberedPairs = s.RememberedPairs, nil
-			})
-			for _, p := range remembered {
-				if msg := a.AddSyncPair(p.LocalDir, p.RemoteRoot); msg != "" {
-					slog.Warn("could not restore sync pair after leaving virtual files",
-						"local", p.LocalDir, "err", msg)
-				} else {
-					slog.Info("restored sync pair after leaving virtual files", "local", p.LocalDir)
-				}
-			}
-		}
+		// The pairs the on-demand switch parked were restored by start() above
+		// (prepareLivePairs), for every account: a mode round-trip must hand the
+		// user back their folder setup. Takeover re-adopts the (now plain) files
+		// against the surviving baseline, so nothing re-downloads.
+		a.rebuildTrayMenu()
 	}
 	// A registered (or just-unregistered) sync root only reaches Explorer at
 	// process start — verified live 2026-08-22: a fresh window in the old
@@ -1013,10 +1094,8 @@ func (a *App) clearLivePairs() {
 	// Remember what we're clearing so switching back to live restores the
 	// user's folder setup instead of silently forgetting it (bit Adam twice).
 	if len(pairs) > 0 {
-		if d, err := config.Resolve(); err == nil {
-			_ = d.UpdateSettings(func(s *config.Settings) {
-				s.RememberedPairs = pairs
-			})
+		if err := a.eng.ParkPairs(pairs); err != nil {
+			slog.Warn("could not remember the live folder setup", "err", err)
 		}
 	}
 	for _, p := range pairs {
@@ -1062,9 +1141,48 @@ func (a *App) mountAccountOnDemand() {
 	if a.eng == nil || !cfapi.Supported() {
 		return
 	}
-	dir := a.GetBaseDir()
-	if _, already := a.onDemandMounts[dir]; already {
+	a.mountRefused = ""
+	dir := onDemandRootOrder(wholeAccountPair(a.eng), a.eng.OnDemandRoot(), a.eng.StoredBaseDir())
+	if _, already := a.onDemandMounts[dir]; dir != "" && already {
 		return
+	}
+	if dir == "" {
+		if !mayMountUnchosen(accountCount(), a.setupPending(a.eng.Account.ID)) {
+			// A new account, beside others or just signed in: nothing is
+			// mounted until its setup has chosen a folder. Beside others, a
+			// guess mounted here was left registered when setup chose another
+			// folder, and setup offered to "keep" files that were only this
+			// mount's placeholders. For the first account, choosing another
+			// folder did unregister the guess on the VM, but a reporter was
+			// still left with one beside their chosen folder (GitHub #11), so
+			// no guess is mounted there either.
+			slog.Info("account has no folder yet; waiting for its setup before mounting", "account", a.eng.Account.LoginName)
+			return
+		}
+		// The only account, with no folder recorded (an older install): a
+		// fresh folder, or its own existing root, as before.
+		home, _ := os.UserHomeDir()
+		dir = suggestAccountFolder(home, a.eng.Account.LoginName, nil,
+			unchosenUsable(cfapi.ShellSyncRootRegistered, true))
+		if dir == "" {
+			a.mountRefused = "There is no free, empty folder to use for this account. Choose a folder for it in Settings."
+			a.warnNoFolder(a.eng)
+			return
+		}
+	} else if !a.rootReady(a.eng, dir) {
+		return // renamed or moved away: wait for it rather than re-create it
+	}
+	// Never mount a folder another account is syncing: both would then own
+	// one folder and see each other's files as their own (GitHub #11).
+	if msg := a.syncClashFor(a.eng.Account.ID, dir); msg != "" {
+		a.mountRefused = msg
+		a.warnFolderClash(a.eng, dir, msg)
+		return
+	}
+	// Record the folder, so the account mounts the same one every time rather
+	// than whatever default is free on the next start.
+	if a.eng.StoredBaseDir() == "" {
+		_ = a.eng.SetBaseDir(dir)
 	}
 	slog.Info("mounting account folder as virtual files", "dir", dir)
 	if err := a.mountOnDemand(dir, ""); err != nil {
@@ -1156,14 +1274,26 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 	root := strings.Trim(remoteRoot, "/")
 	// report records a VFS operation in the activity feed (which auto-refreshes
 	// the flyout via the recorder subscription) and toasts on error.
+	dedupe := newDownloadDedupe(30 * time.Second)
 	report := func(kind, remotePath string, err error) {
-		ev := activity.Event{Local: localDir, Path: remotePath, Kind: kind}
+		// The watcher reports local names; hydration (below) reports the
+		// placeholder identity, which is the RAW server name. One decode here
+		// keeps the feed, the toasts and the recorder's error keys on the
+		// local name for both, so an error recorded by one can be cleared by
+		// the other (Deck #554).
+		shown := vfsDisplayPath(eng.Escaper(), remotePath)
+		// The same file's failed download arrives twice when it was pinned:
+		// once from the stream, once from the watcher (Deck #686).
+		if !dedupe.admit(kind, localDir, shown, err) {
+			return
+		}
+		ev := activity.Event{Local: localDir, Path: shown, Kind: kind}
 		if err != nil {
 			ev.Err = err.Error()
 		}
 		eng.Recorder().Add(ev)
 		if err != nil || kind == "delete-kept" {
-			a.vfsErrorToast(kind, remotePath, err)
+			a.vfsErrorToast(kind, shown, err)
 		}
 	}
 	hydrate := func(identity []byte, offset, length int64) ([]byte, error) {
@@ -1225,14 +1355,14 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			}
 			items = append(items, cfapi.PlaceholderInfo{
 				Name: name, Size: e.Size, IsDir: e.IsDir, ModTime: e.LastModified,
-				Identity: []byte(p), ETag: e.ETag, FileID: e.FileID, MountRoot: isRoot,
+				Identity: []byte(p), ETag: e.ETag, UploadTime: e.UploadTime, FileID: e.FileID, MountRoot: isRoot,
 			})
 		}
 		mountroots.setMany(roots)
 		// On-demand mode has no sync pairs, so applyPlan — where the live path
 		// notices other people's locks — never runs. This listing is the only
 		// place lock state passes through, so feed it in here.
-		eng.NoteRemoteLocks(localDir, root, entries)
+		eng.NoteRemoteLocks(localDir, root, remote, entries)
 		return items, nil
 	}
 	// A failed listing returns NIL, which cfapi reads as "do not mark this
@@ -1247,15 +1377,18 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		}
 		base := make(map[string]string, len(items))
 		fids := make(map[string]string, len(items))
+		keys := make(map[string]string, len(items))
 		for _, it := range items {
 			if !it.IsDir {
 				base[string(it.Identity)] = it.ETag
+				keys[string(it.Identity)] = transport.ContentKey(it.Size, it.ModTime, it.UploadTime)
 				if it.FileID != "" {
 					fids[string(it.Identity)] = it.FileID
 				}
 			}
 		}
 		etags.setMany(base)
+		etags.setContentKeys(keys)
 		fileids.setMany(fids)
 		return items
 	}
@@ -1363,6 +1496,15 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			RecordBaseline: func(remote, etag string) { etags.set(remote, etag) },
 			Baseline:       func(remote string) (string, bool) { e := etags.get(remote); return e, e != "" },
 			ForgetBaseline: func(remote string) { etags.del(remote) },
+			RecordContent:  func(m map[string]string) { etags.setContentKeys(m) },
+			Content:        func(remote string) string { return etags.contentKey(remote) },
+			// Word's "~$" / LibreOffice's ".~lock." appearing and vanishing is
+			// how a document being opened and closed shows itself; the engine
+			// turns it into a lock on the server (Deck #721).
+			EditorLockFiles: func(paths []string) { eng.NoteEditorLockFiles(a.ctx, localDir, root, paths) },
+			// The lockout's deny-write handle would make the watcher's own
+			// dehydrate of that file fail.
+			BeforeReplace: eng.ReleaseLockoutHandle,
 			// Batch forms: each store write rewrites the whole JSON file, so a
 			// moved directory's carry and a directory's pull each have to be
 			// ONE write rather than one per item.
@@ -1400,6 +1542,10 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			// type in Settings, and this mount outlives that.
 			Encode: func(rel string) string { return eng.Escaper().Encode(rel) },
 			Decode: func(rel string) string { d, _ := eng.Escaper().Decode(rel); return d },
+			// The app-wide pause (the shown account's engine holds it), so the
+			// tray's Pause stops every account's mount, not just this one's
+			// (Deck #723). pauseChangedOnDemand tells the watcher when it flips.
+			Paused: a.Paused,
 			Log:    func(f string, args ...any) { slog.Info("vfs", "msg", fmt.Sprintf(f, args...)) },
 		})
 		if werr != nil {
@@ -1418,6 +1564,17 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 	}
 	m := &odMount{connKey: connKey, remoteRoot: root, accountID: eng.Account.ID}
 	a.onDemandMounts[localDir] = m
+	if strings.Trim(remoteRoot, "/") == "" {
+		// The account's whole-account root: remember it, so the account
+		// reconnects to this folder next time, primary or background.
+		if err := eng.SetOnDemandRoot(localDir); err != nil {
+			slog.Warn("could not record the virtual-files root", "dir", localDir, "err", err)
+		}
+		if d, err := config.Resolve(); err == nil {
+			vol := volumeID(localDir)
+			_ = d.WithAccount(eng.Account.ID).UpdateAccountState(func(s *config.AccountState) { s.RootVolume = vol })
+		}
+	}
 	a.refreshOverlayRoots()
 
 	// Background state heal: converts plain directories inside the mount back
@@ -1443,7 +1600,20 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		m.convertCancel = cancel
 		slog.Info("adopt: converting existing files in the background",
 			"files", len(pending.plan.Entries), "dir", localDir)
-		go a.runAdoptConvert(cctx, m, pending.plan, localDir, root, up, startWatcher)
+		go a.runAdoptConvert(cctx, m, pending.plan, localDir, root, up, startWatcher, false)
+		return nil
+	}
+	// An adopt interrupted by a shutdown owes its conflicts and dead stubs
+	// (Deck #500): finish them now, under the same ordering constraint — a
+	// conflict rename or stub delete seen by the watcher would reach the server.
+	if entries := loadAdoptResume(eng.Account.ID, localDir, root); len(entries) > 0 {
+		cctx, cancel := context.WithCancel(a.ctx)
+		m.convertCancel = cancel
+		slog.Info("adopt: resuming an interrupted conversion", "entries", len(entries), "dir", localDir)
+		// The escaper is read per call, as the watcher's Encode is: the user can
+		// change disguised types between the scan and this resume.
+		plan := vfs.ResumePlan(entries, func(rel string) string { return eng.Escaper().Encode(rel) })
+		go a.runAdoptConvert(cctx, m, plan, localDir, root, up, startWatcher, true)
 		return nil
 	}
 	m.watcher = startWatcher()
@@ -1525,11 +1695,16 @@ func (a *App) uploadWithConflictFor(eng *agent.Engine, etags *etagStore) func(ct
 		if err := transfer.UploadDeferred(localPath); err != nil {
 			return err
 		}
+		// Likewise while it is already being uploaded: the upload would be
+		// refused after the server's copy had been moved (Deck #714).
+		if transfer.Uploading(localPath) {
+			return fmt.Errorf("%s: %w", remotePath, transfer.ErrUploadInProgress)
+		}
 
 		base := etags.get(remotePath)
 		cur, curExists, statErr := eng.StatRemote(ctx, remotePath)
 		switch {
-		case base != "" && statErr == nil && curExists && cur.ETag != base && !sameBytesAsServer(localPath, cur):
+		case base != "" && statErr == nil && curExists && serverEditedSince(base, etags.contentKey(remotePath), cur) && !sameBytesAsServer(localPath, cur):
 			// Server changed too — keep both: park the server's version. A
 			// failed park must ABORT the upload: proceeding would overwrite
 			// the very edit the check just detected. The watcher retries.
@@ -1554,14 +1729,21 @@ func (a *App) uploadWithConflictFor(eng *agent.Engine, etags *etagStore) func(ct
 		}
 		// Baseline from the upload's OWN revision when the server names it — a
 		// fresh Stat could adopt a concurrent writer's newer revision as ours.
-		if etag == "" {
-			if cur, ok, serr := eng.StatRemote(ctx, remotePath); serr == nil && ok {
-				etag = cur.ETag
-			}
+		// The Stat is still needed for the content key, which the PUT does not
+		// return; it is recorded only when the Stat IS our revision, and
+		// cleared otherwise so an older version's key can't vouch for this one.
+		after, ok, serr := eng.StatRemote(ctx, remotePath)
+		if etag == "" && serr == nil && ok {
+			etag = after.ETag
 		}
 		if etag != "" {
 			etags.set(remotePath, etag)
 		}
+		key := ""
+		if serr == nil && ok && etag != "" && after.ETag == etag {
+			key = after.ContentKey()
+		}
+		etags.setContentKeys(map[string]string{remotePath: key})
 		return nil
 	}
 }
@@ -1661,6 +1843,17 @@ func (a *App) pokeOnDemand() {
 	}
 }
 
+// pauseChangedOnDemand tells every on-demand mount's watcher the pause may
+// have flipped: a pause stops their uploads and pinned downloads, a resume
+// starts them again (Deck #723).
+func (a *App) pauseChangedOnDemand() {
+	for _, m := range a.onDemandMounts {
+		if m.watcher != nil {
+			m.watcher.PauseChanged()
+		}
+	}
+}
+
 // disconnectAllOnDemand pauses every mount WITHOUT touching its registration:
 // placeholders keep their cloud state and the next launch reconnects in place.
 // This is the shutdown/auth-loss/account-switch path. Full unmountAllOnDemand
@@ -1699,6 +1892,13 @@ func (a *App) unmountAllOnDemand() {
 			m.healCancel()
 		}
 		cfapi.Unmount(dir, m.connKey)
+		// Unregistering strips the cloud state from the whole tree, so an
+		// unfinished adopt has nothing left to resume into; a later switch back
+		// scans afresh.
+		clearAdoptResume(m.accountID)
+		// Nor is the folder a virtual-files root any more: a switch back must
+		// not prefer it over a folder chosen since.
+		forgetOnDemandRoot(m.accountID)
 		delete(a.onDemandMounts, dir)
 	}
 	a.refreshOverlayRoots()
@@ -2020,7 +2220,7 @@ func (a *App) animateTray() {
 	}
 	t := time.NewTicker(120 * time.Millisecond)
 	defer t.Stop()
-	frame, last := 0, ""
+	frame, last, lastTip := 0, "", ""
 	for {
 		select {
 		case <-a.ctx.Done():
@@ -2028,20 +2228,48 @@ func (a *App) animateTray() {
 		case <-t.C:
 			state := a.trayState()
 			badge := a.trayBadge()
+			tip := trayTooltip(brand.Current.Name, a.status, a.eng != nil && a.eng.Paused())
 			key := state
 			if badge {
 				key += "+badge"
 			}
-			if state == "sync" {
+			switch {
+			case state == "sync":
 				frame++
-				a.tray.SetIcon(trayIcon("sync", frame, badge))
+				a.setTrayIcon(trayIcon("sync", frame, badge), tip)
 				last = key
-			} else if key != last {
-				a.tray.SetIcon(trayIcon(state, 0, badge))
+			case key != last:
+				a.setTrayIcon(trayIcon(state, 0, badge), tip)
 				last = key
+			case tip != lastTip:
+				a.tray.SetTooltip(tip)
 			}
+			lastTip = tip
 		}
 	}
+}
+
+// trayTooltip is the tray icon's hover text: the app's name, and on a second
+// line what it is doing, as OneDrive's does. The name alone said nothing about
+// whether it was syncing (GitHub #9 follow-up).
+func trayTooltip(name, status string, paused bool) string {
+	if paused {
+		return name + "\nPaused"
+	}
+	if s := strings.TrimSpace(status); s != "" {
+		return name + "\n" + s
+	}
+	return name
+}
+
+// setTrayIcon changes the tray icon and puts its tooltip back. Wails changes
+// the icon with a NIM_MODIFY carrying only NIF_ICON, and under
+// NOTIFYICON_VERSION_4 an update without NIF_SHOWTIP hides the standard
+// tooltip again, so the name set at startup was gone the first time the icon
+// changed, a moment after launch (GitHub #9).
+func (a *App) setTrayIcon(icon []byte, tip string) {
+	a.tray.SetIcon(icon)
+	a.tray.SetTooltip(tip)
 }
 
 // busyStatusWords are the status-text fragments that mean "the engine is
@@ -2212,13 +2440,28 @@ func (a *App) SyncNow() {
 // Paused reports whether syncing is paused.
 func (a *App) Paused() bool { return a.eng != nil && a.eng.Paused() }
 
+// eachEngine runs f on every running account engine, the shown account's and
+// the background ones. Pause and quiet hours are one switch for the whole app
+// in the tray and in Settings, so they have to reach every account; they used
+// to reach only the shown one, and background accounts kept syncing.
+func (a *App) eachEngine(f func(*agent.Engine)) {
+	if a.eng != nil {
+		f(a.eng)
+	}
+	for _, se := range a.secondaries {
+		if se.eng != nil {
+			f(se.eng)
+		}
+	}
+}
+
 // TogglePause flips the paused state and returns the new value.
 func (a *App) TogglePause() bool {
 	if a.eng == nil {
 		return false
 	}
 	p := !a.eng.Paused()
-	a.eng.SetPaused(p)
+	a.eachEngine(func(e *agent.Engine) { e.SetPaused(p) })
 	a.rebuildTrayMenu() // update the Pause/Resume label
 	return p
 }
@@ -2229,9 +2472,9 @@ func (a *App) PauseFor(minutes int) {
 		return
 	}
 	if minutes <= 0 {
-		a.eng.SetPaused(true)
+		a.eachEngine(func(e *agent.Engine) { e.SetPaused(true) })
 	} else {
-		a.eng.PauseFor(time.Duration(minutes) * time.Minute)
+		a.eachEngine(func(e *agent.Engine) { e.PauseFor(time.Duration(minutes) * time.Minute) })
 	}
 	a.rebuildTrayMenu()
 }
@@ -2246,14 +2489,14 @@ func (a *App) PauseUntilTomorrow() {
 	if !t.After(now) {
 		t = t.Add(24 * time.Hour)
 	}
-	a.eng.PauseFor(t.Sub(now))
+	a.eachEngine(func(e *agent.Engine) { e.PauseFor(t.Sub(now)) })
 	a.rebuildTrayMenu()
 }
 
 // Resume clears any pause (manual or timed).
 func (a *App) Resume() {
 	if a.eng != nil {
-		a.eng.SetPaused(false)
+		a.eachEngine(func(e *agent.Engine) { e.SetPaused(false) })
 		a.rebuildTrayMenu()
 	}
 }
@@ -2300,9 +2543,9 @@ func (a *App) SetPauseSchedule(enabled bool, fromMin, toMin int) {
 			s.PauseToMin = toMin
 		})
 	}
-	if a.eng != nil {
-		a.eng.SetPauseSchedule(agent.PauseSchedule{Enabled: enabled, FromMin: fromMin, ToMin: toMin})
-	}
+	a.eachEngine(func(e *agent.Engine) {
+		e.SetPauseSchedule(agent.PauseSchedule{Enabled: enabled, FromMin: fromMin, ToMin: toMin})
+	})
 	a.rebuildTrayMenu()
 }
 
@@ -2466,17 +2709,83 @@ func (a *App) OpenURL(href string) {
 // absURL resolves a possibly-relative Nextcloud href (e.g. "/apps/files/")
 // against the account's server URL. Absolute URLs are returned unchanged.
 func (a *App) absURL(href string) string {
-	if href == "" || strings.Contains(href, "://") {
-		return href
-	}
 	if a.eng == nil {
 		return href
 	}
-	return strings.TrimRight(a.eng.Account.ServerURL, "/") + "/" + strings.TrimLeft(href, "/")
+	return resolveServerHref(a.eng.Account.ServerURL, href)
+}
+
+// resolveServerHref joins a Nextcloud href onto the server URL. Hrefs come in
+// two shapes: our own paths are relative to the webroot ("/index.php/..."),
+// but the server's navigation API returns paths that already carry it
+// ("/nextcloud/apps/files/..." for a server at https://host/nextcloud). The
+// webroot is stripped when present, the way Nextcloud's own getAbsoluteURL
+// does it, so a subpath install doesn't get it twice (GitHub #16). Anything
+// with a scheme (https:, mailto:) is returned unchanged.
+func resolveServerHref(serverURL, href string) string {
+	if href == "" {
+		return href
+	}
+	if u, err := url.Parse(href); err == nil && (u.Scheme != "" || u.Host != "") {
+		return href
+	}
+	base := strings.TrimRight(serverURL, "/")
+	if su, err := url.Parse(base); err == nil {
+		if root := strings.TrimRight(su.Path, "/"); root != "" {
+			if href == root {
+				return base
+			}
+			if rest, ok := strings.CutPrefix(href, root+"/"); ok {
+				href = rest
+			}
+		}
+	}
+	return base + "/" + strings.TrimLeft(href, "/")
+}
+
+// releaseLocksOnExit gives back every account's file locks, and lets go of
+// colleagues' files held by the lockout, before the process exits (Deck #722).
+// The tray Quit, an in-app update and Windows ending the session all return
+// from app.Run without stopping the engines, and a default Nextcloud never
+// expires a lock, so without this a document open when Nimbo went away stayed
+// locked for everyone until Nimbo next started. Accounts go in parallel under
+// one deadline: Windows allows little time at the end of a session, and
+// anything left over is still recorded for the startup sweep.
+func (a *App) releaseLocksOnExit(timeout time.Duration) {
+	var engs []*agent.Engine
+	if a.eng != nil {
+		engs = append(engs, a.eng)
+	}
+	for _, se := range a.secondaries {
+		if se != nil && se.eng != nil {
+			engs = append(engs, se.eng)
+		}
+	}
+	if len(engs) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, e := range engs {
+		wg.Add(1)
+		go func(e *agent.Engine) {
+			defer wg.Done()
+			if n, err := e.ReleaseLocksForExit(ctx); n > 0 || err != nil {
+				slog.Info("released locks on exit", "account", e.Account.ID, "released", n, "err", err)
+			}
+		}(e)
+	}
+	wg.Wait()
 }
 
 // Quit exits the application.
-func (a *App) Quit() {
+func (a *App) Quit() { a.quit("asked by the app window") }
+
+// quit exits, logging why: without the reason a log that ends looks the same
+// whether the user quit, an update did, or the process died (Deck #714).
+func (a *App) quit(reason string) {
+	slog.Info("quitting", "reason", reason)
 	if a.app != nil {
 		a.app.Quit()
 	}
@@ -2485,6 +2794,23 @@ func (a *App) Quit() {
 // buildTrayMenu constructs the tray right-click menu reflecting current state.
 func (a *App) buildTrayMenu() *application.Menu {
 	m := application.NewMenu()
+	// Waiting for a sign-in: there is nothing to sync, pause or open, so the
+	// menu is the way back in and the way out. Without it, closing the sign-in
+	// window on a fresh install left no route to either (GitHub #12).
+	if a.NeedsLogin() {
+		m.Add("Sign in…").OnClick(func(*application.Context) { a.showLogin() })
+		// Updating needs no account, and Settings (where updates normally
+		// live) can't open without one (GitHub #11).
+		if canApplyUpdate() {
+			m.Add("Check for updates…").OnClick(func(*application.Context) { go a.checkForUpdateToast() })
+		}
+		if u := brand.Current.HelpPage(""); u != "" {
+			m.Add("Help").OnClick(func(*application.Context) { openURL(u) })
+		}
+		m.AddSeparator()
+		m.Add("Quit " + brand.Current.Name).OnClick(func(*application.Context) { a.quit("tray menu") })
+		return m
+	}
 	m.Add("Sync now").OnClick(func(*application.Context) { a.SyncNow() })
 
 	ps := a.PauseInfo()
@@ -2520,8 +2846,11 @@ func (a *App) buildTrayMenu() *application.Menu {
 	}
 	m.Add("Sync status").OnClick(func(*application.Context) { a.OpenStatus() })
 	m.Add("Settings").OnClick(func(*application.Context) { a.OpenSettings() })
+	if u := brand.Current.HelpPage(""); u != "" {
+		m.Add("Help").OnClick(func(*application.Context) { openURL(u) })
+	}
 	m.AddSeparator()
-	m.Add("Quit Nimbo").OnClick(func(*application.Context) { a.Quit() })
+	m.Add("Quit " + brand.Current.Name).OnClick(func(*application.Context) { a.quit("tray menu") })
 	return m
 }
 
@@ -2607,6 +2936,21 @@ func (a *App) RecentActivity() []ActivityItem {
 		out[i] = t.item
 	}
 	return out
+}
+
+// ClearActivity empties the recent activity list for every account, so the
+// flyout and Sync status → Activity both start again from nothing. Failures
+// that are still unresolved stay in the "needs attention" count.
+func (a *App) ClearActivity() {
+	if a.eng != nil {
+		a.eng.Recorder().Clear()
+	}
+	for _, se := range a.secondaries {
+		if se.eng != nil {
+			se.eng.Recorder().Clear()
+		}
+	}
+	a.emit("activity")
 }
 
 // ConflictItem is a pending conflict awaiting a choice, with both versions'
@@ -2954,6 +3298,37 @@ type LockDTO struct {
 	OwnerType int    `json:"ownerType"` // 0 manual, 1 an app (Text/Office), 2 token
 	Since     string `json:"since"`     // RFC3339; empty when the server gave no time
 	Account   string `json:"account"`   // login name of the account it belongs to
+	LocalDir  string `json:"localDir"`  // the sync folder it is listed under, for UnlockStaleLock
+	CanUnlock bool   `json:"canUnlock"` // a stale lock on a file this account owns (#733)
+}
+
+// UnlockStaleLock clears another person's stale lock on a file the account
+// owns: the In use list's Unlock button (#733). account, localDir and path are
+// the LockDTO's. Returns "" on success or a message for the UI.
+func (a *App) UnlockStaleLock(account, localDir, path string) string {
+	eng := a.engineForLogin(account)
+	if eng == nil {
+		return "That account is not signed in."
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	if err := eng.UnlockStale(ctx, localDir, path); err != nil {
+		return "Could not unlock " + filepath.Base(filepath.FromSlash(path)) + ": " + err.Error()
+	}
+	return ""
+}
+
+// engineForLogin finds the shown or background account with this login name.
+func (a *App) engineForLogin(login string) *agent.Engine {
+	if a.eng != nil && a.eng.Account.LoginName == login {
+		return a.eng
+	}
+	for _, se := range a.secondaries {
+		if se.eng != nil && se.eng.Account.LoginName == login {
+			return se.eng
+		}
+	}
+	return nil
 }
 
 // Diagnostics returns Nimbo's current health (no network calls) for the UI.
@@ -2993,6 +3368,7 @@ func (a *App) Diagnostics() DiagnosticsDTO {
 		if eng == nil {
 			return
 		}
+		now := time.Now()
 		for _, f := range eng.LockedFiles() {
 			var since string
 			if !f.Since.IsZero() {
@@ -3001,6 +3377,7 @@ func (a *App) Diagnostics() DiagnosticsDTO {
 			dto.ObservedLocks = append(dto.ObservedLocks, LockDTO{
 				Path: f.Path, Owner: f.Who(), Summary: f.Summary(), OwnerType: int(f.OwnerType),
 				Since: since, Account: eng.Account.LoginName,
+				LocalDir: f.LocalDir, CanUnlock: f.CanUnlock(eng.Account.LoginName, now),
 			})
 		}
 	}
@@ -3069,9 +3446,9 @@ func humanAgo(d time.Duration) string {
 }
 
 // ResolveConflict settles a conflict: choice is "local", "remote", or "both".
-func (a *App) ResolveConflict(localDir, path, choice string) {
+func (a *App) ResolveConflict(localDir, path, choice string) string {
 	if a.eng == nil {
-		return
+		return "not signed in"
 	}
 	var c transfer.Choice
 	switch choice {
@@ -3085,11 +3462,14 @@ func (a *App) ResolveConflict(localDir, path, choice string) {
 	for _, it := range a.eng.PendingConflicts() {
 		if it.LocalDir == localDir && it.Path == path {
 			if err := a.eng.ResolveConflict(context.Background(), it, c); err != nil {
-				slog.Warn("resolve conflict failed", "err", err)
+				slog.Warn("resolve conflict failed", "path", path, "choice", choice, "err", err)
+				return err.Error()
 			}
-			return
+			slog.Info("conflict resolved", "path", path, "choice", choice)
+			return ""
 		}
 	}
+	return "" // already settled: a pass or an earlier click got there first
 }
 
 // DetachedDTO is a folder that stopped being shared with the user (or whose
@@ -3239,12 +3619,7 @@ func (a *App) BlockedList() []BlockedItem {
 	}
 	var out []BlockedItem
 	for _, b := range a.eng.BlockedFiles() {
-		base := filepath.Base(b.Path)
-		out = append(out, BlockedItem{
-			Abs: b.Abs, Path: b.Path, Reason: b.Reason,
-			Ext:       filepath.Ext(base),
-			Escapable: a.eng.CanEscape(base),
-		})
+		out = append(out, blockedItem(b, a.eng.CanEscape))
 	}
 	for _, ext := range a.eng.EscapedExtensions() {
 		out = append(out, BlockedItem{Path: ext, Ext: ext, Escaping: true,
@@ -3629,6 +4004,9 @@ func (a *App) dispatchToastActivation(args string) {
 				notify.Toast("Folder badges", msg, "")
 			}
 		}()
+	case "conflicts":
+		// A "Sync conflict" toast: straight to the choice it is asking for.
+		application.InvokeAsync(func() { a.openStatus("conflicts") })
 	case "inuse":
 		// A "File in use" toast: show WHO has WHAT open, in context.
 		application.InvokeAsync(func() { a.openStatus("inuse") })
@@ -3657,8 +4035,16 @@ func (a *App) dispatchToastActivation(args string) {
 		// The "update available" toast's body: open the Settings window on its
 		// General tab, where "Check for updates / Update now" and the release
 		// notes live. (This used to open the sync-status window on a nonexistent
-		// "settings" tab — the wrong menu.)
-		application.InvokeAsync(func() { a.openSettingsTab("general") })
+		// "settings" tab — the wrong menu.) Signed out there are no Settings
+		// to open, so show the flyout, whose sign-in card carries the same
+		// update controls (GitHub #11).
+		application.InvokeAsync(func() {
+			if a.NeedsLogin() && a.tray != nil {
+				a.tray.ShowWindow()
+				return
+			}
+			a.openSettingsTab("general")
+		})
 	case "notify": // a Nextcloud notification's Accept/Decline button
 		acct := v.Get("acct")
 		id, _ := strconv.Atoi(v.Get("id"))
@@ -3884,24 +4270,43 @@ func errString(err error) string {
 // SidebarSupported reports whether the Explorer sidebar entry is available.
 func (a *App) SidebarSupported() bool { return shellns.Supported() }
 
-// SidebarEnabled reports whether the Nimbo sidebar root is registered.
+// SidebarEnabled reports whether the Nimbo entry is in the Explorer navigation
+// pane.
 //
 // Answered from our own recorded choice, not the registry: a packaged build
 // reads HKCU through the MSIX container, which returns the package's private
-// copy rather than the keys Explorer actually uses. The registry is consulted
-// only when nothing has been recorded yet — a fresh install (nothing there) or
-// an entry left by an older unpackaged build (which is real, and ours).
-func (a *App) SidebarEnabled() bool { return sidebarWanted() }
+// copy rather than the keys Explorer actually uses. With nothing recorded, a
+// cloud sync root (on-demand mode) answers "on": Windows puts the root's own
+// node in the pane when the root is registered and it stays until we hide it,
+// so that is what the user is looking at. Otherwise the registry is consulted
+// for an entry left by an older unpackaged build (which is real, and ours).
+func (a *App) SidebarEnabled() bool { return a.sidebarWanted() }
 
-// sidebarWanted resolves the stored sidebar preference, falling back to the
-// registry the first time.
-func sidebarWanted() bool {
+func (a *App) sidebarWanted() bool {
+	recorded, _ := sidebarChoice()
+	cloudRoot := a.GetSyncMode() == "ondemand" || cfapi.ShellSyncRootRegistered(a.GetBaseDir())
+	return sidebarWantedFrom(recorded, cloudRoot, shellns.Enabled())
+}
+
+// sidebarWantedFrom is the rule behind SidebarEnabled: a recorded choice wins;
+// otherwise a cloud sync root's node is shown (Windows' default), and without
+// one only an entry already in the registry counts.
+func sidebarWantedFrom(recorded *bool, cloudRoot, legacyEntry bool) bool {
+	if recorded != nil {
+		return *recorded
+	}
+	return cloudRoot || legacyEntry
+}
+
+// sidebarChoice returns the recorded preference (nil when never chosen) and
+// the folder it was applied for.
+func sidebarChoice() (*bool, string) {
 	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil && s.SidebarEnabled != nil {
-			return *s.SidebarEnabled
+		if s, e := d.LoadSettings(); e == nil {
+			return s.SidebarEnabled, s.SidebarTarget
 		}
 	}
-	return shellns.Enabled()
+	return nil, ""
 }
 
 // sidebarSyncRoot is recorded as the sidebar's target when we deliberately have
@@ -3922,9 +4327,42 @@ func rememberSidebar(on bool, target string) {
 	})
 }
 
-// SetSidebar adds or removes the Nimbo root in the Explorer navigation
-// pane, pointing at the default sync location.
+// SetSidebar shows or hides the Nimbo entry in the Explorer navigation pane.
+//
+// Which entry depends on the folder. A cloud sync root (on-demand mode, or a
+// live folder with a status root) is given a node by Windows itself when the
+// root is registered, and that node is what the user sees: the choice is
+// applied to it through its pinned-to-tree flag, and any delegate-folder entry
+// of ours is dropped so there is never a second, identical-looking Nimbo beside
+// it (#574). Otherwise the entry is our own delegate folder, pointing at the
+// default sync location, added or removed as asked.
+//
+// Until this distinction the toggle only ever touched our own entry, which
+// beside a sync root was already stood down, so in on-demand mode it changed
+// nothing on screen whichever way it was set (issue #7).
 func (a *App) SetSidebar(on bool) string {
+	target := a.GetBaseDir()
+	if a.GetSyncMode() == "ondemand" || cfapi.ShellSyncRootRegistered(target) {
+		if err := shellns.Unregister(); err != nil {
+			return err.Error()
+		}
+		node := cfapi.ShellSyncRootNamespaceCLSID(target)
+		if node == "" {
+			if !on {
+				return "Explorer has no entry for the cloud folder yet, so there is nothing to hide. Try again once the folder shows in Explorer."
+			}
+			// Preference on, target recorded as the sentinel: if the folder later
+			// stops being a sync root, syncSidebar sees an unapplied target and
+			// puts our own entry back.
+			rememberSidebar(true, sidebarSyncRoot)
+			return ""
+		}
+		if err := shellns.SetCloudRootPinned(node, on); err != nil {
+			return err.Error()
+		}
+		rememberSidebar(on, sidebarSyncRoot)
+		return ""
+	}
 	if !on {
 		if err := shellns.Unregister(); err != nil {
 			return err.Error()
@@ -3932,20 +4370,8 @@ func (a *App) SetSidebar(on bool) string {
 		rememberSidebar(false, "")
 		return ""
 	}
-	target := a.GetBaseDir()
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		return err.Error()
-	}
-	if cfapi.ShellSyncRootRegistered(target) {
-		// Explorer already lists this folder under its cloud provider name. A
-		// delegate-folder entry on top of that is a second, identical-looking
-		// Nimbo in the navigation pane.
-		_ = shellns.Unregister()
-		// Preference on, target recorded as the sentinel: if the folder later
-		// stops being a sync root, syncSidebar sees an unapplied target and puts
-		// our own entry back.
-		rememberSidebar(true, sidebarSyncRoot)
-		return ""
 	}
 	icon, err := navIconPath()
 	if err != nil {
@@ -3958,16 +4384,25 @@ func (a *App) SetSidebar(on bool) string {
 	return ""
 }
 
-// syncSidebar re-points the Explorer entry at the current base dir when the user
-// has it on and it isn't already there. Called on startup and after a move.
+// syncSidebar makes the navigation pane match the user's choice for the current
+// base dir. Called on startup (after the mount — see start), after a mode
+// switch (which restarts through start) and after a folder move.
 //
-// The "isn't already there" test is against our own record, not the registry:
-// see SidebarEnabled. That record is also what repairs a stale entry — a build
-// that pre-dates it has no SidebarTarget, so the first launch rewrites the keys
-// once and fixes whatever an old unpackaged install left pointing at a folder
-// that no longer exists.
+// Beside a cloud sync root the node is Windows' own, created pinned into the
+// pane with every fresh registration (a first mount, a mode switch, a move, a
+// sign-in after "start fresh"), so a recorded "off" has to be re-applied here
+// or the entry comes back. A plain restart registers the same root again and
+// leaves the flag alone (checked on a real machine). Our own entry is dropped
+// there regardless — see below.
+//
+// For a plain live folder the entry is ours, (re)written when the user has it
+// on and the record says it is not yet applied for this folder. That record,
+// not the registry, is the test — see SidebarEnabled — and it is also what
+// repairs a stale entry: a build that pre-dates it has no SidebarTarget, so the
+// first launch rewrites the keys once and fixes whatever an old unpackaged
+// install left pointing at a folder that no longer exists.
 func (a *App) syncSidebar() {
-	if !shellns.Supported() || !sidebarWanted() {
+	if !shellns.Supported() {
 		return
 	}
 	target := a.GetBaseDir()
@@ -4000,13 +4435,20 @@ func (a *App) syncSidebar() {
 			return // leave the record alone so the next launch retries
 		}
 		slog.Info("removed the duplicate navigation-pane entry; the cloud sync root provides it", "dir", target)
-		rememberSidebar(true, sidebarSyncRoot)
+		recorded, _ := sidebarChoice()
+		if recorded == nil {
+			// Never chosen: Windows shows the node, and SidebarEnabled says so.
+			rememberSidebar(true, sidebarSyncRoot)
+			return
+		}
+		a.applyCloudRootChoice(target, *recorded)
 		return
 	}
-	if d, err := config.Resolve(); err == nil {
-		if s, e := d.LoadSettings(); e == nil && s.SidebarEnabled != nil && s.SidebarTarget == target {
-			return // already applied for this folder
-		}
+	if !a.sidebarWanted() {
+		return
+	}
+	if recorded, applied := sidebarChoice(); recorded != nil && applied == target {
+		return // already applied for this folder
 	}
 	icon, err := navIconPath()
 	if err != nil {
@@ -4018,6 +4460,35 @@ func (a *App) syncSidebar() {
 		return
 	}
 	rememberSidebar(true, target)
+}
+
+// applyCloudRootChoice hides or shows the node Windows supplies for target's
+// cloud sync root so that it matches want, then records the choice. The
+// out-of-container round trip is skipped when the node already agrees: that
+// key is only ever written outside the container (by Windows, or by our task),
+// so unlike our own entry's keys a read of it from inside is not shadowed by a
+// private copy. The node can lag the registration by a moment, so it is given
+// a short while to appear before the choice is left for the next launch.
+func (a *App) applyCloudRootChoice(target string, want bool) {
+	node := cfapi.ShellSyncRootNamespaceCLSID(target)
+	for i := 0; node == "" && i < 8; i++ {
+		time.Sleep(250 * time.Millisecond)
+		node = cfapi.ShellSyncRootNamespaceCLSID(target)
+	}
+	if node == "" {
+		slog.Warn("cloud sync root has no navigation-pane node to apply the sidebar choice to", "dir", target, "shown", want)
+		return
+	}
+	if pinned, ok := shellns.CloudRootPinned(node); ok && pinned == want {
+		rememberSidebar(want, sidebarSyncRoot)
+		return
+	}
+	if err := shellns.SetCloudRootPinned(node, want); err != nil {
+		slog.Warn("could not apply the sidebar choice to the cloud folder's entry", "dir", target, "shown", want, "err", err)
+		return
+	}
+	slog.Info("applied the sidebar choice to the cloud folder's navigation-pane entry", "dir", target, "shown", want)
+	rememberSidebar(want, sidebarSyncRoot)
 }
 
 // navIconPath writes the embedded app icon to the config dir and returns its
@@ -4070,6 +4541,11 @@ func (a *App) TailLog() string {
 		if i := strings.IndexByte(s, '\n'); i >= 0 {
 			s = s[i+1:]
 		}
+	}
+	// A crash report goes to crash.log, not here: show it too, so Copy
+	// carries it (Deck #714).
+	if c := crashReportTail(filepath.Join(filepath.Dir(p), "crash.log")); c != "" {
+		s += "\n===== crash.log =====\n" + c
 	}
 	return s
 }
@@ -4173,7 +4649,7 @@ func (a *App) ReportProblem() string {
 		return err.Error()
 	}
 	revealPath(out)
-	openURL("https://github.com/otherworld-dev/Nimbo/issues/new")
+	openURL("https://github.com/otherworld-dev/Nimbo/issues/new?template=bug_report.yml")
 	return ""
 }
 
@@ -4297,22 +4773,20 @@ func (a *App) SwitchAccount(id string) string {
 	if cur, ok := st.Default(); ok && cur.ID == id {
 		return "" // already active
 	}
-	if err := st.SetDefault(id); err != nil {
+	// An account whose app password is gone from the keychain can't be shown
+	// until it signs in again, so ask for that and change nothing yet: the
+	// sign-in makes it the active account itself (account.Complete, then
+	// BeginLogin restarts the engine), and cancelling it must leave the
+	// current account shown and syncing.
+	if _, err := account.LoadSecret(id); err != nil {
+		application.InvokeAsync(a.showLogin)
+		return ""
+	}
+	if err := account.Update(d.AccountsFile(), func(s *account.Store) error { return s.SetDefault(id) }); err != nil {
 		return err.Error()
 	}
 	a.disconnectAllOnDemand()
 	a.stopEngine()
-	// Switching to an account whose app password is gone from the keychain
-	// means the user WANTS that account — ask for its sign-in directly instead
-	// of bouncing through a failing engine start plus an error message on top
-	// of the login window it would open anyway.
-	if _, err := account.LoadSecret(id); err != nil {
-		a.setStatus("Sign in again")
-		a.emit("account")
-		a.rebuildTrayMenu()
-		application.InvokeAsync(a.showLogin)
-		return ""
-	}
 	a.start(a.ctx)
 	if a.eng == nil {
 		return "couldn't start syncing for that account — check its sign-in"
@@ -4345,15 +4819,23 @@ func (a *App) RemoveAccount(id string) string {
 	if _, ok := st.Find(id); !ok {
 		return "no such account"
 	}
-	a.stopSecondary(id) // stop its background sync before removing its data
+	// Its virtual-files root goes with it: left registered, it stays in the
+	// Explorer sidebar pointing at a folder nothing syncs (GitHub #10).
+	a.unmountOnDemandFor(id)
+	a.unregisterRecordedRoot(id) // and one it had recorded but wasn't mounting
+	a.stopSecondary(id)          // stop its background sync before removing its data
 	a.acctMu.Lock()
 	delete(a.acctStatus, id)
 	a.acctMu.Unlock()
 	_ = account.DeleteSecret(id)
-	if err := st.Remove(id); err != nil {
+	if err := account.Update(d.AccountsFile(), func(s *account.Store) error { s.Remove(id); return nil }); err != nil {
 		return err.Error()
 	}
 	a.clearSyncData(d.WithAccount(id), id)
+	// Folders held back because the removed account used them too can sync
+	// again: re-ask the gate now rather than at the next start. Live mode only;
+	// in on-demand mode an account's pairs must never get live watchers.
+	a.regateAll()
 	a.emit("account")
 	return ""
 }
@@ -4372,21 +4854,37 @@ func (a *App) SignOut(clearData bool) string {
 	if !a.policyNow().AllowSignOut {
 		return "Sign out is disabled by your organisation's policy."
 	}
-	a.unmountAllOnDemand() // disconnect cloud sync roots + stop watchers
+	// Unmount only the account signing out; the others keep their roots
+	// registered (unmounting them too flattened their folders, GitHub #11).
+	if a.eng != nil {
+		a.unmountOnDemandFor(a.eng.Account.ID)
+	}
+	a.disconnectAllOnDemand()
 	a.stopEngine()
 	moreAccounts := false
 	if d, err := config.Resolve(); err == nil {
 		var accID string
-		if st, e := account.LoadStore(d.AccountsFile()); e == nil {
+		_ = account.Update(d.AccountsFile(), func(st *account.Store) error {
 			if acc, ok := st.Default(); ok {
 				accID = acc.ID
 				_ = account.DeleteSecret(acc.ID)
-				_ = st.Remove(acc.ID)
+				st.Remove(acc.ID)
 			}
 			moreAccounts = len(st.Accounts) > 0
+			return nil
+		})
+		if accID != "" {
+			// Its root, if its engine wasn't running to unmount it above.
+			a.unregisterRecordedRoot(accID)
 		}
 		if clearData {
 			a.clearSyncData(d.WithAccount(accID), accID)
+		}
+	}
+	// No account left: the live-mode sidebar entry has nothing to point at.
+	if !moreAccounts {
+		if err := shellns.Unregister(); err != nil {
+			slog.Warn("could not remove the sidebar entry after signing out", "err", err)
 		}
 	}
 	// Another account is configured: hand over to it instead of signing out of
@@ -4536,15 +5034,13 @@ func (a *App) SaveLocalAddress(addr, pin string) string {
 	if err != nil {
 		return err.Error()
 	}
-	acc, ok := st.Find(eng.Account.ID)
-	if !ok {
+	if _, ok := st.Find(eng.Account.ID); !ok {
 		return "Account not found."
 	}
 	ctx, cancel := context.WithTimeout(a.ctx, 25*time.Second)
 	defer cancel()
 	if strings.TrimSpace(addr) == "" {
-		acc.Local = nil
-		if err := st.Upsert(acc); err != nil {
+		if err := setLocalRoute(d.AccountsFile(), eng.Account.ID, nil); err != nil {
 			return err.Error()
 		}
 		if err := eng.ApplyLocalRoute(ctx, nil); err != nil {
@@ -4556,14 +5052,29 @@ func (a *App) SaveLocalAddress(addr, pin string) string {
 	if lr == nil {
 		return dto.Message
 	}
-	acc.Local = lr
-	if err := st.Upsert(acc); err != nil {
+	if err := setLocalRoute(d.AccountsFile(), eng.Account.ID, lr); err != nil {
 		return err.Error()
 	}
 	if err := eng.ApplyLocalRoute(ctx, lr); err != nil {
 		return err.Error()
 	}
 	return ""
+}
+
+// setLocalRoute records lr as the account's local network route (nil clears
+// it) and nothing else. The address test before it can run for 25 seconds, so
+// a copy of the store loaded ahead of the test is stale by the time it would
+// be saved: an account signed in meanwhile would vanish with it.
+func setLocalRoute(path, id string, lr *account.LocalRoute) error {
+	return account.Update(path, func(st *account.Store) error {
+		acc, ok := st.Find(id)
+		if !ok {
+			return fmt.Errorf("account %s is no longer configured", id)
+		}
+		acc.Local = lr
+		st.Upsert(acc)
+		return nil
+	})
 }
 
 // clearSyncData removes this device's sync setup (the pair list) and local sync
@@ -4587,6 +5098,7 @@ func (a *App) clearSyncData(d config.Dirs, accountID string) {
 		d.VFSFileIDsFile(),
 		d.VFSMountRootsFile(),
 		d.GuardStateFile(),
+		d.AccountStateFile(), // the account folder and its parked pairs
 	}
 	if accountID != "" {
 		db := d.StateDB(accountID)
@@ -4607,6 +5119,7 @@ func (a *App) onAuthLost() {
 	application.InvokeAsync(func() {
 		a.disconnectAllOnDemand()
 		a.stopEngine()
+		a.authLost.Store(true) // before the status event: the flyout re-checks NeedsLogin on it
 		a.setStatus("Sign in again")
 		a.rebuildTrayMenu()
 		notify.RaiseActionable("Sign in required", brand.Current.Name+" couldn't authenticate — please sign in again.", "action=login",
@@ -4644,7 +5157,22 @@ func (a *App) showLogin() {
 	a.loginWin.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) {
 		a.cancelLoginPoll()
 		a.loginWin = nil
+		a.setupClosed()
 	})
+}
+
+// afterStart runs fn once the Wails main loop is up. onAuthLost goes through
+// InvokeAsync, which panics before app.Run (the VM crash of 2026-08-21), and
+// the launch-time engine start runs on a goroutine that can beat Run to it.
+func (a *App) afterStart(fn func()) {
+	if a.started == nil {
+		fn()
+		return
+	}
+	go func() {
+		<-a.started
+		fn()
+	}()
 }
 
 // cancelLoginPoll stops any in-flight login-flow poll.
@@ -4660,8 +5188,17 @@ func (a *App) cancelLoginPoll() {
 
 // --- Login (first run) ---
 
-// NeedsLogin reports whether no account is configured yet.
-func (a *App) NeedsLogin() bool { return a.eng == nil }
+// NeedsLogin reports whether the app is waiting for the user to sign in: no
+// engine is running and there is no usable account — none configured (first
+// run, or the last one signed out), its app password gone from the keychain,
+// or the server turned the credentials down. A server that is only
+// unreachable is not this: that one retries by itself.
+func (a *App) NeedsLogin() bool {
+	if a.eng != nil {
+		return false
+	}
+	return a.authLost.Load() || !hasAccount()
+}
 
 // BeginLogin starts Login Flow v2: it opens the browser and polls in the
 // background, emitting "login:done" or "login:error". Returns the login URL (or
@@ -4704,16 +5241,17 @@ func (a *App) BeginLogin(server string) string {
 			return
 		}
 		d, cerr := config.Resolve()
+		var acct account.Account
 		if cerr == nil {
-			var st *account.Store
-			if st, cerr = account.LoadStore(d.AccountsFile()); cerr == nil {
-				_, cerr = account.Complete(st, creds)
-			}
+			acct, cerr = account.Complete(d.AccountsFile(), creds)
 		}
 		if cerr != nil {
 			a.app.Event.Emit("login:error", cerr.Error())
 			return
 		}
+		// The setup screen comes next and chooses the account's folder, so the
+		// start below must not mount a default one ahead of it (GitHub #11).
+		a.beginSetup(acct.ID)
 		// Adding an account while one is already syncing: tear the old engine
 		// down first — the fresh login is now the default account (Complete
 		// sets it) and start() binds to the default.
@@ -4734,6 +5272,30 @@ func (a *App) CloseLogin() {
 		a.loginWin.Close()
 		a.loginWin = nil
 	}
+	a.setupClosed()
+}
+
+// setupClosed ends the shown account's setup when the sign-in window goes. A
+// setup that was skipped or closed without choosing a folder gets the default
+// one, mounted now rather than before setup asked, which keeps what skipping
+// did before (GitHub #11). A completed setup has already ended, and a folder
+// chosen but not yet switched to (an adopt still to confirm) is left alone.
+func (a *App) setupClosed() {
+	eng := a.eng
+	if eng == nil || !a.endSetup(eng.Account.ID) {
+		return
+	}
+	// Closed while asking whether to keep a folder's files: that folder was
+	// never chosen.
+	a.restoreSetupFolder(eng)
+	if a.GetSyncMode() != "ondemand" || eng.StoredBaseDir() != "" {
+		return
+	}
+	slog.Info("setup closed without choosing a folder; using the default", "account", eng.Account.LoginName)
+	go func() {
+		a.mountAccountOnDemand()
+		a.syncSidebar()
+	}()
 }
 
 // --- First-run setup (mirrors the official client's final "Add account" step) ---
@@ -4786,8 +5348,21 @@ func (a *App) CompleteSetup(localDir, mode string) string {
 	if a.eng == nil {
 		return "not signed in"
 	}
+	// Captured first: a successful setup restarts the engine under the mode.
+	id := a.eng.Account.ID
+	msg := a.completeSetup(localDir, mode)
+	if msg == "" {
+		a.endSetup(id)
+	}
+	return msg
+}
+
+func (a *App) completeSetup(localDir, mode string) string {
 	if localDir == "" {
 		return "choose a local folder"
+	}
+	if msg := a.folderClashFor(localDir); msg != "" {
+		return msg
 	}
 	switch mode {
 	case "everything":
@@ -4804,10 +5379,14 @@ func (a *App) CompleteSetup(localDir, mode string) string {
 			return "virtual files aren't supported on this system"
 		}
 		// The account folder becomes the single whole-account virtual-files
-		// mount; SetSyncMode("ondemand") mounts it.
+		// mount; SetSyncMode("ondemand") mounts it. The scan below reads it
+		// from the account, so it is recorded now, and put back if setup ends
+		// without the switch.
+		prev := setupFolder{baseDir: a.eng.StoredBaseDir(), root: a.eng.OnDemandRoot()}
 		if err := a.eng.SetBaseDir(localDir); err != nil {
 			return err.Error()
 		}
+		a.holdSetupFolder(a.eng.Account.ID, prev)
 		// A folder that already holds files (e.g. the official client's old
 		// sync folder) gets the adopt flow here too, not just in Settings: the
 		// summary JSON goes back to the setup UI, which shows the same confirm
@@ -4817,13 +5396,15 @@ func (a *App) CompleteSetup(localDir, mode string) string {
 		var sum adoptSummary
 		if json.Unmarshal([]byte(raw), &sum) == nil {
 			if sum.Error != "" && !folderEmpty(localDir) {
+				a.restoreSetupFolder(a.eng)
 				return sum.Error
 			}
 			if sum.Keep+sum.Conflict+sum.Upload+sum.Replace > 0 {
-				return raw
+				return raw // the folder stays provisional until this is answered
 			}
 		}
 		a.pendingAdopt = nil
+		a.takeSetupFolder(a.eng.Account.ID) // switching now: the folder is chosen
 		return a.SetSyncMode("ondemand")
 	default:
 		return "unknown setup mode"
@@ -4887,18 +5468,33 @@ func (a *App) GetBaseDir() string {
 			}
 		}
 	}
-	if d, err := config.Resolve(); err == nil {
-		if s, _ := d.LoadSettings(); s.BaseDir != "" {
-			return s.BaseDir
+	// The account's own folder. Per account: a single global one handed a new
+	// account the first account's folder (GitHub #11).
+	if a.eng != nil {
+		if dir := a.eng.StoredBaseDir(); dir != "" {
+			return dir
 		}
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Nextcloud")
+	// None chosen yet: a default no other account uses.
+	return a.suggestedFolder()
 }
+
+// SetBaseDir sets the active account's folder. It refuses a folder another
+// account uses; the refusal is shown as a dialog because this binding returns
+// nothing (changing that would mean regenerating the Wails bindings).
 func (a *App) SetBaseDir(dir string) {
-	if a.eng != nil {
-		_ = a.eng.SetBaseDir(dir)
+	if a.eng == nil {
+		return
 	}
+	if msg := a.folderClashFor(dir); msg != "" {
+		slog.Warn("refused an account folder that another account uses", "dir", dir)
+		if a.app != nil {
+			a.app.Dialog.Warning().SetTitle("Folder already in use").SetMessage(msg).Show()
+		}
+		return
+	}
+	_ = a.eng.SetBaseDir(dir)
+	a.regateAll()
 }
 
 // healBaseDir repairs a stored baseDir that no longer matches the whole-account
@@ -4968,6 +5564,9 @@ type PairDTO struct {
 	FreezeReason string `json:"freezeReason,omitempty"`
 	// FreezeSample is a few affected paths, so the user can judge the trip.
 	FreezeSample []string `json:"freezeSample,omitempty"`
+	// HeldReason says why this folder is not syncing because another account
+	// uses it (GitHub #11); "" when it syncs normally.
+	HeldReason string `json:"heldReason,omitempty"`
 }
 
 // GetPairs returns configured sync pairs.
@@ -4979,7 +5578,7 @@ func (a *App) GetPairs() []PairDTO {
 	views := a.eng.FrozenViews()
 	out := make([]PairDTO, 0, len(pairs))
 	for _, p := range pairs {
-		d := PairDTO{LocalDir: p.LocalDir, RemoteRoot: p.RemoteRoot, Excludes: p.Excludes}
+		d := PairDTO{LocalDir: p.LocalDir, RemoteRoot: p.RemoteRoot, Excludes: p.Excludes, HeldReason: a.eng.HeldReason(p.LocalDir)}
 		if v, ok := views[p.LocalDir]; ok {
 			d.Frozen = v.Frozen
 			d.FreezeReason = v.FreezeReason
@@ -5006,6 +5605,15 @@ func (a *App) SyncedRemotes() []string {
 // AddSyncFolder / RemoveSyncFolder add or remove a synced folder.
 func (a *App) AddSyncFolder(remotePath string) {
 	if a.eng != nil {
+		// The same path the engine will use (<account folder>/<remote path>).
+		local := filepath.Join(a.eng.BaseDir(), filepath.FromSlash(strings.Trim(remotePath, "/")))
+		if msg := a.folderClashFor(local); msg != "" {
+			slog.Warn("refused a sync folder that another account uses", "dir", local)
+			if a.app != nil {
+				a.app.Dialog.Warning().SetTitle("Folder already in use").SetMessage(msg).Show()
+			}
+			return
+		}
 		_ = a.eng.AddSyncFolder(remotePath)
 		a.rebuildTrayMenu()
 	}
@@ -5017,6 +5625,9 @@ func (a *App) AddSyncPair(localDir, remotePath string) string {
 	if a.eng == nil {
 		return "not signed in"
 	}
+	if msg := a.folderClashFor(localDir); msg != "" {
+		return msg
+	}
 	if err := a.eng.AddSyncPair(localDir, remotePath); err != nil {
 		return err.Error()
 	}
@@ -5026,6 +5637,7 @@ func (a *App) AddSyncPair(localDir, remotePath string) string {
 	if strings.Trim(remotePath, "/") == "" {
 		_ = a.eng.SetBaseDir(localDir)
 	}
+	a.regateAll()
 	a.rebuildTrayMenu()
 	return ""
 }
@@ -5119,11 +5731,19 @@ func (a *App) RemoveSyncFolder(remotePath string, deleteLocal bool) {
 			}
 		}
 	}
+	if msg := localDeleteBlocked(a.eng, localDir, deleteLocal); msg != "" {
+		slog.Warn("refused deleting the files of a folder another account uses", "dir", localDir)
+		if a.app != nil {
+			a.app.Dialog.Warning().SetTitle("Files not deleted").SetMessage(msg).Show()
+		}
+		return
+	}
 	if err := a.eng.ForgetSyncFolder(remotePath, deleteLocal); err != nil {
 		slog.Warn("could not remove the sync folder", "remote", remotePath, "err", err)
 	} else if localDir != "" {
 		a.eng.DisableStatusIcons(localDir)
 	}
+	a.regateAll() // another account's folder held back by this one may sync now
 	a.rebuildTrayMenu()
 }
 
@@ -5147,6 +5767,9 @@ func (a *App) RemoveExclude(localDir, rel string) {
 func (a *App) DeselectFolder(localDir, rel string, deleteLocal bool) string {
 	if a.eng == nil {
 		return "not signed in"
+	}
+	if msg := localDeleteBlocked(a.eng, localDir, deleteLocal); msg != "" {
+		return msg
 	}
 	if err := a.eng.DeselectFolder(localDir, rel, deleteLocal); err != nil {
 		return err.Error()

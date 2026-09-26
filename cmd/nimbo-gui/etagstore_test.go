@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -97,5 +98,62 @@ func TestMoveManyKeepsABaselineWithNowhereToGo(t *testing.T) {
 	s.moveMany([][2]string{{"d/x.txt", ""}, {"d/x.txt", "/"}})
 	if got := s.get("d/x.txt"); got != "e-x" {
 		t.Errorf("get(%q) = %q, want e-x", "d/x.txt", got)
+	}
+}
+
+// Content keys (GitHub #7) live beside the ETag baselines and must follow them
+// through every move and forget, and survive a restart: a key left behind at
+// an old path, or lost, costs a false conflict the next time a colleague locks
+// the file.
+func TestEtagStoreContentKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vfs-etags.json")
+	s := newEtagStore(path)
+	s.setMany(map[string]string{"a.txt": "e1", "d/b.txt": "e2", "d/c.txt": "e3"})
+	s.setContentKeys(map[string]string{"a.txt": "k1", "d/b.txt": "k2", "d/c.txt": "k3"})
+
+	if got := s.contentKey("/a.txt"); got != "k1" {
+		t.Fatalf("contentKey(a.txt) = %q, want k1", got)
+	}
+	s.setContentKeys(map[string]string{"a.txt": ""}) // "" clears
+	if got := s.contentKey("a.txt"); got != "" {
+		t.Errorf("cleared key still %q", got)
+	}
+	s.moveMany([][2]string{{"d/b.txt", "e/b.txt"}})
+	if s.contentKey("d/b.txt") != "" || s.contentKey("e/b.txt") != "k2" {
+		t.Errorf("move did not carry the key: old=%q new=%q", s.contentKey("d/b.txt"), s.contentKey("e/b.txt"))
+	}
+	// A move onto a path with an old key, from one with none, must not leave
+	// the old key describing the arriving file.
+	s.setMany(map[string]string{"n.txt": "en", "old.txt": "eo"})
+	s.setContentKeys(map[string]string{"old.txt": "k-old"})
+	s.moveMany([][2]string{{"n.txt", "old.txt"}})
+	if got := s.contentKey("old.txt"); got != "" {
+		t.Errorf("move from a keyless source left the destination's old key %q", got)
+	}
+	s.del("e/b.txt")
+	if s.contentKey("e/b.txt") != "" {
+		t.Error("del left the key behind")
+	}
+	s.setContentKeys(map[string]string{"d/x.txt": "kx"})
+	s.delUnder("d")
+	if s.contentKey("d/c.txt") != "" || s.contentKey("d/x.txt") != "" {
+		t.Error("delUnder left keys behind")
+	}
+	s.setContentKeys(map[string]string{"z.txt": "kz"})
+
+	re := newEtagStore(path)
+	if re.contentKey("z.txt") != "kz" {
+		t.Errorf("key not persisted: %q", re.contentKey("z.txt"))
+	}
+	// The ETag file keeps its old format (a flat path -> ETag map), so an older
+	// Nimbo that ignores the key file still reads its baselines.
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var flat map[string]string
+	if err := json.Unmarshal(b, &flat); err != nil || flat["z.txt"] != "" || len(flat) == 0 {
+		t.Errorf("ETag file no longer a flat map (err=%v): %s", err, b)
 	}
 }

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Help and how-to
+    url: https://www.nimbosync.com/help/
+    about: Installing, signing in, file modes, push, troubleshooting. Most questions are answered here.

@@ -2,10 +2,12 @@ package agent
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/otherworld/nimbo/internal/activity"
 	"github.com/otherworld/nimbo/internal/transfer"
 )
 
@@ -128,13 +130,30 @@ func movedAsideToast(root string, rels []string) (title, msg string) {
 // noteBusy records an upload waiting on a program, so no pass claims "Up to
 // date" while it waits: the pass that met it set "Waiting", and the next quiet
 // pass overwrote it within minutes (Deck #691).
-func (e *Engine) noteBusy(abs, rel string) {
+func (e *Engine) noteBusy(abs, rel string) (first bool) {
 	e.busyMu.Lock()
 	if e.busy == nil {
 		e.busy = make(map[string]string)
 	}
+	_, had := e.busy[abs]
 	e.busy[abs] = rel
 	e.busyMu.Unlock()
+	return !had
+}
+
+// noteWaiting records a file held back because a program has it (Outlook and
+// a .pst). It is not a failure: the hold is working as meant, the status line
+// says Waiting and the file goes up once the program lets go. Recorded as an
+// error it showed as a red "failed" row (Deck #714). One neutral "waiting" row
+// per wait, not one for every pass that meets it again.
+func (e *Engine) noteWaiting(localDir, abs, rel string) {
+	if !e.noteBusy(abs, rel) {
+		return
+	}
+	slog.Info("waiting for a program to let go of a file", "path", rel)
+	if e.recorder != nil {
+		e.recorder.Add(activity.Event{Local: localDir, Path: rel, Kind: "waiting"})
+	}
 }
 
 // clearBusy drops abs once its upload has gone, or it no longer exists.

@@ -20,15 +20,16 @@ func IsDehydrated(os.FileInfo) bool { return false }
 // PlaceholderInfo mirrors the Windows type so cross-platform code referencing it
 // (e.g. the vfs stub) compiles.
 type PlaceholderInfo struct {
-	Name      string
-	Size      int64
-	IsDir     bool
-	ModTime   time.Time
-	Identity  []byte
-	ETag      string
-	FileID    string
-	MountRoot bool
-	Encrypted bool
+	Name       string
+	Size       int64
+	IsDir      bool
+	ModTime    time.Time
+	Identity   []byte
+	ETag       string
+	UploadTime int64
+	FileID     string
+	MountRoot  bool
+	Encrypted  bool
 }
 
 // Debug is a diagnostic hook (used on Windows); unused here.
@@ -98,6 +99,9 @@ func RegisterStatusRoot(string) error { return errors.New("cloud sync roots are 
 // ShellSyncRootRegistered is always false off Windows: there is no Explorer.
 func ShellSyncRootRegistered(string) bool { return false }
 
+// ShellSyncRootNamespaceCLSID is always empty off Windows.
+func ShellSyncRootNamespaceCLSID(string) string { return "" }
+
 // IsPlaceholder is always false off Windows.
 func IsPlaceholder(string) (bool, error) { return false, nil }
 
@@ -123,3 +127,21 @@ func PlaceholderModified(string) (bool, error) {
 
 // SetInSync is unavailable off Windows (no cloud placeholders to mark).
 func SetInSync(string) error { return errors.New("on-demand files are Windows-only") }
+
+// NimboShellSyncRoots lists nothing on non-Windows platforms.
+func NimboShellSyncRoots() []ShellSyncRoot { return nil }
+
+// UnregisterShellSyncRootByID is a no-op on non-Windows platforms.
+func UnregisterShellSyncRootByID(string, string) {}
+
+// UnregisterShellSyncRoot is a no-op on non-Windows platforms.
+func UnregisterShellSyncRoot(string) {}
+
+// MarkInSync is unavailable off Windows (no cloud placeholders to mark).
+func MarkInSync(string, []byte) error { return errors.New("on-demand files are Windows-only") }
+
+// SweepDirsInSync marks nothing off Windows (no cloud placeholders).
+func SweepDirsInSync(string, time.Duration) int { return 0 }
+
+// SweepSettlePins settles nothing off Windows (no cloud placeholders).
+func SweepSettlePins(string, time.Duration) int { return 0 }

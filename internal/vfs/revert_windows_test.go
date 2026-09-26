@@ -15,13 +15,14 @@ import (
 // fakePlaceholders marks rel paths as placeholders (hydrated unless in dehydrated).
 func fakePlaceholders(t *testing.T, hydrated, dehydrated map[string]bool) {
 	t.Helper()
+	stopFinishedWatchers(t)
 	origP, origR := cfIsPlaceholder, cfRevertPlaceholder
 	cfIsPlaceholder = func(fi os.FileInfo, full string) bool {
 		rel := filepath.ToSlash(filepath.Base(full)) // test trees are flat or use full match below
 		_ = rel
 		return hydrated[filepath.ToSlash(full)] || dehydrated[filepath.ToSlash(full)]
 	}
-	t.Cleanup(func() { cfIsPlaceholder, cfRevertPlaceholder = origP, origR })
+	t.Cleanup(func() { stopTestWatchers(t); cfIsPlaceholder, cfRevertPlaceholder = origP, origR })
 }
 
 func TestScanRevertClassifies(t *testing.T) {
