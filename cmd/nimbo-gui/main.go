@@ -40,10 +40,6 @@ var channel = "direct"
 // isStoreBuild reports whether this is the Microsoft Store distribution build.
 func isStoreBuild() bool { return channel == "store" }
 
-// wailsLogger is the logger handed to Wails: Nimbo's own, with Wails' lines
-// marked src=wails. Call it after the log is set up.
-func wailsLogger() *slog.Logger { return slog.Default().With("src", "wails") }
-
 // hasAccount reports whether an account is configured AND its app password is
 // still in the keychain. An account whose secret has vanished (wiped store,
 // profile trouble) must take the sign-in path here: starting the engine can
