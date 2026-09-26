@@ -5,6 +5,13 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ## [0.2.0] - 2026-09-26
 
+Mostly about file locking and multiple accounts. On-demand mode now takes and
+respects locks the way live mode does, locks are let go of when Nimbo quits, and a
+colleague opening a document no longer makes everyone else download it again or
+end up with a conflicted copy. Each account now gets a folder of its own, large
+uploads and downloads no longer hold up the rest of the sync, and there are help
+pages linked from the app along with a way to sign in and quit when signed out.
+
 ### Added
 
 - In on-demand mode, opening a document in Word or LibreOffice now locks it on the
