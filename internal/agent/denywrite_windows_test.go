@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/otherworld/nimbo/internal/transport"
 )
 
 // The whole feature rests on this: while the handle is held, another writer must
@@ -99,5 +101,37 @@ func TestHoldDenyWriteAllowsConcurrentReaders(t *testing.T) {
 	}
 	if string(b) != "payload" {
 		t.Errorf("read %q, want payload", b)
+	}
+}
+
+// Windows only: the lockout is a deny-write handle, which Unix has no
+// equivalent of (denywrite_other.go is a no-op).
+//
+// BeforeReplace's engine half: the deny-write handle goes, so the watcher can
+// dehydrate the file, while the warning (the owner file) stays until the
+// colleague's lock is gone.
+func TestReleaseLockoutHandleLetsWritersIn(t *testing.T) {
+	e := newLockoutEngine(t)
+	mount := t.TempDir()
+	doc := filepath.Join(mount, "Budget.xlsx")
+	if err := os.WriteFile(doc, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Budget.xlsx", Lock: &transport.LockInfo{Owner: "bob"}}})
+	t.Cleanup(func() { e.NoteRemoteLocks(mount, "", "", []transport.Entry{{Path: "Budget.xlsx"}}) })
+	if f, err := os.OpenFile(doc, os.O_RDWR, 0); err == nil {
+		f.Close()
+		t.Fatal("the lockout did not hold the document (a writer got in)")
+	}
+
+	e.ReleaseLockoutHandle(doc)
+
+	f, err := os.OpenFile(doc, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("writer still refused after the release: %v", err)
+	}
+	f.Close()
+	if _, err := os.Stat(filepath.Join(mount, "~$Budget.xlsx")); err != nil {
+		t.Errorf("the warning went with the handle: %v", err)
 	}
 }

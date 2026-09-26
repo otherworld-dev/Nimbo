@@ -107,10 +107,10 @@ func TestMigrateAccountFolderKeepsAnExistingAccountFolder(t *testing.T) {
 // default account must not claim it; it gets no folder and picks one later.
 func TestMigrateAccountFolderSkipsAnotherAccountsFolder(t *testing.T) {
 	root := Dirs{Config: t.TempDir(), Data: t.TempDir()}
-	_ = root.SaveSettings(Settings{BaseDir: `D:\B`})
+	_ = root.SaveSettings(Settings{BaseDir: filepath.FromSlash("/B")})
 	a, b := root.WithAccount("a"), root.WithAccount("b")
-	_ = a.SavePairs([]SyncPair{{LocalDir: `C:\Users\x\Nextcloud\Photos`, RemoteRoot: "Photos"}})
-	_ = b.SavePairs([]SyncPair{{LocalDir: `D:\B\Work`, RemoteRoot: "Work"}})
+	_ = a.SavePairs([]SyncPair{{LocalDir: filepath.FromSlash("/Users/x/Nextcloud/Photos"), RemoteRoot: "Photos"}})
+	_ = b.SavePairs([]SyncPair{{LocalDir: filepath.FromSlash("/B/Work"), RemoteRoot: "Work"}})
 
 	a.MigrateAccountFolder([]string{"b"})
 
