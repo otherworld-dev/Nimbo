@@ -1,0 +1,56 @@
+# Builds and tests Nimbo on every push to GitHub. Three independent jobs:
+# windows (the product), linux (core + CLI + GUI build), android (the app).
+name: CI
+
+on:
+  push:
+    branches: [dev, main, "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # The GUI is built with cgo, like package.ps1 does. The runner image
+      # normally ships MinGW gcc; install it only if it's missing.
+      - name: C compiler
+        shell: pwsh
+        run: |
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            choco install mingw --no-progress -y
+            "C:\ProgramData\mingw64\mingw64\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          }
+
+      - name: Show gcc
+        run: gcc --version
+
+      # unsafeptr is off: internal/cfapi reads Cloud Files callback structs
+      # from raw addresses Windows hands us, which that analyzer always flags.
+      - name: Vet
+        run: go vet -unsafeptr=false ./...
+
+      # Live Cloud Files tests skip themselves unless NIMBO_CFAPI_LIVE is set.
+      - name: Test
+        run: go test ./...
+
+      - name: Build CLI
+        run: go build -o bin/nimbo.exe ./cmd/nimbo
+
+      - name: Build GUI
+        env:
+          CGO_ENABLED: "1"
+        run: go build -ldflags "-H windowsgui" -o bin/nimbo-gui.exe ./cmd/nimbo-gui
