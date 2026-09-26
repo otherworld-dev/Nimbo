@@ -106,6 +106,7 @@ func (s *goawayServer) handle(raw net.Conn) {
 		case *http2.MetaHeadersFrame:
 			if f.StreamEnded() {
 				end(f.StreamID)
+				hangUp(tc, fr)
 				return
 			}
 		case *http2.DataFrame:
@@ -115,8 +116,25 @@ func (s *goawayServer) handle(raw net.Conn) {
 			}
 			if f.StreamEnded() {
 				end(f.StreamID)
+				hangUp(tc, fr)
 				return
 			}
+		}
+	}
+}
+
+// hangUp ends a connection the way a real server does: close_notify, then read
+// until the client closes its side. Closing the socket at once, with the
+// client's WINDOW_UPDATE or SETTINGS ack still unread, makes Windows reset the
+// connection, and the reset can overtake the last frame written (the GOAWAY or
+// the 201), failing the client with "connection aborted/forcibly closed"
+// instead (~1 run in 30 locally, reliably on a CI runner).
+func hangUp(tc *tls.Conn, fr *http2.Framer) {
+	_ = tc.CloseWrite()
+	_ = tc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		if _, err := fr.ReadFrame(); err != nil {
+			return
 		}
 	}
 }
