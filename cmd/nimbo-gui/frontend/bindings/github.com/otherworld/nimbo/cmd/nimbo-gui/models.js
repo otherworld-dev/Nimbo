@@ -1140,6 +1140,101 @@ export class HeaderInfo {
 }
 
 /**
+ * LaneEntryDTO is one large transfer for the Status window and the flyout.
+ */
+export class LaneEntryDTO {
+    /**
+     * Creates a new LaneEntryDTO instance.
+     * @param {Partial<LaneEntryDTO>} [$$source = {}] - The source object to create the LaneEntryDTO.
+     */
+    constructor($$source = {}) {
+        if (!("account" in $$source)) {
+            /**
+             * set when several accounts are signed in
+             * @member
+             * @type {string}
+             */
+            this["account"] = "";
+        }
+        if (!("path" in $$source)) {
+            /**
+             * relative to its sync folder, slash-separated
+             * @member
+             * @type {string}
+             */
+            this["path"] = "";
+        }
+        if (!("abs" in $$source)) {
+            /**
+             * local path; what the Lane* methods take
+             * @member
+             * @type {string}
+             */
+            this["abs"] = "";
+        }
+        if (!("dir" in $$source)) {
+            /**
+             * "up" or "down"
+             * @member
+             * @type {string}
+             */
+            this["dir"] = "";
+        }
+        if (!("size" in $$source)) {
+            /**
+             * @member
+             * @type {number}
+             */
+            this["size"] = 0;
+        }
+        if (!("doneBytes" in $$source)) {
+            /**
+             * moved by the current attempt
+             * @member
+             * @type {number}
+             */
+            this["doneBytes"] = 0;
+        }
+        if (!("state" in $$source)) {
+            /**
+             * "running", "waiting", "paused" or "setaside"
+             * @member
+             * @type {string}
+             */
+            this["state"] = "";
+        }
+        if (!("position" in $$source)) {
+            /**
+             * 1-based place in the queue, for waiting ones
+             * @member
+             * @type {number}
+             */
+            this["position"] = 0;
+        }
+        if (!("until" in $$source)) {
+            /**
+             * set aside until (RFC 3339); "" = until resumed
+             * @member
+             * @type {string}
+             */
+            this["until"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new LaneEntryDTO instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {LaneEntryDTO}
+     */
+    static createFrom($$source = {}) {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new LaneEntryDTO(/** @type {Partial<LaneEntryDTO>} */($$parsedSource));
+    }
+}
+
+/**
  * LimitsDTO is the bandwidth configuration (KiB/s; 0 = unlimited).
  */
 export class LimitsDTO {

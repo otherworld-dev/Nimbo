@@ -234,6 +234,8 @@ func (a *App) start(ctx context.Context) {
 			a.app.Event.Emit("progress", toProgressDTO(p))
 		}
 	})
+	// The large-file queue changed (Status → Large files, the flyout's line).
+	eng.SetLaneFunc(func() { a.emit("lane") })
 	// Desktop toasts for conflicts, can't-sync files and sync errors (subject to
 	// the user's notifications preference).
 	eng.SetToastFunc(notify.Toast)
@@ -384,6 +386,7 @@ func (a *App) startSecondaries(ctx context.Context) {
 		runCtx, cancel := context.WithCancel(ctx)
 		id := ac.ID
 		eng.SetStatusFunc(func(s string) { a.recordAcctStatus(id, s); a.emit("account") })
+		eng.SetLaneFunc(func() { a.emit("lane") })
 		eng.SetToastFunc(notify.Toast)
 		eng.SetAuthLostFunc(func() {
 			// Only this account's sync stops — don't sign the whole app out.
@@ -2485,10 +2488,7 @@ func (a *App) PauseUntilTomorrow() {
 		return
 	}
 	now := time.Now()
-	t := time.Date(now.Year(), now.Month(), now.Day(), 8, 0, 0, 0, now.Location())
-	if !t.After(now) {
-		t = t.Add(24 * time.Hour)
-	}
+	t := tomorrowMorning(now)
 	a.eachEngine(func(e *agent.Engine) { e.PauseFor(t.Sub(now)) })
 	a.rebuildTrayMenu()
 }
