@@ -2550,6 +2550,41 @@ func (e *Engine) progAddTotal(files int, bytes int64) {
 	e.emitProgress()
 }
 
+// progRetract takes back files/bytes previously added to the burst's totals
+// (progStart/progAddTotal), and sentBytes previously added to progBytes (the
+// done-so-far counter), for a job leaving the burst without finishing: a
+// large file set aside mid-sync (lanejobs.go) still has an unknown fate —
+// the re-plan that follows may find nothing to do — so its share of the
+// progress bar ends rather than counting toward a total it may never reach.
+// A no-op once the burst itself has ended (progRuns == 0): there is nothing
+// left to retract from. Clamped at 0 so a race between this and another
+// update can never take a total negative.
+func (e *Engine) progRetract(files int, bytes, sentBytes int64) {
+	e.progMu.Lock()
+	if e.progRuns > 0 {
+		e.prog.Total -= files
+		if e.prog.Total < 0 {
+			e.prog.Total = 0
+		}
+		e.prog.TotalBytes -= bytes
+		if e.prog.TotalBytes < 0 {
+			e.prog.TotalBytes = 0
+		}
+		for {
+			cur := e.progBytes.Load()
+			next := cur - sentBytes
+			if next < 0 {
+				next = 0
+			}
+			if e.progBytes.CompareAndSwap(cur, next) {
+				break
+			}
+		}
+	}
+	e.progMu.Unlock()
+	e.emitProgress()
+}
+
 // progEnd marks one burst run done; the last one out clears progress.
 func (e *Engine) progEnd() {
 	e.progMu.Lock()

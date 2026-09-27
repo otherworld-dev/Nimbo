@@ -505,3 +505,79 @@ func TestALateOnParkAfterDoneDoesNothing(t *testing.T) {
 	}
 	e.progEnd() // balance the manual progStart above
 }
+
+// Finding A (Task 3 review, fix round 1): setting a running lane upload
+// aside must retract its share of the burst's totals, or the flyout's % and
+// ETA stay computed against a file that has stopped counting toward Done and
+// will never reach Total (the #702 spec: a set-aside file's share of the
+// progress bar ends).
+func TestSettingALaneUploadAsideDropsItsShareOfTheTotals(t *testing.T) {
+	_, g, e, p := lanePair(t, "PUT", "D/big.bin")
+	writeLocal(t, p.LocalDir, "D/big.bin", bigBody)
+	var err error
+	returnsSoon(t, "the pass", func() { _, err = e.SyncOnce(context.Background(), p) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the large transfer to start", g.hasStarted)
+	abs := filepath.Join(p.LocalDir, "D", "big.bin")
+
+	e.progStart(1, 0) // a sentinel burst: keeps progRuns > 0 across the set-aside
+	t.Cleanup(e.progEnd)
+	before := e.Progress()
+	if !e.LaneSetAside(abs, time.Time{}) {
+		t.Fatal("LaneSetAside refused the running upload")
+	}
+	waitFor(t, "the totals to drop by the set-aside file's share", func() bool {
+		p := e.Progress()
+		return p.Total == before.Total-1 && p.TotalBytes == before.TotalBytes-int64(len(bigBody))
+	})
+	// Give a wrong retraction (e.g. one that fires twice, or drifts) a chance
+	// to show up before declaring it settled.
+	time.Sleep(50 * time.Millisecond)
+	after := e.Progress()
+	if after.Total != before.Total-1 || after.TotalBytes != before.TotalBytes-int64(len(bigBody)) {
+		t.Fatalf("Progress = %+v, want Total=%d TotalBytes=%d", after, before.Total-1, before.TotalBytes-int64(len(bigBody)))
+	}
+}
+
+// Finding B (Task 3 review, fix round 1): done(errLaneUnparked) must clear
+// inflight itself, because onPark can lose the race to done (see
+// TestALateOnParkAfterDoneDoesNothing) — a timer whose until is already
+// past, or a quick LaneResume, can call done before the lane ever gets
+// around to calling onPark for the same job. If nothing else clears it and
+// the re-plan that follows finds nothing to do (the file was deleted, or
+// already matches), an in-sync file would show the syncing overlay forever.
+func TestDoneUnparkedClearsInflightEvenIfOnParkNeverRuns(t *testing.T) {
+	e, _ := newHookEngine(t, "http://example.invalid")
+	p := Pair{LocalDir: t.TempDir()}
+	pk := PairKey(p.LocalDir, p.RemoteRoot)
+	abs := filepath.Join(p.LocalDir, "D", "big.bin")
+
+	e.SetPaused(true) // transferLane() below creates the lane paused: the job queues, never runs
+	if !e.sendToLane(p, pk, engine.Action{Kind: engine.ActUpload, Path: "D/big.bin"}, 8<<10, nil) {
+		t.Fatal("sendToLane refused the job")
+	}
+	l := e.transferLane()
+	l.mu.Lock()
+	j := l.queue[0]
+	l.mu.Unlock()
+	if !inflightOf(e, abs) {
+		t.Fatal("sendToLane did not mark the path inflight")
+	}
+
+	j.done(errLaneUnparked) // onPark never runs: nothing else may clear inflight
+	if inflightOf(e, abs) {
+		t.Fatal("done(errLaneUnparked) left the path marked inflight")
+	}
+
+	// A late onPark, arriving after all, must still be the no-op ruling 1
+	// requires — not because it is needed here (done already cleared
+	// inflight), but to confirm it doesn't reach back and touch a fresh
+	// job's state that took the path over meanwhile.
+	e.markInflight(abs, true)
+	j.onPark()
+	if !inflightOf(e, abs) {
+		t.Fatal("a late onPark cleared a fresh job's inflight mark")
+	}
+}

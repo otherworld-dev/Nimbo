@@ -93,6 +93,22 @@ func (e *Engine) sendToLane(p Pair, pk string, a engine.Action, size int64, remo
 	// leave (Resume, its time, a stop) before or after onPark has run.
 	var endOnce sync.Once
 	end := func() { endOnce.Do(e.progEnd) }
+	// parkEnd is end's park-path sibling: it additionally retracts this job's
+	// share of the burst's totals (the size progStart added below, and
+	// whatever it had sent of it) before ending its progress run, so a
+	// set-aside file's slice of the progress bar ends rather than counting
+	// toward a total it may never reach (the re-plan that follows can find
+	// nothing to do). It shares endOnce with end, so whichever of the two
+	// runs first is the only one that does anything: a job that finishes or
+	// is stopped normally must never have its totals retracted, and a job
+	// already parked must never be double-ended when it later leaves for
+	// real (see laneDone's errLaneUnparked case).
+	parkEnd := func() {
+		endOnce.Do(func() {
+			e.progRetract(1, size, j.sent.Load())
+			e.progEnd()
+		})
+	}
 	// left is set by done, before laneDone runs, so a late onPark (the lane
 	// can call it AFTER done: a concurrent unpark/stop/timer can take the job
 	// out from under exec() between it releasing the lock and it calling
@@ -106,7 +122,7 @@ func (e *Engine) sendToLane(p Pair, pk string, a engine.Action, size int64, remo
 		if left.Load() {
 			return
 		}
-		e.laneParked(abs, a, end)
+		e.laneParked(abs, a, parkEnd)
 	}
 	j.done = func(err error) {
 		left.Store(true)
@@ -172,6 +188,18 @@ func (e *Engine) laneDone(p Pair, pk string, a engine.Action, scan map[string]en
 	abs := filepath.Join(p.LocalDir, filepath.FromSlash(a.Path))
 	switch {
 	case errors.Is(err, errLaneUnparked):
+		// onPark can lose the race to done (see the left guard above): a
+		// timer whose until is already past, or a quick Resume, can call
+		// done(errLaneUnparked) before the lane ever gets around to calling
+		// onPark for this job. So this can't rely on onPark having already
+		// cleared inflight and retaken the lock warning — it must do both
+		// itself, same as errLaneStopped below, or a file whose re-plan finds
+		// nothing to do would show the syncing overlay forever. Both are
+		// idempotent: a harmless repeat if onPark got there first.
+		e.markInflight(abs, false)
+		if e.lockWarn != nil {
+			e.lockWarn.retake(abs)
+		}
 		slog.Info("large transfer back from being set aside", "path", a.Path, "op", a.Kind.String())
 		e.nudgePath(p.LocalDir, p.RemoteRoot, abs)
 	case errors.Is(err, errLaneStopped):
