@@ -192,6 +192,7 @@ type Engine struct {
 	progStop    chan struct{} // stops the speed sampler
 	progStartAt time.Time     // burst start, for a stable average-rate ETA
 	onProgress  func(SyncProgress)
+	onLane      func() // told when the large-file lane changes (queue view); see SetLaneFunc
 
 	onToast      func(title, message, link string) // desktop toasts (GUI sets this)
 	encMu        sync.Mutex

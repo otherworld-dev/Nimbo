@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/otherworld/nimbo/internal/engine"
 )
 
 // gatedDAV wraps fakeDAV so a transfer of one path hangs until open is
@@ -312,4 +314,194 @@ func TestStoppingAFoldersWatcherStopsItsLaneTransfers(t *testing.T) {
 		t.Fatalf("lane still holds %d for a folder that stopped syncing", n)
 	}
 	waitFor(t, "the upload to be cancelled", g.wasCancelled)
+}
+
+func progRunsOf(e *Engine) int {
+	e.progMu.Lock()
+	defer e.progMu.Unlock()
+	return e.progRuns
+}
+
+// Set aside mid-upload: the upload stops, the status says so, a pass leaves
+// the file alone, and Resume takes it out of the lane for a fresh pass, which
+// then uploads it. The progress burst ends once, not twice.
+func TestSettingALaneUploadAsideStopsItAndResumeReplansIt(t *testing.T) {
+	f, g, e, p := lanePair(t, "PUT", "D/big.bin")
+	writeLocal(t, p.LocalDir, "D/big.bin", bigBody)
+	var err error
+	returnsSoon(t, "the pass", func() { _, err = e.SyncOnce(context.Background(), p) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the large transfer to start", g.hasStarted)
+	abs := filepath.Join(p.LocalDir, "D", "big.bin")
+
+	ents := e.LaneEntries()
+	if len(ents) != 1 || ents[0].State != "running" || !ents[0].Upload || ents[0].Size != int64(len(bigBody)) ||
+		ents[0].Path != "D/big.bin" || ents[0].LocalDir != p.LocalDir {
+		t.Fatalf("entries = %+v", ents)
+	}
+
+	e.progStart(1, 0) // a sentinel burst: a second progEnd would take it away
+	t.Cleanup(e.progEnd)
+	if !e.LaneSetAside(abs, time.Time{}) {
+		t.Fatal("LaneSetAside refused the running upload")
+	}
+	waitFor(t, "the upload to stop", g.wasCancelled)
+	waitFor(t, "the set-aside status", func() bool { return statusOf(e) == "1 large file set aside" })
+	if n := progRunsOf(e); n != 1 {
+		t.Fatalf("progress runs = %d after setting aside, want 1 (the sentinel)", n)
+	}
+	if ents := e.LaneEntries(); len(ents) != 1 || ents[0].State != "setaside" {
+		t.Fatalf("entries after set aside = %+v", ents)
+	}
+
+	returnsSoon(t, "a pass over the set-aside file", func() { _, err = e.SyncPaths(context.Background(), p, []string{"D/big.bin"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := g.hits.Load(); n != 1 {
+		t.Fatalf("a pass started the set-aside upload again (%d starts)", n)
+	}
+
+	if !e.LaneResume(abs) {
+		t.Fatal("LaneResume refused the set-aside upload")
+	}
+	if n := progRunsOf(e); n != 1 {
+		t.Fatalf("progress runs = %d after resume, want 1: the job's burst ended twice", n)
+	}
+	if e.transferLane().count() != 0 || e.transferLane().parkedCount() != 0 {
+		t.Fatal("the lane still holds the file after Resume")
+	}
+	waitFor(t, "the status to move on", func() bool { return !strings.Contains(statusOf(e), "large file") })
+
+	g.open()
+	if _, err := e.SyncOnce(context.Background(), p); err != nil { // what the nudge's pass does
+		t.Fatal(err)
+	}
+	waitFor(t, "the lane to finish", func() bool { return e.transferLane().count() == 0 })
+	if got := f.putBody("D/big.bin"); got != bigBody {
+		t.Fatalf("large file on the server is %d bytes, want %d", len(got), len(bigBody))
+	}
+}
+
+// A set-aside download's folder must not be stamped settled: after a quit
+// the next start must still fetch it (the #691 lesson).
+func TestASetAsideDownloadLeavesItsFolderToBeScannedAgain(t *testing.T) {
+	f, g, e, p := lanePair(t, "GET", "D/big.bin")
+	f.setNode("D/big.bin", davNode{etag: "e-big", body: bigBody})
+	f.setNode("D", davNode{isDir: true, etag: "e-d2"})
+	f.setNode("", davNode{isDir: true, etag: "e-root2"})
+	var err error
+	returnsSoon(t, "the pass that met the large file", func() { _, err = e.SyncOnce(context.Background(), p) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the large transfer to start", g.hasStarted)
+	if !e.LaneSetAside(filepath.Join(p.LocalDir, "D", "big.bin"), time.Now().Add(time.Hour)) {
+		t.Fatal("LaneSetAside refused the running download")
+	}
+	waitFor(t, "the download to stop", g.wasCancelled)
+	if _, err := e.SyncOnce(context.Background(), p); err != nil { // a full pass while it is set aside
+		t.Fatal(err)
+	}
+	e.closeLane() // quit
+	g.open()
+
+	if _, err := e.SyncOnce(context.Background(), p); err != nil {
+		t.Fatalf("the pass after restart: %v", err)
+	}
+	waitFor(t, "the lane to finish", func() bool { return e.transferLane().count() == 0 })
+	got, rerr := os.ReadFile(filepath.Join(p.LocalDir, "D", "big.bin"))
+	if rerr != nil || string(got) != bigBody {
+		t.Fatalf("the set-aside file was never fetched after the quit (%v): its folder was stamped settled", rerr)
+	}
+}
+
+// The seed/settle passes in lanePair already create the lane (transferLane is
+// called from the first SyncOnce), so SetLaneFunc below is registering onto
+// an existing lane, not a future one; transferLane's onChange closure reads
+// e.onLane at call time, which is why setting the hook after the lane exists
+// still reaches it.
+func TestLaneChangesReachTheListener(t *testing.T) {
+	_, g, e, p := lanePair(t, "PUT", "D/big.bin")
+	var calls atomic.Int32
+	e.SetLaneFunc(func() { calls.Add(1) })
+	writeLocal(t, p.LocalDir, "D/big.bin", bigBody)
+	var err error
+	returnsSoon(t, "the pass", func() { _, err = e.SyncOnce(context.Background(), p) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the large transfer to start", g.hasStarted)
+	waitFor(t, "a lane change to be reported", func() bool { return calls.Load() > 0 })
+}
+
+func inflightOf(e *Engine, abs string) bool {
+	e.inflightMu.Lock()
+	defer e.inflightMu.Unlock()
+	return e.inflight[abs]
+}
+
+// A late onPark must be a no-op (ruling 1, Task 3). The lane can call a
+// job's onPark AFTER its done: exec() parks a cancelled running job and
+// unlocks before calling onPark, and in that gap a concurrent unpark/stop/
+// timer can find the job already on the parked list and call done first.
+// Without the left guard, that late onPark would run laneParked and clear
+// the inflight mark and lock-warning retake of a fresh job a pass has
+// already re-planned and re-sent for the same path. This reproduces the
+// race deterministically by calling the job's own closures directly, in the
+// done-then-onPark order the race can produce, without ever running its
+// transfer (the lane is paused so sendToLane's job only ever queues).
+func TestALateOnParkAfterDoneDoesNothing(t *testing.T) {
+	e, _ := newHookEngine(t, "http://example.invalid")
+	p := Pair{LocalDir: t.TempDir()}
+	pk := PairKey(p.LocalDir, p.RemoteRoot)
+	abs := filepath.Join(p.LocalDir, "D", "big.bin")
+
+	e.SetPaused(true) // transferLane() below creates the lane paused: the job queues, never runs
+	if !e.sendToLane(p, pk, engine.Action{Kind: engine.ActUpload, Path: "D/big.bin"}, 8<<10, nil) {
+		t.Fatal("sendToLane refused the job")
+	}
+	l := e.transferLane()
+	l.mu.Lock()
+	if len(l.queue) != 1 {
+		l.mu.Unlock()
+		t.Fatalf("queue = %d, want 1", len(l.queue))
+	}
+	j := l.queue[0]
+	l.mu.Unlock()
+
+	if !inflightOf(e, abs) {
+		t.Fatal("sendToLane did not mark the path inflight")
+	}
+	if n := progRunsOf(e); n != 1 {
+		t.Fatalf("progRuns = %d after sendToLane, want 1", n)
+	}
+
+	// The race: a concurrent stop (standing in for stop/unpark/a timer) takes
+	// the job and calls done before the lane calls onPark for the same job.
+	j.done(errLaneStopped)
+	if inflightOf(e, abs) {
+		t.Fatal("done did not clear inflight")
+	}
+	if n := progRunsOf(e); n != 0 {
+		t.Fatalf("progRuns = %d after done, want 0", n)
+	}
+
+	// A fresh pass re-plans and re-sends the same path: a new job takes over
+	// the inflight mark and starts a new progress burst.
+	e.markInflight(abs, true)
+	e.progStart(1, 0)
+
+	// The stale onPark, arriving late, must leave the fresh job's bookkeeping
+	// alone.
+	j.onPark()
+	if !inflightOf(e, abs) {
+		t.Fatal("a late onPark cleared the fresh job's inflight mark")
+	}
+	if n := progRunsOf(e); n != 1 {
+		t.Fatalf("progRuns = %d after the late onPark, want 1: it touched the fresh job's progress burst", n)
+	}
+	e.progEnd() // balance the manual progStart above
 }
