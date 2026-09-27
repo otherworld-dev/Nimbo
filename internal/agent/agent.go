@@ -2149,6 +2149,11 @@ func (e *Engine) FileStatus(abs string) string {
 			return "warn"
 		}
 	}
+	// A large file set aside (Deck #702) isn't on the server, or not in this
+	// version: no badge, rather than a synced tick, until it comes back.
+	if l := e.currentLane(); l != nil && l.parkedAt(abs) {
+		return "none"
+	}
 	// A share on this exact remote path marks the item as shared — the share
 	// ROOT only, not everything inside it (OneDrive's model). It outranks the
 	// idle answers ("ok"/mount "none") but never a transfer or a problem, and

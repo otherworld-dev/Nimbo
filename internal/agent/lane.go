@@ -360,6 +360,16 @@ func (l *lane) findLocked(abs string) (*laneJob, laneState) {
 	return nil, 0
 }
 
+// parkedAt reports whether the job at the local path abs is set aside,
+// including a running one on its way there. Cheap enough for Explorer's
+// per-item badge queries: one lock and a look through the (tiny) lane.
+func (l *lane) parkedAt(abs string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	j, st := l.findLocked(abs)
+	return st == laneParked || (st == laneRunning && j.parking)
+}
+
 func (l *lane) removeQueuedLocked(j *laneJob) {
 	for i, o := range l.queue {
 		if o == j {

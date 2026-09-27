@@ -2,9 +2,12 @@ package agent
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/config"
+	"github.com/otherworld/nimbo/internal/engine"
 )
 
 // TestFileStatusInsideOnDemandRoots pins the division of labour for status
@@ -197,5 +200,58 @@ func TestAddSyncPairIdempotentOnExactMatch(t *testing.T) {
 	}
 	if err := e.AddSyncPair(filepath.Join(tmp, "Other"), ""); err == nil {
 		t.Error("same remote to a DIFFERENT folder must still be refused")
+	}
+}
+
+// A large file set aside is not on the server (or not in its latest
+// version), so Explorer must not show it the green synced tick; it shows no
+// badge until it comes back. The badge is refreshed as it is set aside and
+// as it comes back.
+func TestFileStatusOfASetAsideLargeFileIsNone(t *testing.T) {
+	e, _ := newHookEngine(t, "http://example.invalid")
+	p := Pair{LocalDir: t.TempDir()}
+	if err := e.dirs.SavePairs([]config.SyncPair{{LocalDir: p.LocalDir}}); err != nil {
+		t.Fatal(err)
+	}
+	pk := PairKey(p.LocalDir, p.RemoteRoot)
+	abs := filepath.Join(p.LocalDir, "D", "big.bin")
+	var mu sync.Mutex
+	refreshed := 0
+	e.SetOverlayRefresh(func(path string) {
+		if path == abs {
+			mu.Lock()
+			refreshed++
+			mu.Unlock()
+		}
+	})
+	refreshes := func() int { mu.Lock(); defer mu.Unlock(); return refreshed }
+
+	e.SetPaused(true) // the job only queues: nothing is sent
+	if !e.sendToLane(p, pk, engine.Action{Kind: engine.ActUpload, Path: "D/big.bin"}, 8<<10, nil) {
+		t.Fatal("sendToLane refused the job")
+	}
+	if got := e.FileStatus(abs); got != "sync" {
+		t.Fatalf("a queued large file: FileStatus = %q, want %q", got, "sync")
+	}
+	before := refreshes()
+	if !e.LaneSetAside(abs, time.Time{}) {
+		t.Fatal("LaneSetAside refused the queued file")
+	}
+	if got := e.FileStatus(abs); got != "none" {
+		t.Fatalf("a set-aside large file: FileStatus = %q, want %q (it is not on the server)", got, "none")
+	}
+	if refreshes() == before {
+		t.Fatal("setting the file aside didn't refresh its badge")
+	}
+
+	before = refreshes()
+	if !e.LaneResume(abs) {
+		t.Fatal("LaneResume refused the set-aside file")
+	}
+	if got := e.FileStatus(abs); got == "none" {
+		t.Fatalf("after Resume, FileStatus is still forced to %q", got)
+	}
+	if refreshes() == before {
+		t.Fatal("resuming the file didn't refresh its badge")
 	}
 }
