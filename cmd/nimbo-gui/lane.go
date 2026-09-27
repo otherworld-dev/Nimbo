@@ -13,10 +13,10 @@ import (
 
 // LaneEntryDTO is one large transfer for the Status window and the flyout.
 type LaneEntryDTO struct {
-	Account   string `json:"account"`   // set when several accounts are signed in
-	Path      string `json:"path"`      // relative to its sync folder, slash-separated
-	Abs       string `json:"abs"`       // local path; what the Lane* methods take
-	Dir       string `json:"dir"`       // "up" or "down"
+	Account   string `json:"account"` // set when several accounts are signed in
+	Path      string `json:"path"`    // relative to its sync folder, slash-separated
+	Abs       string `json:"abs"`     // local path; what the Lane* methods take
+	Dir       string `json:"dir"`     // "up" or "down"
 	Size      int64  `json:"size"`
 	DoneBytes int64  `json:"doneBytes"` // moved by the current attempt
 	State     string `json:"state"`     // "running", "waiting", "paused" or "setaside"
