@@ -32,6 +32,9 @@ object Notifications {
     const val CHANNEL_SERVER = "server"
     const val NOTIF_ID_FOREGROUND = 1
 
+    /** "Tap to resume sync" after a reboot; one at a time, replaced in place. */
+    private const val NOTIF_ID_RESUME_SYNC = 2
+
     private const val TAG = "NimboNotifications"
 
     /** Alert notification ids start well clear of NOTIF_ID_FOREGROUND. */
@@ -39,6 +42,7 @@ object Notifications {
 
     private const val REQ_CONTENT = 100
     private const val REQ_SYNC_NOW = 101
+    private const val REQ_RESUME_SYNC = 102
     private const val REQ_ALERT_BASE = 1000
 
     /** Immutable is required from API 31 and harmless below it. */
@@ -135,6 +139,38 @@ object Notifications {
 
             manager.notify(id, notification)
         }.onFailure { Log.w(TAG, "showAlert failed", it) }
+    }
+
+    /**
+     * Posted when Android won't let sync start in the background, which in
+     * practice means after a reboot. Tapping opens the app, which starts sync
+     * the normal way; ignoring battery optimisation is what lets it start by itself.
+     */
+    @SuppressLint("MissingPermission")
+    fun showResumeSync(context: Context) {
+        runCatching {
+            val manager = NotificationManagerCompat.from(context)
+            if (!manager.areNotificationsEnabled()) return
+            if (!Permissions.hasNotifications(context)) return
+
+            val message = "Android didn't let Nimbo start syncing in the background. Tap to start it. " +
+                "To have it start by itself after a restart, turn on Ignore battery optimisation for Nimbo."
+            val notification = NotificationCompat.Builder(context, CHANNEL_ALERTS)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle("Sync is not running")
+                .setContentText(message)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+                .setContentIntent(mainActivityIntent(context, REQ_RESUME_SYNC))
+                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .build()
+
+            manager.notify(NOTIF_ID_RESUME_SYNC, notification)
+        }.onFailure { Log.w(TAG, "showResumeSync failed", it) }
+    }
+
+    fun cancelResumeSync(context: Context) {
+        runCatching { NotificationManagerCompat.from(context).cancel(NOTIF_ID_RESUME_SYNC) }
     }
 
     /**

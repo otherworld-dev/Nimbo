@@ -57,13 +57,21 @@ class SyncService : LifecycleService() {
 
         fun syncNow(context: Context) = send(context, ACTION_SYNC_NOW)
 
-        private fun send(context: Context, action: String) {
+        /**
+         * Like [start], but false when Android refused the start outright. A
+         * true is not the last word: a refusal can also come later, from
+         * startForeground in onStartCommand, which handles it itself.
+         */
+        fun tryStart(context: Context): Boolean = send(context, ACTION_START)
+
+        private fun send(context: Context, action: String): Boolean {
             val intent = Intent(context, SyncService::class.java).setAction(action)
             // Android 12+ can refuse a background foreground-service start
             // (ForegroundServiceStartNotAllowedException). That is a refusal to
             // start work, not a reason to take the caller down with us.
-            runCatching { ContextCompat.startForegroundService(context, intent) }
+            return runCatching { ContextCompat.startForegroundService(context, intent) }
                 .onFailure { Log.w(TAG, "startForegroundService($action) refused", it) }
+                .isSuccess
         }
     }
 
@@ -88,7 +96,19 @@ class SyncService : LifecycleService() {
 
         // FIRST, before any engine work: NimboCore.startEngine() blocks on the
         // network and the 5-second startForeground window is unforgiving.
-        goForeground("Starting…", null)
+        if (!goForeground("Starting…", null) && !inForeground) {
+            // Android refused the foreground start: on Android 15+ a dataSync
+            // service may not start in the boot window (unless the app ignores
+            // battery optimisation), and on 12+ not from the background at all.
+            // A service started with startForegroundService() that never goes
+            // foreground gets the app killed, so stop now and ask the user to
+            // open the app instead. The periodic SyncWorker keeps syncing.
+            if (intent?.action != ACTION_STOP) Notifications.showResumeSync(this)
+            stopping = true
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        Notifications.cancelResumeSync(this) // sync is running again, however it got here
 
         when (intent?.action) {
             ACTION_STOP -> {
@@ -286,9 +306,10 @@ class SyncService : LifecycleService() {
         }
     }
 
-    private fun goForeground(status: String, progressPercent: Int?) {
+    /** False when Android refused to put the service in the foreground. */
+    private fun goForeground(status: String, progressPercent: Int?): Boolean {
         val notification = Notifications.buildForeground(this, status, progressPercent)
-        runCatching {
+        return runCatching {
             ServiceCompat.startForeground(
                 this,
                 Notifications.NOTIF_ID_FOREGROUND,
@@ -296,7 +317,7 @@ class SyncService : LifecycleService() {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
             )
             inForeground = true
-        }.onFailure { Log.w(TAG, "startForeground failed", it) }
+        }.onFailure { Log.w(TAG, "startForeground failed", it) }.isSuccess
     }
 
     private fun updateForeground(status: String, progress: SyncProgress?) {

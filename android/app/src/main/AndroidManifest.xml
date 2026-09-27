@@ -3,7 +3,8 @@
     Nimbo for Android — application manifest.
 
     Shape of the app: one launcher Activity (Compose UI) plus one foreground
-    "dataSync" Service that owns the running Go sync engine. WorkManager's
+    "dataSync" Service that owns the running Go sync engine, and a boot
+    receiver that brings the service back after a restart. WorkManager's
     periodic wake-up is registered in code, so it needs no manifest entry
     (androidx.startup provides its initializer).
 
@@ -88,6 +89,18 @@
             android:name=".service.SyncService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!--
+          Starts sync again after a reboot (by way of BootStartWorker, which
+          waits for a network). Exported: the system sends BOOT_COMPLETED.
+        -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <!--
           Hands downloaded and synced files to other apps. Android refuses

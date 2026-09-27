@@ -100,7 +100,7 @@ fun PermissionsScreen(
                 PermissionRow(
                     icon = Icons.Filled.BatteryFull,
                     title = "Ignore battery optimisation",
-                    why = "Stops Android suspending sync while the screen is off.",
+                    why = "Stops Android suspending sync while the screen is off, and lets sync start by itself after a restart.",
                     requirement = "Recommended",
                     granted = ignoringBattery,
                     onGrant = onGrantBattery,
