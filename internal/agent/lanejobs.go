@@ -23,8 +23,8 @@ import (
 func (e *Engine) transferLane() *lane {
 	paused := e.Paused() // before watchMu: Paused takes e.mu
 	e.watchMu.Lock()
-	defer e.watchMu.Unlock()
-	if e.tl == nil {
+	created := e.tl == nil
+	if created {
 		e.tl = newLane(paused)
 		e.tl.onChange = func() {
 			if f := e.onLane; f != nil {
@@ -32,7 +32,15 @@ func (e *Engine) transferLane() *lane {
 			}
 		}
 	}
-	return e.tl
+	l := e.tl
+	e.watchMu.Unlock()
+	// A pause that landed between reading Paused above and the lane existing
+	// found no lane to pause (pauseChanged uses currentLane): catch it now.
+	// Any later pause finds the lane itself.
+	if created && e.Paused() {
+		l.pause()
+	}
+	return l
 }
 
 // currentLane returns the lane if there is one, without creating it.
@@ -307,8 +315,10 @@ func (e *Engine) LaneSyncFirst(abs string) bool {
 	return l != nil && l.first(abs)
 }
 
-// LaneSetAside sets the large transfer of abs aside until until (zero: until
-// LaneResume). A restart ends it either way. False when the lane doesn't
+// LaneSetAside asks for the large transfer of abs to be set aside until
+// until (zero: until LaneResume). A waiting one is set aside at once; a
+// running one is stopped and set aside once its transfer returns, unless it
+// finishes first. A restart ends it either way. False when the lane doesn't
 // hold abs.
 func (e *Engine) LaneSetAside(abs string, until time.Time) bool {
 	l := e.currentLane()

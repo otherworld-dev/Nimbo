@@ -61,6 +61,9 @@ func DownloadProgress(ctx context.Context, c *transport.Client, remotePath, loca
 		hasher = newHasher()
 		flag = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 	}
+	if offset > 0 && prog != nil {
+		prog(offset) // the part already here counts, as a resumed upload's chunks do
+	}
 
 	f, err := os.OpenFile(part, flag, 0o644)
 	if err != nil {

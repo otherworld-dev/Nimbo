@@ -76,7 +76,8 @@ func (a *App) LaneList() []LaneEntryDTO {
 	return out
 }
 
-// firstEngine runs f on each engine until one reports it held abs.
+// firstEngine runs f on each engine in turn until one reports it held abs;
+// the engines after that are still visited, but f is not called for them.
 func (a *App) firstEngine(f func(*agent.Engine) bool) {
 	done := false
 	a.eachEngine(func(e *agent.Engine) {

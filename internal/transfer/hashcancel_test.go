@@ -147,3 +147,25 @@ func TestCancellingADownloadStopsTheRedundancyHash(t *testing.T) {
 		t.Fatalf("the hash read the file %d times after the download was cancelled, want 1", n)
 	}
 }
+
+// A resumed download counts the bytes it already had, as a resumed upload
+// counts the chunks the server already has, so a set-aside 40 GB download
+// that comes back half done shows half done, not 0 B of 40 GB.
+func TestAResumedDownloadReportsTheBytesItAlreadyHad(t *testing.T) {
+	content := testContent(256 << 10)
+	c, _ := rangeServer(t, content)
+	local := filepath.Join(t.TempDir(), "big.bin")
+	if err := os.WriteFile(local+partSuffix, content[:100<<10], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var total atomic.Int64
+	if _, err := DownloadProgress(context.Background(), c, "big.bin", local, func(n int64) { total.Add(n) }); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(local); !bytes.Equal(got, content) {
+		t.Fatalf("downloaded file is %d bytes and wrong, want the %d-byte original", len(got), len(content))
+	}
+	if n := total.Load(); n != int64(len(content)) {
+		t.Fatalf("progress reported %d bytes, want %d (the part it resumed from counts)", n, len(content))
+	}
+}

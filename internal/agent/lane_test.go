@@ -511,3 +511,65 @@ func TestLaneRefusesAStoppedPairUntilItIsAllowedAgain(t *testing.T) {
 		t.Fatal("the lane refused a pair that syncs again")
 	}
 }
+
+// Quit or sign-out with a file set aside for a while: close drops it, done
+// hears errLaneStopped exactly once, and its timer never fires afterwards.
+func TestLaneCloseDropsATimedSetAsideJob(t *testing.T) {
+	l := newLane(true)
+	a := newTestJob("pk", "D/a")
+	l.add(a.j)
+	if !l.park(a.j.abs, time.Now().Add(100*time.Millisecond)) {
+		t.Fatal("park refused the waiting job")
+	}
+	returnsSoon(t, "close", l.close)
+	if err := <-a.doneErr; !errors.Is(err, errLaneStopped) {
+		t.Fatalf("done got %v, want errLaneStopped", err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	if n := a.dones.Load(); n != 1 {
+		t.Fatalf("done was told %d times: the timer fired after close", n)
+	}
+	if n := a.starts.Load(); n != 0 {
+		t.Fatalf("the set-aside job ran %d times", n)
+	}
+}
+
+// A running job being set aside (or paused) whose transfer returns just as
+// the lane closes, after close has marked it closed but before its stop has
+// reached the job, is a stop, not a failure: done hears errLaneStopped, not
+// context.Canceled, so no failed row is written for a file set aside at quit.
+func TestLaneASetAsideJobEndingDuringCloseIsStopped(t *testing.T) {
+	for _, how := range []string{"set aside", "paused"} {
+		t.Run(how, func(t *testing.T) {
+			l := newLane(false)
+			a := newTestJob("pk", "a")
+			cancelled, proceed := make(chan struct{}), make(chan struct{})
+			a.j.run = func(ctx context.Context) error {
+				a.starts.Add(1)
+				<-ctx.Done()
+				close(cancelled)
+				<-proceed // hold exec off until close has marked the lane closed
+				return ctx.Err()
+			}
+			l.add(a.j)
+			waitFor(t, "a to start", func() bool { return a.starts.Load() == 1 })
+			if how == "set aside" {
+				l.park(a.j.abs, time.Time{})
+			} else {
+				l.pause()
+			}
+			<-cancelled
+			l.mu.Lock()
+			l.closed = true // close's first step; its stop hasn't run yet
+			l.mu.Unlock()
+			close(proceed)
+			if err := <-a.doneErr; !errors.Is(err, errLaneStopped) {
+				t.Fatalf("done got %v, want errLaneStopped", err)
+			}
+			l.close()
+			if n := a.dones.Load(); n != 1 {
+				t.Fatalf("done was told %d times, want 1", n)
+			}
+		})
+	}
+}

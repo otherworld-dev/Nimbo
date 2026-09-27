@@ -151,14 +151,15 @@ func (l *lane) holdsLocked(match func(*laneJob) bool) bool {
 	return false
 }
 
-// has reports a queued or running job for exactly rel in pair pk.
+// has reports a job for exactly rel in pair pk: queued, running or set aside.
 func (l *lane) has(pk, rel string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.holdsLocked(func(j *laneJob) bool { return j.pk == pk && j.rel == rel })
 }
 
-// covers reports a queued or running job for rel or anything beneath it.
+// covers reports a job for rel or anything beneath it: queued, running or
+// set aside.
 func (l *lane) covers(pk, rel string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -212,7 +213,10 @@ func (l *lane) exec(ctx context.Context, j *laneJob) {
 		l.queue = append([]*laneJob{j}, l.queue...)
 		finished = false
 	}
-	if err != nil && j.stopped {
+	if err != nil && (j.stopped || (finished && (j.parking || j.requeue) && l.closed)) {
+		// Stopped, or set aside or paused just as the lane closed (close
+		// marked it closed before its stop reached this job): either way a
+		// stop, not a failure.
 		err = errLaneStopped
 	}
 	l.dispatchLocked()
