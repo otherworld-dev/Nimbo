@@ -4253,9 +4253,17 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	}
 	actions, bigTransfers := splitForLane(actions, func(a engine.Action) int64 { return transferSize(p, a, remote) })
 	for _, a := range bigTransfers {
-		if e.sendToLane(p, pk, a, transferSize(p, a, remote), remote) {
+		switch {
+		case e.sendToLane(p, pk, a, transferSize(p, a, remote), remote):
 			laneHeld = append(laneHeld, a.Path) // unsent: its folder isn't settled
-		} else {
+		case tl.pairStopped(pk):
+			// The folder stopped syncing (removed, moved, held back) while
+			// this pass was planning it. Its large transfers aren't the
+			// pass's to run either: a download would recreate the folder the
+			// user asked to delete. Unsent, so its folder isn't settled.
+			slog.Info("large transfer dropped: its folder stopped syncing", "path", a.Path)
+			laneHeld = append(laneHeld, a.Path)
+		default:
 			actions = append(actions, a)
 		}
 	}
@@ -5089,6 +5097,11 @@ func (e *Engine) startWatcher(p Pair) {
 	e.nudges[key] = nudge
 	e.watchDone[key] = done
 	e.watchMu.Unlock()
+	// The folder syncs (again): if stopWatcher took it out of the lane, let
+	// its large transfers back in (see stopLanePair).
+	if l := e.currentLane(); l != nil {
+		l.allowPair(key)
+	}
 
 	go func() {
 		defer close(done) // let stopWatcherSync wait for an in-flight sync to drain

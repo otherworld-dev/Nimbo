@@ -245,10 +245,13 @@ func (e *Engine) laneSettled() {
 
 // stopLanePair stops a folder pair's lane transfers and waits for them: the
 // folder is being removed or moved, and nothing of it may still be sending.
+// The lane then refuses the pair's transfers until its watcher starts again
+// (startWatcher): the watcher's pass is cancelled but not waited for, and one
+// already past planning would otherwise hand over a download that recreates
+// the folder being deleted. The lane is created if need be, so a pass that
+// creates it after this still finds the pair refused.
 func (e *Engine) stopLanePair(pk string) {
-	if l := e.currentLane(); l != nil {
-		l.stop(func(j *laneJob) bool { return j.pk == pk })
-	}
+	e.transferLane().stopPair(pk)
 }
 
 // stopLaneUnder stops the lane transfers of abs and of anything beneath it,

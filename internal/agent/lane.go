@@ -87,8 +87,13 @@ type lane struct {
 	parked  []*laneJob // set aside: still held (passes leave them alone), never dispatched
 	paused  bool
 	closed  bool
-	seq     uint64
-	wg      sync.WaitGroup
+	// stoppedPairs are the pairs stopPair took out of the lane and add
+	// refuses, until allowPair: a folder that stopped syncing (removed,
+	// moved, held back) takes no new transfers from a pass that was already
+	// planning it.
+	stoppedPairs map[string]bool
+	seq          uint64
+	wg           sync.WaitGroup
 	// onChange is told, without mu held, whenever a job arrives, starts,
 	// moves, is set aside or leaves. Set once, before the lane is used.
 	onChange func()
@@ -110,10 +115,11 @@ func relUnder(p, dir string) bool {
 	return dir == "" || p == dir || strings.HasPrefix(p, dir+"/")
 }
 
-// add queues j. False when the lane is closed or already holds j's path.
+// add queues j. False when the lane is closed, j's pair has been stopped
+// (stopPair), or the lane already holds j's path.
 func (l *lane) add(j *laneJob) bool {
 	l.mu.Lock()
-	if l.closed || l.holdsLocked(func(o *laneJob) bool { return o.pk == j.pk && o.rel == j.rel }) {
+	if l.closed || l.stoppedPairs[j.pk] || l.holdsLocked(func(o *laneJob) bool { return o.pk == j.pk && o.rel == j.rel }) {
 		l.mu.Unlock()
 		return false
 	}
@@ -292,6 +298,34 @@ func (l *lane) stop(match func(*laneJob) bool) {
 		<-w
 	}
 	l.changed()
+}
+
+// stopPair stops every job of pair pk, as stop does, and refuses new ones
+// for pk until allowPair(pk). The pair is marked first, so a job added while
+// the stop runs is refused rather than missed.
+func (l *lane) stopPair(pk string) {
+	l.mu.Lock()
+	if l.stoppedPairs == nil {
+		l.stoppedPairs = map[string]bool{}
+	}
+	l.stoppedPairs[pk] = true
+	l.mu.Unlock()
+	l.stop(func(j *laneJob) bool { return j.pk == pk })
+}
+
+// allowPair lets pair pk's jobs in again after stopPair.
+func (l *lane) allowPair(pk string) {
+	l.mu.Lock()
+	delete(l.stoppedPairs, pk)
+	l.mu.Unlock()
+}
+
+// pairStopped reports whether stopPair has stopped pk and allowPair not yet
+// let it back.
+func (l *lane) pairStopped(pk string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.stoppedPairs[pk]
 }
 
 // close stops everything and refuses new jobs. It returns once every running

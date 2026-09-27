@@ -480,3 +480,34 @@ func TestLaneStaleSetAsideTimerIsANoOp(t *testing.T) {
 		t.Fatalf("done got %v, want errLaneUnparked", err)
 	}
 }
+
+// A folder that stops syncing stops its lane transfers, and the lane takes no
+// more for it until it syncs again: a pass already planning when the folder
+// was removed must not hand over a transfer that recreates it.
+func TestLaneRefusesAStoppedPairUntilItIsAllowedAgain(t *testing.T) {
+	l := newLane(false)
+	t.Cleanup(l.close)
+	a := newTestJob("A", "big")
+	l.add(a.j)
+	waitFor(t, "a to start", func() bool { return a.starts.Load() == 1 })
+	returnsSoon(t, "stopping the pair", func() { l.stopPair("A") })
+	if err := <-a.doneErr; !errors.Is(err, errLaneStopped) {
+		t.Fatalf("done got %v, want errLaneStopped", err)
+	}
+	if l.add(newTestJob("A", "big").j) {
+		t.Fatal("the lane took a job for a pair that stopped syncing")
+	}
+	if !l.pairStopped("A") {
+		t.Fatal("pairStopped(A) = false after stopPair")
+	}
+	if b := newTestJob("B", "big"); !l.add(b.j) {
+		t.Fatal("stopping pair A made the lane refuse pair B")
+	}
+	l.allowPair("A")
+	if l.pairStopped("A") {
+		t.Fatal("pairStopped(A) = true after allowPair")
+	}
+	if c := newTestJob("A", "big"); !l.add(c.j) {
+		t.Fatal("the lane refused a pair that syncs again")
+	}
+}

@@ -581,3 +581,63 @@ func TestDoneUnparkedClearsInflightEvenIfOnParkNeverRuns(t *testing.T) {
 		t.Fatal("a late onPark cleared a fresh job's inflight mark")
 	}
 }
+
+// A folder removed while a pass of it is between planning and the lane (the
+// watcher is cancelled, not waited for): that pass must neither hand the lane
+// its large download nor fetch it itself, or the download recreates the
+// folder the user asked to delete. Once the folder syncs again (its watcher
+// starts: re-added, or moved back), the lane takes its transfers again.
+func TestAPassOfAStoppedFolderLeavesItsLargeTransfersAlone(t *testing.T) {
+	f, g, e, p := lanePair(t, "GET", "D/big.bin")
+	f.setNode("D/big.bin", davNode{etag: "e-big", body: bigBody})
+	f.setNode("D", davNode{isDir: true, etag: "e-d2"})
+	f.setNode("", davNode{isDir: true, etag: "e-root2"})
+	pk := PairKey(p.LocalDir, p.RemoteRoot)
+	local := filepath.Join(p.LocalDir, "D", "big.bin")
+
+	e.stopLanePair(pk) // as stopWatcher does while the pass below is planning
+	var err error
+	returnsSoon(t, "the pass", func() { _, err = e.SyncOnce(context.Background(), p) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // give a stray lane job time to reach the server
+	if n := g.hits.Load(); n != 0 {
+		t.Fatalf("a folder that stopped syncing still fetched its large file (%d GETs)", n)
+	}
+	if e.transferLane().has(pk, "D/big.bin") {
+		t.Fatal("the lane took a transfer for a folder that stopped syncing")
+	}
+	if _, serr := os.Stat(local); serr == nil {
+		t.Fatal("the large file was downloaded into a folder that stopped syncing")
+	}
+
+	// The folder syncs again: its watcher starts (on a run that is already
+	// over, so it stops again at once and the test drives the pass itself).
+	runCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.watchMu.Lock()
+	e.runCtx = runCtx
+	e.watchers, e.triggers, e.triggersFull = map[string]context.CancelFunc{}, map[string]chan struct{}{}, map[string]chan struct{}{}
+	e.nudges, e.watchDone = map[string]chan string{}, map[string]chan struct{}{}
+	e.watchMu.Unlock()
+	e.startWatcher(p)
+	e.watchMu.Lock()
+	done := e.watchDone[pk]
+	e.watchMu.Unlock()
+	if done != nil {
+		<-done
+	}
+	if e.transferLane().pairStopped(pk) {
+		t.Fatal("starting the folder's watcher left the lane refusing it")
+	}
+	g.open()
+	returnsSoon(t, "the pass", func() { _, err = e.SyncOnce(context.Background(), p) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the large download to land", func() bool {
+		b, rerr := os.ReadFile(local)
+		return rerr == nil && string(b) == bigBody
+	})
+}
