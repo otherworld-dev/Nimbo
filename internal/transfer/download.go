@@ -43,7 +43,7 @@ func DownloadProgress(ctx context.Context, c *transport.Client, remotePath, loca
 	}
 	part := localPath + partSuffix
 
-	offset, hasher, err := resumeState(part)
+	offset, hasher, err := resumeState(ctx, part)
 	if err != nil {
 		return FileResult{}, err
 	}
@@ -148,8 +148,9 @@ func headerETag(hdr http.Header) string {
 
 // resumeState inspects an existing partial file and returns the byte offset to
 // resume from plus a hasher seeded with the bytes already on disk. A missing
-// part file yields offset 0 and a fresh hasher.
-func resumeState(part string) (int64, hashWriter, error) {
+// part file yields offset 0 and a fresh hasher. Seeding reads the whole part,
+// which on a huge download takes minutes, so it stops once ctx is done.
+func resumeState(ctx context.Context, part string) (int64, hashWriter, error) {
 	h := newHasher()
 	fi, err := os.Stat(part)
 	if os.IsNotExist(err) {
@@ -163,7 +164,7 @@ func resumeState(part string) (int64, hashWriter, error) {
 		return 0, nil, err
 	}
 	defer f.Close()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, &hashReader{ctx: ctx, r: f, what: "part"}); err != nil {
 		return 0, nil, fmt.Errorf("seed resume hash: %w", err)
 	}
 	return fi.Size(), h, nil

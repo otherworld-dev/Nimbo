@@ -5,6 +5,7 @@
 package transfer
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
@@ -26,17 +27,46 @@ func sumHex(h interface{ Sum(b []byte) []byte }) string {
 }
 
 // sha1File computes the SHA1 of a file's contents as a lowercase hex string.
-func sha1File(path string) (string, error) {
+func sha1File(path string) (string, error) { return sha1FileCtx(context.Background(), path) }
+
+// sha1FileCtx is sha1File that stops, with ctx's error, once ctx is done.
+func sha1FileCtx(ctx context.Context, path string) (string, error) {
 	f, err := openShared(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 	h := newHasher()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, &hashReader{ctx: ctx, r: f, what: "file"}); err != nil {
 		return "", fmt.Errorf("hash %s: %w", path, err)
 	}
 	return sumHex(h), nil
+}
+
+// testHookHashRead, when set, runs before each read a hash pass makes, with
+// what is being hashed: "file" (a whole file before it is uploaded), "chunk"
+// (a chunk a resumed upload already has on the server) or "part" (a resumed
+// download's .nimbo-part). Tests cancel a transfer mid-hash with it.
+var testHookHashRead func(what string)
+
+// hashReader feeds a hash pass. Hashing a 300 GB file takes minutes, at the
+// start of every attempt, and a transfer that is paused, set aside or stopped
+// must not make whoever stopped it wait that long (Deck #702): once ctx is
+// done, the next read fails with ctx's error.
+type hashReader struct {
+	ctx  context.Context
+	r    io.Reader
+	what string
+}
+
+func (h *hashReader) Read(p []byte) (int, error) {
+	if testHookHashRead != nil {
+		testHookHashRead(h.what)
+	}
+	if err := h.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return h.r.Read(p)
 }
 
 // SHA1File returns the lowercase hex SHA1 of a file's contents. Exported for the

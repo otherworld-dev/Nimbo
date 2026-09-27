@@ -121,7 +121,7 @@ func uploadOnce(ctx context.Context, c *transport.Client, localPath, remotePath 
 	var data []byte
 	var sum string
 	if chunked {
-		sum, err = sha1File(localPath)
+		sum, err = sha1FileCtx(ctx, localPath)
 	} else if data, err = readShared(localPath); err == nil {
 		h := sha1.Sum(data)
 		sum = hex.EncodeToString(h[:])
@@ -290,7 +290,7 @@ func uploadChunked(ctx context.Context, c *transport.Client, localPath, remotePa
 				return "", "", err
 			}
 		} else {
-			if _, err := io.Copy(running, io.NewSectionReader(f, offset, n)); err != nil {
+			if _, err := io.Copy(running, &hashReader{ctx: ctx, r: io.NewSectionReader(f, offset, n), what: "chunk"}); err != nil {
 				return "", "", err
 			}
 			if prog != nil {
