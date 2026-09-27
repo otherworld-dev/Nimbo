@@ -159,3 +159,19 @@ func (e *Engine) laneSettled() {
 		e.status("Up to date") // status() swaps in the lane's line while it still has work
 	}
 }
+
+// stopLanePair stops a folder pair's lane transfers and waits for them: the
+// folder is being removed or moved, and nothing of it may still be sending.
+func (e *Engine) stopLanePair(pk string) {
+	if l := e.currentLane(); l != nil {
+		l.stop(func(j *laneJob) bool { return j.pk == pk })
+	}
+}
+
+// stopLaneUnder stops the lane transfers of abs and of anything beneath it,
+// and waits for them: the path was blacklisted or deselected.
+func (e *Engine) stopLaneUnder(abs string) {
+	if l := e.currentLane(); l != nil {
+		l.stop(func(j *laneJob) bool { return within(j.abs, abs) })
+	}
+}

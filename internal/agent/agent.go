@@ -1083,6 +1083,7 @@ func (e *Engine) BlacklistPath(abs string) error {
 		return err
 	}
 	e.removeBlocked(abs)
+	e.stopLaneUnder(abs)
 	return nil
 }
 
@@ -2694,6 +2695,7 @@ func (e *Engine) DeselectFolder(localDir, rel string, deleteLocal bool) error {
 	if err := e.AddExclude(localDir, rel); err != nil {
 		return err
 	}
+	e.stopLaneUnder(filepath.Join(localDir, filepath.FromSlash(rel)))
 	if !deleteLocal {
 		e.TriggerSync()
 		return nil
@@ -2912,8 +2914,14 @@ func (e *Engine) PauseState() PauseStatus {
 // pauseChanged updates status, resumes work if newly unpaused, and notifies.
 func (e *Engine) pauseChanged() {
 	if e.Paused() {
+		if l := e.currentLane(); l != nil {
+			l.pause() // large transfers stop at once and carry on at resume (Deck #702)
+		}
 		e.status("Paused")
 	} else {
+		if l := e.currentLane(); l != nil {
+			l.resume()
+		}
 		e.status("Up to date")
 		e.TriggerSync()
 	}
@@ -5123,6 +5131,7 @@ func (e *Engine) stopWatcher(key string) {
 	if cancel != nil {
 		cancel()
 	}
+	e.stopLanePair(key) // its large transfers too, before the folder goes
 }
 
 // stopWatcherSync cancels a pair's watcher AND waits for its goroutine — hence
@@ -5148,6 +5157,7 @@ func (e *Engine) stopWatcherSync(key string) {
 			slog.Warn("watcher did not stop within 30s; proceeding", "key", key)
 		}
 	}
+	e.stopLanePair(key) // a move must not overlap a large transfer either
 }
 
 // runPush connects to notify_push and fans events out to all active watchers.

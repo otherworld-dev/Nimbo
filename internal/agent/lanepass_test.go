@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // gatedDAV wraps fakeDAV so a transfer of one path hangs until open is
@@ -241,4 +242,74 @@ func TestAFolderDeletedOnTheServerStopsItsLaneDownload(t *testing.T) {
 	if _, serr := os.Stat(filepath.Join(p.LocalDir, "D")); !os.IsNotExist(serr) {
 		t.Fatalf("folder deleted on the server is still here: %v", serr)
 	}
+}
+
+// Pause stops the large transfer at once; nothing restarts while paused;
+// resume carries on.
+func TestPauseStopsALaneUploadAndResumeFinishesIt(t *testing.T) {
+	f, g, e, p := lanePair(t, "PUT", "D/big.bin")
+	writeLocal(t, p.LocalDir, "D/big.bin", bigBody)
+	var err error
+	returnsSoon(t, "the pass", func() { _, err = e.SyncOnce(context.Background(), p) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the large transfer to start", g.hasStarted)
+
+	e.SetPaused(true)
+	waitFor(t, "the upload to stop on pause", g.wasCancelled)
+	if n := e.transferLane().count(); n != 1 {
+		t.Fatalf("lane holds %d, want the paused upload kept", n)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := g.hits.Load(); n != 1 {
+		t.Fatalf("upload restarted while paused (%d starts)", n)
+	}
+
+	g.open()
+	e.SetPaused(false)
+	waitFor(t, "the lane to finish after resume", func() bool { return e.transferLane().count() == 0 })
+	if got := f.putBody("D/big.bin"); got != bigBody {
+		t.Fatalf("large file on the server is %d bytes after resume, want %d", len(got), len(bigBody))
+	}
+}
+
+func TestBlacklistingALaneFileStopsItsUpload(t *testing.T) {
+	f, g, e, p := lanePair(t, "PUT", "D/big.bin")
+	writeLocal(t, p.LocalDir, "D/big.bin", bigBody)
+	var err error
+	returnsSoon(t, "the pass", func() { _, err = e.SyncOnce(context.Background(), p) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the large transfer to start", g.hasStarted)
+	returnsSoon(t, "blacklisting", func() { err = e.BlacklistPath(filepath.Join(p.LocalDir, "D", "big.bin")) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := e.transferLane().count(); n != 0 {
+		t.Fatalf("lane still holds %d after the file was blacklisted", n)
+	}
+	waitFor(t, "the upload to be cancelled", g.wasCancelled)
+	if got := f.putBody("D/big.bin"); got != "" {
+		t.Fatal("a blacklisted file reached the server")
+	}
+}
+
+// Removing or moving a sync folder stops its watcher with stopWatcher(Sync);
+// its lane transfers must be stopped and waited for too.
+func TestStoppingAFoldersWatcherStopsItsLaneTransfers(t *testing.T) {
+	_, g, e, p := lanePair(t, "PUT", "D/big.bin")
+	writeLocal(t, p.LocalDir, "D/big.bin", bigBody)
+	var err error
+	returnsSoon(t, "the pass", func() { _, err = e.SyncOnce(context.Background(), p) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the large transfer to start", g.hasStarted)
+	returnsSoon(t, "stopping the folder", func() { e.stopWatcherSync(PairKey(p.LocalDir, p.RemoteRoot)) })
+	if n := e.transferLane().count(); n != 0 {
+		t.Fatalf("lane still holds %d for a folder that stopped syncing", n)
+	}
+	waitFor(t, "the upload to be cancelled", g.wasCancelled)
 }
