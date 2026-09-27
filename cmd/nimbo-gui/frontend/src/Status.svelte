@@ -18,8 +18,13 @@
   // A folder that stopped being shared with the user (or whose storage was
   // unmounted): the local copy was kept and parked, and awaits a decision.
   type Detached = { localDir: string; rel: string; name: string; localPath: string; movedOut: boolean; at: string };
+  // A large file (64 MB or more) in its account's lane (Deck #702). They sync
+  // two at a time next to the normal sync; the user can move one to the front
+  // or set one aside for a while.
+  type LaneEntry = { account: string; path: string; abs: string; dir: "up" | "down"; size: number; doneBytes: number;
+                     state: "running" | "waiting" | "paused" | "setaside"; position: number; until: string };
 
-  let tab = $state<"activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "detached" | "trash">("activity");
+  let tab = $state<"activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "large" | "detached" | "trash">("activity");
   let activity = $state<Activity[]>([]);
   let conflicts = $state<Conflict[]>([]);
   let notifs = $state<Notif[]>([]);
@@ -31,6 +36,53 @@
   let otherAttn = $state<OtherAttention[]>([]);
   let detached = $state<Detached[]>([]);
   let detachedBusy = $state("");
+
+  let lane = $state<LaneEntry[]>([]);
+  let asideMenu = $state(""); // abs of the card whose Set aside menu is open
+  async function loadLane() { lane = ((await App.LaneList()) ?? []) as unknown as LaneEntry[]; }
+  // "lane" fires on every change, hundreds at once when a pass hands over many
+  // large files: fetch at most every 250 ms.
+  let lanePending = false;
+  function loadLaneSoon() {
+    if (lanePending) return;
+    lanePending = true;
+    setTimeout(() => { lanePending = false; loadLane(); }, 250);
+  }
+  // Byte counts move without a lane event, so poll while the tab shows a transfer.
+  $effect(() => {
+    if (tab !== "large" || !lane.some(l => l.state === "running")) return;
+    const t = setInterval(loadLane, 1000);
+    return () => clearInterval(t);
+  });
+  const laneName = (l: LaneEntry) => l.path.slice(l.path.lastIndexOf("/") + 1);
+  const laneFolder = (l: LaneEntry) => { const i = l.path.lastIndexOf("/"); return i < 0 ? "" : l.path.slice(0, i); };
+  const lanePct = (l: LaneEntry) => l.size > 0 ? Math.min(100, Math.floor(l.doneBytes * 100 / l.size)) : 0;
+  function ordinal(n: number): string {
+    const teen = n % 100 >= 11 && n % 100 <= 13;
+    const suf = teen ? "th" : ({ 1: "st", 2: "nd", 3: "rd" } as Record<number, string>)[n % 10] ?? "th";
+    return n + suf;
+  }
+  function untilText(iso: string): string {
+    if (!iso) return "until you resume it";
+    const d = new Date(iso), now = new Date();
+    const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    if (d.toDateString() === now.toDateString()) return `until ${time}`;
+    const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
+    if (d.toDateString() === tomorrow.toDateString()) return `until tomorrow, ${time}`;
+    return `until ${d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}`;
+  }
+  function laneLine(l: LaneEntry): string {
+    switch (l.state) {
+      case "running":
+        return `${l.dir === "up" ? "Uploading" : "Downloading"} · ${humanBytes(l.doneBytes)} of ${humanBytes(l.size)} (${lanePct(l)}%)`;
+      case "waiting": return l.position === 1 ? "Waiting · next" : `Waiting · ${ordinal(l.position)} in line`;
+      case "paused": return "Paused";
+      default: return "Set aside " + untilText(l.until);
+    }
+  }
+  async function syncFirst(l: LaneEntry) { await App.LaneSyncFirst(l.abs); loadLane(); }
+  async function setAside(l: LaneEntry, minutes: number) { asideMenu = ""; await App.LaneSetAside(l.abs, minutes); loadLane(); }
+  async function resumeLane(l: LaneEntry) { await App.LaneResume(l.abs); loadLane(); }
 
   async function loadActivity() { activity = (await App.RecentActivity()) ?? []; }
   async function loadConflicts() {
@@ -72,7 +124,7 @@
   }
   async function loadTrash() { trashBusy = true; trash = (await App.TrashList()) ?? []; trashBusy = false; }
   async function loadDetached() { detached = (await App.DetachedFolders()) ?? []; }
-  function loadAll() { loadActivity(); loadConflicts(); loadNotifs(); loadBlocked(); loadLocks(); loadDetached(); }
+  function loadAll() { loadActivity(); loadConflicts(); loadNotifs(); loadBlocked(); loadLocks(); loadDetached(); loadLane(); }
   loadAll();
 
   // The user's decision for a kept copy. "move" first asks where; the folder
@@ -99,7 +151,7 @@
   // bare "<tab>" or "<tab>" + newline + "<highlight-key>": the flyout newline-
   // joins the target row's key into OpenStatusTab's one string arg (so no extra
   // Go binding is needed), and we flash + scroll to the matching row.
-  type Tab = "activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "detached" | "trash";
+  type Tab = "activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "large" | "detached" | "trash";
   const NL = String.fromCharCode(10); // newline — never occurs in a tab name or file path
   let highlight = $state("");
   let hlTimer: ReturnType<typeof setTimeout>;
@@ -133,6 +185,7 @@
   Events.On("blocked", loadBlocked);
   Events.On("locks", loadLocks);
   Events.On("detached", loadDetached);
+  Events.On("lane", loadLaneSoon);
 
   const conflictDesc = (k: string) =>
     k === "deleted-locally" ? "You deleted this; it changed on the server."
@@ -236,6 +289,10 @@
     <button class:active={tab==="notifications"} onclick={() => tab="notifications"}>Notifications{notifs.length ? ` (${notifs.length})` : ""}</button>
     <button class:active={tab==="blocked"} onclick={() => tab="blocked"}>Can't sync{realBlocked.length ? ` (${realBlocked.length})` : ""}</button>
     <button class:active={tab==="inuse"} onclick={() => tab="inuse"}>In use{locks.length ? ` (${locks.length})` : ""}</button>
+    <!-- Only while there are large files, like "No longer shared". -->
+    {#if lane.length || tab === "large"}
+      <button class:active={tab==="large"} onclick={() => tab="large"}>Large files{lane.length ? ` (${lane.length})` : ""}</button>
+    {/if}
     <!-- Rare, so the tab only appears while there is something to decide. -->
     {#if detached.length || tab === "detached"}
       <button class:active={tab==="detached"} onclick={() => tab="detached"}>No longer shared{detached.length ? ` (${detached.length})` : ""}</button>
@@ -409,6 +466,38 @@
         {/each}
       {/if}
 
+    {:else if tab === "large"}
+      <p class="laneintro">Files of 64 MB or more sync here, two at a time, next to the normal sync, so smaller changes never wait behind them.</p>
+      {#if lane.length === 0}<p class="empty">No large files syncing.</p>{/if}
+      {#each lane as l (l.abs)}
+        <div class="card" class:hl={l.abs === highlight}>
+          <div class="title">{l.dir === "up" ? "↑" : "↓"} {laneName(l)}</div>
+          <div class="lanesub">{#if l.account}<span class="acct">{l.account}</span> {/if}{laneFolder(l) || "Top folder"} · {humanBytes(l.size)}</div>
+          <div class="desc">{laneLine(l)}</div>
+          {#if l.state === "running"}
+            <div class="lanebar"><div style="width: {lanePct(l)}%"></div></div>
+          {/if}
+          <div class="btns">
+            {#if l.state === "setaside"}
+              <button class="primary" onclick={() => resumeLane(l)}>Resume</button>
+            {:else}
+              {#if (l.state === "waiting" || l.state === "paused") && l.position > 1}
+                <button onclick={() => syncFirst(l)}>Sync first</button>
+              {/if}
+              <button onclick={() => asideMenu = asideMenu === l.abs ? "" : l.abs}>Set aside ▾</button>
+            {/if}
+          </div>
+          {#if asideMenu === l.abs && l.state !== "setaside"}
+            <div class="btns asidemenu">
+              <button onclick={() => setAside(l, 60)}>For 1 hour</button>
+              <button onclick={() => setAside(l, 240)}>For 4 hours</button>
+              <button onclick={() => setAside(l, -1)}>Until tomorrow</button>
+              <button onclick={() => setAside(l, 0)}>Until I resume it</button>
+            </div>
+          {/if}
+        </div>
+      {/each}
+
     {:else}
       {#if trashBusy && trash.length === 0}<p class="empty">Loading…</p>
       {:else if trash.length === 0}<p class="empty">Trash is empty.</p>
@@ -458,6 +547,12 @@
   .card .desc { color: var(--fg2); font-size: 12px; margin: 4px 0 10px; }
   .locksub { font-size: 11.5px; color: var(--muted); }
   .lockbtns { margin-top: 8px; }
+  .laneintro { font-size: 12px; color: var(--muted); margin: 0 0 10px; }
+  .lanesub { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  .lanesub .acct { color: var(--accent); border: 1px solid var(--border); border-radius: 8px; padding: 0 6px; }
+  .lanebar { height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; margin: -4px 0 10px; }
+  .lanebar div { height: 100%; background: var(--accent); }
+  .asidemenu { margin-top: 8px; }
   .versions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 12px; }
   .ver { border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; background: var(--panel); }
   .ver.newest { border-color: var(--accent); background: var(--tint); }
