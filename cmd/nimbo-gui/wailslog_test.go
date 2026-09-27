@@ -25,31 +25,30 @@ func TestWailsLoggerWritesToTheAppLog(t *testing.T) {
 	}
 }
 
-// Wails' asset server logs every file a window loads at INFO, five lines each
-// time a window opens. That is debug detail: it must not fill the log at the
-// normal level, and it must still be there with verbose logging on.
-func TestWailsAssetRequestsAreDebugOnly(t *testing.T) {
+// Wails writes five DEBUG lines for every call the UI makes into Go, and the
+// flyout makes one every 250 ms during a scan: with verbose logging on that
+// buried Nimbo's own lines. Its asset server also logs every file a window
+// loads at INFO. None of it may reach the log, even with verbose logging on,
+// while Wails' real INFO lines (start-up info, WebView2 recovery) still do.
+func TestWailsNoiseStaysOutOfTheLog(t *testing.T) {
 	var buf bytes.Buffer
-	lv := new(slog.LevelVar)
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: lv})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	l := wailsLogger()
+	l.Debug("Binding call started:", "method", "main.App.NeedsLogin")
+	l.Debug("handleWebViewRequest: Processing request", "url", "http://wails.localhost/wails/runtime")
 	l.Info("[AssetFileServerFS] Handling request", "url", "/style.css")
 	l.Info("webview2: rebuilding controller after browser process exit")
+
 	got := buf.String()
-	if strings.Contains(got, "Handling request") {
-		t.Errorf("asset request logged at the normal level: %q", got)
+	for _, noise := range []string{"Binding call", "handleWebViewRequest", "Handling request"} {
+		if strings.Contains(got, noise) {
+			t.Errorf("%q reached the log with verbose logging on: %q", noise, got)
+		}
 	}
 	if !strings.Contains(got, "level=INFO") || !strings.Contains(got, "rebuilding controller") {
-		t.Errorf("Wails' other INFO lines must stay: %q", got)
-	}
-
-	buf.Reset()
-	lv.Set(slog.LevelDebug)
-	l.Info("[AssetFileServerFS] Handling request", "url", "/style.css")
-	if got := buf.String(); !strings.Contains(got, "level=DEBUG") || !strings.Contains(got, "url=/style.css") {
-		t.Errorf("with verbose logging the asset request should show at DEBUG: %q", got)
+		t.Errorf("Wails' own INFO lines must stay: %q", got)
 	}
 }
