@@ -303,8 +303,8 @@ func (e *Executor) runTransfers(ctx context.Context, transfers []engine.Action, 
 // re-downloads the whole file twice per lock cycle.
 //
 // Deliberately conservative: no server checksum, a size mismatch, or any error
-// means "download it".
-func (e *Executor) redundantDownload(rel string) (string, bool) {
+// means "download it", and so does ctx being done (the hash stops then).
+func (e *Executor) redundantDownload(ctx context.Context, rel string) (string, bool) {
 	r, ok := e.Remote[rel]
 	if !ok || r.IsDir || r.SHA1 == "" {
 		return "", false
@@ -313,7 +313,7 @@ func (e *Executor) redundantDownload(rel string) (string, bool) {
 	if err != nil || fi.IsDir() || fi.Size() != r.Size {
 		return "", false
 	}
-	localSHA, err := sha1File(e.localPath(rel))
+	localSHA, err := sha1FileCtx(ctx, e.localPath(rel))
 	if err != nil || localSHA == "" {
 		return "", false
 	}
@@ -350,9 +350,12 @@ func (e *Executor) applyTransfer(ctx context.Context, a engine.Action) error {
 
 	// A download whose bytes we already hold is pure waste — see redundantDownload.
 	if a.Kind == engine.ActDownload {
-		if localSHA, redundant := e.redundantDownload(a.Path); redundant {
+		if localSHA, redundant := e.redundantDownload(ctx, a.Path); redundant {
 			slog.Info("download skipped (metadata-only change, content identical)", "path", a.Path)
 			return e.rebaselineUnchanged(a.Path, localSHA)
+		}
+		if err := ctx.Err(); err != nil {
+			return err // stopped while hashing: don't go on to fetch it
 		}
 	}
 

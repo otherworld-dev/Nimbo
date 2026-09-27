@@ -23,6 +23,7 @@ export {
     FlyoutAppearanceDTO,
     FolderInfo,
     HeaderInfo,
+    LaneEntryDTO,
     LimitsDTO,
     LocalTestDTO,
     LockDTO,

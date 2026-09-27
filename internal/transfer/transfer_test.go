@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"os"
@@ -29,7 +30,7 @@ func TestRedundantDownload(t *testing.T) {
 
 	t.Run("identical content is redundant", func(t *testing.T) {
 		remote(engine.RemoteState{Path: "a.txt", Size: int64(len(body)), SHA1: digest, ETag: "new"})
-		got, redundant := e.redundantDownload("a.txt")
+		got, redundant := e.redundantDownload(context.Background(), "a.txt")
 		if !redundant {
 			t.Fatal("redundant = false, want true")
 		}
@@ -40,21 +41,21 @@ func TestRedundantDownload(t *testing.T) {
 
 	t.Run("different content must download", func(t *testing.T) {
 		remote(engine.RemoteState{Path: "a.txt", Size: int64(len(body)), SHA1: "00000000000000000000000000000000000000aa"})
-		if _, redundant := e.redundantDownload("a.txt"); redundant {
+		if _, redundant := e.redundantDownload(context.Background(), "a.txt"); redundant {
 			t.Error("redundant = true, want false")
 		}
 	})
 
 	t.Run("no server checksum must download", func(t *testing.T) {
 		remote(engine.RemoteState{Path: "a.txt", Size: int64(len(body))})
-		if _, redundant := e.redundantDownload("a.txt"); redundant {
+		if _, redundant := e.redundantDownload(context.Background(), "a.txt"); redundant {
 			t.Error("redundant = true, want false — never guess without a checksum")
 		}
 	})
 
 	t.Run("size mismatch must download", func(t *testing.T) {
 		remote(engine.RemoteState{Path: "a.txt", Size: 999, SHA1: digest})
-		if _, redundant := e.redundantDownload("a.txt"); redundant {
+		if _, redundant := e.redundantDownload(context.Background(), "a.txt"); redundant {
 			t.Error("redundant = true, want false")
 		}
 	})
@@ -62,21 +63,21 @@ func TestRedundantDownload(t *testing.T) {
 	t.Run("missing local file must download", func(t *testing.T) {
 		remote(engine.RemoteState{Path: "gone.txt", Size: 1, SHA1: digest})
 		e.Remote["gone.txt"] = e.Remote["a.txt"]
-		if _, redundant := e.redundantDownload("gone.txt"); redundant {
+		if _, redundant := e.redundantDownload(context.Background(), "gone.txt"); redundant {
 			t.Error("redundant = true, want false")
 		}
 	})
 
 	t.Run("directory is never redundant", func(t *testing.T) {
 		remote(engine.RemoteState{Path: "a.txt", IsDir: true, SHA1: digest})
-		if _, redundant := e.redundantDownload("a.txt"); redundant {
+		if _, redundant := e.redundantDownload(context.Background(), "a.txt"); redundant {
 			t.Error("redundant = true, want false")
 		}
 	})
 
 	t.Run("unknown path must download", func(t *testing.T) {
 		remote(engine.RemoteState{Path: "a.txt", Size: int64(len(body)), SHA1: digest})
-		if _, redundant := e.redundantDownload("nosuch.txt"); redundant {
+		if _, redundant := e.redundantDownload(context.Background(), "nosuch.txt"); redundant {
 			t.Error("redundant = true, want false")
 		}
 	})

@@ -42,6 +42,28 @@
   let notifCount = $state(0);
   let header = $state<Header>({ user: "", server: "", statusType: "", statusMsg: "", statusIcon: "", quotaUsed: 0, quotaTotal: 0, quotaPct: 0, unlimited: false });
   let attention = $state<Attention>({ conflicts: 0, blocked: 0, locked: 0, detached: 0 });
+  // The large-file queue (Deck #702): one quiet line while it holds anything.
+  let laneRunning = $state(0), laneWaiting = $state(0), laneAside = $state(0);
+  async function loadLane() {
+    const l = ((await App.LaneList()) ?? []) as unknown as { state: string }[];
+    laneRunning = l.filter(x => x.state === "running").length;
+    laneWaiting = l.filter(x => x.state === "waiting" || x.state === "paused").length;
+    laneAside = l.filter(x => x.state === "setaside").length;
+  }
+  let lanePending = false;
+  function loadLaneSoon() {
+    if (lanePending) return;
+    lanePending = true;
+    setTimeout(() => { lanePending = false; loadLane(); }, 250);
+  }
+  const largeFiles = (n: number) => `${n} large file${n === 1 ? "" : "s"}`;
+  let laneText = $derived.by(() => {
+    const parts: string[] = [];
+    if (laneRunning) parts.push(`${largeFiles(laneRunning)} syncing`);
+    if (laneWaiting) parts.push(parts.length ? `${laneWaiting} waiting` : `${largeFiles(laneWaiting)} waiting`);
+    if (laneAside) parts.push(parts.length ? `${laneAside} set aside` : `${largeFiles(laneAside)} set aside`);
+    return parts.join(", ");
+  });
   let pauseInfo = $state<{ paused: boolean; reason: string; until: string }>({ paused: false, reason: "", until: "" });
   let pauseMenu = $state(false);
   let editStatus = $state(false);
@@ -165,6 +187,7 @@
     if (needsLogin) header = h;
     else if (h.user || !header.user) header = h;
     attention = await fetchAttention();
+    loadLane();
     notifCount = await App.NotificationCount();
     showDock = await App.ShowAppDock();
     dockSide = await App.AppDockSide();
@@ -239,6 +262,7 @@
     if (!needsLogin && cur && (cur.user !== header.user || cur.server !== header.server)) refresh();
   });
   Events.On("progress", (e: any) => { progress = e.data; });
+  Events.On("lane", loadLaneSoon);
   // Activity fires per file — hundreds/sec during a big sync. Coalesce into a
   // light refresh (just the recent list) at most ~2×/sec, so the panel doesn't
   // thrash re-fetching/re-rendering the whole header + app rail on every file.
@@ -501,6 +525,15 @@
     <button class="inuse" onclick={() => App.OpenStatusTab("inuse")}>
       <span class="iicon">🔒</span>
       <span class="atext">{attention.locked} file{attention.locked === 1 ? "" : "s"} in use by someone else</span>
+      <span class="go">View →</span>
+    </button>
+  {/if}
+
+  <!-- Large files syncing in their own lane: informational, like the line above. -->
+  {#if laneText}
+    <button class="inuse" onclick={() => App.OpenStatusTab("large")}>
+      <span class="iicon">⇅</span>
+      <span class="atext">{laneText}</span>
       <span class="go">View →</span>
     </button>
   {/if}

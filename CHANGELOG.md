@@ -3,6 +3,29 @@
 All notable changes to Nimbo are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Large files (64 MB or more) sync two at a time per account, alongside the rest of
+  the sync, and have a tab of their own: Status → Large files lists each one
+  running with its progress, waiting with its place in the queue, paused, or set
+  aside with when it's due back. The flyout shows a line while any are syncing,
+  waiting or set aside, and clicking it opens the tab. "Sync first" moves a
+  waiting file to the front of the queue, it never interrupts one that's already
+  running. "Set aside" stops one for an hour, four hours, until tomorrow at 8am, or
+  until you bring it back yourself, so a file that keeps failing or is crawling
+  stops holding up the others. A restart ends a set-aside, and when the file comes
+  back it rejoins the queue and carries on from where it got to rather than
+  starting again, an upload picks up from the chunks already on the server (#702).
+
+### Fixed
+
+- Pausing now stops large uploads and downloads, they carried on regardless in
+  0.2.0 even though the notes for that release said pausing covered them. Removing
+  or moving a sync folder, blacklisting a file, or unticking a folder now stops its
+  large transfers too (#702).
+
 ## [0.2.0] - 2026-09-26
 
 Mostly about file locking and multiple accounts. On-demand mode now takes and

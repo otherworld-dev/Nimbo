@@ -192,6 +192,7 @@ type Engine struct {
 	progStop    chan struct{} // stops the speed sampler
 	progStartAt time.Time     // burst start, for a stable average-rate ETA
 	onProgress  func(SyncProgress)
+	onLane      func() // told when the large-file lane changes (queue view); see SetLaneFunc
 
 	onToast      func(title, message, link string) // desktop toasts (GUI sets this)
 	encMu        sync.Mutex
@@ -1083,6 +1084,7 @@ func (e *Engine) BlacklistPath(abs string) error {
 		return err
 	}
 	e.removeBlocked(abs)
+	e.stopLaneUnder(abs)
 	return nil
 }
 
@@ -2147,6 +2149,11 @@ func (e *Engine) FileStatus(abs string) string {
 			return "warn"
 		}
 	}
+	// A large file set aside (Deck #702) isn't on the server, or not in this
+	// version: no badge, rather than a synced tick, until it comes back.
+	if l := e.currentLane(); l != nil && l.parkedAt(abs) {
+		return "none"
+	}
 	// A share on this exact remote path marks the item as shared — the share
 	// ROOT only, not everything inside it (OneDrive's model). It outranks the
 	// idle answers ("ok"/mount "none") but never a transfer or a problem, and
@@ -2548,6 +2555,41 @@ func (e *Engine) progAddTotal(files int, bytes int64) {
 	e.emitProgress()
 }
 
+// progRetract takes back files/bytes previously added to the burst's totals
+// (progStart/progAddTotal), and sentBytes previously added to progBytes (the
+// done-so-far counter), for a job leaving the burst without finishing: a
+// large file set aside mid-sync (lanejobs.go) still has an unknown fate —
+// the re-plan that follows may find nothing to do — so its share of the
+// progress bar ends rather than counting toward a total it may never reach.
+// A no-op once the burst itself has ended (progRuns == 0): there is nothing
+// left to retract from. Clamped at 0 so a race between this and another
+// update can never take a total negative.
+func (e *Engine) progRetract(files int, bytes, sentBytes int64) {
+	e.progMu.Lock()
+	if e.progRuns > 0 {
+		e.prog.Total -= files
+		if e.prog.Total < 0 {
+			e.prog.Total = 0
+		}
+		e.prog.TotalBytes -= bytes
+		if e.prog.TotalBytes < 0 {
+			e.prog.TotalBytes = 0
+		}
+		for {
+			cur := e.progBytes.Load()
+			next := cur - sentBytes
+			if next < 0 {
+				next = 0
+			}
+			if e.progBytes.CompareAndSwap(cur, next) {
+				break
+			}
+		}
+	}
+	e.progMu.Unlock()
+	e.emitProgress()
+}
+
 // progEnd marks one burst run done; the last one out clears progress.
 func (e *Engine) progEnd() {
 	e.progMu.Lock()
@@ -2694,6 +2736,7 @@ func (e *Engine) DeselectFolder(localDir, rel string, deleteLocal bool) error {
 	if err := e.AddExclude(localDir, rel); err != nil {
 		return err
 	}
+	e.stopLaneUnder(filepath.Join(localDir, filepath.FromSlash(rel)))
 	if !deleteLocal {
 		e.TriggerSync()
 		return nil
@@ -2912,8 +2955,14 @@ func (e *Engine) PauseState() PauseStatus {
 // pauseChanged updates status, resumes work if newly unpaused, and notifies.
 func (e *Engine) pauseChanged() {
 	if e.Paused() {
+		if l := e.currentLane(); l != nil {
+			l.pause() // large transfers stop at once and carry on at resume (Deck #702)
+		}
 		e.status("Paused")
 	} else {
+		if l := e.currentLane(); l != nil {
+			l.resume()
+		}
 		e.status("Up to date")
 		e.TriggerSync()
 	}
@@ -4209,9 +4258,17 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 	}
 	actions, bigTransfers := splitForLane(actions, func(a engine.Action) int64 { return transferSize(p, a, remote) })
 	for _, a := range bigTransfers {
-		if e.sendToLane(p, pk, a, transferSize(p, a, remote), remote) {
+		switch {
+		case e.sendToLane(p, pk, a, transferSize(p, a, remote), remote):
 			laneHeld = append(laneHeld, a.Path) // unsent: its folder isn't settled
-		} else {
+		case tl.pairStopped(pk):
+			// The folder stopped syncing (removed, moved, held back) while
+			// this pass was planning it. Its large transfers aren't the
+			// pass's to run either: a download would recreate the folder the
+			// user asked to delete. Unsent, so its folder isn't settled.
+			slog.Info("large transfer dropped: its folder stopped syncing", "path", a.Path)
+			laneHeld = append(laneHeld, a.Path)
+		default:
 			actions = append(actions, a)
 		}
 	}
@@ -5045,6 +5102,11 @@ func (e *Engine) startWatcher(p Pair) {
 	e.nudges[key] = nudge
 	e.watchDone[key] = done
 	e.watchMu.Unlock()
+	// The folder syncs (again): if stopWatcher took it out of the lane, let
+	// its large transfers back in (see stopLanePair).
+	if l := e.currentLane(); l != nil {
+		l.allowPair(key)
+	}
 
 	go func() {
 		defer close(done) // let stopWatcherSync wait for an in-flight sync to drain
@@ -5123,6 +5185,7 @@ func (e *Engine) stopWatcher(key string) {
 	if cancel != nil {
 		cancel()
 	}
+	e.stopLanePair(key) // its large transfers too, before the folder goes
 }
 
 // stopWatcherSync cancels a pair's watcher AND waits for its goroutine — hence
@@ -5148,6 +5211,7 @@ func (e *Engine) stopWatcherSync(key string) {
 			slog.Warn("watcher did not stop within 30s; proceeding", "key", key)
 		}
 	}
+	e.stopLanePair(key) // a move must not overlap a large transfer either
 }
 
 // runPush connects to notify_push and fans events out to all active watchers.

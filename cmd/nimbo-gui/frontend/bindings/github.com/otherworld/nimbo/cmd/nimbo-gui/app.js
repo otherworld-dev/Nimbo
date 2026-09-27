@@ -591,12 +591,52 @@ export function InitialStatusTab() {
 }
 
 /**
+ * LaneList returns every account's large transfers: running, then waiting in
+ * queue order, then set aside.
+ * @returns {$CancellablePromise<$models.LaneEntryDTO[]>}
+ */
+export function LaneList() {
+    return $Call.ByID(3963512447).then(/** @type {($result: any) => any} */(($result) => {
+        return $$createType29($result);
+    }));
+}
+
+/**
+ * LaneResume brings a set-aside large file back into the queue.
+ * @param {string} abs
+ * @returns {$CancellablePromise<void>}
+ */
+export function LaneResume(abs) {
+    return $Call.ByID(925915116, abs);
+}
+
+/**
+ * LaneSetAside sets a large file aside: minutes from now, -1 until tomorrow
+ * morning, 0 until the user resumes it. A restart ends it either way.
+ * @param {string} abs
+ * @param {number} minutes
+ * @returns {$CancellablePromise<void>}
+ */
+export function LaneSetAside(abs, minutes) {
+    return $Call.ByID(1182554255, abs, minutes);
+}
+
+/**
+ * LaneSyncFirst moves a waiting large file to the front of its queue.
+ * @param {string} abs
+ * @returns {$CancellablePromise<void>}
+ */
+export function LaneSyncFirst(abs) {
+    return $Call.ByID(2986034398, abs);
+}
+
+/**
  * LicenceInfo reports the current licence state for the Settings UI.
  * @returns {$CancellablePromise<license$0.Info>}
  */
 export function LicenceInfo() {
     return $Call.ByID(2163230976).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType28($result);
+        return $$createType30($result);
     }));
 }
 
@@ -607,7 +647,7 @@ export function LicenceInfo() {
  */
 export function ListAccounts() {
     return $Call.ByID(2919187697).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType30($result);
+        return $$createType32($result);
     }));
 }
 
@@ -680,7 +720,7 @@ export function NotificationCount() {
  */
 export function NotificationList() {
     return $Call.ByID(2567004906).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType32($result);
+        return $$createType34($result);
     }));
 }
 
@@ -800,7 +840,7 @@ export function OpenVersions(remotePath) {
  */
 export function OtherAccountAttention() {
     return $Call.ByID(3107861882).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType34($result);
+        return $$createType36($result);
     }));
 }
 
@@ -819,7 +859,7 @@ export function PauseFor(minutes) {
  */
 export function PauseInfo() {
     return $Call.ByID(3615706181).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType35($result);
+        return $$createType37($result);
     }));
 }
 
@@ -864,7 +904,7 @@ export function PinApp(id) {
  */
 export function PolicyInfo() {
     return $Call.ByID(4136447139).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType36($result);
+        return $$createType38($result);
     }));
 }
 
@@ -874,7 +914,7 @@ export function PolicyInfo() {
  */
 export function Progress() {
     return $Call.ByID(1801045022).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType37($result);
+        return $$createType39($result);
     }));
 }
 
@@ -894,7 +934,7 @@ export function Quit() {
  */
 export function RecentActivity() {
     return $Call.ByID(3561310187).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType39($result);
+        return $$createType41($result);
     }));
 }
 
@@ -1044,7 +1084,7 @@ export function SaveLocalAddress(addr, pin) {
  */
 export function Search(term) {
     return $Call.ByID(3097496321, term).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType41($result);
+        return $$createType43($result);
     }));
 }
 
@@ -1294,7 +1334,7 @@ export function SetVerbose(on) {
  */
 export function ShareList() {
     return $Call.ByID(427148648).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType43($result);
+        return $$createType45($result);
     }));
 }
 
@@ -1439,7 +1479,7 @@ export function TailLog() {
  */
 export function TestLocalAddress(addr, pin) {
     return $Call.ByID(176774928, addr, pin).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType44($result);
+        return $$createType46($result);
     }));
 }
 
@@ -1466,7 +1506,7 @@ export function TogglePause() {
  */
 export function TrashList() {
     return $Call.ByID(2716350569).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType46($result);
+        return $$createType48($result);
     }));
 }
 
@@ -1513,7 +1553,7 @@ export function Version() {
  */
 export function VersionList() {
     return $Call.ByID(3868762695).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType48($result);
+        return $$createType50($result);
     }));
 }
 
@@ -1554,24 +1594,26 @@ const $$createType24 = $Create.Array($$createType23);
 const $$createType25 = $models.ScheduleDTO.createFrom;
 const $$createType26 = $models.SetupInfo.createFrom;
 const $$createType27 = $models.HeaderInfo.createFrom;
-const $$createType28 = license$0.Info.createFrom;
-const $$createType29 = $models.AccountEntryDTO.createFrom;
-const $$createType30 = $Create.Array($$createType29);
-const $$createType31 = $models.NotifItem.createFrom;
+const $$createType28 = $models.LaneEntryDTO.createFrom;
+const $$createType29 = $Create.Array($$createType28);
+const $$createType30 = license$0.Info.createFrom;
+const $$createType31 = $models.AccountEntryDTO.createFrom;
 const $$createType32 = $Create.Array($$createType31);
-const $$createType33 = $models.OtherAttention.createFrom;
+const $$createType33 = $models.NotifItem.createFrom;
 const $$createType34 = $Create.Array($$createType33);
-const $$createType35 = $models.PauseDTO.createFrom;
-const $$createType36 = $models.PolicyDTO.createFrom;
-const $$createType37 = $models.ProgressDTO.createFrom;
-const $$createType38 = $models.ActivityItem.createFrom;
-const $$createType39 = $Create.Array($$createType38);
-const $$createType40 = $models.SearchItem.createFrom;
+const $$createType35 = $models.OtherAttention.createFrom;
+const $$createType36 = $Create.Array($$createType35);
+const $$createType37 = $models.PauseDTO.createFrom;
+const $$createType38 = $models.PolicyDTO.createFrom;
+const $$createType39 = $models.ProgressDTO.createFrom;
+const $$createType40 = $models.ActivityItem.createFrom;
 const $$createType41 = $Create.Array($$createType40);
-const $$createType42 = $models.ShareDTO.createFrom;
+const $$createType42 = $models.SearchItem.createFrom;
 const $$createType43 = $Create.Array($$createType42);
-const $$createType44 = $models.LocalTestDTO.createFrom;
-const $$createType45 = $models.TrashDTO.createFrom;
-const $$createType46 = $Create.Array($$createType45);
-const $$createType47 = $models.VersionDTO.createFrom;
+const $$createType44 = $models.ShareDTO.createFrom;
+const $$createType45 = $Create.Array($$createType44);
+const $$createType46 = $models.LocalTestDTO.createFrom;
+const $$createType47 = $models.TrashDTO.createFrom;
 const $$createType48 = $Create.Array($$createType47);
+const $$createType49 = $models.VersionDTO.createFrom;
+const $$createType50 = $Create.Array($$createType49);
