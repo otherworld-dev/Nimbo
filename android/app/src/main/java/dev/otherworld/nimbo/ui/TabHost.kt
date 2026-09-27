@@ -8,6 +8,8 @@
 package dev.otherworld.nimbo.ui
 
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
@@ -63,11 +65,15 @@ fun TabHost(
         },
     ) { inner ->
         // Each tab's screen carries its own top bar and insets; only the bottom
-        // bar's space is reserved here.
+        // bar's space is reserved here. That space already includes the system
+        // navigation bar, so it is marked consumed: otherwise each tab's own
+        // Scaffold adds the navigation bar again and lifts its FAB off the tabs.
+        val bottom = PaddingValues(bottom = inner.calculateBottomPadding())
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(bottom = inner.calculateBottomPadding()),
+                .padding(bottom)
+                .consumeWindowInsets(bottom),
         ) {
             content()
         }
