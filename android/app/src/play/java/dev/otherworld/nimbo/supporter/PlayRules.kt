@@ -60,6 +60,15 @@ fun changeFor(current: OwnedProduct?, target: String): Change {
     }
 }
 
+enum class OffersState { LOADING, LOADED, UNAVAILABLE }
+
+/** Offers are usable only when setup worked and Play knew every product. */
+fun offersStateFor(setupOk: Boolean, loadedIds: Set<String>): OffersState = when {
+    !setupOk -> OffersState.UNAVAILABLE
+    loadedIds.containsAll(PlayProducts.subscriptions + PlayProducts.tips) -> OffersState.LOADED
+    else -> OffersState.UNAVAILABLE
+}
+
 fun manageUrl(productId: String?): String =
     "https://play.google.com/store/account/subscriptions?package=dev.otherworld.nimbo" +
         (productId?.let { "&sku=$it" } ?: "")

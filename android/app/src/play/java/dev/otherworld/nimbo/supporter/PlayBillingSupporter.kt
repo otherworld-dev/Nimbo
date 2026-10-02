@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.resume
@@ -58,9 +59,13 @@ class PlayBillingSupporter(
     private val _offers = MutableStateFlow<List<PlayOffer>>(emptyList())
     val offers: StateFlow<List<PlayOffer>> = _offers.asStateFlow()
 
+    private val _offersState = MutableStateFlow(OffersState.LOADING)
+    val offersState: StateFlow<OffersState> = _offersState.asStateFlow()
+
     private val _owned = MutableStateFlow<List<OwnedProduct>>(emptyList())
     val owned: StateFlow<List<OwnedProduct>> = _owned.asStateFlow()
 
+    private val allProductIds = PlayProducts.subscriptions + PlayProducts.tips
     private var details: Map<String, ProductDetails> = emptyMap()
     private val mutex = Mutex()
 
@@ -68,7 +73,10 @@ class PlayBillingSupporter(
         mutex.withLock {
             val setup = connect()
             if (setup != BillingResponseCode.OK) {
-                if (force) {
+                // Null means Play never answered in time: no prices are coming, and
+                // the cached status stays as it was.
+                if (details.isEmpty()) _offersState.value = OffersState.UNAVAILABLE
+                if (force && setup != null) {
                     _notice.value = SupporterNotice(
                         unavailableMessage(setup == BillingResponseCode.BILLING_UNAVAILABLE),
                         isError = true,
@@ -77,8 +85,14 @@ class PlayBillingSupporter(
                 return
             }
             // Either query failing is no answer: keep what we had.
-            val subs = queryPurchases(ProductType.SUBS) ?: return
-            val tips = queryPurchases(ProductType.INAPP) ?: return
+            val subs = queryPurchases(ProductType.SUBS)
+            val tips = if (subs != null) queryPurchases(ProductType.INAPP) else null
+            if (subs == null || tips == null) {
+                if (force) _notice.value = SupporterNotice(unavailableMessage(billingUnavailable = false), isError = true)
+                // Prices don't depend on purchases; don't leave them loading.
+                if (!details.keys.containsAll(allProductIds)) loadOffers(setupOk = true)
+                return
+            }
             val owned = (subs + tips).flatMap { purchase ->
                 purchase.products.map { id ->
                     OwnedProduct(
@@ -97,7 +111,7 @@ class PlayBillingSupporter(
             _status.value = next
             cache.write(next)
 
-            if (details.isEmpty()) loadOffers()
+            if (!details.keys.containsAll(allProductIds)) loadOffers(setupOk = true)
         }
     }
 
@@ -152,9 +166,10 @@ class PlayBillingSupporter(
         _notice.value = null
     }
 
-    private suspend fun connect(): Int {
+    /** Play's setup response code, or null if it never answered in time. */
+    private suspend fun connect(): Int? {
         if (client.isReady) return BillingResponseCode.OK
-        val code = suspendCancellableCoroutine<Int> { cont ->
+        val code = withTimeoutOrNull(CONNECT_TIMEOUT_MS) { suspendCancellableCoroutine<Int> { cont ->
             client.startConnection(object : BillingClientStateListener {
                 override fun onBillingSetupFinished(result: BillingResult) {
                     if (cont.isActive) cont.resume(result.responseCode)
@@ -164,7 +179,7 @@ class PlayBillingSupporter(
                     // Automatic service reconnection handles this.
                 }
             })
-        }
+        } }
         if (code != BillingResponseCode.OK) Log.i(TAG, "billing setup: $code")
         return code
     }
@@ -182,7 +197,7 @@ class PlayBillingSupporter(
         }
     }
 
-    private suspend fun loadOffers() {
+    private suspend fun loadOffers(setupOk: Boolean) {
         val subs = queryDetails(ProductType.SUBS, PlayProducts.subscriptions)
         val tips = queryDetails(ProductType.INAPP, PlayProducts.tips)
         details = (subs + tips).associateBy { it.productId }
@@ -195,6 +210,7 @@ class PlayBillingSupporter(
                 ?: return@mapNotNull null
             PlayOffer(id, tierForProduct(id), price)
         }
+        _offersState.value = offersStateFor(setupOk, _offers.value.map { it.productId }.toSet())
     }
 
     /** One product type per query: Play doesn't mix them. */
@@ -210,6 +226,7 @@ class PlayBillingSupporter(
         }
 
     private companion object {
+        const val CONNECT_TIMEOUT_MS = 15_000L
         const val TAG = "NimboSupporter"
     }
 }

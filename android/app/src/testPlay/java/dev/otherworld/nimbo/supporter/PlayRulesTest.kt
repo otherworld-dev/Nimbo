@@ -66,4 +66,13 @@ class PlayRulesTest {
         assertEquals("Couldn't reach Google Play. Try again.", unavailableMessage(billingUnavailable = false))
         assertFalse(unavailableMessage(true).isBlank())
     }
+
+    @Test
+    fun `offers are unavailable unless setup worked and every product loaded`() {
+        val all = (PlayProducts.subscriptions + PlayProducts.tips).toSet()
+        assertEquals(OffersState.LOADED, offersStateFor(true, all))
+        assertEquals(OffersState.UNAVAILABLE, offersStateFor(false, all))
+        assertEquals(OffersState.UNAVAILABLE, offersStateFor(true, emptySet()))
+        assertEquals(OffersState.UNAVAILABLE, offersStateFor(true, all - "tip_large"))
+    }
 }

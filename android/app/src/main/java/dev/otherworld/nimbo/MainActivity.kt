@@ -113,7 +113,9 @@ class MainActivity : ComponentActivity(), NimboHost {
             }
         )
 
-        handleIntent(intent)
+        // A restored activity re-delivers its original intent (extras and link
+        // included), which would replay a launch the user already acted on.
+        if (savedInstanceState == null) handleIntent(intent)
 
         val host: NimboHost = this
         setContent {

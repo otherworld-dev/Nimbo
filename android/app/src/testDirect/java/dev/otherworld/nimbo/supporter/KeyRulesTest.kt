@@ -90,6 +90,12 @@ class KeyRulesTest {
     }
 
     @Test
+    fun `a key whose first check was paused can still open the portal`() {
+        val paused = StoredKey("p", SupporterTier.NONE, KeyState.PAUSED)
+        assertEquals(paused, manageableKey(listOf(paused)))
+    }
+
+    @Test
     fun `a subscriber changes tier in the portal, never with a second checkout`() {
         val sub = listOf(StoredKey("s", SupporterTier.SUPPORTER, KeyState.ACTIVE))
         assertEquals(MonthlyAction.CHECKOUT, monthlyActionFor(emptyList(), SupporterTier.BACKER))

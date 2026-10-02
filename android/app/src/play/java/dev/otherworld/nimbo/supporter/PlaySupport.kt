@@ -7,6 +7,7 @@ package dev.otherworld.nimbo.supporter
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.util.Log
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -35,6 +36,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
 fun SupportActions(repo: SupporterRepository) {
     val play = repo as PlayBillingSupporter
     val offers by play.offers.collectAsStateWithLifecycle()
+    val offersState by play.offersState.collectAsStateWithLifecycle()
     val owned by play.owned.collectAsStateWithLifecycle()
     val activity = LocalContext.current.findActivity()
     // ACTION_VIEW rather than a Custom Tab, so the Play Store app opens it.
@@ -42,7 +44,8 @@ fun SupportActions(repo: SupporterRepository) {
 
     if (offers.isEmpty()) {
         Text(
-            "Loading prices from Google Play…",
+            if (offersState == OffersState.UNAVAILABLE) "Purchases aren't available right now. Try again later."
+            else "Loading prices from Google Play…",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -92,7 +95,10 @@ fun SupportActions(repo: SupporterRepository) {
 
     if (current != null) {
         OutlinedButton(
-            onClick = { uri.openUri(manageUrl(current.productId)) },
+            onClick = {
+                runCatching { uri.openUri(manageUrl(current.productId)) }
+                    .onFailure { Log.w("NimboSupporter", "could not open the subscription page", it) }
+            },
             shape = RoundedCornerShape(14.dp),
         ) {
             Text("Manage or cancel")

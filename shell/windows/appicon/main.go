@@ -7,6 +7,12 @@
 //	                        # Android adaptive-icon layers; defaults to
 //	                        # ../../../android/app/src/main/res
 //
+//	The Android supporter icon variants (run from this directory):
+//
+//	  go run . -accent "#2E7D5B" -name ic_launcher_forest android
+//	  go run . -accent "#B4441C" -name ic_launcher_ember android
+//	  go run . -accent "#3D4B5C" -name ic_launcher_slate android
+//
 // Committed; re-run only to change the artwork.
 package main
 

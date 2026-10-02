@@ -99,9 +99,15 @@ fun tierOf(keys: List<StoredKey>): SupporterTier = highestTier(keys.filter { it.
 
 fun dueForCheck(now: Long, lastCheckedAt: Long): Boolean = now - lastCheckedAt >= RECHECK_AFTER_MS
 
-/** The key to open the billing portal with: a live subscription, never a tip. */
+/**
+ * The key to open the billing portal with: a live subscription, never a tip.
+ * A paused key qualifies whatever its tier (a tip can't be paused, and a key
+ * whose first check was "paused" has no tier yet but needs the portal to fix
+ * its card).
+ */
 fun manageableKey(keys: List<StoredKey>): StoredKey? =
-    keys.filter { it.counts() && it.tier >= SupporterTier.SUPPORTER }.maxByOrNull { it.tier }
+    keys.filter { it.counts() && (it.tier >= SupporterTier.SUPPORTER || it.state == KeyState.PAUSED) }
+        .maxByOrNull { it.tier }
 
 enum class MonthlyAction { CHECKOUT, CURRENT, PORTAL }
 

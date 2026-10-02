@@ -96,8 +96,8 @@ fun NimboNav(vm: NimboViewModel, supporterVm: SupporterViewModel) {
         when {
             state.route == Route.LOCAL_PICKER -> vm.navigate(Route.ADD_FOLDER)
             state.route == Route.ADD_FOLDER -> vm.navigate(Route.FOLDERS)
-            // Inside the browser, back walks up the tree rather than leaving.
             state.route == Route.SUPPORT -> vm.navigate(state.supportReturn)
+            // Inside the browser, back walks up the tree rather than leaving.
             inFileSubfolder -> vm.filesUp()
             else -> vm.navigate(Route.HOME)
         }
