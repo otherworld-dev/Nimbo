@@ -43,6 +43,7 @@ var (
 	cfShellCreated        = cfapi.ShellNotifyCreated
 	cfSettlePin           = cfapi.SettlePin
 	cfWantsFreeUp         = cfapi.WantsFreeUp
+	cfClearStrayOffline   = cfapi.ClearStrayOffline
 	cfExclude             = cfapi.ExcludeFromSync
 	cfPlaceholderIdentity = cfapi.PlaceholderIdentity
 	cfPlaceholderModified = cfapi.PlaceholderModified
@@ -451,6 +452,23 @@ func (w *Watcher) parse(b []byte) {
 		if skipName(name) {
 			if isEditorLockName(name) {
 				editorLocks = append(editorLocks, filepath.Join(w.root, name))
+			}
+			// A rename with one ignored end is not a move: it takes the other
+			// end into or out of the sync. Into: the old name is gone, which
+			// is a delete (debounced, so a safe-save's copy arriving under it
+			// cancels it). Out of: renameOld is cleared so the RENAMED_NEW
+			// that follows uploads as a new file. Left set, a stale renameOld
+			// paired with a LATER RENAMED_NEW: a safe-save in one batch became
+			// a MOVE of the document onto itself, and two different files a
+			// MOVE of one over the other (Deck #793).
+			switch action {
+			case fileActionRenamedOld:
+				renameOld = ""
+			case fileActionRenamedNew:
+				if renameOld != "" {
+					w.scheduleDelete(renameOld)
+					renameOld = ""
+				}
 			}
 			if next == 0 {
 				break
@@ -895,6 +913,17 @@ func (w *Watcher) cancelDelete(path string) bool {
 // as a server DELETE of the file.
 func (w *Watcher) NotifyRenamed(oldPath, newPath string) {
 	if w.ctx.Err() != nil {
+		return
+	}
+	// A rename with an ignored end is not a move to push. Windows' safe-save
+	// (ReplaceFile: LibreOffice, Word, PDF tools) renames the document to a
+	// temporary name and deletes it once the new copy is in place; a MOVE here
+	// took the server copy, with its versions and share links, to a name whose
+	// delete the watcher then skips, so it stayed on the server for good (Deck
+	// #793). The watcher's own events already say the right thing: a RENAMED
+	// pair or REMOVED for the old name (a delete, cancelled when the saved copy
+	// arrives) and a RENAMED_NEW or ADDED for the new one (an upload).
+	if skipName(oldPath) || skipName(newPath) { // skipName judges the base name only
 		return
 	}
 	claimed := w.beginRename(oldPath, newPath)
@@ -1697,6 +1726,23 @@ func (w *Watcher) handleChange(path string) {
 	// item; the only thing to do here is the not-dirty housekeeping below.
 	// (forced still wins: that flag exists for the 404-fallback upload, where
 	// the stub really is the only copy of something.)
+	// Saving over an online-only file with Windows' safe-save (ReplaceFile)
+	// leaves a PLAIN file holding all the new bytes but wearing the old stub's
+	// FILE_ATTRIBUTE_OFFLINE, which ReplaceFile copies across. Read as a stub
+	// below, the edit was never uploaded (measured on the VM, Deck #793), and
+	// once an upload converted it to a placeholder it would read as one on
+	// every later edit too. Only the filter's recall bits mean the bytes are
+	// elsewhere, so the copied bit comes off first.
+	if !ch.IsDir && !ch.Placeholder {
+		if cleared, cerr := cfClearStrayOffline(path); cerr != nil {
+			w.ops.Log("vfs clear offline attribute %s: %v", path, cerr)
+		} else if cleared {
+			w.ops.Log("vfs %s: cleared an offline attribute a save copied onto it", w.remoteFor(path))
+			if fi, serr := os.Lstat(path); serr == nil {
+				info = fi
+			}
+		}
+	}
 	online := !ch.IsDir && cfIsDehydrated(info, filepath.ToSlash(path))
 	if (!ch.NeedsUpload || online) && !forced {
 		// The filter clears the in-sync bit on every rename or move, so a
@@ -3128,8 +3174,20 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		// cloud state (mode switches and provider shutdown strip it, Deck #580),
 		// which Explorer draws as forever-pending. Heal it if it provably still
 		// mirrors the server; either way the refresh below is placeholder-only.
+		//
+		// One that does not match, written AFTER the server's copy, is a local
+		// edit whose live event was missed (a restart, an overflow, a build
+		// that read it as an online-only stub, Deck #793). Nothing else would
+		// ever send it, so it goes to the ordinary upload: the conflict check
+		// there sets the server's copy aside if that changed too, and
+		// handleChange refuses a file whose bytes really are elsewhere. Without
+		// that proof (the server's copy is newer, or its time is unknown) the
+		// local copy may simply predate a server edit, and it is left alone.
 		if !cfIsPlaceholder(fi, full) {
-			w.healPlainFile(full, fi, r)
+			if !w.healPlainFile(full, fi, r) && editedAfter(fi, r) {
+				w.ops.Log("vfs %s: local copy is newer than the server's and was never sent; uploading it", w.remoteFor(full))
+				w.scheduleUploadIfIdle(full)
+			}
 			continue
 		}
 		// Rescue dirty in-both files on EVERY pass: an edit whose upload failed
@@ -3379,21 +3437,21 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 // surgery only — no transfer, no server ops. Anything short of proof is left
 // alone: a mismatch means a local edit the watcher never saw or a newer server
 // version, and stamping either "in sync" would be a lie the write-back gate
-// then acts on.
-func (w *Watcher) healPlainFile(full string, fi os.FileInfo, r cfapi.PlaceholderInfo) {
+// then acts on. It reports whether it healed the file.
+func (w *Watcher) healPlainFile(full string, fi os.FileInfo, r cfapi.PlaceholderInfo) bool {
 	if fi.Size() != r.Size {
-		return
+		return false
 	}
 	if d := fi.ModTime().Sub(r.ModTime); d < -2*time.Second || d > 2*time.Second {
-		return
+		return false
 	}
 	remote := string(r.Identity)
 	if base, ok := w.baselineFor(remote); ok && base != "" && base != r.ETag {
-		return // server moved on; matching metadata proves nothing
+		return false // server moved on; matching metadata proves nothing
 	}
 	if err := cfMarkInSync(full, r.Identity); err != nil {
 		w.ops.Log("vfs heal plain file %s: %v", remote, err)
-		return
+		return false
 	}
 	w.ops.Log("vfs healed plain file %s (matches server)", remote)
 	cfShellNotify(full) // or Explorer keeps the stale pending glyph until F5
@@ -3402,6 +3460,16 @@ func (w *Watcher) healPlainFile(full string, fi os.FileInfo, r cfapi.Placeholder
 	if r.FileID != "" {
 		w.recordFileID(remote, r.FileID)
 	}
+	return true
+}
+
+// editedAfter reports whether the local file was written after the server's
+// copy, beyond the 2 s slack healPlainFile allows for filesystem timestamp
+// rounding. A placeholder is stamped with the server's mtime when it is
+// created, so a copy only flattened (never edited) carries that time and does
+// not qualify; an unknown server time proves nothing either way.
+func editedAfter(fi os.FileInfo, r cfapi.PlaceholderInfo) bool {
+	return !r.ModTime.IsZero() && fi.ModTime().Sub(r.ModTime) > 2*time.Second
 }
 
 // suppressDelete marks a path (and its subtree) as removed by us, so the

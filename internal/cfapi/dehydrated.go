@@ -28,3 +28,20 @@ func PlaceholderAttrs(attrs uint32) bool {
 	const mask = fileAttributeOffline | fileAttributeRecallOnOpen | fileAttributeRecallOnDataAccess
 	return attrs&mask != 0
 }
+
+const (
+	fileAttributeDirectory    = 0x00000010 // FILE_ATTRIBUTE_DIRECTORY
+	fileAttributeReparsePoint = 0x00000400 // FILE_ATTRIBUTE_REPARSE_POINT
+)
+
+// strayOffline reports whether attrs carry FILE_ATTRIBUTE_OFFLINE on a plain
+// file with nothing behind it. Applications can set OFFLINE; only the cloud
+// filter or an HSM driver can set the recall bits, and every placeholder is a
+// reparse point. OFFLINE on a plain file without either is not a promise that
+// the bytes are elsewhere, it is an attribute copied onto the file: Windows'
+// safe-save (ReplaceFile) carries the replaced file's attributes over, so
+// saving over an online-only placeholder leaves exactly this (Deck #793).
+func strayOffline(attrs uint32) bool {
+	const elsewhere = fileAttributeRecallOnOpen | fileAttributeRecallOnDataAccess | fileAttributeReparsePoint | fileAttributeDirectory
+	return attrs&fileAttributeOffline != 0 && attrs&elsewhere == 0
+}
