@@ -27,8 +27,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.otherworld.nimbo.BuildConfig
 import dev.otherworld.nimbo.LocalNimboHost
 import dev.otherworld.nimbo.core.absoluteUrl
+import dev.otherworld.nimbo.supporter.SupportActions
+import dev.otherworld.nimbo.supporter.Supporter
+import dev.otherworld.nimbo.supporter.SupporterTier
+import dev.otherworld.nimbo.supporter.SupporterViewModel
 import dev.otherworld.nimbo.ui.screens.AddFolderScreen
 import dev.otherworld.nimbo.ui.screens.AppsScreen
 import dev.otherworld.nimbo.ui.screens.DiagnosticsScreen
@@ -45,11 +50,13 @@ import dev.otherworld.nimbo.ui.screens.ShareSheet
 import dev.otherworld.nimbo.ui.screens.SharedScreen
 import dev.otherworld.nimbo.ui.screens.VersionsSheet
 import dev.otherworld.nimbo.ui.screens.SignInScreen
+import dev.otherworld.nimbo.ui.screens.SupportScreen
 import dev.otherworld.nimbo.ui.screens.TrashScreen
 
 @Composable
-fun NimboNav(vm: NimboViewModel) {
+fun NimboNav(vm: NimboViewModel, supporterVm: SupporterViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val supporter by supporterVm.ui.collectAsStateWithLifecycle()
     val host = LocalNimboHost.current
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -82,15 +89,22 @@ fun NimboNav(vm: NimboViewModel) {
             state.route == Route.SEARCH ||
             state.route == Route.NOTIFICATIONS ||
             state.route == Route.SETTINGS ||
+            state.route == Route.SUPPORT ||
             inFileSubfolder
     ) {
         when {
             state.route == Route.LOCAL_PICKER -> vm.navigate(Route.ADD_FOLDER)
             state.route == Route.ADD_FOLDER -> vm.navigate(Route.FOLDERS)
             // Inside the browser, back walks up the tree rather than leaving.
+            state.route == Route.SUPPORT -> vm.navigate(state.supportReturn)
             inFileSubfolder -> vm.filesUp()
             else -> vm.navigate(Route.HOME)
         }
+    }
+
+    // Refresh whenever the Support screen opens: the user is looking, so ask.
+    LaunchedEffect(state.route) {
+        if (state.route == Route.SUPPORT) supporterVm.refresh()
     }
 
     Scaffold(
@@ -309,9 +323,27 @@ fun NimboNav(vm: NimboViewModel) {
                     appearance = state.appearance,
                     serverAppearance = state.serverAppearance,
                     themeColor = state.themeColor,
+                    supporter = supporter,
                     onAppearanceChange = { pref -> vm.setAppearance(pref) },
+                    onOpenSupport = { vm.openSupport(Route.SETTINGS) },
                     onBack = { vm.navigate(Route.HOME) },
                 )
+
+                Route.SUPPORT -> SupportScreen(
+                    tier = supporter.tier,
+                    notice = supporter.notice,
+                    debugOverride = supporter.debugOverride,
+                    onDismissNotice = { supporterVm.clearNotice() },
+                    onDebugOverride = if (BuildConfig.DEBUG) {
+                        { tier: SupporterTier? -> supporterVm.setDebugOverride(tier) }
+                    } else {
+                        null
+                    },
+                    onOpenBusiness = { host.openUrl("https://www.nimbosync.com/business.html") },
+                    onBack = { vm.navigate(state.supportReturn) },
+                ) {
+                    SupportActions(Supporter.repository)
+                }
 
                 Route.DIAGNOSTICS -> DiagnosticsScreen(
                     diagnostics = state.diagnostics,

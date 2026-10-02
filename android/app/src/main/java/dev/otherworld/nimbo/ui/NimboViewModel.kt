@@ -233,6 +233,10 @@ class NimboViewModel(app: Application) : AndroidViewModel(app) {
         loadTheme()
     }
 
+    fun openSupport(from: Route) {
+        _state.update { it.copy(route = Route.SUPPORT, supportReturn = from) }
+    }
+
     /** Records the appearance choice and applies it immediately. */
     fun setAppearance(preference: AppearancePreference) {
         _state.update { it.copy(appearance = preference) }

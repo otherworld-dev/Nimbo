@@ -39,8 +39,10 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import dev.otherworld.nimbo.platform.Permissions
+import dev.otherworld.nimbo.supporter.SupporterViewModel
 import dev.otherworld.nimbo.ui.NimboNav
 import dev.otherworld.nimbo.ui.NimboViewModel
+import dev.otherworld.nimbo.ui.Route
 import dev.otherworld.nimbo.ui.theme.NimboTheme
 
 private const val TAG = "MainActivity"
@@ -85,6 +87,7 @@ class MainActivity : ComponentActivity(), NimboHost {
 
 
     private val viewModel: NimboViewModel by viewModels()
+    private val supporterVm: SupporterViewModel by viewModels()
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -124,7 +127,7 @@ class MainActivity : ComponentActivity(), NimboHost {
                     // The user's Nextcloud colour, as the desktop client does.
                     accent = parseThemeColor(state.themeColor),
                 ) {
-                    NimboNav(viewModel)
+                    NimboNav(viewModel, supporterVm)
                 }
             }
         }
@@ -146,6 +149,15 @@ class MainActivity : ComponentActivity(), NimboHost {
      * notifications screen they had already navigated away from.
      */
     private fun handleIntent(intent: Intent?) {
+        // Direct build only (its manifest declares the filter): the checkout
+        // page's "Add to Nimbo" link. Consumed so a later resume doesn't
+        // re-add the key.
+        val link = intent?.dataString
+        if (link != null && supporterVm.handleLink(link)) {
+            intent?.data = null
+            viewModel.openSupport(Route.SETTINGS)
+            return
+        }
         if (intent?.getBooleanExtra(EXTRA_OPEN_NOTIFICATIONS, false) != true) return
         val focus = intent.getIntExtra(EXTRA_NOTIFICATION_ID, 0).takeIf { it != 0 }
         intent.removeExtra(EXTRA_OPEN_NOTIFICATIONS)
