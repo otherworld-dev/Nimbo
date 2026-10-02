@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Direct (non-Play) build only: the checkout success page's "Add to Nimbo"
+    button opens nimbo-supporter://add?key=… and lands here. The key is
+    checked against Otherworld Services before anything unlocks, so a forged
+    link can do nothing. Merged into MainActivity's declaration in the main
+    manifest.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="nimbo-supporter" android:host="add" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

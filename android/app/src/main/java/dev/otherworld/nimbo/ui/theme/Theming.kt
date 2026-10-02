@@ -9,6 +9,7 @@
 package dev.otherworld.nimbo.ui.theme
 
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 
 /** Where the app takes dark/light from. */
 enum class AppearancePreference(val stored: String, val label: String) {
@@ -55,9 +56,19 @@ fun parseThemeColor(hex: String?): Color? {
  * lighter to the eye than pure blue, and an average would put white text on a
  * bright green accent.
  */
-fun readableOn(background: Color): Color {
-    val luminance = 0.2126 * background.red + 0.7152 * background.green + 0.0722 * background.blue
-    return if (luminance > 0.5) Color.Black else Color.White
+fun readableOn(background: Color): Color =
+    Color(readableOnArgb(background.toArgb().toLong() and 0xFFFFFFFFL))
+
+/**
+ * [readableOn] for a packed 0xAARRGGBB colour. Pure, so the unit tests can
+ * hold the fixed supporter accents to exactly the same rule without Compose.
+ */
+fun readableOnArgb(argb: Long): Long {
+    val r = ((argb shr 16) and 0xFF) / 255.0
+    val g = ((argb shr 8) and 0xFF) / 255.0
+    val b = (argb and 0xFF) / 255.0
+    val luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return if (luminance > 0.5) 0xFF000000 else 0xFFFFFFFF
 }
 
 /**

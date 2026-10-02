@@ -107,6 +107,9 @@ fun HomeScreen(
     onSignOut: () -> Unit,
     onResumeFrozen: (String) -> Unit,
     onRemoveFolderWithLocal: ((String, Boolean) -> Unit)? = null,
+    showSupportNudge: Boolean = false,
+    onSupport: () -> Unit = {},
+    onDismissSupport: () -> Unit = {},
 ) {
     var overflowOpen by remember { mutableStateOf(false) }
     var pendingRemoval by remember { mutableStateOf<String?>(null) }
@@ -201,6 +204,13 @@ fun HomeScreen(
             // burying that under the buttons that imply it is would be a lie.
             items(items = frozen, key = { "frozen-" + it.localDir }) { folder ->
                 FrozenFolderCard(folder = folder, busy = busy, onResume = onResumeFrozen)
+            }
+
+            // Only ever shown when nothing above it is wrong (see Nudge.kt).
+            if (showSupportNudge) {
+                item(key = "support-nudge") {
+                    SupportNudgeCard(onSupport = onSupport, onNotNow = onDismissSupport)
+                }
             }
 
             item {

@@ -137,6 +137,6 @@ jobs:
           -ldflags=-extldflags=-Wl,-z,max-page-size=16384
           -o android/core/nimbo-core.aar ./mobile
 
-      - name: Unit tests and debug build
+      - name: Unit tests and debug builds (both flavours)
         working-directory: android
-        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
+        run: ./gradlew --no-daemon testPlayDebugUnitTest testDirectDebugUnitTest assemblePlayDebug assembleDirectDebug

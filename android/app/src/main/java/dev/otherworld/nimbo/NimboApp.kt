@@ -3,7 +3,7 @@
  *
  * Does the things that must happen exactly once per process and before any
  * screen or service runs: create the Go core client, register the notification
- * channels, and supply the image loader that knows how to fetch thumbnails
+ * channels, start the supporter status check, and supply the image loader that knows how to fetch thumbnails
  * through the engine. All cheap and offline — no network, no disk scan.
  */
 package dev.otherworld.nimbo
@@ -14,6 +14,7 @@ import coil.ImageLoaderFactory
 import dev.otherworld.nimbo.core.NimboCore
 import dev.otherworld.nimbo.core.nimboImageLoader
 import dev.otherworld.nimbo.service.Notifications
+import dev.otherworld.nimbo.supporter.Supporter
 
 class NimboApp : Application(), ImageLoaderFactory {
 
@@ -21,6 +22,8 @@ class NimboApp : Application(), ImageLoaderFactory {
         super.onCreate()
         NimboCore.init(this)
         Notifications.ensureChannels(this)
+        // Supporter status: cached tier now, Play/key check in the background.
+        Supporter.init(this)
     }
 
     /** Coil's singleton loader, taught to resolve PreviewRequest via the facade. */

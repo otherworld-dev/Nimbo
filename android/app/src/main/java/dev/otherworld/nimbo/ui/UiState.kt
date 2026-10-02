@@ -44,6 +44,8 @@ enum class Route {
     NOTIFICATIONS,
     /** App preferences. */
     SETTINGS,
+    /** Support Nimbo: tiers, one-off thanks, and the build's way of paying. */
+    SUPPORT,
     /** Starred files and folders. */
     FAVORITES,
     /** What the user shared out, and what was shared with them. */
@@ -77,6 +79,8 @@ data class UiState(
     /** What Nextcloud reports for appearance: dark / light / default. */
     val serverAppearance: String = "",
     val appearance: AppearancePreference = AppearancePreference.FOLLOW_NEXTCLOUD,
+    /** Where Back from the Support screen goes: Settings or the Sync tab. */
+    val supportReturn: Route = Route.SETTINGS,
     val status: String = "",
     val progress: SyncProgress? = null,
     val paused: Boolean = false,

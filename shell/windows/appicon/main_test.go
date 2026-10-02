@@ -2,6 +2,9 @@ package main
 
 import (
 	"image/color"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -60,4 +63,38 @@ func d(a, b uint8) int {
 		return int(a - b)
 	}
 	return int(b - a)
+}
+
+func TestWriteAndroidNamedVariant(t *testing.T) {
+	res := t.TempDir()
+	writeAndroid(res, "ic_launcher_forest")
+
+	for _, f := range []string{
+		"drawable/ic_launcher_forest_background.xml",
+		"drawable/ic_launcher_forest_foreground.xml",
+		"drawable/ic_launcher_forest_monochrome.xml",
+		"mipmap-anydpi-v26/ic_launcher_forest.xml",
+	} {
+		if _, err := os.Stat(filepath.Join(res, f)); err != nil {
+			t.Fatalf("missing %s: %v", f, err)
+		}
+	}
+	icon, _ := os.ReadFile(filepath.Join(res, "mipmap-anydpi-v26", "ic_launcher_forest.xml"))
+	for _, ref := range []string{"@drawable/ic_launcher_forest_background", "@drawable/ic_launcher_forest_foreground", "@drawable/ic_launcher_forest_monochrome"} {
+		if !strings.Contains(string(icon), ref) {
+			t.Errorf("adaptive icon does not reference %s", ref)
+		}
+	}
+}
+
+func TestWriteAndroidDefaultLeavesTheHandWrittenIcon(t *testing.T) {
+	res := t.TempDir()
+	writeAndroid(res, "ic_launcher")
+	if _, err := os.Stat(filepath.Join(res, "drawable", "ic_launcher_foreground.xml")); err != nil {
+		t.Fatal(err)
+	}
+	// ic_launcher.xml carries a hand-written comment; the generator must not replace it.
+	if _, err := os.Stat(filepath.Join(res, "mipmap-anydpi-v26", "ic_launcher.xml")); !os.IsNotExist(err) {
+		t.Fatalf("default name wrote mipmap-anydpi-v26/ic_launcher.xml")
+	}
 }

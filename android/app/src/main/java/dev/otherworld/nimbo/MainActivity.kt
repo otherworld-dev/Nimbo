@@ -31,6 +31,7 @@ import dev.otherworld.nimbo.ui.theme.parseThemeColor
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.ui.graphics.Color
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.browser.customtabs.CustomTabsIntent
@@ -39,8 +40,10 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import dev.otherworld.nimbo.platform.Permissions
+import dev.otherworld.nimbo.supporter.SupporterViewModel
 import dev.otherworld.nimbo.ui.NimboNav
 import dev.otherworld.nimbo.ui.NimboViewModel
+import dev.otherworld.nimbo.ui.Route
 import dev.otherworld.nimbo.ui.theme.NimboTheme
 
 private const val TAG = "MainActivity"
@@ -85,6 +88,7 @@ class MainActivity : ComponentActivity(), NimboHost {
 
 
     private val viewModel: NimboViewModel by viewModels()
+    private val supporterVm: SupporterViewModel by viewModels()
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -109,11 +113,14 @@ class MainActivity : ComponentActivity(), NimboHost {
             }
         )
 
-        handleIntent(intent)
+        // A restored activity re-delivers its original intent (extras and link
+        // included), which would replay a launch the user already acted on.
+        if (savedInstanceState == null) handleIntent(intent)
 
         val host: NimboHost = this
         setContent {
             val state by viewModel.state.collectAsStateWithLifecycle()
+            val supporter by supporterVm.ui.collectAsStateWithLifecycle()
             CompositionLocalProvider(LocalNimboHost provides host) {
                 NimboTheme(
                     darkTheme = resolveDark(
@@ -121,13 +128,21 @@ class MainActivity : ComponentActivity(), NimboHost {
                         serverAppearance = state.serverAppearance,
                         systemDark = isSystemInDarkTheme(),
                     ),
-                    // The user's Nextcloud colour, as the desktop client does.
-                    accent = parseThemeColor(state.themeColor),
+                    // A Patron's chosen accent, else the user's Nextcloud colour
+                    // as the desktop client does.
+                    accent = supporter.effectiveAccent.argb?.let { Color(it) }
+                        ?: parseThemeColor(state.themeColor),
                 ) {
-                    NimboNav(viewModel)
+                    NimboNav(viewModel, supporterVm)
                 }
             }
         }
+    }
+
+    /** The icon changes only once Nimbo is off screen, or Android closes the task. */
+    override fun onStop() {
+        super.onStop()
+        if (!isChangingConfigurations) supporterVm.applyIcon()
     }
 
     /**
@@ -146,6 +161,15 @@ class MainActivity : ComponentActivity(), NimboHost {
      * notifications screen they had already navigated away from.
      */
     private fun handleIntent(intent: Intent?) {
+        // Direct build only (its manifest declares the filter): the checkout
+        // page's "Add to Nimbo" link. Consumed so a later resume doesn't
+        // re-add the key.
+        val link = intent?.dataString
+        if (link != null && supporterVm.handleLink(link)) {
+            intent?.data = null
+            viewModel.openSupport(Route.SETTINGS)
+            return
+        }
         if (intent?.getBooleanExtra(EXTRA_OPEN_NOTIFICATIONS, false) != true) return
         val focus = intent.getIntExtra(EXTRA_NOTIFICATION_ID, 0).takeIf { it != 0 }
         intent.removeExtra(EXTRA_OPEN_NOTIFICATIONS)

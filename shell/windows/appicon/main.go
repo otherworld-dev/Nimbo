@@ -3,8 +3,15 @@
 //
 //	go run .                # writes ../../../cmd/nimbo-gui/assets/nimbo.ico
 //	go run . logos <dir>    # MSIX PNG logo set into <dir>
-//	go run . android [dir]  # Android adaptive-icon layers; defaults to
+//	go run . [-accent #hex] [-name ic_launcher_x] android [dir]
+//	                        # Android adaptive-icon layers; defaults to
 //	                        # ../../../android/app/src/main/res
+//
+//	The Android supporter icon variants (run from this directory):
+//
+//	  go run . -accent "#2E7D5B" -name ic_launcher_forest android
+//	  go run . -accent "#B4441C" -name ic_launcher_ember android
+//	  go run . -accent "#3D4B5C" -name ic_launcher_slate android
 //
 // Committed; re-run only to change the artwork.
 package main
@@ -20,6 +27,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -45,6 +53,7 @@ func main() {
 	// optional -accent flag overrides it to preview or generate a reseller's
 	// icon without editing brand.json.
 	accent := flag.String("accent", "", "brand accent hex (#RRGGBB) to use instead of brand.json")
+	name := flag.String("name", "ic_launcher", "android: base name of the icon resources (variants: ic_launcher_<x>)")
 	flag.Parse()
 	hex := brand.Current.AccentHex
 	if *accent != "" {
@@ -67,7 +76,11 @@ func main() {
 		if len(args) >= 2 {
 			res = args[1]
 		}
-		writeAndroid(res)
+		if !regexp.MustCompile(`^[a-z][a-z0-9_]*$`).MatchString(*name) {
+			fmt.Fprintln(os.Stderr, "-name must be a lowercase Android resource name")
+			os.Exit(2)
+		}
+		writeAndroid(res, *name)
 		return
 	}
 	out := filepath.Join("..", "..", "..", "cmd", "nimbo-gui", "assets")
