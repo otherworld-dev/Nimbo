@@ -344,6 +344,7 @@ fun NimboNav(vm: NimboViewModel, supporterVm: SupporterViewModel) {
                     themeColor = state.themeColor,
                     supporter = supporter,
                     onAppearanceChange = { pref -> vm.setAppearance(pref) },
+                    onIconChange = { icon -> supporterVm.setIcon(icon) },
                     onOpenSupport = { vm.openSupport(Route.SETTINGS) },
                     onBack = { vm.navigate(Route.HOME) },
                 )

@@ -7,6 +7,7 @@
  */
 package dev.otherworld.nimbo.ui.screens
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,8 +38,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
+import dev.otherworld.nimbo.R
+import dev.otherworld.nimbo.supporter.AppIcon
 import dev.otherworld.nimbo.supporter.SupporterTier
 import dev.otherworld.nimbo.supporter.SupporterUi
 import dev.otherworld.nimbo.ui.theme.AppearancePreference
@@ -52,6 +56,7 @@ fun SettingsScreen(
     themeColor: String,
     supporter: SupporterUi,
     onAppearanceChange: (AppearancePreference) -> Unit,
+    onIconChange: (AppIcon) -> Unit,
     onOpenSupport: () -> Unit,
     onBack: () -> Unit,
 ) {
@@ -82,6 +87,24 @@ fun SettingsScreen(
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
             SectionHeader("Colour")
             AccentRow(themeColor)
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            SectionHeader("App icon")
+            if (supporter.perks.icons) {
+                Column(modifier = Modifier.selectableGroup()) {
+                    AppIcon.entries.forEach { icon ->
+                        IconRow(icon = icon, selected = icon == supporter.icon, onSelect = { onIconChange(icon) })
+                    }
+                }
+                Text(
+                    "Your home-screen shortcut may need re-adding after a change.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+            } else {
+                LockedPerkRow("Alternative app icons", SupporterTier.BACKER, onOpenSupport)
+            }
         }
     }
 }
@@ -203,5 +226,33 @@ private fun SupportRow(tier: SupporterTier, onClick: () -> Unit) {
             )
         }
         SupporterBadge(tier)
+    }
+}
+
+@Composable
+private fun IconRow(icon: AppIcon, selected: Boolean, onSelect: () -> Unit) {
+    val (background, foreground) = when (icon) {
+        AppIcon.DEFAULT -> R.drawable.ic_launcher_background to R.drawable.ic_launcher_foreground
+        AppIcon.FOREST -> R.drawable.ic_launcher_forest_background to R.drawable.ic_launcher_forest_foreground
+        AppIcon.EMBER -> R.drawable.ic_launcher_ember_background to R.drawable.ic_launcher_ember_foreground
+        AppIcon.SLATE -> R.drawable.ic_launcher_slate_background to R.drawable.ic_launcher_slate_foreground
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .selectable(selected = selected, role = Role.RadioButton, onClick = onSelect)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RadioButton(selected = selected, onClick = null)
+        Spacer(Modifier.width(8.dp))
+        // The adaptive icon's two layers, stacked: an <adaptive-icon> itself
+        // can't be loaded by painterResource.
+        Box(modifier = Modifier.size(40.dp).clip(CircleShape)) {
+            Image(painterResource(background), contentDescription = null, modifier = Modifier.fillMaxSize())
+            Image(painterResource(foreground), contentDescription = null, modifier = Modifier.fillMaxSize())
+        }
+        Spacer(Modifier.width(12.dp))
+        Text(icon.label, style = MaterialTheme.typography.bodyLarge)
     }
 }

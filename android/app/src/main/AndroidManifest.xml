@@ -78,11 +78,71 @@
             android:launchMode="singleTask"
             android:theme="@style/Theme.Nimbo"
             android:windowSoftInputMode="adjustResize">
+        </activity>
+
+        <!--
+            Launcher entries, one per app icon (alternative icons are a
+            supporter perk). Exactly one is enabled at a time; AppIconSwitcher
+            flips them. The default is enabled here so a fresh install has an
+            icon. Moving the launcher off MainActivity costs one-time loss of a
+            pinned shortcut on some launchers; done before the first public
+            Android release so nobody pays it.
+        -->
+        <activity-alias
+            android:name=".LauncherDefault"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_round"
+            android:targetActivity=".MainActivity">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherForest"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_forest"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_forest"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherEmber"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_ember"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_ember"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherSlate"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_slate"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_slate"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
 
         <!-- Owns the running Go engine; started with startForegroundService(). -->
         <service
