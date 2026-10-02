@@ -50,6 +50,23 @@ android {
         }
     }
 
+    // Where the app is distributed decides how supporters pay. Google Play's
+    // payment policy allows only Play Billing in the Play build; everywhere
+    // else (GitHub releases, the self-hosted F-Droid repo) supporters pay
+    // through Otherworld's own checkout and get a key. Each flavour carries
+    // only its own payment code, so the direct build has no Google libraries
+    // and the Play build can never show an outside payment link.
+    //
+    // Both keep the same applicationId. They are signed with different keys
+    // (Play App Signing vs our own), so one can't update the other; switching
+    // means uninstalling first, which also stops a sideloaded build silently
+    // replacing a Play install.
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("play") { dimension = "distribution" }
+        create("direct") { dimension = "distribution" }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -61,6 +78,8 @@ android {
 
     buildFeatures {
         compose = true
+        // BuildConfig.DEBUG gates the supporter tier override, debug builds only.
+        buildConfig = true
     }
 
     packaging {

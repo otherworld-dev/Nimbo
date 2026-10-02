@@ -62,7 +62,8 @@ scripts/build-core.ps1        # -> core/nimbo-core.aar
 
 ```powershell
 scripts/build-core.ps1 -Targets android/arm64   # the Go core (fast dev loop)
-./gradlew :app:assembleDebug                    # -> app/build/outputs/apk/debug/
+./gradlew :app:assembleDirectDebug              # -> app/build/outputs/apk/direct/debug/
+./gradlew :app:assemblePlayDebug                # -> app/build/outputs/apk/play/debug/
 ```
 
 `local.properties` (gitignored) must point `sdk.dir` at the Android SDK. The
