@@ -17,6 +17,9 @@ import (
 // provider leaves hollow files behind for a sync to trip over.
 func IsDehydrated(os.FileInfo) bool { return false }
 
+// ClearStrayOffline has nothing to clear outside Windows.
+func ClearStrayOffline(string) (bool, error) { return false, nil }
+
 // PlaceholderInfo mirrors the Windows type so cross-platform code referencing it
 // (e.g. the vfs stub) compiles.
 type PlaceholderInfo struct {
