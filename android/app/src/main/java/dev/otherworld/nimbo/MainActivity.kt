@@ -31,6 +31,7 @@ import dev.otherworld.nimbo.ui.theme.parseThemeColor
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.ui.graphics.Color
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.browser.customtabs.CustomTabsIntent
@@ -117,6 +118,7 @@ class MainActivity : ComponentActivity(), NimboHost {
         val host: NimboHost = this
         setContent {
             val state by viewModel.state.collectAsStateWithLifecycle()
+            val supporter by supporterVm.ui.collectAsStateWithLifecycle()
             CompositionLocalProvider(LocalNimboHost provides host) {
                 NimboTheme(
                     darkTheme = resolveDark(
@@ -124,8 +126,10 @@ class MainActivity : ComponentActivity(), NimboHost {
                         serverAppearance = state.serverAppearance,
                         systemDark = isSystemInDarkTheme(),
                     ),
-                    // The user's Nextcloud colour, as the desktop client does.
-                    accent = parseThemeColor(state.themeColor),
+                    // A Patron's chosen accent, else the user's Nextcloud colour
+                    // as the desktop client does.
+                    accent = supporter.effectiveAccent.argb?.let { Color(it) }
+                        ?: parseThemeColor(state.themeColor),
                 ) {
                     NimboNav(viewModel, supporterVm)
                 }

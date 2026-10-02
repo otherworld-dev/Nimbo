@@ -80,4 +80,9 @@ class SupporterViewModel(app: Application) : AndroidViewModel(app) {
         prefs.icon = icon
         choices.value = choices.value.copy(icon = icon)
     }
+
+    fun setAccent(accent: AccentChoice) {
+        prefs.accent = accent
+        choices.value = choices.value.copy(accent = accent)
+    }
 }
