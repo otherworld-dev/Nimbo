@@ -113,7 +113,7 @@ fun SettingsScreen(
                     }
                 }
                 Text(
-                    "Your home-screen shortcut may need re-adding after a change.",
+                    "Your new icon appears after you leave Nimbo. Your home-screen shortcut may need re-adding.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),

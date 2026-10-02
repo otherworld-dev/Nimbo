@@ -151,6 +151,16 @@ class DirectKeySupporterTest {
     }
 
     @Test
+    fun `a forced refresh that can't reach anyone keeps the add-key notice`() = runBlocking {
+        val repo = supporter(FakeStore(), FakeChecker())
+        assertTrue(repo.addKey(keyA))
+        val saved = repo.notice.value
+        assertTrue(saved != null)
+        repo.refresh(force = true)
+        assertEquals(saved, repo.notice.value)
+    }
+
+    @Test
     fun `the add link adds the key`() = runBlocking {
         val store = FakeStore()
         val repo = supporter(store, FakeChecker(mapOf(keyA to CheckOutcome.Active(SupporterTier.ONE_OFF))), scope = this)

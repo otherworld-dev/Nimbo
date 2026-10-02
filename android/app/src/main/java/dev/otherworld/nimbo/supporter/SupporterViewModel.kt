@@ -41,12 +41,17 @@ class SupporterViewModel(app: Application) : AndroidViewModel(app) {
                 if (tier != SupporterTier.NONE && !choices.value.nudgeRetired) retireNudge()
             }
         }
-        // The icon follows the perks: a lapsed Backer gets the default back,
-        // a returning one gets their choice back.
+    }
+
+    /**
+     * The icon follows the perks (a lapsed Backer gets the default back), but
+     * is only applied when the app leaves the screen: disabling the launcher
+     * alias a task started from makes Android close that task.
+     */
+    fun applyIcon() {
+        val icon = ui.value.effectiveIcon
         viewModelScope.launch {
-            ui.map { it.effectiveIcon }.distinctUntilChanged().collect { icon ->
-                withContext(Dispatchers.IO) { AppIconSwitcher.apply(getApplication(), icon) }
-            }
+            withContext(Dispatchers.IO) { AppIconSwitcher.apply(getApplication(), icon) }
         }
     }
 

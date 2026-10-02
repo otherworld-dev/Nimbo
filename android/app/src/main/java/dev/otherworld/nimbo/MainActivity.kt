@@ -139,6 +139,12 @@ class MainActivity : ComponentActivity(), NimboHost {
         }
     }
 
+    /** The icon changes only once Nimbo is off screen, or Android closes the task. */
+    override fun onStop() {
+        super.onStop()
+        if (!isChangingConfigurations) supporterVm.applyIcon()
+    }
+
     /**
      * The activity is singleTop-ish via CLEAR_TOP, so a shade tap on a running
      * app arrives here rather than through onCreate.

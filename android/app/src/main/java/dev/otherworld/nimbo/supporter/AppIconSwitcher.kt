@@ -4,6 +4,9 @@
  * The new alias is enabled before the others are disabled, so there is never
  * a moment with no launcher entry. Does nothing when the right alias is
  * already the only one showing, so launchers aren't poked on every start.
+ *
+ * Call it only while the app is in the background (MainActivity.onStop):
+ * disabling the alias a task was launched from makes Android close the task.
  */
 package dev.otherworld.nimbo.supporter
 

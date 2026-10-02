@@ -53,7 +53,7 @@ class DirectKeySupporter(
             when {
                 outcomes.any { it.second == CheckOutcome.Paused } -> _notice.value =
                     SupporterNotice("Payment problem: update it in Manage subscription.", isError = true)
-                force && !definite -> _notice.value =
+                force && !definite && _notice.value == null -> _notice.value =
                     SupporterNotice("Couldn't check right now. Your status hasn't changed.", isError = true)
             }
         }

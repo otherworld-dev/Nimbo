@@ -83,7 +83,7 @@
         <!--
             Launcher entries, one per app icon (alternative icons are a
             supporter perk). Exactly one is enabled at a time; AppIconSwitcher
-            flips them. The default is enabled here so a fresh install has an
+            flips them when the app goes to the background. The default is enabled here so a fresh install has an
             icon. Moving the launcher off MainActivity costs one-time loss of a
             pinned shortcut on some launchers; done before the first public
             Android release so nobody pays it.
