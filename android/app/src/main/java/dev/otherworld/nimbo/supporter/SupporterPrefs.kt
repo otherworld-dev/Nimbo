@@ -9,7 +9,6 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
 import androidx.core.content.edit
-import dev.otherworld.nimbo.BuildConfig
 
 class SupporterPrefs(context: Context) : StatusCache {
 
@@ -37,18 +36,11 @@ class SupporterPrefs(context: Context) : StatusCache {
         get() = runCatching { prefs.getBoolean(KEY_NUDGE_RETIRED, false) }.getOrDefault(false)
         set(value) = save { putBoolean(KEY_NUDGE_RETIRED, value) }
 
-    var debugOverride: SupporterTier?
-        get() = string(KEY_DEBUG)?.let { name -> SupporterTier.entries.firstOrNull { it.name == name } }
-        set(value) = save { if (value == null) remove(KEY_DEBUG) else putString(KEY_DEBUG, value.name) }
-
     fun choices() = SupporterChoices(
         icon = icon,
         accent = accent,
         firstSeenAt = firstSeenAt,
         nudgeRetired = nudgeRetired,
-        // A release build ignores a stored override, even one left behind by
-        // a debug build installed over the same data.
-        debugOverride = if (BuildConfig.DEBUG) debugOverride else null,
     )
 
     private fun string(key: String): String? = runCatching { prefs.getString(key, null) }.getOrNull()
@@ -66,6 +58,5 @@ class SupporterPrefs(context: Context) : StatusCache {
         const val KEY_ACCENT = "accent"
         const val KEY_FIRST_SEEN = "first_seen_at"
         const val KEY_NUDGE_RETIRED = "nudge_retired"
-        const val KEY_DEBUG = "debug_tier"
     }
 }

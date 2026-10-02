@@ -78,8 +78,6 @@ android {
 
     buildFeatures {
         compose = true
-        // BuildConfig.DEBUG gates the supporter tier override, debug builds only.
-        buildConfig = true
     }
 
     packaging {

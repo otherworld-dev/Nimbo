@@ -44,12 +44,11 @@ class SupporterModelTest {
     }
 
     @Test
-    fun `a debug override replaces the real tier, the real status is kept`() {
-        val real = SupporterStatus(SupporterTier.NONE, SupporterSource.NONE, 0)
-        val ui = supporterUi(real, null, SupporterChoices(debugOverride = SupporterTier.PATRON))
+    fun `the UI acts on the real tier`() {
+        val real = SupporterStatus(SupporterTier.PATRON, SupporterSource.KEY, 0)
+        val ui = supporterUi(real, null, SupporterChoices())
         assertEquals(SupporterTier.PATRON, ui.tier)
         assertTrue(ui.perks.accents)
-        assertEquals(SupporterTier.NONE, ui.status.tier)
     }
 
     @Test

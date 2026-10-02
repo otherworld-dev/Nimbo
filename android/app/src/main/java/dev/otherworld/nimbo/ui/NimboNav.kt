@@ -27,12 +27,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.otherworld.nimbo.BuildConfig
 import dev.otherworld.nimbo.LocalNimboHost
 import dev.otherworld.nimbo.core.absoluteUrl
 import dev.otherworld.nimbo.supporter.SupportActions
 import dev.otherworld.nimbo.supporter.Supporter
-import dev.otherworld.nimbo.supporter.SupporterTier
 import dev.otherworld.nimbo.supporter.SupporterViewModel
 import dev.otherworld.nimbo.supporter.shouldShowNudge
 import dev.otherworld.nimbo.ui.screens.AddFolderScreen
@@ -353,13 +351,7 @@ fun NimboNav(vm: NimboViewModel, supporterVm: SupporterViewModel) {
                 Route.SUPPORT -> SupportScreen(
                     tier = supporter.tier,
                     notice = supporter.notice,
-                    debugOverride = supporter.debugOverride,
                     onDismissNotice = { supporterVm.clearNotice() },
-                    onDebugOverride = if (BuildConfig.DEBUG) {
-                        { tier: SupporterTier? -> supporterVm.setDebugOverride(tier) }
-                    } else {
-                        null
-                    },
                     onOpenBusiness = { host.openUrl("https://www.nimbosync.com/business.html") },
                     onBack = { vm.navigate(state.supportReturn) },
                 ) {

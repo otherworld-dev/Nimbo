@@ -7,7 +7,6 @@ package dev.otherworld.nimbo.supporter
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import dev.otherworld.nimbo.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -34,8 +33,7 @@ class SupporterViewModel(app: Application) : AndroidViewModel(app) {
     )
 
     init {
-        // Supporting from anywhere retires the Home card for good. The REAL
-        // tier, so the debug override can't retire it while testing the card.
+        // Supporting from anywhere retires the Home card for good.
         viewModelScope.launch {
             ui.map { it.status.tier }.distinctUntilChanged().collect { tier ->
                 if (tier != SupporterTier.NONE && !choices.value.nudgeRetired) retireNudge()
@@ -73,12 +71,6 @@ class SupporterViewModel(app: Application) : AndroidViewModel(app) {
         if (choices.value.firstSeenAt != 0L) return
         prefs.firstSeenAt = now
         choices.value = choices.value.copy(firstSeenAt = now)
-    }
-
-    fun setDebugOverride(tier: SupporterTier?) {
-        if (!BuildConfig.DEBUG) return
-        prefs.debugOverride = tier
-        choices.value = choices.value.copy(debugOverride = tier)
     }
 
     fun setIcon(icon: AppIcon) {

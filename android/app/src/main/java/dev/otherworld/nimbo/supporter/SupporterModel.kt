@@ -73,15 +73,13 @@ data class SupporterChoices(
     /** First time the Sync tab's Home was shown with an account (ms); 0 = not yet. */
     val firstSeenAt: Long = 0L,
     val nudgeRetired: Boolean = false,
-    /** Debug builds only: pretend to be this tier. */
-    val debugOverride: SupporterTier? = null,
 )
 
 /** Everything the supporter UI renders from. */
 data class SupporterUi(
     /** The real answer from Play or the key check. */
     val status: SupporterStatus = SupporterStatus(),
-    /** The tier the UI acts on: the real one, or the debug override. */
+    /** The tier the UI acts on. */
     val tier: SupporterTier = SupporterTier.NONE,
     val perks: Perks = Perks.of(SupporterTier.NONE),
     val notice: SupporterNotice? = null,
@@ -91,11 +89,10 @@ data class SupporterUi(
     val effectiveAccent: AccentChoice = AccentChoice.FOLLOW_NEXTCLOUD,
     val firstSeenAt: Long = 0L,
     val nudgeRetired: Boolean = false,
-    val debugOverride: SupporterTier? = null,
 )
 
 fun supporterUi(status: SupporterStatus, notice: SupporterNotice?, choices: SupporterChoices): SupporterUi {
-    val tier = choices.debugOverride ?: status.tier
+    val tier = status.tier
     val perks = Perks.of(tier)
     return SupporterUi(
         status = status,
@@ -108,6 +105,5 @@ fun supporterUi(status: SupporterStatus, notice: SupporterNotice?, choices: Supp
         effectiveAccent = effectiveAccent(choices.accent, perks),
         firstSeenAt = choices.firstSeenAt,
         nudgeRetired = choices.nudgeRetired,
-        debugOverride = choices.debugOverride,
     )
 }
