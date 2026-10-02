@@ -184,3 +184,26 @@ fun LockedPerkRow(title: String, perkOf: SupporterTier, onClick: () -> Unit) {
         }
     }
 }
+
+/** The one-time ask on the Sync tab. Either button retires it for good. */
+@Composable
+fun SupportNudgeCard(onSupport: () -> Unit, onNotNow: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                "Nimbo has been syncing for two weeks. If it's earned its keep, you can support it.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(Modifier.height(12.dp))
+            Row {
+                Button(onClick = onSupport, shape = RoundedCornerShape(14.dp)) { Text("Support") }
+                Spacer(Modifier.width(8.dp))
+                TextButton(onClick = onNotNow) { Text("Not now") }
+            }
+        }
+    }
+}

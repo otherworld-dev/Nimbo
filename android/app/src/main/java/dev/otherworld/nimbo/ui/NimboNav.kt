@@ -34,6 +34,7 @@ import dev.otherworld.nimbo.supporter.SupportActions
 import dev.otherworld.nimbo.supporter.Supporter
 import dev.otherworld.nimbo.supporter.SupporterTier
 import dev.otherworld.nimbo.supporter.SupporterViewModel
+import dev.otherworld.nimbo.supporter.shouldShowNudge
 import dev.otherworld.nimbo.ui.screens.AddFolderScreen
 import dev.otherworld.nimbo.ui.screens.AppsScreen
 import dev.otherworld.nimbo.ui.screens.DiagnosticsScreen
@@ -105,6 +106,10 @@ fun NimboNav(vm: NimboViewModel, supporterVm: SupporterViewModel) {
     // Refresh whenever the Support screen opens: the user is looking, so ask.
     LaunchedEffect(state.route) {
         if (state.route == Route.SUPPORT) supporterVm.refresh()
+    }
+
+    LaunchedEffect(state.route, state.account) {
+        if (state.route == Route.HOME && state.account != null) supporterVm.noteHomeSeen()
     }
 
     Scaffold(
@@ -208,6 +213,20 @@ fun NimboNav(vm: NimboViewModel, supporterVm: SupporterViewModel) {
                             notificationCount = state.notificationCount,
                             onSignOut = { vm.signOut() },
                             onResumeFrozen = { dir -> vm.resumeFrozen(dir) },
+                            showSupportNudge = shouldShowNudge(
+                                now = System.currentTimeMillis(),
+                                firstSeenAt = supporter.firstSeenAt,
+                                lastSyncAt = state.lastSyncAt,
+                                failingCount = state.failing.size,
+                                frozenCount = state.frozen.size,
+                                tier = supporter.tier,
+                                retired = supporter.nudgeRetired,
+                            ),
+                            onSupport = {
+                                supporterVm.retireNudge()
+                                vm.openSupport(Route.HOME)
+                            },
+                            onDismissSupport = { supporterVm.retireNudge() },
                         )
 
                         Tab.APPS -> AppsScreen(
