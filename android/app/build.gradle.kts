@@ -10,7 +10,7 @@
 //    rules we are not writing yet (see proguard-rules.pro for the ones we would
 //    need when minification is switched on).
 //  * The dependency list below is the complete, pinned set from the
-//    implementation contract — do not add to it.
+//    implementation contract — do not add to it, apart from the Play Billing Library on playImplementation.
 
 plugins {
     id("com.android.application")
@@ -119,6 +119,12 @@ dependencies {
     // libandroidx.graphics.path.so that is not 16 KB page-aligned, which Android
     // 15+ devices flag at install time (and Play requires). 1.1.0 is aligned.
     implementation("androidx.graphics:graphics-path:1.1.0")
+
+    // Google Play Billing, Play build only (see productFlavors). The one
+    // exception to the pinned list above: Play's payment policy makes it
+    // mandatory for in-app support in the Play build, and the direct build
+    // must not contain it.
+    "playImplementation"("com.android.billingclient:billing:8.0.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 
