@@ -25,6 +25,20 @@ All notable changes to Nimbo are recorded here. The format follows
   0.2.0 even though the notes for that release said pausing covered them. Removing
   or moving a sync folder, blacklisting a file, or unticking a folder now stops its
   large transfers too (#702).
+- Saving a document in on-demand mode with LibreOffice, Word or a PDF tool no
+  longer leaves a `~RF….TMP` copy on the server or uploads the save as a new
+  file, it now updates the server's copy in place so its versions and share
+  links stay with it. Saving over an online-only file uploads the new content
+  rather than leaving it local, and an edit made while Nimbo wasn't running is
+  now sent the next time it checks the folder (#7).
+- In on-demand mode, files downloaded by apps that write to a `.part` file first,
+  such as Libation, now upload properly. Nimbo tried to sync the `.part` file,
+  which Nextcloud doesn't allow, and then kept failing with "Failed to rename",
+  leaving an empty file on the server. `.part` files are now ignored as they
+  already were in live mode (#18).
+- On Linux, deleting a folder that held read-only files no longer fails with
+  permission denied and leaves folders that can't be opened, and folders an
+  earlier build left that way are fixed on the next delete.
 
 ## [0.2.0] - 2026-09-26
 
