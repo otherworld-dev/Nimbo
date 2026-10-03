@@ -1157,6 +1157,12 @@ func skipName(rel string) bool {
 		return true
 	case strings.HasSuffix(lb, ".tmp") || strings.HasSuffix(lb, ".~tmp") || strings.HasSuffix(lb, ".crdownload"):
 		return true
+	// A downloader's partial file, renamed over the real name once complete.
+	// Nextcloud refuses the name, and live sync's default ignore list has
+	// always held it; here its upload was refused and the rename went up as a
+	// MOVE of a file the server never had (GitHub #18).
+	case strings.HasSuffix(lb, ".part"):
+		return true
 	// The official Nextcloud/ownCloud client keeps its sync database and log
 	// INSIDE the sync folder; they survive a migration as pure pollution.
 	case lb == ".nextcloudsync.log" || lb == ".owncloudsync.log":
