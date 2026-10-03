@@ -1022,6 +1022,9 @@ func TestSkipName(t *testing.T) {
 		`.sync_74b7ab355ec5.db`, `.sync_74b7ab355ec5.db-wal`, `.sync_74b7ab355ec5.db-shm`,
 		`.sync_abc.db-journal`, `.nextcloudsync.log`, `.owncloudsync.log`,
 		`sub\.sync_11ff.db`, `.Nextcloudsync.log`,
+		// A downloader's partial file: Nextcloud refuses the name outright, and
+		// live sync's default ignore list has always had it (GitHub #18).
+		`Book.jD5E4ntS.m4b.part`, `sub\dl.PART`,
 	}
 	keep := []string{`doc.txt`, `sub\doc.txt`, `tmp`, `partial.part2`, `lock.txt`, `a~$b`,
 		// Not artifacts: user files that merely resemble them.
@@ -1386,6 +1389,79 @@ func TestParseRenameFromAnIgnoredNameUploads(t *testing.T) {
 	select {
 	case mv := <-rec.moved:
 		t.Fatalf("stale rename source paired into a server MOVE %v", mv)
+	case <-time.After(2 * time.Second):
+	}
+}
+
+// Libation, and downloaders like it, write a book to "<name>.<random>.m4b.part"
+// and rename that over an empty "<name>.m4b" it made first. The .part was not
+// ignored in on-demand mode, so its upload was refused (".part" is a forbidden
+// extension) and the rename went to the server as a MOVE of a file that was
+// never there, which Nextcloud answers 500 "Failed to rename" rather than 404.
+// That was retried until it gave up, leaving the empty book on the server
+// (GitHub #18). The rename is the finished file arriving: an upload.
+func TestParseDownloaderPartRenamedOverItsFileUploads(t *testing.T) {
+	root := t.TempDir()
+	book := filepath.Join(root, "Book.m4b")
+	if err := os.WriteFile(book, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := newRecorder()
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.parse(notifyBuf(t, []struct {
+		action uint32
+		name   string
+	}{
+		{fileActionModified, "Book.jD5E4ntS.m4b.part"},
+		{fileActionRemoved, "Book.m4b"},
+		{fileActionRenamedOld, "Book.jD5E4ntS.m4b.part"},
+		{fileActionRenamedNew, "Book.m4b"},
+	}))
+
+	w.mu.Lock()
+	_, up := w.upload[book]
+	_, del := w.delete[book]
+	_, partUp := w.upload[filepath.Join(root, "Book.jD5E4ntS.m4b.part")]
+	for _, tm := range w.upload {
+		tm.Stop()
+	}
+	w.mu.Unlock()
+	if !up {
+		t.Error("the finished book was not scheduled for upload")
+	}
+	if del {
+		t.Error("a server delete is pending for the book that just arrived")
+	}
+	if partUp {
+		t.Error("the .part file was scheduled for upload")
+	}
+	select {
+	case mv := <-rec.moved:
+		t.Fatalf("the .part rename produced a server MOVE %v", mv)
+	case d := <-rec.deleted:
+		t.Fatalf("the .part rename produced a server DELETE of %q", d)
+	case <-time.After(2 * time.Second): // past deleteDebounce
+	}
+}
+
+// The same rename, reported by the Cloud Files filter's rename callback.
+func TestNotifyRenamedFromAPartFileIsNotAMove(t *testing.T) {
+	root := t.TempDir()
+	book := filepath.Join(root, "Book.m4b")
+	if err := os.WriteFile(book, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := newRecorder()
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.NotifyRenamed(filepath.Join(root, "Book.jD5E4ntS.m4b.part"), book)
+
+	select {
+	case mv := <-rec.moved:
+		t.Fatalf("a rename from a .part file produced a server MOVE %v", mv)
 	case <-time.After(2 * time.Second):
 	}
 }
