@@ -68,6 +68,11 @@ func main() {
 		writeLogos(args[1])
 		return
 	}
+	// `go run . play <file>` writes the 512 px Google Play listing icon.
+	if len(args) >= 2 && args[0] == "play" {
+		writePlayIcon(args[1])
+		return
+	}
 	// Android adaptive-icon layers, as vectors: go run . android [res-dir].
 	// The Android app is in this repo, so the destination defaults in-tree;
 	// pass a dir only to generate into an out-of-tree checkout.
@@ -244,6 +249,34 @@ func writeLogos(dir string) {
 			panic(err)
 		}
 		f.Close()
+	}
+}
+
+// writePlayIcon writes the Google Play listing icon: 512 px and square, with
+// the tile gradient running full-bleed under the nimbus, as Play rounds the
+// corners itself and asks for artwork without its own corners or shadow.
+func writePlayIcon(path string) {
+	const size = 512
+	img := image.NewRGBA(image.Rect(0, 0, size, size))
+	for y := 0; y < size; y++ {
+		row := lerpColor(indigoTop, indigoBot, float64(y)/float64(size-1))
+		for x := 0; x < size; x++ {
+			img.Set(x, y, row)
+		}
+	}
+	drawCloud(img, size)
+	// Play's spec asks for a 32-bit PNG, and Go's encoder writes plain RGB when
+	// every pixel is opaque. One corner pixel a shade off opaque keeps the alpha
+	// channel, and Play's rounded mask hides that corner anyway.
+	c := img.RGBAAt(0, 0)
+	img.SetRGBA(0, 0, color.RGBA{c.R, c.G, c.B, 0xfe})
+	f, err := os.Create(path)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	if err := png.Encode(f, img); err != nil {
+		panic(err)
 	}
 }
 
