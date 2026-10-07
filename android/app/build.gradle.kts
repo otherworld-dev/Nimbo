@@ -5,12 +5,20 @@
 //    generated Java package `dev.otherworld.mobile`). It is arm64-only, so the
 //    APK is restricted to `arm64-v8a`; adding another ABI would produce an APK
 //    that installs and then dies on the first JNI call.
-//  * minSdk 26 matches `gomobile bind -androidapi 26`.
+//  * minSdk 26 matches `gomobile bind -androidapi 26`. targetSdk 36 is Google
+//    Play's floor for new apps and updates since 31 Aug 2026.
+//  * The `play` release build is signed with the Play upload key from the
+//    gitignored `keystore.properties` + `upload-keystore.jks` (Google holds the
+//    app signing key). Without them it is unsigned, so CI and other checkouts
+//    still build. The `direct` build never uses the upload key.
 //  * Minification is off for the prototype: R8 plus a JNI boundary needs keep
 //    rules we are not writing yet (see proguard-rules.pro for the ones we would
 //    need when minification is switched on).
 //  * The dependency list below is the complete, pinned set from the
 //    implementation contract — do not add to it, apart from the Play Billing Library on playImplementation.
+
+import java.io.FileInputStream
+import java.util.Properties
 
 plugins {
     id("com.android.application")
@@ -21,12 +29,29 @@ plugins {
 
 android {
     namespace = "dev.otherworld.nimbo"
-    compileSdk = 35
+    compileSdk = 36
+
+    val keystorePropertiesFile = rootProject.file("keystore.properties")
+    val keystoreProperties = Properties()
+    if (keystorePropertiesFile.exists()) {
+        keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+    }
+
+    signingConfigs {
+        create("release") {
+            if (keystorePropertiesFile.exists()) {
+                storeFile = rootProject.file(keystoreProperties["storeFile"] as String)
+                storePassword = keystoreProperties["storePassword"] as String
+                keyAlias = keystoreProperties["keyAlias"] as String
+                keyPassword = keystoreProperties["keyPassword"] as String
+            }
+        }
+    }
 
     defaultConfig {
         applicationId = "dev.otherworld.nimbo"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
 
@@ -63,7 +88,14 @@ android {
     // replacing a Play install.
     flavorDimensions += "distribution"
     productFlavors {
-        create("play") { dimension = "distribution" }
+        create("play") {
+            dimension = "distribution"
+            // Debug keeps the debug key: a build type's signing config wins
+            // over a flavour's, so this only reaches playRelease.
+            if (keystorePropertiesFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
         create("direct") { dimension = "distribution" }
     }
 
@@ -123,6 +155,15 @@ dependencies {
     // mandatory for in-app support in the Play build, and the direct build
     // must not contain it.
     "playImplementation"("com.android.billingclient:billing:8.0.0")
+
+    // Play Billing brings in androidx.fragment 1.1.0 (via play-services-basement).
+    // The ActivityResult API needs Fragment 1.3.0+ wherever Fragment is on the
+    // classpath, and release lint fails the build otherwise. A constraint only
+    // raises the version Billing already pulls in; it adds no library, and the
+    // direct build still has no Fragment at all.
+    constraints {
+        add("playImplementation", "androidx.fragment:fragment:1.8.5")
+    }
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 

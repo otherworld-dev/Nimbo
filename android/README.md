@@ -67,8 +67,8 @@ scripts/build-core.ps1 -Targets android/arm64   # the Go core (fast dev loop)
 ```
 
 `local.properties` (gitignored) must point `sdk.dir` at the Android SDK. The
-committed toolchain is AGP 8.7.3 / Gradle 8.11.1 / Kotlin 2.0.21 / JDK 17,
-compileSdk 35, minSdk 26.
+committed toolchain is AGP 8.9.3 / Gradle 8.11.1 / Kotlin 2.0.21 / JDK 17,
+compileSdk and targetSdk 36, minSdk 26.
 
 The debug build is **arm64-v8a only**, matching the `.aar` the dev-loop script
 produces. Run `scripts/build-core.ps1` with no `-Targets` for all four ABIs
