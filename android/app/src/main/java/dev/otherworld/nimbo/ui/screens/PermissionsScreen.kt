@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -114,7 +115,14 @@ fun PermissionsScreen(
                 tonalElevation = 3.dp,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Column(modifier = Modifier.padding(horizontal = 24.dp, vertical = 18.dp)) {
+                // Above the navigation bar, as in AddFolderScreen: with three-button
+                // navigation the system bar otherwise covers Continue (seen on a
+                // Galaxy S24 Ultra, Android 16).
+                Column(
+                    modifier = Modifier
+                        .navigationBarsPadding()
+                        .padding(horizontal = 24.dp, vertical = 18.dp),
+                ) {
                     if (!hasAllFiles) {
                         Text(
                             text = "All files access is required to continue.",
