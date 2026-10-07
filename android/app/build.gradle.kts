@@ -2,13 +2,13 @@
 //
 // Notes that matter:
 //  * The Go sync engine ships as a local `.aar` (`../core/nimbo-core.aar`,
-//    generated Java package `dev.otherworld.mobile`). Release builds carry
-//    `arm64-v8a` (phones) and `x86_64` (x86 Chromebooks, emulators). The x86_64
-//    library is needed, not optional: an arm64-only app on an x86 device runs
-//    under ARM translation, and Go's start-up CPU detection dies there with
-//    SIGILL. Every ABI listed below must be in the .aar, or a device that picks
-//    the missing one installs the app and crashes on the first JNI call, so
-//    release builds refuse to start without both.
+//    generated Java package `dev.otherworld.mobile`). It is arm64-only, so the
+//    APK is restricted to `arm64-v8a`; adding another ABI would produce an APK
+//    that installs and then dies on the first JNI call. An x86_64 core is not a
+//    quick fix for x86 devices either: modernc's SQLite issues legacy x86_64
+//    syscalls (lstat, from musl's fstatat) that Android's seccomp filter kills,
+//    so it crashes as soon as a folder is added. Play distribution to ChromeOS
+//    is switched off until that is sorted.
 //  * minSdk 26 matches `gomobile bind -androidapi 26`. targetSdk 36 is Google
 //    Play's floor for new apps and updates since 31 Aug 2026.
 //  * The `play` release build is signed with the Play upload key from the
@@ -23,7 +23,6 @@
 
 import java.io.FileInputStream
 import java.util.Properties
-import java.util.zip.ZipFile
 
 plugins {
     id("com.android.application")
@@ -31,9 +30,6 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.plugin.serialization")
 }
-
-// The ABIs the app ships, which the Go core .aar must all carry (see above).
-val shippedAbis = listOf("arm64-v8a", "x86_64")
 
 android {
     namespace = "dev.otherworld.nimbo"
@@ -63,9 +59,9 @@ android {
         versionCode = 2
         versionName = "0.1.0"
 
-        // The ABIs the Go core's libgojni.so is built for (see the note at the top).
+        // The Go core's libgojni.so is built for arm64 only.
         ndk {
-            abiFilters += shippedAbis
+            abiFilters += "arm64-v8a"
         }
     }
 
@@ -178,25 +174,4 @@ dependencies {
     // Plain JVM unit tests for the pure logic in core/ (no Android framework
     // types involved, so these run on the host without Robolectric).
     testImplementation("junit:junit:4.13.2")
-}
-
-// A dev-loop core (build-core.ps1 -Targets android/arm64) has no x86_64 library,
-// and a release built from it would install on x86 devices and crash on start.
-// Release builds check the .aar first; debug builds don't, so the dev loop and
-// CI stay arm64-only and fast.
-val coreAar = file("../core/nimbo-core.aar")
-tasks.configureEach {
-    if (name.startsWith("pre") && name.endsWith("ReleaseBuild")) {
-        doFirst {
-            val libs = ZipFile(coreAar).use { zip ->
-                zip.entries().asSequence().map { it.name }.toSet()
-            }
-            for (abi in shippedAbis) {
-                check("jni/$abi/libgojni.so" in libs) {
-                    "core/nimbo-core.aar has no $abi library: run scripts/build-core.ps1 " +
-                        "with no -Targets before a release build"
-                }
-            }
-        }
-    }
 }

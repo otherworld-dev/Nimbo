@@ -5,11 +5,9 @@
 param(
     [string]$Out = (Join-Path $PSScriptRoot "..\core\nimbo-core.aar"),
     [string]$AndroidApi = "26",
-    # ABIs to build. The default is what release builds ship: arm64 for phones,
-    # amd64 for x86 Chromebooks and emulators (app/build.gradle.kts refuses a
-    # release build without both). "android/arm64" alone is about twice as fast
-    # and runs on every phone, so use it for the dev loop.
-    [string]$Targets = "android/arm64,android/amd64"
+    # ABIs to build. "android" = all four (ship builds); "android/arm64" alone
+    # is ~4x faster and covers every modern device — use it for the dev loop.
+    [string]$Targets = "android"
 )
 $ErrorActionPreference = "Stop"
 

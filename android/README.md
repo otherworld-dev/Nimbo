@@ -70,11 +70,9 @@ scripts/build-core.ps1 -Targets android/arm64   # the Go core (fast dev loop)
 committed toolchain is AGP 8.9.3 / Gradle 8.11.1 / Kotlin 2.0.21 / JDK 17,
 compileSdk and targetSdk 36, minSdk 26.
 
-The app ships for **arm64-v8a** (phones) and **x86_64** (x86 Chromebooks and the
-emulator, where an arm64-only build crashes under ARM translation). The dev-loop
-core above is arm64 only, which is fine on a phone. Run `scripts/build-core.ps1`
-with no `-Targets` for both ABIs before a release build, which refuses to start
-without them.
+The debug build is **arm64-v8a only**, matching the `.aar` the dev-loop script
+produces. Run `scripts/build-core.ps1` with no `-Targets` for all four ABIs
+before shipping anything.
 
 ## Launcher icon variants
 
