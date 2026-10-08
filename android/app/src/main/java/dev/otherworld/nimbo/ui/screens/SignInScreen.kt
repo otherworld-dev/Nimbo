@@ -4,6 +4,7 @@
  */
 package dev.otherworld.nimbo.ui.screens
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -24,7 +25,6 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -39,13 +39,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import dev.otherworld.nimbo.R
 
 @Composable
 fun SignInScreen(
@@ -73,19 +75,23 @@ fun SignInScreen(
         ) {
             Spacer(Modifier.height(24.dp))
 
-            // Wordmark
+            // Wordmark: the launcher icon's own two layers, as Compose can't
+            // draw an adaptive icon directly. A launcher shows the middle 72 of
+            // the layers' 108 units, hence the 1.5x scale inside the clip.
             Box(
                 modifier = Modifier
                     .size(84.dp)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primary),
-                contentAlignment = Alignment.Center,
+                    .clip(CircleShape),
             ) {
-                Icon(
-                    imageVector = Icons.Filled.Cloud,
+                Image(
+                    painter = painterResource(R.drawable.ic_launcher_background),
                     contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier.size(44.dp),
+                    modifier = Modifier.matchParentSize().scale(1.5f),
+                )
+                Image(
+                    painter = painterResource(R.drawable.ic_launcher_foreground),
+                    contentDescription = null,
+                    modifier = Modifier.matchParentSize().scale(1.5f),
                 )
             }
             Spacer(Modifier.height(20.dp))

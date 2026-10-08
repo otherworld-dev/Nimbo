@@ -1,0 +1,27 @@
+<!doctype html>
+<!-- Google Play phone screenshot frame, 1080x1920. Real captures from a Galaxy
+     S24 Ultra signed in to a test account, status and navigation bars cropped
+     (screenshots/raw/). Render one per capture with headless Chrome:
+     chrome --headless --hide-scrollbars --window-size=1080,1920 --screenshot=out.png
+       "src/screenshot-frame.html?img=../screenshots/raw/01-sync.png&cap=Caption" -->
+<html lang="en-GB"><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@500;700&display=block" rel="stylesheet">
+<style>
+  html, body { margin: 0; width: 1080px; height: 1920px; overflow: hidden; }
+  body { background: linear-gradient(165deg, #6F6AF2 0%, #4A3ED2 100%); font-family: Roboto, sans-serif;
+         display: flex; flex-direction: column; align-items: center; }
+  h1 { color: #fff; font-size: 64px; font-weight: 700; line-height: 1.15; text-align: center;
+       margin: 96px 70px 0; letter-spacing: -0.5px; min-height: 148px; display: flex; align-items: center; }
+  .phone { margin-top: 44px; padding: 16px; background: #0d0d12; border-radius: 72px;
+           box-shadow: 0 30px 70px rgba(20, 10, 90, .45); }
+  .phone img { display: block; width: 800px; height: auto; border-radius: 56px; }
+</style></head>
+<body>
+  <h1 id="cap"></h1>
+  <div class="phone"><img id="shot" alt=""></div>
+  <script>
+    const q = new URLSearchParams(location.search);
+    document.getElementById('cap').textContent = q.get('cap') || '';
+    document.getElementById('shot').src = q.get('img') || '';
+  </script>
+</body></html>
