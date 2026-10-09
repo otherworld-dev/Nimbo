@@ -1400,7 +1400,8 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 	// COM) and connects the provider — the exact window a live-install mode
 	// switch once hung in, silently. Run verbose for per-step cfapi detail.
 	slog.Info("registering cloud sync root", "dir", localDir)
-	connKey, err := cfapi.Mount(localDir, brand.Current.Name, exe, hydrate, list)
+	// The display name is the sidebar entry's label, one per account (#726).
+	connKey, err := cfapi.Mount(localDir, sidebarLabelFor(eng.Account), exe, hydrate, list)
 	if err != nil {
 		return err
 	}
@@ -4283,7 +4284,7 @@ func (a *App) SidebarSupported() bool { return shellns.Supported() }
 func (a *App) SidebarEnabled() bool { return a.sidebarWanted() }
 
 func (a *App) sidebarWanted() bool {
-	recorded, _ := sidebarChoice()
+	recorded, _, _ := sidebarChoice()
 	cloudRoot := a.GetSyncMode() == "ondemand" || cfapi.ShellSyncRootRegistered(a.GetBaseDir())
 	return sidebarWantedFrom(recorded, cloudRoot, shellns.Enabled())
 }
@@ -4298,15 +4299,15 @@ func sidebarWantedFrom(recorded *bool, cloudRoot, legacyEntry bool) bool {
 	return cloudRoot || legacyEntry
 }
 
-// sidebarChoice returns the recorded preference (nil when never chosen) and
-// the folder it was applied for.
-func sidebarChoice() (*bool, string) {
+// sidebarChoice returns the recorded preference (nil when never chosen), the
+// folder it was applied for and the label our own entry was written with.
+func sidebarChoice() (*bool, string, string) {
 	if d, err := config.Resolve(); err == nil {
 		if s, e := d.LoadSettings(); e == nil {
-			return s.SidebarEnabled, s.SidebarTarget
+			return s.SidebarEnabled, s.SidebarTarget, s.SidebarName
 		}
 	}
-	return nil, ""
+	return nil, "", ""
 }
 
 // sidebarSyncRoot is recorded as the sidebar's target when we deliberately have
@@ -4324,6 +4325,19 @@ func rememberSidebar(on bool, target string) {
 	}
 	_ = d.UpdateSettings(func(s *config.Settings) {
 		s.SidebarEnabled, s.SidebarTarget = &on, target
+	})
+}
+
+// rememberSidebarEntry records that our own entry is on, pointing at target and
+// shown as name.
+func rememberSidebarEntry(target, name string) {
+	d, err := config.Resolve()
+	if err != nil {
+		return
+	}
+	on := true
+	_ = d.UpdateSettings(func(s *config.Settings) {
+		s.SidebarEnabled, s.SidebarTarget, s.SidebarName = &on, target, name
 	})
 }
 
@@ -4377,10 +4391,11 @@ func (a *App) SetSidebar(on bool) string {
 	if err != nil {
 		return err.Error()
 	}
-	if err := shellns.Register(brand.Current.Name, target, icon); err != nil {
+	name := a.ownSidebarLabel()
+	if err := shellns.Register(brand.Current.Name, name, target, icon); err != nil {
 		return err.Error()
 	}
-	rememberSidebar(true, target)
+	rememberSidebarEntry(target, name)
 	return ""
 }
 
@@ -4435,7 +4450,7 @@ func (a *App) syncSidebar() {
 			return // leave the record alone so the next launch retries
 		}
 		slog.Info("removed the duplicate navigation-pane entry; the cloud sync root provides it", "dir", target)
-		recorded, _ := sidebarChoice()
+		recorded, _, _ := sidebarChoice()
 		if recorded == nil {
 			// Never chosen: Windows shows the node, and SidebarEnabled says so.
 			rememberSidebar(true, sidebarSyncRoot)
@@ -4447,19 +4462,20 @@ func (a *App) syncSidebar() {
 	if !a.sidebarWanted() {
 		return
 	}
-	if recorded, applied := sidebarChoice(); recorded != nil && applied == target {
-		return // already applied for this folder
+	name := a.ownSidebarLabel()
+	if recorded, applied, appliedName := sidebarChoice(); recorded != nil && applied == target && appliedName == name {
+		return // already applied for this folder, under this label
 	}
 	icon, err := navIconPath()
 	if err != nil {
 		slog.Warn("sidebar icon unavailable", "err", err)
 		return
 	}
-	if err := shellns.Register(brand.Current.Name, target, icon); err != nil {
+	if err := shellns.Register(brand.Current.Name, name, target, icon); err != nil {
 		slog.Warn("sidebar registration failed", "err", err)
 		return
 	}
-	rememberSidebar(true, target)
+	rememberSidebarEntry(target, name)
 }
 
 // applyCloudRootChoice hides or shows the node Windows supplies for target's

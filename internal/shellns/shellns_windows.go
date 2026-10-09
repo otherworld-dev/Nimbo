@@ -123,14 +123,17 @@ func desired(name, targetFolder, iconPath string) []regVal {
 }
 
 // Register pins a navigation-pane root named name, pointing at targetFolder and
-// shown with iconPath. Idempotent; updates target/icon on each call.
+// shown with iconPath. Idempotent; updates name/target/icon on each call.
+// brandName names the folder a packaged build keeps the icon in (see
+// stableIconPath); it is the product name, never the entry's label, which
+// carries the account and so changes with it.
 //
 // On a packaged build the write is handed to a scheduled task and this returns
 // once that task has run its script (a second or two), or with an error if it
 // did not run within outOfContainerTimeout.
-func Register(name, targetFolder, iconPath string) error {
+func Register(brandName, name, targetFolder, iconPath string) error {
 	if Packaged() {
-		return registerOutOfContainer(name, targetFolder, iconPath)
+		return registerOutOfContainer(brandName, name, targetFolder, iconPath)
 	}
 	for _, v := range desired(name, targetFolder, iconPath) {
 		if err := write(v); err != nil {
@@ -271,8 +274,8 @@ func stableIconPath(brandDir string) string {
 // the app can read its own copy but the task cannot (the app's path is
 // redirected into the package's LocalCache), and hard-coding that redirected
 // path would tie the icon to the current package family name.
-func registerOutOfContainer(name, targetFolder, iconPath string) error {
-	icon := stableIconPath(name)
+func registerOutOfContainer(brandName, name, targetFolder, iconPath string) error {
+	icon := stableIconPath(brandName)
 	if icon == "" {
 		icon = iconPath
 	}

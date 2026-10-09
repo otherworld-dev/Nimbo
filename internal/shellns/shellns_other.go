@@ -15,7 +15,7 @@ func Enabled() bool { return false }
 func Packaged() bool { return false }
 
 // Register is a no-op on non-Windows platforms.
-func Register(string, string, string) error { return nil }
+func Register(string, string, string, string) error { return nil }
 
 // Unregister is a no-op on non-Windows platforms.
 func Unregister() error { return nil }
