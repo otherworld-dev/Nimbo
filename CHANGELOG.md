@@ -18,6 +18,11 @@ All notable changes to Nimbo are recorded here. The format follows
   stops holding up the others. A restart ends a set-aside, and when the file comes
   back it rejoins the queue and carries on from where it got to rather than
   starting again, an upload picks up from the chunks already on the server (#702).
+- The Explorer sidebar entry is now named after the account, "Nimbo - adam" rather
+  than just "Nimbo", so with more than one account you can tell which entry is
+  which. If two accounts have the same login on different servers the server is
+  added as well. Existing entries are renamed the next time Nimbo starts, and one
+  you have hidden stays hidden (#19).
 
 ### Fixed
 

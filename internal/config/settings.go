@@ -119,6 +119,10 @@ type Settings struct {
 	// package's private hive, not the keys Explorer reads — so it has to
 	// remember what it asked for to know when a rewrite is due.
 	SidebarTarget string `json:"sidebarTarget,omitempty"`
+	// SidebarName is the label our own entry was last written with. It names
+	// the account, so it changes with the shown account even when the folder
+	// does not, and an entry written before it carried the account has none.
+	SidebarName string `json:"sidebarName,omitempty"`
 }
 
 // AppWindowSize is a remembered app-window size in logical pixels.
