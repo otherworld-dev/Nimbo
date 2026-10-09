@@ -19,6 +19,7 @@ import (
 
 	"github.com/otherworld/nimbo/internal/config"
 	"github.com/otherworld/nimbo/internal/notify"
+	"github.com/otherworld/nimbo/internal/psquote"
 )
 
 // In-app, opt-in registration of the Explorer corner badges — the one piece of
@@ -196,11 +197,9 @@ try {
 }
 
 // psSingleQuote renders s as a PowerShell single-quoted literal — no expansion,
-// embedded quotes doubled — so a staging path can never break out of the string
-// or inject into the elevated command.
-func psSingleQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
+// embedded quotes doubled, the typographic ones too — so a staging path can
+// never break out of the string or inject into the elevated command.
+func psSingleQuote(s string) string { return psquote.Quote(s) }
 
 // encodePSCommand base64-encodes a script as UTF-16LE for powershell.exe's
 // -EncodedCommand, so the whole elevated script lives on the (tamper-proof

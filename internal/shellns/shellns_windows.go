@@ -46,6 +46,8 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+
+	"github.com/otherworld/nimbo/internal/psquote"
 )
 
 // NavGUID identifies the Nimbo navigation-pane node (fixed for the app).
@@ -491,18 +493,10 @@ func waitGone(path string, timeout time.Duration) error {
 	}
 }
 
-// psQuote renders s as a PowerShell single-quoted literal (no expansion, so a
-// path holding a $ or a backtick stays literal; an embedded quote is doubled).
-//
-// PowerShell takes the typographic quotes ‘ ’ ‚ ‛ as single quotes too, so
-// those are doubled as well. The values quoted here include the account's
-// login, which the server supplies, so a quote it chose must never be able to
-// end the string.
-func psQuote(s string) string {
-	return "'" + psSingleQuotes.Replace(s) + "'"
-}
-
-var psSingleQuotes = strings.NewReplacer("'", "''", "‘", "‘‘", "’", "’’", "‚", "‚‚", "‛", "‛‛")
+// psQuote renders s as a PowerShell single-quoted literal. The values quoted
+// here include the account's login, which the server supplies, so this has to
+// be psquote's version, which also doubles the typographic quotes.
+func psQuote(s string) string { return psquote.Quote(s) }
 
 // scriptBytes is a script's file content: UTF-8 with a BOM. Without the BOM
 // Windows PowerShell 5.1 reads the file in the ANSI code page, which garbles

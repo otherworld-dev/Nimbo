@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/otherworld/nimbo/internal/cfapi"
+	"github.com/otherworld/nimbo/internal/psquote"
 	"github.com/otherworld/nimbo/internal/transfer"
 	"github.com/otherworld/nimbo/internal/transport"
 )
@@ -1260,7 +1261,7 @@ func corruptRecovery(full string) string {
 	if drive == "" {
 		drive = "C:"
 	}
-	q := strings.ReplaceAll(full, "'", "''")
+	q := psquote.Escape(full) // file names come from the server: ’ must not end the string either
 	return fmt.Sprintf(`Windows reports the cloud-file metadata of %s as corrupt `+
 		`(a Windows Cloud Files fault); it cannot be opened, repaired or deleted `+
 		`normally and the server copy is unaffected. To clear it: quit this app, then in `+

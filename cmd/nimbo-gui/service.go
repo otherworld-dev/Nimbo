@@ -38,6 +38,7 @@ import (
 	"github.com/otherworld/nimbo/internal/notify"
 	"github.com/otherworld/nimbo/internal/overlay"
 	"github.com/otherworld/nimbo/internal/policy"
+	"github.com/otherworld/nimbo/internal/psquote"
 	"github.com/otherworld/nimbo/internal/shellmenu"
 	"github.com/otherworld/nimbo/internal/shellns"
 	"github.com/otherworld/nimbo/internal/transfer"
@@ -5711,7 +5712,7 @@ func pickFolderFallback(start string) string {
 	script := "Add-Type -AssemblyName System.Windows.Forms | Out-Null; " +
 		"$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
 	if start != "" {
-		script += "try { $d.SelectedPath = '" + strings.ReplaceAll(start, "'", "''") + "' } catch {}; "
+		script += "try { $d.SelectedPath = " + psquote.Quote(start) + " } catch {}; "
 	}
 	script += "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }"
 	cmd := exec.Command("powershell", "-NoProfile", "-STA", "-Command", script)
