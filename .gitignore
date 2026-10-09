@@ -66,6 +66,7 @@ CLAUDE.md
 # Private docs (kept outside the repo, never committed)
 /docs/
 /android/docs/
+.superpowers/
 /packaging/msix/SIGNING.md
 /packaging/msix/STORE.md
 /packaging/msix/store-listing.md
