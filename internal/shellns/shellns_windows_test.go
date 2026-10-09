@@ -4,7 +4,9 @@ package shellns
 
 import (
 	"encoding/base64"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -81,11 +83,53 @@ func TestPsQuoteEscapesEmbeddedQuotes(t *testing.T) {
 		`C:\Users\O'Brien`:   `'C:\Users\O''Brien'`,
 		`C:\a$b` + "`c":      "'C:\\a$b`c'", // literal, no PowerShell expansion
 		`'; Remove-Item C:\`: `'''; Remove-Item C:\'`,
+		"a\u2019; calc; \u2018": "'a\u2019\u2019; calc; \u2018\u2018'", // PowerShell reads these as ' too
+		"\u201A\u201B":          "'\u201A\u201A\u201B\u201B'",
 	}
 	for in, want := range cases {
 		if got := psQuote(in); got != want {
 			t.Errorf("psQuote(%q) = %s, want %s", in, got, want)
 		}
+	}
+}
+
+// What PowerShell itself makes of a quoted value, written the way
+// runOutOfContainer writes its script: every name must come back unchanged,
+// with nothing run. "Œ" is in the list because its UTF-8 form holds 0x92,
+// which is ’ in cp1252, so it broke out of the quotes when the script was
+// read without a BOM.
+func TestPsQuoteRoundTripsThroughPowerShell(t *testing.T) {
+	if _, err := exec.LookPath("powershell.exe"); err != nil {
+		t.Skip("powershell.exe not available")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ran")
+	for i, name := range []string{
+		"Nimbo - adam",
+		"Nimbo - José Ørsted",
+		"Nimbo - aŒ; New-Item " + marker + "; Œ",
+		"Nimbo - a\u2019; New-Item " + marker + "; \u2019",
+		"Nimbo - a'; New-Item " + marker + "; '",
+	} {
+		out := filepath.Join(dir, fmt.Sprintf("out%d.txt", i))
+		ps1 := filepath.Join(dir, fmt.Sprintf("s%d.ps1", i))
+		script := fmt.Sprintf("[IO.File]::WriteAllText(%s, %s, (New-Object Text.UTF8Encoding($false)))\r\n", psQuote(out), psQuote(name))
+		if err := os.WriteFile(ps1, scriptBytes(script), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if b, err := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1).CombinedOutput(); err != nil {
+			t.Fatalf("%q: powershell: %v: %s", name, err, b)
+		}
+		got, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatalf("%q: no output: %v", name, err)
+		}
+		if string(got) != name {
+			t.Errorf("round trip: got %q, want %q", got, name)
+		}
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("a quoted name ran as code")
 	}
 }
 

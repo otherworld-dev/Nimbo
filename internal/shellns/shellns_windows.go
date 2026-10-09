@@ -397,7 +397,7 @@ func runOutOfContainer(action, body string) error {
 		fmt.Sprintf("Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue\r\n", psQuote(taskXML)) +
 		fmt.Sprintf("Remove-Item -LiteralPath %s -Force -ErrorAction SilentlyContinue\r\n", psQuote(vbs)) +
 		"Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\r\n"
-	if err := os.WriteFile(ps1, []byte(script), 0o644); err != nil {
+	if err := os.WriteFile(ps1, scriptBytes(script), 0o644); err != nil {
 		return err
 	}
 	// The task cannot run powershell.exe directly: a console process gets its
@@ -493,8 +493,23 @@ func waitGone(path string, timeout time.Duration) error {
 
 // psQuote renders s as a PowerShell single-quoted literal (no expansion, so a
 // path holding a $ or a backtick stays literal; an embedded quote is doubled).
+//
+// PowerShell takes the typographic quotes ‘ ’ ‚ ‛ as single quotes too, so
+// those are doubled as well. The values quoted here include the account's
+// login, which the server supplies, so a quote it chose must never be able to
+// end the string.
 func psQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	return "'" + psSingleQuotes.Replace(s) + "'"
+}
+
+var psSingleQuotes = strings.NewReplacer("'", "''", "‘", "‘‘", "’", "’’", "‚", "‚‚", "‛", "‛‛")
+
+// scriptBytes is a script's file content: UTF-8 with a BOM. Without the BOM
+// Windows PowerShell 5.1 reads the file in the ANSI code page, which garbles
+// any non-ASCII name and can turn a byte of one (0x91-0x92 in cp1252) into a
+// quote that psQuote never saw.
+func scriptBytes(script string) []byte {
+	return append([]byte("\xEF\xBB\xBF"), script...)
 }
 
 // xmlEscape escapes the XML special characters in s for the task definition.
