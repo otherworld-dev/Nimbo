@@ -1220,7 +1220,7 @@ func (a *App) mountOnDemand(localDir, remoteRoot string) error {
 	return a.mountOnDemandWith(a.eng, a.etags, a.fileids, a.mountroots, localDir, remoteRoot)
 }
 
-// hydrateReadCloser wraps a hydration reader (the SetHydrateStream closure in
+// hydrateReadCloser wraps a hydration reader (the hydrate stream closure in
 // mountOnDemandWith, below) so a failure that only shows up partway through
 // the transfer still reaches the activity feed and toast. That closure's own
 // report call fires at open — once OpenRange has returned response headers —
@@ -1300,12 +1300,33 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			a.vfsErrorToast(kind, shown, err)
 		}
 	}
-	hydrate := func(identity []byte, offset, length int64) ([]byte, error) {
-		data, err := eng.DownloadRange(a.ctx, string(identity), offset, length)
-		if offset == 0 { // record once per file-open, not per chunk
+	// hydrate streams a placeholder's bytes: one reader for the whole of one
+	// FETCH_DATA request rather than a separate HTTP GET per piece the filter
+	// asks for (Task 1/2). ctx is that request's own context, cancelled by the
+	// filter on CANCEL_FETCH_DATA or by cfapi's stall watchdog; app shutdown is
+	// covered one layer down, not by this closure — app.Run() returning calls
+	// disconnectAllOnDemand (below), which calls cfapi.Disconnect, which calls
+	// the provider's cancelFetches and so cancels every in-flight request
+	// context the same way a live cancel does.
+	hydrate := func(ctx context.Context, identity []byte, offset, length int64) (io.ReadCloser, error) {
+		rc, err := eng.OpenRange(ctx, string(identity), offset, length)
+		// One activity entry per file-open, as today — but never for a
+		// withdrawn request. OpenRange can outlast the filter's 60s cancel (a
+		// silently dropping network gives each attempt up to 30s to dial), and
+		// the cancel then surfaces here as context.Canceled: an error entry
+		// plus a toast, repeated per re-request, for something that is not a
+		// failure. The wrapper below has always skipped cancellation; this
+		// agrees with it.
+		if offset == 0 && !errors.Is(err, context.Canceled) {
 			report("download", string(identity), err)
 		}
-		return data, err
+		if err != nil {
+			return nil, err
+		}
+		// The report above only covers the open; wrap so a body failure — or a
+		// clean end short of length — reports too (see hydrateReadCloser's doc
+		// comment, above mountOnDemandWith).
+		return &hydrateReadCloser{ReadCloser: rc, remotePath: string(identity), length: length, report: report}, nil
 	}
 	// listRemote returns a directory's children as placeholders (rel is
 	// sync-root-relative, "" = root). Each entry's identity is its remote path so
@@ -1402,39 +1423,16 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 	// switch once hung in, silently. Run verbose for per-step cfapi detail.
 	slog.Info("registering cloud sync root", "dir", localDir)
 	// The display name is the sidebar entry's label, one per account (#726).
-	connKey, err := cfapi.Mount(localDir, sidebarLabelFor(eng.Account), exe, hydrate, list)
+	// The stream goes in WITH the mount, not after it: Mount seeds the root
+	// from list (a network round trip) once the provider is connected, and a
+	// placeholder opened in that window used to be served by a byte-slice
+	// fallback on the app's context instead, with no stall watchdog and no
+	// way to cancel it (Deck #701).
+	connKey, err := cfapi.MountStream(localDir, sidebarLabelFor(eng.Account), exe, hydrate, list)
 	if err != nil {
 		return err
 	}
 	slog.Info("cloud sync root connected", "dir", localDir)
-	// Stream the fetch instead of the byte-slice hydrate above: one reader for
-	// the whole request rather than a separate HTTP GET per 1 MB piece the
-	// filter asks for (Task 1/2). ctx here is the individual request's own
-	// context, cancelled by the filter on CANCEL_FETCH_DATA; app shutdown is
-	// already covered one layer down, not by this closure — app.Run() returning
-	// calls disconnectAllOnDemand (below), which calls cfapi.Disconnect, which
-	// calls the provider's cancelFetches and so cancels every in-flight request
-	// context the same way a live cancel does.
-	cfapi.SetHydrateStream(connKey, func(ctx context.Context, identity []byte, offset, length int64) (io.ReadCloser, error) {
-		rc, err := eng.OpenRange(ctx, string(identity), offset, length)
-		// One activity entry per file-open, as today — but never for a
-		// withdrawn request. OpenRange can outlast the filter's 60s cancel (a
-		// silently dropping network gives each attempt up to 30s to dial), and
-		// the cancel then surfaces here as context.Canceled: an error entry
-		// plus a toast, repeated per re-request, for something that is not a
-		// failure. The wrapper below has always skipped cancellation; this
-		// agrees with it.
-		if offset == 0 && !errors.Is(err, context.Canceled) {
-			report("download", string(identity), err)
-		}
-		if err != nil {
-			return nil, err
-		}
-		// The report above only covers the open; wrap so a body failure — or a
-		// clean end short of length — reports too (see hydrateReadCloser's doc
-		// comment, above mountOnDemandWith).
-		return &hydrateReadCloser{ReadCloser: rc, remotePath: string(identity), length: length, report: report}, nil
-	})
 	// Write-back + down-sync: watch the mount for user changes (upload/mkdir/
 	// delete/move) and pull changes made elsewhere (List). When notify_push is
 	// available the reconcile is driven by push (Poke), so the poll is a long

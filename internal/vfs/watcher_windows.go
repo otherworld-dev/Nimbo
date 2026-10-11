@@ -1488,7 +1488,7 @@ func (w *Watcher) remoteFor(path string) string {
 // serverFor is remoteFor plus disguised-type escaping: the name the SERVER knows
 // this path by. Everything server-bound must use it — the PUT/DELETE/MOVE target
 // AND the placeholder identity, because the identity is what the OS hands back on
-// hydration (fetchDataCallback -> DownloadRange), so a raw identity on a
+// hydration (fetchDataCallback -> OpenRange), so a raw identity on a
 // disguised file is a 404 on every open.
 //
 // isDir short-circuits: escaping covers file basenames only, and a directory
