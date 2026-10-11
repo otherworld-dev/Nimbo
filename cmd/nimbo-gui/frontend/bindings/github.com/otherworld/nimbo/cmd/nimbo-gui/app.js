@@ -203,7 +203,8 @@ export function BrowseOffline(rel) {
 }
 
 /**
- * BrowseRemote lists a remote directory (one level), excluding the dir itself.
+ * BrowseRemote lists a remote directory (one level), excluding the dir itself
+ * and anything the account's ignore rules exclude; folders first, then A-Z.
  * @param {string} path
  * @returns {$CancellablePromise<$models.BrowseEntry[]>}
  */
