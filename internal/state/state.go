@@ -8,6 +8,7 @@ package state
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -57,6 +58,12 @@ CREATE TABLE IF NOT EXISTS clone_state (
   account_id TEXT NOT NULL,
   pair_key   TEXT NOT NULL,
   status     TEXT NOT NULL,  -- 'started' (clone in progress) or 'done'
+  PRIMARY KEY (account_id, pair_key)
+);
+CREATE TABLE IF NOT EXISTS clone_first (
+  account_id TEXT NOT NULL,
+  pair_key   TEXT NOT NULL,
+  paths      TEXT NOT NULL,  -- JSON array of pair-relative folders the initial clone downloads first, in order
   PRIMARY KEY (account_id, pair_key)
 );
 CREATE TABLE IF NOT EXISTS scan_checkpoint (
@@ -476,11 +483,61 @@ func (s *Store) SetCloneStatus(pairKey, status string) error {
 // keyed by (local dir, remote root), so re-adding the same folder later would
 // find a leftover "started" and RESUME — refetching (overwriting) any local
 // file whose size differs — where a fresh pair takes over and never overwrites.
-// Clearing a pair with no row is a no-op.
+// The folders chosen to download first go with it. Clearing a pair with no row
+// is a no-op.
 func (s *Store) ClearCloneStatus(pairKey string) error {
-	_, err := s.db.Exec(
-		`DELETE FROM clone_state WHERE account_id = ? AND pair_key = ?`,
+	for _, table := range []string{"clone_state", "clone_first"} {
+		if _, err := s.db.Exec(
+			`DELETE FROM `+table+` WHERE account_id = ? AND pair_key = ?`,
+			s.accountID, pairKey,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CloneFirst returns the folders a pair's initial clone downloads before
+// everything else, in the order chosen (pair-relative, slash-separated). None
+// chosen is an empty result, not an error.
+func (s *Store) CloneFirst(pairKey string) ([]string, error) {
+	var raw string
+	err := s.db.QueryRow(
+		`SELECT paths FROM clone_first WHERE account_id = ? AND pair_key = ?`,
 		s.accountID, pairKey,
+	).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	if err := json.Unmarshal([]byte(raw), &paths); err != nil {
+		return nil, fmt.Errorf("read clone_first: %w", err)
+	}
+	return paths, nil
+}
+
+// SetCloneFirst records the folders a pair's initial clone downloads first. It
+// is kept with the pair rather than in memory so an interrupted clone still
+// honours it when it resumes after a restart. An empty list removes the row.
+func (s *Store) SetCloneFirst(pairKey string, paths []string) error {
+	if len(paths) == 0 {
+		_, err := s.db.Exec(
+			`DELETE FROM clone_first WHERE account_id = ? AND pair_key = ?`,
+			s.accountID, pairKey,
+		)
+		return err
+	}
+	raw, err := json.Marshal(paths)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO clone_first (account_id, pair_key, paths) VALUES (?, ?, ?)
+		   ON CONFLICT(account_id, pair_key) DO UPDATE SET paths = excluded.paths`,
+		s.accountID, pairKey, string(raw),
 	)
 	return err
 }
@@ -622,7 +679,7 @@ func (s *Store) DeleteBaseline(pairKey, path string) error {
 	return nil
 }
 
-// RekeyPair moves a pair's entire baseline (and its clone status) from oldKey to
+// RekeyPair moves a pair's entire baseline (and its clone state) from oldKey to
 // newKey. The pair_key is derived from the local folder path (see PairKey), so
 // MOVING a sync folder changes the key — without this re-key the engine would
 // find an empty baseline at the new path and re-clone the whole folder (and read
@@ -655,7 +712,7 @@ func (s *Store) RekeyPair(oldKey, newKey string) error {
 		return fmt.Errorf("probe destination: %w", err)
 	}
 
-	for _, table := range []string{"baseline", "clone_state"} {
+	for _, table := range []string{"baseline", "clone_state", "clone_first"} {
 		if _, err := tx.Exec(
 			`UPDATE `+table+` SET pair_key=? WHERE account_id=? AND pair_key=?`,
 			newKey, s.accountID, oldKey,
