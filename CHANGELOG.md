@@ -79,6 +79,11 @@ All notable changes to Nimbo are recorded here. The format follows
   after the switch. Live mode never syncs those, so the dialog now counts them
   separately and says they stay on the server, and the download size it shows only
   covers the files that really will come down (#512).
+- In on-demand mode, files are less likely to end up unopenable with error 363. A
+  Windows bug can leave the files created in the same batch as one with a long
+  server path impossible to open or delete, and Nimbo now creates any entry with a
+  path of 64 bytes or more on its own rather than only those of 128 or more, as a
+  margin for Windows versions the fault wasn't measured on (#685).
 
 ## [0.2.0] - 2026-09-26
 
