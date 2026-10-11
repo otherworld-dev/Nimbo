@@ -181,3 +181,22 @@ func TestCompleteRollsBackSecretWhenStoreFails(t *testing.T) {
 		t.Errorf("secret left behind after the store write failed: %v", fake.m)
 	}
 }
+
+// The sidebar name is the user's, so a re-login (which replaces the record
+// wholesale) must keep it.
+func TestCompleteKeepsLabel(t *testing.T) {
+	SetSecretStore(newFakeSecretStore())
+	defer SetSecretStore(keychainStore{})
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	first := Account{ID: newID("https://cloud.example.com", "alice"),
+		ServerURL: "https://cloud.example.com", LoginName: "alice", Label: "Work files"}
+	update(t, path, func(st *Store) { st.Upsert(first) })
+	got, err := Complete(path, Credentials{Server: "https://cloud.example.com", LoginName: "alice", AppPassword: "pw2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, _ := LoadStore(path)
+	if stored, _ := st.Find(got.ID); stored.Label != "Work files" {
+		t.Fatalf("re-login dropped the sidebar name: %q", stored.Label)
+	}
+}

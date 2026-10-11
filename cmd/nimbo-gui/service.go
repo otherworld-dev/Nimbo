@@ -4743,6 +4743,12 @@ type AccountEntryDTO struct {
 	Active bool   `json:"active"`
 	Status string `json:"status"` // latest engine status line ("" if not running)
 	Route  string `json:"route"`  // "local" while syncing over the local network, else "public"
+	// SidebarName is the name the user chose for the account's Explorer
+	// sidebar entry ("" = automatic), SidebarAuto the automatic one (the
+	// field's placeholder) and SidebarLabel the one actually shown.
+	SidebarName  string `json:"sidebarName"`
+	SidebarAuto  string `json:"sidebarAuto"`
+	SidebarLabel string `json:"sidebarLabel"`
 }
 
 // ListAccounts returns every configured account. All of them sync
@@ -4768,7 +4774,9 @@ func (a *App) ListAccounts() []AccountEntryDTO {
 		out = append(out, AccountEntryDTO{
 			ID: ac.ID, User: ac.LoginName, Server: ac.ServerURL,
 			Active: ac.ID == def.ID, Status: a.acctStatus[ac.ID],
-			Route: route,
+			Route:       route,
+			SidebarName: ac.Label, SidebarAuto: autoSidebarLabel(ac, st.Accounts),
+			SidebarLabel: sidebarLabel(ac, st.Accounts),
 		})
 	}
 	return out

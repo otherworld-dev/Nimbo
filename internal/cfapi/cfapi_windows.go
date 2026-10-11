@@ -295,6 +295,15 @@ func shellRootID(path string) (string, error) {
 	return fmt.Sprintf("Nimbo!%s!%08x", u.Uid, h.Sum32()), nil
 }
 
+// RenameSyncRoot changes the name Explorer shows for a mounted on-demand root.
+// It is the same registration Mount makes, repeated with the new name: the
+// brokered Register has update semantics, so the root, its placeholders and
+// its connection are left as they are, and Windows keeps the navigation-pane
+// node (and whether the user hid it) while renaming it.
+func RenameSyncRoot(path, displayName, iconPath string) error {
+	return RegisterShellSyncRoot(path, displayName, iconPath, ShellPolicyOnDemand)
+}
+
 // RegisterShellSyncRoot registers path with Explorer so it renders as a cloud
 // folder and draws sync-state icons. displayName/iconPath are shown in the UI.
 //
