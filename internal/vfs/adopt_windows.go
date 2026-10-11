@@ -34,6 +34,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/otherworld/nimbo/internal/cfapi"
 	"github.com/otherworld/nimbo/internal/engine"
@@ -284,12 +286,20 @@ func (o AdoptOps) logf(format string, args ...any) {
 	}
 }
 
+// adoptWorkers bounds how many Keep entries Apply marks at once. Each mark is a
+// few blocking filesystem calls on a different file (stat, attribute probe,
+// open, CfConvertToPlaceholder) with no shared state between them, so a small
+// pool overlaps the waiting; it is kept small so a conversion on a slow disk
+// does not swamp it. A var so tests can pin it to 1 for exact sequencing.
+var adoptWorkers = 8
+
 // Apply performs every local mutation of the plan. Call it only after the sync
 // root is mounted (MarkInSync needs a registered root) and STRICTLY BEFORE the
 // mount's write-back watcher starts — see the package comment for why.
 //
 // It can convert hundreds of thousands of files (minutes of work), so progress
-// (optional) is called once per entry with (done, total), and ctx cancellation
+// (optional) is called once per entry with (done, total) — from one goroutine
+// at a time, with done rising by exactly one each call — and ctx cancellation
 // stops the run at the next entry boundary: converted files stay converted
 // (they are correct), the rest stay plain files a re-scan re-offers.
 //
@@ -303,29 +313,49 @@ func (o AdoptOps) logf(format string, args ...any) {
 // Every entry re-verifies against the disk before acting (the plan may be
 // stale), entries are independent (one failure cannot strand the rest), and
 // every step is idempotent — a crash mid-run is recovered by re-scanning.
+//
+// The run has two passes. First, in plan order and one at a time, the rare
+// entries: conflict renames, dead-stub deletes and the upload list. They stay
+// sequential so Uploads keeps plan order and so conflict renames never race
+// each other: two conflicts can be given the same conflicted-copy name
+// (ConflictName strips any old marker and stamps the current second, and a
+// rename replaces an existing target). They go first so a cancel during the
+// long second pass leaves them done.
+// Second, the Keep entries — nearly all of a real folder — are marked by
+// adoptWorkers goroutines. Each touches only its own file, and Apply never
+// converts a directory (directories are not plan entries), so no entry depends
+// on another having been done first.
 func (p Plan) Apply(ctx context.Context, localDir, remoteRoot string, progress func(done, total int)) ApplyResult {
 	var res ApplyResult
 	total := len(p.Entries)
-	for i, e := range p.Entries {
-		if ctx != nil && ctx.Err() != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var (
+		mu   sync.Mutex // guards done and the progress call, so done stays monotonic
+		done int
+	)
+	tick := func() {
+		mu.Lock()
+		done++
+		if progress != nil {
+			progress(done, total)
+		}
+		mu.Unlock()
+	}
+
+	keeps := 0
+	for _, e := range p.Entries {
+		if e.Action == ActionKeep {
+			keeps++ // second pass
+			continue
+		}
+		if ctx.Err() != nil {
 			return res // cancelled — every completed entry stands, the rest wait for a re-scan
 		}
-		if progress != nil {
-			progress(i+1, total)
-		}
+		tick()
 		full := filepath.Join(localDir, filepath.FromSlash(e.Rel))
 		switch e.Action {
-		case ActionKeep:
-			fi, err := os.Stat(full)
-			if err != nil || !unchangedSince(fi, e) || cfapi.IsDehydrated(fi) {
-				res.Skipped++
-				continue
-			}
-			if err := adoptMark(full, remoteRoot, e.RemoteRel); err != nil {
-				res.Failed++
-				continue
-			}
-			res.Kept++
 		case ActionConflict:
 			fi, err := os.Stat(full)
 			if err != nil || !unchangedSince(fi, e) || cfapi.IsDehydrated(fi) {
@@ -366,6 +396,58 @@ func (p Plan) Apply(ctx context.Context, localDir, remoteRoot string, progress f
 			res.Replaced++
 		}
 	}
+
+	var kept, skipped, failed atomic.Int64
+	workers := adoptWorkers
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > keeps {
+		workers = keeps
+	}
+	next := make(chan Entry)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for e := range next {
+				// Checked again here, not just by the feeder: an entry already
+				// handed over when the cancel lands must not be started.
+				if ctx.Err() != nil {
+					continue
+				}
+				tick()
+				full := filepath.Join(localDir, filepath.FromSlash(e.Rel))
+				fi, err := os.Stat(full)
+				if err != nil || !unchangedSince(fi, e) || cfapi.IsDehydrated(fi) {
+					skipped.Add(1)
+					continue
+				}
+				if err := adoptMark(full, remoteRoot, e.RemoteRel); err != nil {
+					failed.Add(1)
+					continue
+				}
+				kept.Add(1)
+			}
+		}()
+	}
+feed:
+	for _, e := range p.Entries {
+		if e.Action != ActionKeep {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			break feed
+		case next <- e:
+		}
+	}
+	close(next)
+	wg.Wait()
+	res.Kept += int(kept.Load())
+	res.Skipped += int(skipped.Load())
+	res.Failed += int(failed.Load())
 	return res
 }
 
@@ -408,10 +490,20 @@ func UploadPending(localDir, remoteRoot string, uploads []UploadItem, ops AdoptO
 // file that is ALREADY a placeholder (a hydrated one left by another client),
 // MarkInSync would keep the foreign identity blob — dehydrating and re-opening
 // it later would hand our hydrate callback an identity we can't serve. So the
-// identity is repointed first; on a plain file that call fails harmlessly and
-// MarkInSync does the conversion with the right identity itself.
+// identity is repointed first.
+//
+// The repoint is only tried on a placeholder. On a plain file — nearly every
+// file an adopt converts — it is a wasted open plus a CfUpdatePlaceholder that
+// is bound to fail, so a cheap attribute probe (no open, cannot block on the
+// file) rules it out first, and MarkInSync's convert sets our identity itself.
+// The probe is truthful here: the app exposes placeholders process-wide
+// (cfapi.ExposePlaceholders) and Apply runs on a connected root, so a hydrated
+// foreign placeholder is not disguised as a plain file. If the probe errors,
+// the repoint is tried anyway, as before.
 func adoptMark(full, remoteRoot, rel string) error {
 	identity := []byte(strings.Trim(remoteRoot+"/"+rel, "/"))
-	_ = cfUpdateIdentity(full, identity)
+	if isPh, err := cfIsPlaceholderPath(full); err != nil || isPh {
+		_ = cfUpdateIdentity(full, identity)
+	}
 	return cfMarkInSync(full, identity)
 }

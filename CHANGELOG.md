@@ -27,6 +27,14 @@ All notable changes to Nimbo are recorded here. The format follows
   renamed straight away and leaving the box empty goes back to the automatic
   name (#19).
 
+### Changed
+
+- Switching a folder that already holds your files to on-demand mode converts them
+  faster, the files are now marked several at a time and plain files skip a step
+  that only placeholders need. The log also records how far it has got every
+  10,000 files, so a big folder no longer looks stuck while it works through
+  (#510).
+
 ### Fixed
 
 - Pausing now stops large uploads and downloads, they carried on regardless in

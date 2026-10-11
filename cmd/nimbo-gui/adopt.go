@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/atomicfile"
 	"github.com/otherworld/nimbo/internal/brand"
@@ -246,7 +247,13 @@ func (a *App) runAdoptConvert(ctx context.Context, m *odMount, plan vfs.Plan, di
 	if !resumed {
 		saveAdoptResume(m.accountID, dir, root, plan)
 	}
-	res := plan.Apply(ctx, dir, root, func(done, _ int) { a.adoptConvertDone.Store(int64(done)) })
+	breadcrumb := adoptBreadcrumb(adoptBreadcrumbEvery, time.Now, func(done, total int, perSec float64) {
+		slog.Info(fmt.Sprintf("adopt: converted %d/%d (%.0f/s)", done, total, perSec))
+	})
+	res := plan.Apply(ctx, dir, root, func(done, total int) {
+		a.adoptConvertDone.Store(int64(done))
+		breadcrumb(done, total)
+	})
 	slog.Info("adopt applied", "kept", res.Kept, "stubsReplaced", res.Replaced,
 		"conflictsRenamed", res.Renamed, "skipped", res.Skipped, "failed", res.Failed,
 		"uploadsPending", len(res.Uploads), "cancelled", ctx.Err() != nil, "resumed", resumed)
@@ -281,6 +288,29 @@ func (a *App) runAdoptConvert(ctx context.Context, m *odMount, plan vfs.Plan, di
 			thousands(res.Kept)), "action=explorer-restart")
 	}
 	a.emit("activity")
+}
+
+// adoptBreadcrumbEvery is how often (in entries) a conversion logs its
+// progress. At the old ~140 files a second that is about a line a minute.
+const adoptBreadcrumbEvery = 10000
+
+// adoptBreadcrumb returns a progress callback for Plan.Apply that calls log
+// every `every` entries and once at the end, with the rate so far. A big
+// conversion runs for many minutes, and with nothing in the log it reads as
+// hung. Apply calls progress from one goroutine at a time with done counting
+// up by one, so each multiple of every is seen exactly once.
+func adoptBreadcrumb(every int, now func() time.Time, log func(done, total int, perSec float64)) func(done, total int) {
+	start := now()
+	return func(done, total int) {
+		if done%every != 0 && done != total {
+			return
+		}
+		perSec := 0.0
+		if secs := now().Sub(start).Seconds(); secs > 0 {
+			perSec = float64(done) / secs
+		}
+		log(done, total, perSec)
+	}
 }
 
 // thousands renders n with thousands separators for user-facing counts.
