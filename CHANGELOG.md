@@ -29,6 +29,12 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ### Changed
 
+- Choose folders (Settings → Folders) is now a tree you can expand, with the size
+  of each folder next to it and a part-ticked box on any folder with something
+  unticked inside it. It only lists folders, sorted A-Z, and leaves out anything
+  your ignore rules exclude. Ticks and unticks are now collected up and applied
+  together with one Apply, with a single keep-or-delete question for everything
+  unticked and roughly how much space that frees (#539).
 - Switching a folder that already holds your files to on-demand mode converts them
   faster, the files are now marked several at a time and plain files skip a step
   that only placeholders need. The log also records how far it has got every
