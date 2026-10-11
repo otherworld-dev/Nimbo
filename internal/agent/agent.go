@@ -194,6 +194,14 @@ type Engine struct {
 	onProgress  func(SyncProgress)
 	onLane      func() // told when the large-file lane changes (queue view); see SetLaneFunc
 
+	// First syncs in progress, by pair key, so the folders chosen to download
+	// first can be changed while they run (clonefirst.go).
+	cloneMu sync.Mutex
+	clones  map[string]*cloneRunning
+	// cloneTestPools narrows the clone's listing and download pools ({listers,
+	// downloaders}) so a test can see a deterministic order; zero = normal.
+	cloneTestPools [2]int
+
 	onToast      func(title, message, link string) // desktop toasts (GUI sets this)
 	encMu        sync.Mutex
 	encSeen      map[string]bool // E2EE folders already notified (once per engine)
@@ -228,6 +236,9 @@ type SyncProgress struct {
 	DoneBytes   int64  `json:"doneBytes"`   // bytes transferred this burst
 	TotalBytes  int64  `json:"totalBytes"`  // bytes planned this burst (for % and ETA)
 	Enumerating bool   `json:"enumerating"` // still discovering work — total not yet final, so show indeterminate
+	// Clones are the first syncs running, with the folders each downloads
+	// first; the UI offers to change those while they run.
+	Clones []CloneRun `json:"clones,omitempty"`
 }
 
 // ConflictItem is a deferred conflict awaiting a user choice (PolicyAsk).
@@ -1771,6 +1782,14 @@ var (
 // connections that target different locations. The local directory is created
 // if it doesn't exist.
 func (e *Engine) AddSyncPair(localDir, remoteRoot string) error {
+	return e.AddSyncPairFirst(localDir, remoteRoot, nil)
+}
+
+// AddSyncPairFirst is AddSyncPair with folders (pair-relative, in order) for
+// the pair's first sync to download before everything else. They are saved
+// before the pair is, so the first pass, which starts once the pair is
+// saved, already honours them.
+func (e *Engine) AddSyncPairFirst(localDir, remoteRoot string, first []string) error {
 	remoteRoot = strings.Trim(remoteRoot, "/")
 	localDir = filepath.Clean(strings.TrimSpace(localDir))
 	if localDir == "" || localDir == "." || !filepath.IsAbs(localDir) {
@@ -1786,6 +1805,9 @@ func (e *Engine) AddSyncPair(localDir, remoteRoot string) error {
 		// was lost) replays the setup flow, and "that remote folder is already
 		// synced" dead-ended it (2026-08-21).
 		if strings.Trim(p.RemoteRoot, "/") == remoteRoot && filepath.Clean(p.LocalDir) == localDir {
+			if len(first) > 0 {
+				_ = e.SetCloneFirst(localDir, remoteRoot, first) // refused once its first sync is done
+			}
 			return nil
 		}
 		if strings.Trim(p.RemoteRoot, "/") == remoteRoot {
@@ -1800,6 +1822,12 @@ func (e *Engine) AddSyncPair(localDir, remoteRoot string) error {
 	}
 	if err := e.forgetCloneStatus(localDir, remoteRoot); err != nil {
 		return err
+	}
+	if len(first) > 0 {
+		// After forgetCloneStatus, which clears any left from an older pair.
+		if err := e.SetCloneFirst(localDir, remoteRoot, first); err != nil {
+			slog.Warn("cannot save the folders to download first; using the normal order", "err", err)
+		}
 	}
 	pairs = append(pairs, config.SyncPair{LocalDir: localDir, RemoteRoot: remoteRoot})
 	if err := e.dirs.SavePairs(pairs); err != nil {
@@ -2493,9 +2521,11 @@ func syncErrKind(err error) string {
 
 // Progress returns the current sync-progress snapshot.
 func (e *Engine) Progress() SyncProgress {
+	clones := e.CloneRuns() // before progMu: it takes the clone locks
 	e.progMu.Lock()
 	defer e.progMu.Unlock()
 	p := e.prog
+	p.Clones = clones
 	if p.Active {
 		p.DoneBytes = e.progBytes.Load()
 		// Retried/resumed transfers can re-report bytes; never show >100%.
@@ -3390,13 +3420,15 @@ func (e *Engine) SyncOnce(ctx context.Context, p Pair) (transfer.Stats, error) {
 }
 
 // cloneEnumConcurrency bounds concurrent recursive PROPFINDs while the tree is
-// being counted; cloneDownloadConcurrency bounds how many top-level folders
-// download at once (each via its own Executor worker pool). Enumeration runs
-// ahead of (and independently of) downloading so the progress total is known in
-// minutes instead of being chained to the slow downloads.
+// being counted; cloneDownloadConcurrency x cloneFileWorkers is how many files
+// download at once (32: 64 gave no gain, the path caps ~5 MB/s, not the
+// client). Enumeration runs ahead of (and independently of) downloading so the
+// progress total is known in minutes instead of being chained to the slow
+// downloads.
 const (
 	cloneEnumConcurrency     = 6
 	cloneDownloadConcurrency = 4
+	cloneFileWorkers         = 8
 )
 
 // cloneRemote performs a resumable initial sync. It enumerates the tree in bulk
@@ -3454,11 +3486,13 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 		}
 		return rel
 	}
+	// One Executor per call: the download pool runs each file through its own
+	// (Workers 1), so the pool's size alone sets how many are in flight.
 	newExec := func(remote map[string]engine.RemoteState) *transfer.Executor {
 		return &transfer.Executor{
 			Client: e.client, State: st, PairKey: pk,
 			LocalRoot: p.LocalDir, RemoteRoot: p.RemoteRoot, Remote: remote, Escaper: e.escaper.Load(),
-			Workers: 8, Policy: e.policy, // ×cloneDownloadConcurrency = total in-flight (32). 64 gave no gain — the path caps ~5 MB/s, not the client.
+			Workers: 1, Policy: e.policy,
 			OnBegin: func(a engine.Action) {
 				e.markInflight(filepath.Join(p.LocalDir, filepath.FromSlash(a.Path)), true)
 				if a.Kind == engine.ActDownload {
@@ -3546,104 +3580,139 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 	}
 	rootActions, rootFiles, rootBytes := plan(rootRemote) // filters rootRemote in place
 
-	// Folders that survived the ignore filter get recursed.
-	var dispatch []string
+	// The work queue, ordered by the folders chosen to download first
+	// (clonefirst.go). Kept with the pair so a restart mid-clone keeps them.
+	sched := newCloneSched(root, ig.Match)
+	e.trackClone(pk, p, sched)
+	defer e.untrackClone(pk) // before progEnd's emit (defers run in reverse)
+	defer context.AfterFunc(ctx, sched.stop)()
+
+	// Folders that survived the ignore filter get recursed, each in a listing
+	// of its own.
 	for _, td := range topDirs {
-		if _, kept := rootRemote[relOf(td, true)]; kept {
-			dispatch = append(dispatch, td)
+		if rel := relOf(td, true); rootRemote[rel].IsDir {
+			sched.addListing(rel)
 		}
 	}
-
-	// "Enumerating" stays true until every folder's listing has been counted, so
-	// the bar is indeterminate (not misleadingly near-full) while the total grows.
-	enumPending := int32(1 + len(dispatch)) // root + each folder
-	enumDone := func() {
-		if atomic.AddInt32(&enumPending, -1) == 0 {
-			e.progMu.Lock()
-			e.prog.Enumerating = false
-			e.progMu.Unlock()
-			e.emitProgress()
-		}
+	first, ferr := st.CloneFirst(pk)
+	if ferr != nil {
+		slog.Warn("cannot read the folders to download first; using the normal order", "err", ferr)
 	}
+	sched.setFirst(first) // after the listings, so a chosen folder deeper down is carved out
 
-	// Root contents first (its folders are created here), then count it.
+	// Root contents: its folders are created now, its files queue like any
+	// other folder's (so a chosen folder can overtake them too).
 	e.progAddTotal(rootFiles, rootBytes)
-	enumDone()
-	if len(rootActions) > 0 {
-		s, rerr := newExec(rootRemote).Run(ctx, rootActions)
-		note(s, rerr)
+	cloneMkdirs(ctx, newExec(rootRemote), rootActions, note)
+	sched.queueDownloads(downloadsOf(rootActions), rootRemote)
+
+	// list makes one recursive listing and queues what it finds. A folder
+	// carved out of it is left to its own listing, except the carved folder's
+	// own row: that is planned here, where its parent is known (so its share
+	// flag is right), while its contents are the carve's. A carved folder that
+	// is no longer on the server has nothing to download.
+	list := func(l *cloneListing) {
+		entries, perr := e.client.PropFindRecursive(ctx, l.full)
+		if perr != nil {
+			notFound := errors.Is(perr, transport.ErrNotFound)
+			sched.failedListing(l, notFound)
+			// A carved folder's 404 is only a failure if the listing holding
+			// it saw the folder (lostCarves, after listing): then its contents
+			// were left to this listing and nobody fetched them.
+			if !(l.carved && notFound) {
+				note(transfer.Stats{}, perr)
+			}
+			return
+		}
+		carved := sched.seal(l)
+		sub := make(map[string]engine.RemoteState, len(entries))
+		// Every ancestor of an entry is in the same recursive listing, except
+		// the listed folder's own parent: the pair root, read above, for a
+		// top-level folder; for a carved one its own row is planned elsewhere.
+		onMount := make(map[string]bool, len(entries))
+		for _, en := range entries {
+			onMount[strings.Trim(en.Path, "/")] = en.OnMount()
+		}
+	entry:
+		for _, en := range entries {
+			full := strings.Trim(en.Path, "/")
+			rel := relOf(full, en.IsDir)
+			if rel == "" || (l.carved && rel == l.rel) {
+				continue
+			}
+			for _, c := range carved {
+				if rel == c {
+					sched.sawRow(c)
+				}
+				if strings.HasPrefix(rel, c+"/") {
+					continue entry
+				}
+			}
+			parentOnMount, parentKnown := rootOnMount, rootKnown
+			if parent := dirParent(full); parent != root {
+				parentOnMount, parentKnown = onMount[parent]
+			}
+			sub[rel] = cloneRemoteState(rel, en, parentOnMount, parentKnown)
+		}
+		actions, dlF, dlB := plan(sub)
+		cloneMkdirs(ctx, newExec(sub), actions, note)
+		e.progAddTotal(dlF, dlB)
+		sched.queueDownloads(downloadsOf(actions), sub)
 	}
 
-	// Counting must not wait on the slow downloads, or "enumerating" drags on for
-	// the whole clone (the total isn't known until the last folder is listed). So
-	// list every folder up-front — bounded only by PROPFIND concurrency — and count
-	// it immediately; that clears "enumerating" within minutes. Each listing is
-	// then handed to a separate download pool and freed once its folder completes,
-	// so peak memory falls as the clone progresses.
-	type folderWork struct {
-		sub     map[string]engine.RemoteState
-		actions []engine.Action
+	listers, downloaders := cloneEnumConcurrency, cloneDownloadConcurrency*cloneFileWorkers
+	if e.cloneTestPools[0] > 0 {
+		listers, downloaders = e.cloneTestPools[0], e.cloneTestPools[1]
 	}
-	// Buffered to len(dispatch) so a just-counted folder can always be queued
-	// without blocking enumeration behind a download that's still catching up.
-	works := make(chan folderWork, len(dispatch))
 
+	// Downloads start as soon as anything is queued; listing carries on beside
+	// them, so the total is known in minutes rather than chained to the slow
+	// downloads. Each file goes through the Executor on its own, so the next
+	// one is always the best waiting (a choice made mid-clone counts at once).
 	var dlwg sync.WaitGroup
-	for i := 0; i < cloneDownloadConcurrency; i++ {
+	for i := 0; i < downloaders; i++ {
 		dlwg.Add(1)
 		go func() {
 			defer dlwg.Done()
-			for w := range works {
-				s, rerr := newExec(w.sub).Run(ctx, w.actions)
+			for {
+				a, remote, ok := sched.nextDownload()
+				if !ok {
+					return
+				}
+				s, rerr := newExec(remote).Run(ctx, []engine.Action{a})
 				note(s, rerr)
 			}
 		}()
 	}
 
-	sem := make(chan struct{}, cloneEnumConcurrency)
+	// List every folder up-front — bounded only by PROPFIND concurrency — and
+	// count it at once; "enumerating" (an indeterminate bar, not a misleadingly
+	// near-full one while the total grows) ends when the last listing is in.
 	var enwg sync.WaitGroup
-	for _, td := range dispatch {
+	for i := 0; i < listers; i++ {
 		enwg.Add(1)
-		sem <- struct{}{}
-		go func(dirFull string) {
+		go func() {
 			defer enwg.Done()
-			defer func() { <-sem }()
-			entries, perr := e.client.PropFindRecursive(ctx, dirFull)
-			if perr != nil {
-				note(transfer.Stats{}, perr)
-				enumDone()
-				return
-			}
-			sub := make(map[string]engine.RemoteState, len(entries))
-			// Every ancestor of an entry is in the same recursive listing, except
-			// the top folder's own parent — the pair root, read above.
-			onMount := make(map[string]bool, len(entries))
-			for _, en := range entries {
-				onMount[strings.Trim(en.Path, "/")] = en.OnMount()
-			}
-			for _, en := range entries {
-				full := strings.Trim(en.Path, "/")
-				rel := relOf(full, en.IsDir)
-				if rel == "" {
-					continue
+			for {
+				l := sched.nextListing()
+				if l == nil {
+					return
 				}
-				parentOnMount, parentKnown := rootOnMount, rootKnown
-				if parent := dirParent(full); parent != root {
-					parentOnMount, parentKnown = onMount[parent]
-				}
-				sub[rel] = cloneRemoteState(rel, en, parentOnMount, parentKnown)
+				list(l)
+				sched.listingDone()
 			}
-			actions, dlF, dlB := plan(sub)
-			e.progAddTotal(dlF, dlB)
-			enumDone()
-			if len(actions) > 0 {
-				works <- folderWork{sub: sub, actions: actions}
-			}
-		}(td)
+		}()
 	}
-	enwg.Wait()  // every folder listed + counted → "enumerating" is now false
-	close(works) // no more folders to hand to the download pool
-	dlwg.Wait()  // wait for the download pool to drain
+	enwg.Wait() // every folder listed + counted
+	if lost := sched.lostCarves(); len(lost) > 0 {
+		// Not "done": the next pass resumes the clone and lists them again.
+		note(transfer.Stats{}, fmt.Errorf("could not list %s, which the server had just listed", strings.Join(lost, ", ")))
+	}
+	e.progMu.Lock()
+	e.prog.Enumerating = false
+	e.progMu.Unlock()
+	e.emitProgress()
+	dlwg.Wait() // wait for the download pool to drain
 
 	if failed != nil {
 		e.status("Error")
@@ -3653,6 +3722,7 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 		return stats, ctx.Err()
 	}
 	_ = st.SetCloneStatus(pk, "done")
+	_ = st.SetCloneFirst(pk, nil) // nothing left to put first
 	e.markPairSynced(pk)
 	e.status("Up to date")
 	return stats, nil

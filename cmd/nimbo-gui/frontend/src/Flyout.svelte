@@ -14,7 +14,8 @@
 
   type Activity = { time: string; kind: string; path: string; remotePath: string; localPath: string; err: string };
   type Attention = { conflicts: number; blocked: number; locked: number; detached: number };
-  type Progress = { active: boolean; current: string; done: number; total: number; speed: number; avgSpeed: number; doneBytes: number; totalBytes: number; enumerating: boolean };
+  type Progress = { active: boolean; current: string; done: number; total: number; speed: number; avgSpeed: number; doneBytes: number; totalBytes: number; enumerating: boolean;
+                   clones?: { localDir: string; remoteRoot: string; first: string[] }[] };
 
   function etaText(p: Progress): string {
     // ETA off the cumulative average rate, not the jumpy instantaneous speed.
@@ -535,6 +536,17 @@
       <span class="iicon">⇅</span>
       <span class="atext">{laneText}</span>
       <span class="go">View →</span>
+    </button>
+  {/if}
+
+  <!-- A first sync (the whole account downloading for the first time) can
+       take hours: let the user pick what comes down first (Deck #766). -->
+  {#if progress.active && progress.clones?.length}
+    {@const chosen = progress.clones.reduce((n, c) => n + c.first.length, 0)}
+    <button class="inuse" onclick={() => App.OpenStatusTab("first")}>
+      <span class="iicon">⇣</span>
+      <span class="atext">{chosen ? `First sync: ${chosen} folder${chosen === 1 ? "" : "s"} downloading first` : "First sync: choose folders to download first"}</span>
+      <span class="go">{chosen ? "Change →" : "Choose →"}</span>
     </button>
   {/if}
 

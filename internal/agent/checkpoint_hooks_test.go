@@ -66,6 +66,10 @@ type fakeDAV struct {
 	mkcols  map[string]int    // dir -> MKCOLs seen
 	deletes []string          // paths DELETEd, in order
 	getN    map[string]int    // file -> GETs served, failures included
+	getLog  []string          // files GET, in the order asked for
+	// onGET, when set, runs before a GET is served and outside the lock, so a
+	// test can hold one download while it changes something.
+	onGET func(rel string)
 }
 
 func newFakeDAV(nodes map[string]davNode) *fakeDAV {
@@ -117,6 +121,13 @@ func (f *fakeDAV) getCount(file string) int {
 	return f.getN[file]
 }
 
+// gets returns the files asked for so far, in order.
+func (f *fakeDAV) gets() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.getLog...)
+}
+
 func (f *fakeDAV) pfCount(dir string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -138,6 +149,9 @@ func (f *fakeDAV) forgetDeletes() { f.mu.Lock(); f.deletes = nil; f.mu.Unlock() 
 
 func (f *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rel := strings.Trim(strings.TrimPrefix(r.URL.Path, davPrefix), "/")
+	if r.Method == "GET" && f.onGET != nil {
+		f.onGET(rel)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	switch r.Method {
@@ -158,6 +172,7 @@ func (f *fakeDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(f.multistatus(rel, r.Header.Get("Depth") == "infinity")))
 	case "GET":
 		f.getN[rel]++
+		f.getLog = append(f.getLog, rel)
 		if code, ok := f.failGET[rel]; ok {
 			w.WriteHeader(code)
 			return

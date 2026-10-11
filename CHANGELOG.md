@@ -18,6 +18,14 @@ All notable changes to Nimbo are recorded here. The format follows
   stops holding up the others. A restart ends a set-aside, and when the file comes
   back it rejoins the queue and carries on from where it got to rather than
   starting again, an upload picks up from the chunks already on the server (#702).
+- When setting up Nimbo on a new computer you can choose folders to download first,
+  so the folder you need today doesn't end up last behind hundreds of GB. The
+  setup window has a "Choose folders to download first" link under Synchronize
+  everything, and while the first sync runs there is a line in the flyout and a
+  First sync tab in Status to choose, change or clear them. Chosen folders are
+  listed and downloaded before everything else, even one deep inside a bigger
+  folder, a change counts straight away, and the choice is kept if Nimbo is
+  restarted part way through (#766).
 - The Explorer sidebar entry is now named after the account, "Nimbo - adam" rather
   than just "Nimbo", so with more than one account you can tell which entry is
   which. If two accounts have the same login on different servers the server is

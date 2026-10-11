@@ -59,7 +59,9 @@
         scanDirs = d?.adoptScanDirs || 0;
       }, 1500);
     }
-    const msg = await App.CompleteSetup(localDir, mode);
+    // The folders to download first ride on the mode (no extra App method).
+    const arg = mode === "everything" && first.length ? "everything:" + JSON.stringify(first) : mode;
+    const msg = await App.CompleteSetup(localDir, arg);
     if (scanPoll) { clearInterval(scanPoll); scanPoll = null; }
     scanning = false;
     busy = false;
@@ -98,6 +100,28 @@
   }
 
   function skip() { done(); }
+
+  // "Download these first" (Deck #766): with everything syncing, the first
+  // download of a big account takes hours. The folders ticked here come down
+  // before the rest. Optional; the order they are ticked in is kept.
+  type Entry = { name: string; path: string; isDir: boolean };
+  let first = $state<string[]>([]);
+  let picking = $state(false);
+  let pcur = $state("");
+  let pentries = $state<Entry[]>([]);
+  let ploading = $state(false);
+  async function pickGo(path: string) {
+    pcur = path.replace(/^\/+|\/+$/g, "");
+    ploading = true;
+    pentries = (((await App.BrowseRemote(pcur)) ?? []) as Entry[]).filter(e => e.isDir);
+    ploading = false;
+  }
+  function openPick() { picking = true; pickGo(""); }
+  function pickUp() { if (pcur) pickGo(pcur.split("/").slice(0, -1).join("/")); }
+  function toggleFirst(path: string) {
+    first = first.includes(path) ? first.filter(x => x !== path) : [...first, path];
+  }
+  const firstSummary = $derived(first.length <= 3 ? first.join(", ") : `${first.slice(0, 3).join(", ")} and ${first.length - 3} more`);
 </script>
 
 <div class="setup">
@@ -125,6 +149,17 @@
           {#if info.accountBytes > 0}<em>({fmt(info.accountBytes)})</em>{/if}
         </span>
       </label>
+
+      {#if mode === "everything"}
+        <div class="firstline">
+          {#if first.length}
+            <span class="sub ftext" title={first.join(", ")}>Downloads first: <b>{firstSummary}</b></span>
+            <button class="linkbtn" onclick={openPick} disabled={busy}>Change</button>
+          {:else}
+            <button class="linkbtn" onclick={openPick} disabled={busy}>Choose folders to download first (optional)</button>
+          {/if}
+        </div>
+      {/if}
 
       <label class="opt" class:sel={mode === "choose"}>
         <input type="radio" bind:group={mode} value="choose" disabled={busy} />
@@ -158,6 +193,34 @@
           <p class="sub left"><b>{scanDirs}</b> folders checked so far</p>
           <div class="actions">
             <button class="ghost" onclick={cancelScan}>Cancel</button>
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    {#if picking}
+      <div class="modalback">
+        <div class="modalbox pick">
+          <div class="mhead">Download these first</div>
+          <p class="sub left">Tick the folders you need straight away. They download before everything else, and the rest follows.</p>
+          <div class="crumb">
+            <button class="ghost small" onclick={pickUp} disabled={!pcur}>⬆ Up</button>
+            <span class="sub path" title={"/" + pcur}>/{pcur}</span>
+          </div>
+          <div class="plist">
+            {#if ploading}<p class="sub left">Loading…</p>
+            {:else if pentries.length === 0}<p class="sub left">No folders here.</p>{/if}
+            {#each pentries as e (e.path)}
+              <div class="prow">
+                <input type="checkbox" checked={first.includes(e.path)} onchange={() => toggleFirst(e.path)} />
+                <button class="pname" onclick={() => pickGo(e.path)} title="Open {e.name}">📁 {e.name}</button>
+              </div>
+            {/each}
+          </div>
+          <div class="actions">
+            <span class="sub count">{first.length} chosen</span>
+            {#if first.length}<button class="ghost" onclick={() => (first = [])}>Clear</button>{/if}
+            <button class="primary" onclick={() => (picking = false)}>Done</button>
           </div>
         </div>
       </div>
@@ -225,5 +288,19 @@
   .mhead { font-weight: 600; font-size: 14px; }
   .mlist { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
   .left { text-align: left; }
-  .modalbox .actions { margin-top: 4px; }
+  .modalbox .actions { margin-top: 4px; align-items: center; }
+  .firstline { display: flex; align-items: center; gap: 6px; margin: -2px 2px 0 30px; min-width: 0; }
+  .firstline .ftext { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .linkbtn { background: none; border: none; padding: 0; color: var(--accent); font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .linkbtn:hover { text-decoration: underline; }
+  .modalbox.pick { width: 420px; max-height: 80vh; }
+  .crumb { display: flex; align-items: center; gap: 8px; }
+  .crumb .path { max-width: 300px; }
+  button.small { padding: 4px 10px; font-size: 12px; }
+  .plist { border: 1px solid var(--border-2); border-radius: 6px; padding: 4px 8px; overflow-y: auto; min-height: 120px; max-height: 300px; }
+  .prow { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+  .pname { background: none; border: none; padding: 0; color: var(--fg); text-align: left; cursor: pointer; font-size: 13px;
+           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pname:hover { color: var(--accent); }
+  .count { margin-right: auto; }
 </style>

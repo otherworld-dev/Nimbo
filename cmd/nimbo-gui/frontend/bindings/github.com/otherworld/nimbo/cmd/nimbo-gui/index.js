@@ -16,6 +16,7 @@ export {
     BlockedItem,
     BrandDTO,
     BrowseEntry,
+    CloneRunDTO,
     ConflictItem,
     ConflictPreview,
     DetachedDTO,
