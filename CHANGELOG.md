@@ -27,6 +27,14 @@ All notable changes to Nimbo are recorded here. The format follows
   renamed straight away and leaving the box empty goes back to the automatic
   name (#19).
 
+### Changed
+
+- Switching a folder that already holds your files to on-demand mode converts them
+  faster, the files are now marked several at a time and plain files skip a step
+  that only placeholders need. The log also records how far it has got every
+  10,000 files, so a big folder no longer looks stuck while it works through
+  (#510).
+
 ### Fixed
 
 - Pausing now stops large uploads and downloads, they carried on regardless in
@@ -47,6 +55,11 @@ All notable changes to Nimbo are recorded here. The format follows
 - On Linux, deleting a folder that held read-only files no longer fails with
   permission denied and leaves folders that can't be opened, and folders an
   earlier build left that way are fixed on the next delete.
+- Switching from on-demand back to live mode no longer says that online-only files
+  in excluded folders, such as an old `node_modules` on the server, will download
+  after the switch. Live mode never syncs those, so the dialog now counts them
+  separately and says they stay on the server, and the download size it shows only
+  covers the files that really will come down (#512).
 
 ## [0.2.0] - 2026-09-26
 

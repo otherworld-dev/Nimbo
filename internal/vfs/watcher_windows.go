@@ -39,6 +39,7 @@ var (
 	cfUpdateIdentity      = cfapi.UpdateIdentity
 	cfUpdateIdentityKeep  = cfapi.UpdateIdentityKeepState
 	cfMarkInSync          = cfapi.MarkInSync
+	cfIsPlaceholderPath   = cfapi.IsPlaceholder
 	cfSetInSync           = cfapi.SetInSync
 	cfShellNotify         = cfapi.ShellNotifyUpdated
 	cfShellCreated        = cfapi.ShellNotifyCreated
