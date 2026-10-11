@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 // A placeholder batch is poisoned by one long identity.
@@ -29,6 +31,10 @@ import (
 //
 // The provider's defence is to never put a long identity in the same batch
 // as anything else; this test pins the fault and the defence on both paths.
+// "Long" is longIdentityBytes (64), about half the measured edge, because the
+// edge was only ever measured on the one Windows build; batchItems carries
+// one entry past the edge (220 bytes) and one inside that margin (100 bytes),
+// and both must be kept out of the shared batch.
 //
 // RUN THESE ONLY AGAINST A TREE THAT HAS THE DEFENCE. On an unfixed tree they
 // reproduce the fault for real: the poisoned placeholders they leave in the
@@ -76,12 +82,46 @@ func batchMount(t *testing.T, list ListFunc) (string, int64) {
 }
 
 func batchItems(prefix string) []PlaceholderInfo {
-	long := strings.Repeat("p", 220) // a 220-byte identity: well past the fault's threshold
+	long := strings.Repeat("p", 220) // a 220-byte identity: well past the fault's measured edge (133)
+	mid := strings.Repeat("m", 100)  // under the measured edge, but inside the margin: goes alone too
 	return []PlaceholderInfo{
 		{Name: prefix + "a.bin", Size: 4096, ModTime: time.Now(), Identity: []byte("remote/" + prefix + "a.bin")},
 		{Name: prefix + "deep.bin", Size: 4096, ModTime: time.Now(), Identity: []byte(long)},
 		{Name: prefix + "b.bin", Size: 4096, ModTime: time.Now(), Identity: []byte("remote/" + prefix + "b.bin")},
 		{Name: prefix + "d", IsDir: true, ModTime: time.Now(), Identity: []byte("remote/" + prefix + "d")},
+		{Name: prefix + "mid.bin", Size: 4096, ModTime: time.Now(), Identity: []byte(mid)},
+	}
+}
+
+// batchShared is how many of batchItems may share a batch: a, b and d. It is
+// a literal on purpose, so the transfer tests pin the threshold too (at 128
+// the 100-byte entry would ride in the batch and they would count 4).
+const batchShared = 3
+
+// The threshold itself. It was 128 until Deck #685 lowered it to 64 for
+// margin; raising it again means re-measuring the edge on more Windows builds
+// than the one (10.0.26200) it was found on.
+func TestLongIdentityThreshold(t *testing.T) {
+	if longIdentityBytes > 64 {
+		t.Fatalf("longIdentityBytes = %d; it must stay at or under 64 (half the 133-byte edge measured on one Windows build)", longIdentityBytes)
+	}
+	mk := func(n int) PlaceholderInfo {
+		return PlaceholderInfo{Name: fmt.Sprintf("n%d", n), Identity: []byte(strings.Repeat("i", n))}
+	}
+	in := []PlaceholderInfo{mk(0), mk(10), mk(63), mk(64), mk(65), mk(100), mk(127), mk(128), mk(132), mk(133), mk(220)}
+	short, long := splitLongIdentities(in)
+	var gotShort, gotLong []string
+	for _, it := range short {
+		gotShort = append(gotShort, it.Name)
+	}
+	for _, it := range long {
+		gotLong = append(gotLong, it.Name)
+	}
+	if want := "n0 n10 n63"; strings.Join(gotShort, " ") != want {
+		t.Errorf("short = %v, want %s", gotShort, want)
+	}
+	if want := "n64 n65 n100 n127 n128 n132 n133 n220"; strings.Join(gotLong, " ") != want {
+		t.Errorf("long = %v, want %s", gotLong, want)
 	}
 }
 
@@ -217,9 +257,10 @@ func TestTransferPlaceholdersSurvivesALongIdentityInTheBatch(t *testing.T) {
 
 	probe.awaitTransfer(t, root, "tb.bin")
 
-	// The three short entries travel in the transfer; the long one is created
-	// alone beforehand. A transfer carrying all four is the poisoning shape.
-	if got, want := probe.carried(), len(items)-1; got != want {
+	// The three short entries travel in the transfer; the long one and the
+	// one inside the margin are each created alone beforehand. A transfer
+	// carrying the 220-byte one with the others is the poisoning shape.
+	if got, want := probe.carried(), batchShared; got != want {
 		t.Errorf("the biggest transfer carried %d entries, want %d (counts: %v)", got, want, probe.counts())
 	}
 	if c := probe.complained(); len(c) != 0 {
@@ -233,6 +274,9 @@ func TestTransferPlaceholdersSurvivesALongIdentityInTheBatch(t *testing.T) {
 	if id, err := PlaceholderIdentity(filepath.Join(root, "tdeep.bin")); err != nil || string(id) != string(items[1].Identity) {
 		t.Errorf("long identity: %q, %v", id, err)
 	}
+	if id, err := PlaceholderIdentity(filepath.Join(root, "tmid.bin")); err != nil || string(id) != string(items[4].Identity) {
+		t.Errorf("margin identity: %q, %v", id, err)
+	}
 	ents, err := os.ReadDir(root)
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
@@ -244,7 +288,7 @@ func TestTransferPlaceholdersSurvivesALongIdentityInTheBatch(t *testing.T) {
 
 // The reporter's own shape: the long-identity entry ALREADY EXISTS locally
 // (created alone, healthy) and the listing that answers the shell's re-fetch
-// carries it along with the three others. The kernel would answer
+// carries it along with the others. The kernel would answer
 // ALREADY_EXISTS for it — harmless in itself — but an existing entry with a
 // long identity poisons its batch-mates exactly like a new one, so the Lstat
 // pre-filter has to drop it before the batch is built.
@@ -261,7 +305,7 @@ func TestTransferPlaceholdersSkipsALongIdentityThatAlreadyExists(t *testing.T) {
 
 	probe.awaitTransfer(t, root, "xb.bin")
 
-	if got, want := probe.carried(), len(items)-1; got != want {
+	if got, want := probe.carried(), batchShared; got != want {
 		t.Errorf("the biggest transfer carried %d entries, want %d — the pre-existing long entry must be filtered out (counts: %v)", got, want, probe.counts())
 	}
 	// The teeth of the Lstat pre-filter: without it the long entry, which is
@@ -285,5 +329,72 @@ func TestTransferPlaceholdersSkipsALongIdentityThatAlreadyExists(t *testing.T) {
 	}
 	if len(ents) != len(items) {
 		t.Errorf("root lists %d entries, want %d", len(ents), len(items))
+	}
+}
+
+// costIdentity returns an identity of exactly n bytes shaped like a server
+// path, unique per i (n must leave room for the prefix).
+func costIdentity(i, n int) []byte {
+	s := fmt.Sprintf("Documents/Projects/Archive/%05d/", i)
+	s += strings.Repeat("x", n-len(s))
+	return []byte(s)
+}
+
+// The cost of the margin. Entries with a 64-127 byte identity used to share a
+// batch and now each go alone. This times both on the same machine — one
+// CfCreatePlaceholders call carrying all of them, against one call per entry —
+// and checks every entry comes out healthy either way. Every identity is
+// under the measured 133-byte edge, so the batched leg is safe to run.
+//
+// It logs the numbers; it only fails if an entry is unhealthy or the
+// one-at-a-time leg is wildly slow (over 30 s for 2,000 entries).
+func TestPlaceholderIdentityMarginCost(t *testing.T) {
+	if os.Getenv("NIMBO_CFAPI_LIVE") == "" {
+		t.Skip("set NIMBO_CFAPI_LIVE=1 to run against the real Cloud Files API")
+	}
+	const n = 2000
+	items := make([]PlaceholderInfo, n)
+	for i := range items {
+		items[i] = PlaceholderInfo{
+			Name:     fmt.Sprintf("f%05d.bin", i),
+			Size:     4096,
+			ModTime:  time.Now(),
+			Identity: costIdentity(i, 64+i%64), // 64..127 bytes
+		}
+	}
+	run := func(t *testing.T, alone bool) time.Duration {
+		root, _ := batchMount(t, func(rel string) []PlaceholderInfo { return []PlaceholderInfo{} })
+		baseW, err := windows.UTF16PtrFromString(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		if alone {
+			for _, it := range items {
+				if err := createPlaceholdersRaw(baseW, []PlaceholderInfo{it}); err != nil {
+					t.Fatalf("%s: %v", it.Name, err)
+				}
+			}
+		} else if err := createPlaceholdersRaw(baseW, items); err != nil {
+			t.Fatal(err)
+		}
+		took := time.Since(start)
+		for _, it := range items {
+			if !batchHealthy(t, filepath.Join(root, it.Name)) {
+				t.Fatalf("%s: not a readable placeholder", it.Name)
+			}
+		}
+		return took
+	}
+	var batched, alone time.Duration
+	t.Run("batched", func(t *testing.T) { batched = run(t, false) })
+	t.Run("alone", func(t *testing.T) { alone = run(t, true) })
+	if batched == 0 || alone == 0 {
+		return // skipped or failed above
+	}
+	t.Logf("%d placeholders, identities 64-127 bytes: one batch %v, one call each %v (%.1fx)",
+		n, batched.Round(time.Millisecond), alone.Round(time.Millisecond), float64(alone)/float64(batched))
+	if alone > 30*time.Second {
+		t.Errorf("one call per entry took %v for %d entries", alone, n)
 	}
 }

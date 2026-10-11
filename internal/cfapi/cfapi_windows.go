@@ -905,10 +905,20 @@ func CreatePlaceholders(baseDir string, items []PlaceholderInfo) error {
 // not, the name's length is irrelevant, and a long identity created alone is
 // healthy. Our identity is the raw server path, so any directory holding an
 // entry that deep stranded all its siblings on population and on reconcile's
-// pull (GitHub #7's "corrupt metadata" placeholders). 128 leaves a margin
-// under the measured edge; batch_windows_test.go pins both the fault and
-// this defence.
-const longIdentityBytes = 128
+// pull (GitHub #7's "corrupt metadata" placeholders).
+//
+// Why 64 and not just under 133: the edge was measured on one Windows build
+// only, nothing documents it, and other builds may put it somewhere else. A
+// guess that is too high strands files for good, while one that is too low
+// only costs speed, so the threshold sits at about half the measured edge.
+// The cost, measured on the same build (TestPlaceholderIdentityMarginCost):
+// 2,000 placeholders with 64-127 byte identities take ~0.3-0.4 s in one batch
+// and ~0.5-0.7 s one call each, so under 2x and a fraction of a millisecond
+// per entry — small next to the server listing that feeds them. In a deep
+// folder most entries now go one at a time; that is the price.
+//
+// batch_windows_test.go pins this defence (and the threshold itself).
+const longIdentityBytes = 64
 
 // splitLongIdentities partitions items into those safe to create together
 // and those that must each be created alone. Order within each part is kept.
