@@ -32,12 +32,15 @@ func recordMarks(t *testing.T) *[]string {
 		return nil
 	}
 	t.Cleanup(func() { stopTestWatchers(t); cfMarkInSync = orig })
-	// UpdateIdentity is attempted before marking (repointing a foreign hydrated
-	// placeholder); on plain test files the real one would error, which is fine,
-	// but stub it so tests don't depend on cfapi behaviour.
+	// UpdateIdentity is attempted before marking a file that is already a
+	// placeholder (repointing a foreign hydrated one). Test files are plain, so
+	// stub the probe to say so and the repoint to fail, so tests don't depend
+	// on cfapi behaviour.
 	origU := cfUpdateIdentity
 	cfUpdateIdentity = func(path string, identity []byte) error { return errors.New("not a placeholder") }
-	t.Cleanup(func() { stopTestWatchers(t); cfUpdateIdentity = origU })
+	origP := cfIsPlaceholderPath
+	cfIsPlaceholderPath = func(string) (bool, error) { return false, nil }
+	t.Cleanup(func() { stopTestWatchers(t); cfUpdateIdentity = origU; cfIsPlaceholderPath = origP })
 	return &marked
 }
 
@@ -379,6 +382,48 @@ func TestAdoptResumeFinishesConflictsAndStubs(t *testing.T) {
 	for _, rel := range []string{"keep.txt", "up.txt"} {
 		if _, err := os.Stat(filepath.Join(dir, rel)); err != nil {
 			t.Errorf("%s disturbed by the resume: %v", rel, err)
+		}
+	}
+}
+
+// adoptMark repoints the identity only on a file that is already a placeholder
+// (Deck #510). On a plain file, nearly every file an adopt converts, the
+// repoint is an open plus a CfUpdatePlaceholder bound to fail, so it is skipped
+// and MarkInSync's convert sets the identity. A placeholder (another client's
+// hydrated one) still gets the repoint, BEFORE the mark, or it would keep the
+// foreign identity. A failed probe falls back to trying the repoint.
+func TestAdoptMarkRepointsOnlyPlaceholders(t *testing.T) {
+	var calls []string
+	origU, origM, origP := cfUpdateIdentity, cfMarkInSync, cfIsPlaceholderPath
+	t.Cleanup(func() { cfUpdateIdentity, cfMarkInSync, cfIsPlaceholderPath = origU, origM, origP })
+	cfUpdateIdentity = func(path string, identity []byte) error {
+		calls = append(calls, "repoint "+filepath.Base(path)+" "+string(identity))
+		return nil
+	}
+	cfMarkInSync = func(path string, identity []byte) error {
+		calls = append(calls, "mark "+filepath.Base(path)+" "+string(identity))
+		return nil
+	}
+	cfIsPlaceholderPath = func(path string) (bool, error) {
+		switch filepath.Base(path) {
+		case "foreign.txt":
+			return true, nil
+		case "unprobed.txt":
+			return false, errors.New("probe failed")
+		}
+		return false, nil
+	}
+	for _, name := range []string{"plain.txt", "foreign.txt", "unprobed.txt"} {
+		calls = nil
+		if err := adoptMark(filepath.Join(t.TempDir(), name), "Root", "sub/"+name); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"mark " + name + " Root/sub/" + name}
+		if name != "plain.txt" {
+			want = append([]string{"repoint " + name + " Root/sub/" + name}, want...)
+		}
+		if strings.Join(calls, "|") != strings.Join(want, "|") {
+			t.Errorf("%s: calls %v, want %v", name, calls, want)
 		}
 	}
 }

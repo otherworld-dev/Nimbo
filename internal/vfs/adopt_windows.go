@@ -408,10 +408,20 @@ func UploadPending(localDir, remoteRoot string, uploads []UploadItem, ops AdoptO
 // file that is ALREADY a placeholder (a hydrated one left by another client),
 // MarkInSync would keep the foreign identity blob — dehydrating and re-opening
 // it later would hand our hydrate callback an identity we can't serve. So the
-// identity is repointed first; on a plain file that call fails harmlessly and
-// MarkInSync does the conversion with the right identity itself.
+// identity is repointed first.
+//
+// The repoint is only tried on a placeholder. On a plain file — nearly every
+// file an adopt converts — it is a wasted open plus a CfUpdatePlaceholder that
+// is bound to fail, so a cheap attribute probe (no open, cannot block on the
+// file) rules it out first, and MarkInSync's convert sets our identity itself.
+// The probe is truthful here: the app exposes placeholders process-wide
+// (cfapi.ExposePlaceholders) and Apply runs on a connected root, so a hydrated
+// foreign placeholder is not disguised as a plain file. If the probe errors,
+// the repoint is tried anyway, as before.
 func adoptMark(full, remoteRoot, rel string) error {
 	identity := []byte(strings.Trim(remoteRoot+"/"+rel, "/"))
-	_ = cfUpdateIdentity(full, identity)
+	if isPh, err := cfIsPlaceholderPath(full); err != nil || isPh {
+		_ = cfUpdateIdentity(full, identity)
+	}
 	return cfMarkInSync(full, identity)
 }
