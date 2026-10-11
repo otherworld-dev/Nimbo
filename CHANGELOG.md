@@ -47,6 +47,11 @@ All notable changes to Nimbo are recorded here. The format follows
 - On Linux, deleting a folder that held read-only files no longer fails with
   permission denied and leaves folders that can't be opened, and folders an
   earlier build left that way are fixed on the next delete.
+- Switching from on-demand back to live mode no longer says that online-only files
+  in excluded folders, such as an old `node_modules` on the server, will download
+  after the switch. Live mode never syncs those, so the dialog now counts them
+  separately and says they stay on the server, and the download size it shows only
+  covers the files that really will come down (#512).
 
 ## [0.2.0] - 2026-09-26
 
