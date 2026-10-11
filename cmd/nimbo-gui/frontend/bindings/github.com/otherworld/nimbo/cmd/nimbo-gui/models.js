@@ -121,6 +121,30 @@ export class AccountEntryDTO {
              */
             this["route"] = "";
         }
+        if (!("sidebarName" in $$source)) {
+            /**
+             * SidebarName is the name the user chose for the account's Explorer
+             * sidebar entry ("" = automatic), SidebarAuto the automatic one (the
+             * field's placeholder) and SidebarLabel the one actually shown.
+             * @member
+             * @type {string}
+             */
+            this["sidebarName"] = "";
+        }
+        if (!("sidebarAuto" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["sidebarAuto"] = "";
+        }
+        if (!("sidebarLabel" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["sidebarLabel"] = "";
+        }
 
         Object.assign(this, $$source);
     }

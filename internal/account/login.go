@@ -182,9 +182,11 @@ func Complete(path string, creds Credentials) (Account, error) {
 	}
 	err := Update(path, func(store *Store) error {
 		// A re-login replaces the whole record (Upsert), so carry the local
-		// route over — it belongs to the server, not to this sign-in.
+		// route over — it belongs to the server, not to this sign-in — and the
+		// sidebar name the user chose.
 		if prev, ok := store.Find(a.ID); ok {
 			a.Local = prev.Local
+			a.Label = prev.Label
 		}
 		store.Upsert(a)
 		// A fresh sign-in becomes the active account — both on first run and

@@ -398,7 +398,7 @@
 
   // All configured accounts sync side by side; the active one is what the
   // windows and folder settings show. Switch, add, remove.
-  let accounts = $state<{ id: string; user: string; server: string; active: boolean; status: string }[]>([]);
+  let accounts = $state<{ id: string; user: string; server: string; active: boolean; status: string; sidebarName: string; sidebarAuto: string; sidebarLabel: string }[]>([]);
   let acctBusy = $state(false);
   async function loadAccounts() { accounts = (await App.ListAccounts()) ?? []; }
 
@@ -485,6 +485,17 @@
   let shellSupported = $state(false), shellOn = $state(false);
   (async () => { shellSupported = await App.ShellMenuSupported(); shellOn = await App.ShellMenuEnabled(); })();
   async function toggleShell() { shellOn = !shellOn; const err = await App.SetShellMenu(shellOn); if (err) { shellOn = !shellOn; tell({ title: "Couldn't change the Explorer menu", message: err }); } }
+
+  // Each account's sidebar entry is named automatically ("Nimbo - adam"); the
+  // user can give it a name of their own instead (GitHub #19). Saved on change
+  // (Enter or leaving the box); an empty box goes back to the automatic name.
+  async function saveNavName(id: string, name: string) {
+    const err = await App.SetAccountSidebarName(id, name);
+    if (err) tell({ title: "Couldn't rename the sidebar entry", message: err });
+    await loadAccounts();
+  }
+  function hostOf(server: string): string { try { return new URL(server).host; } catch { return server; } }
+  let navNameClash = $derived(new Set(accounts.map((a) => a.sidebarLabel)).size < accounts.length);
 
   let navSupported = $state(false), navOn = $state(false), navBusy = $state(false);
   (async () => { navSupported = await App.SidebarSupported(); navOn = await App.SidebarEnabled(); })();
@@ -1472,6 +1483,14 @@ SHA-256: {localTest.fingerprint}</pre>
       {/if}
       {#if navSupported}
         <label class="check"><input type="checkbox" checked={navOn} disabled={navBusy} onchange={toggleNav} /> Show {brandName} in the Explorer sidebar (points at your default sync location)</label>
+        {#each accounts as ac (ac.id)}
+          <div class="field navname">
+            <label for={"navname-" + ac.id}>Sidebar name{#if accounts.length > 1}{" for "}{ac.user} on {hostOf(ac.server)}{/if}</label>
+            <input id={"navname-" + ac.id} type="text" maxlength="80" placeholder={ac.sidebarAuto} value={ac.sidebarName} onchange={(e) => saveNavName(ac.id, e.currentTarget.value)} />
+          </div>
+        {/each}
+        {#if accounts.length}<p class="fhint navhint">Leave it empty to use the name shown in grey.</p>{/if}
+        {#if navNameClash}<p class="fhint navhint danger">Two accounts have the same sidebar name, so you won't be able to tell their entries apart.</p>{/if}
       {/if}
 
       <div class="row"><h3>Troubleshooting</h3>{#if brandHelp}<button class="link" onclick={() => App.OpenURL(helpPage("troubleshooting"))}>Troubleshooting guide</button>{/if}</div>
@@ -1582,6 +1601,8 @@ SHA-256: {localTest.fingerprint}</pre>
   .seg button.sel { background: var(--accent); color: #fff; }
   .seg button:not(.sel):hover { background: var(--hover); }
   .fhint { color: var(--muted); font-size: 12px; margin: 0 0 6px; }
+  .navname { margin: 4px 0 6px 24px; }
+  .navhint { margin-left: 24px; }
   .fhint code { font-size: 11px; background: var(--bg2, rgba(127,127,127,.12)); padding: 0 3px; border-radius: 3px; }
   .flabel { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 4px; }
   .dhealth { font-size: 13px; font-weight: 600; margin: 16px 0 6px; }

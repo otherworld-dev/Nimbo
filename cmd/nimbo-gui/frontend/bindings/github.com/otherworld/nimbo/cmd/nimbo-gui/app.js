@@ -1089,6 +1089,18 @@ export function Search(term) {
 }
 
 /**
+ * SetAccountSidebarName sets the name an account's Explorer sidebar entry is
+ * shown under ("" goes back to the automatic one) and renames the entry
+ * straight away. It returns "" or a message to show.
+ * @param {string} id
+ * @param {string} name
+ * @returns {$CancellablePromise<string>}
+ */
+export function SetAccountSidebarName(id, name) {
+    return $Call.ByID(1293671913, id, name);
+}
+
+/**
  * SetAllowedFilenames persists the allow-list (trimmed, de-duped) and applies it
  * live: the running engine rebuilds its forbidden-name matcher and re-syncs, so a
  * change takes effect immediately instead of on next launch.

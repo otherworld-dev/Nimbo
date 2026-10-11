@@ -22,7 +22,10 @@ All notable changes to Nimbo are recorded here. The format follows
   than just "Nimbo", so with more than one account you can tell which entry is
   which. If two accounts have the same login on different servers the server is
   added as well. Existing entries are renamed the next time Nimbo starts, and one
-  you have hidden stays hidden (#19).
+  you have hidden stays hidden. If you would rather call an entry something else,
+  give it your own name in Settings → General, under the sidebar option, it is
+  renamed straight away and leaving the box empty goes back to the automatic
+  name (#19).
 
 ### Fixed
 

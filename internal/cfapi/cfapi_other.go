@@ -47,6 +47,9 @@ func RegisterSyncRoot(string) error { return nil }
 // UnregisterSyncRoot is a no-op on non-Windows platforms.
 func UnregisterSyncRoot(string) error { return nil }
 
+// RenameSyncRoot is a no-op on non-Windows platforms.
+func RenameSyncRoot(string, string, string) error { return nil }
+
 // Purge is a no-op on non-Windows platforms.
 func Purge(string) error { return nil }
 
