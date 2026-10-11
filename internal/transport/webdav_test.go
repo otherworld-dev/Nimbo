@@ -554,3 +554,65 @@ func TestContentKey(t *testing.T) {
 		t.Error("an mtime change produced the same key")
 	}
 }
+
+// TestParseResponseSize covers the size a listing reports: a folder's comes
+// from oc:size (everything inside it, all the way down; the folder picker
+// shows it and adds it up for "frees about"), a file's from getcontentlength.
+// A folder's getcontentlength is ignored even when a server sends one.
+func TestParseResponseSize(t *testing.T) {
+	const body = `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns" xmlns:oc="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/Photos/</d:href>
+    <d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop>
+      <d:resourcetype><d:collection/></d:resourcetype>
+      <d:getcontentlength>4096</d:getcontentlength>
+      <oc:size>5368709120</oc:size>
+    </d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/Empty/</d:href>
+    <d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop>
+      <d:resourcetype><d:collection/></d:resourcetype>
+    </d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/a.txt</d:href>
+    <d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop>
+      <d:resourcetype/>
+      <d:getcontentlength>33</d:getcontentlength>
+      <oc:size>33</oc:size>
+    </d:prop></d:propstat>
+  </d:response>
+</d:multistatus>`
+	var ms multistatus
+	if err := xml.Unmarshal([]byte(body), &ms); err != nil {
+		t.Fatal(err)
+	}
+	c := New("https://cloud.example.com", "alice", "pw")
+	got := map[string]Entry{}
+	for _, r := range ms.Responses {
+		e, ok, err := c.parseResponse(r)
+		if err != nil || !ok {
+			t.Fatalf("parse: ok=%v err=%v", ok, err)
+		}
+		got[e.Path] = e
+	}
+	want := map[string]struct {
+		dir  bool
+		size int64
+	}{
+		"Photos": {true, 5368709120},
+		"Empty":  {true, 0},
+		"a.txt":  {false, 33},
+	}
+	for p, w := range want {
+		e, ok := got[p]
+		if !ok {
+			t.Fatalf("%s missing from %v", p, got)
+		}
+		if e.IsDir != w.dir || e.Size != w.size {
+			t.Errorf("%s: dir=%v size=%d, want dir=%v size=%d", p, e.IsDir, e.Size, w.dir, w.size)
+		}
+	}
+}

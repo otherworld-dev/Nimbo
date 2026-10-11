@@ -531,6 +531,15 @@ export class BrowseEntry {
              */
             this["isDir"] = false;
         }
+        if (!("size" in $$source)) {
+            /**
+             * Size is the server's size in bytes. For a folder it is everything inside
+             * it, all the way down (oc:size); 0 when the server didn't say.
+             * @member
+             * @type {number}
+             */
+            this["size"] = 0;
+        }
 
         Object.assign(this, $$source);
     }

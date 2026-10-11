@@ -1,12 +1,33 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/vfs"
 )
+
+// A long conversion leaves a breadcrumb every N entries and one at the end,
+// with the rate so far, so slow never reads as hung in the log (Deck #510).
+func TestAdoptBreadcrumb(t *testing.T) {
+	clock := time.Unix(1000, 0)
+	now := func() time.Time { return clock }
+	var got []string
+	cb := adoptBreadcrumb(10, now, func(done, total int, perSec float64) {
+		got = append(got, fmt.Sprintf("%d/%d@%.0f", done, total, perSec))
+	})
+	for done := 1; done <= 25; done++ {
+		clock = clock.Add(100 * time.Millisecond) // 10 entries a second
+		cb(done, 25)
+	}
+	want := "10/25@10 20/25@10 25/25@10"
+	if strings.Join(got, " ") != want {
+		t.Errorf("breadcrumbs %v, want %s", got, want)
+	}
+}
 
 // The resume record (Deck #500) round-trips per account and folder, and a
 // record for another folder is dropped rather than replayed: a plan must never

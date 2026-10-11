@@ -2,6 +2,8 @@
   import { App } from "../bindings/github.com/otherworld/nimbo/cmd/nimbo-gui";
   import { ask, tell } from "./dialogs.svelte";
   import { Events } from "@wailsio/runtime";
+  import FolderPicker from "./FolderPicker.svelte";
+  import { planChanges, planEmpty, asksKeepOrDelete, freedBytes, downloadBytes, fmtSize } from "./folderSelection";
 
   let brandName = $state("Nimbo");
   let brandCompany = $state("Otherworld Dev Ltd");
@@ -72,12 +74,19 @@
   let everything = $state(false);                   // syncing the whole account into one folder
 
   // Manage flow: deselect (or re-select) subfolders of an existing connection.
+  // Clicks in the tree are staged in mTarget (the excludes after the user's
+  // changes) and nothing reaches the engine until Apply; see folderSelection.ts.
   let managing = $state(false);
   let managePair = $state<Pair | null>(null);
-  let mCur = $state("");
-  let mEntries = $state<Entry[]>([]);
-  // When unticking a synced folder, ask whether to also delete the local copy.
-  let pending = $state<{ localDir: string; rel: string; name: string } | null>(null);
+  let mTarget = $state<string[]>([]);
+  let mSizes = $state<Record<string, number>>({});
+  let mBusy = $state(false);
+  let mErrors = $state<{ rel: string; msg: string }[]>([]);
+  // The one "keep or delete the downloaded files?" question Apply asks when
+  // folders stop syncing.
+  let askKeep = $state(false);
+  const mCommitted = $derived(managePair?.excludes ?? []);
+  const mPlan = $derived(planChanges(mTarget, mCommitted));
 
   async function loadFolders() {
     pairs = (await App.GetPairs()) ?? [];
@@ -116,46 +125,68 @@
 
   // --- Manage an existing connection: deselect/re-select its subfolders ---
   async function startManage(p: Pair) {
-    managing = true; managePair = p; mCur = trim(p.remoteRoot); pending = null; addErr = "";
-    await loadManage();
+    await loadFolders(); // the latest excludes, not the ones the list was drawn with
+    const fresh = pairs.find(pr => pr.localDir === p.localDir) ?? p;
+    managing = true; managePair = fresh; mTarget = [...(fresh.excludes ?? [])];
+    mSizes = {}; mErrors = []; askKeep = false;
   }
-  function exitManage() { managing = false; managePair = null; pending = null; }
-  async function loadManage() {
-    await loadFolders(); // refresh pairs so excludes reflect the latest toggles
-    if (managePair) managePair = pairs.find(pr => pr.localDir === managePair!.localDir) ?? managePair;
-    mEntries = (await App.BrowseRemote(mCur)) ?? [];
+  function closeManage() { managing = false; managePair = null; askKeep = false; mErrors = []; }
+  async function exitManage() {
+    if (!planEmpty(mPlan) && !(await ask({
+      title: "Discard your changes?",
+      message: "You’ve changed which folders sync but haven’t applied it yet.",
+      ok: "Discard", cancel: "Keep editing", danger: true,
+    }))) return;
+    closeManage();
   }
-  const mNavigate = async (p: string) => { mCur = trim(p); await loadManage(); };
-  function mUp() {
-    if (managePair && trim(mCur) !== trim(managePair.remoteRoot))
-      mNavigate(mCur.split("/").slice(0, -1).join("/"));
+  function discardManage() { mTarget = [...mCommitted]; mErrors = []; }
+  function applyManage() {
+    if (planEmpty(mPlan) || mBusy) return;
+    if (asksKeepOrDelete(mPlan, mCommitted)) askKeep = true;
+    else runApply(false);
   }
-  // A folder is "on" unless the managed pair excludes it. While its keep/delete
-  // prompt is open it shows unticked, so cancelling re-ticks it (and a later click
-  // is a fresh untick rather than a stale toggle that re-asks).
-  function mChecked(p: string): boolean {
-    if (!managePair) return false;
-    const rel = relWithin(trim(p), trim(managePair.remoteRoot));
-    if (pending && pending.localDir === managePair.localDir && pending.rel === rel) return false;
-    return !managePair.excludes.includes(rel);
-  }
-  async function onToggleManage(e: Entry) {
+  // Folders that stop syncing go first, then the ones that sync again: when a
+  // folder is re-ticked with one inside it unticked, the inner exclude must be
+  // saved before the outer one is lifted, or the next sync starts downloading it.
+  // A failure is shown against its folder and that folder stays staged; the rest
+  // still apply.
+  async function runApply(deleteLocal: boolean) {
     if (!managePair) return;
-    const rel = relWithin(trim(e.path), trim(managePair.remoteRoot));
-    if (managePair.excludes.includes(rel)) {
-      await App.RemoveExclude(managePair.localDir, rel); // re-select → re-downloads from the server
-      await loadManage();
-    } else {
-      pending = { localDir: managePair.localDir, rel, name: e.name }; // ask keep vs delete
+    askKeep = false; mBusy = true; mErrors = [];
+    const dir = managePair.localDir;
+    const plan = mPlan;
+    const errs: { rel: string; msg: string }[] = [];
+    for (const rel of plan.exclude) {
+      try {
+        const err = await App.DeselectFolder(dir, rel, deleteLocal);
+        if (err) errs.push({ rel, msg: err });
+      } catch (e) { errs.push({ rel, msg: String(e) }); }
     }
+    for (const rel of plan.include) {
+      try { await App.RemoveExclude(dir, rel); }
+      catch (e) { errs.push({ rel, msg: String(e) }); }
+    }
+    await loadFolders();
+    const fresh = pairs.find(pr => pr.localDir === dir);
+    if (!fresh) { mBusy = false; closeManage(); return; } // the connection went away meanwhile
+    managePair = fresh;
+    // Saved state, plus whatever failed to apply, so it shows as still to do.
+    const failedEx = errs.filter(e => plan.exclude.includes(e.rel)).map(e => e.rel);
+    const failedIn = new Set(errs.filter(e => plan.include.includes(e.rel)).map(e => e.rel));
+    mTarget = [...new Set([...(fresh.excludes ?? []).filter(x => !failedIn.has(x)), ...failedEx])];
+    mErrors = errs;
+    mBusy = false;
   }
-  async function confirmDeselect(deleteLocal: boolean) {
-    if (!pending) return;
-    const err = await App.DeselectFolder(pending.localDir, pending.rel, deleteLocal);
-    pending = null;
-    if (err) addErr = err;
-    await loadManage();
-  }
+  const mStops = $derived(mPlan.exclude.length);
+  const mStarts = $derived(mPlan.include.length);
+  const mFreed = $derived(freedBytes(mPlan, mCommitted, mSizes));
+  const mDownload = $derived(downloadBytes(mPlan, mTarget, mSizes));
+  const folders = (n: number) => `${n} folder${n === 1 ? "" : "s"}`;
+  const mSummary = $derived([
+    mStops ? `${folders(mStops)} will stop syncing` : "",
+    mStarts ? `${folders(mStarts)} will sync again` : "",
+  ].filter(Boolean).join(", "));
+  const nameOf = (rel: string) => rel.split("/").pop() || rel;
 
   function toggleSelect(path: string) {
     const t = trim(path);
@@ -417,7 +448,7 @@
     if (now === activeId) return;
     activeId = now;
     exitAdding();
-    managing = false; managePair = null; pending = null;
+    closeManage(); // staged folder changes belonged to the other account
     account = await App.AccountInfo();
     await loadFolders();
     offCur = "";
@@ -570,7 +601,7 @@
       let sum: any = null;
       try { sum = JSON.parse(raw); } catch { sum = null; }
       if (sum?.error) { tell({ title: "File availability", message: sum.error }); syncMode = await App.GetSyncMode(); return; }
-      if (sum && (sum.hydrated || sum.dehydrated)) { revert = sum; return; }
+      if (sum && (sum.hydrated || sum.dehydrated || sum.ignored)) { revert = sum; return; }
       // Nothing mounted/nothing to revert — plain switch below.
     }
     if (syncMode === "ondemand") {
@@ -693,7 +724,7 @@
     if (!revert) return;
     fresh = {
       target: "live", dir: revert.dir,
-      total: (revert.hydrated || 0) + (revert.dehydrated || 0),
+      total: (revert.hydrated || 0) + (revert.dehydrated || 0) + (revert.ignored || 0),
       localOnly: 0, changed: 0,
     };
     revert = null;
@@ -921,7 +952,8 @@
             <p class="hint">Your files in <b>{revert.dir}</b> go back to being ordinary files, in place.</p>
             <ul class="hint">
               {#if revert.hydrated}<li><b>{revert.hydrated.toLocaleString()}</b> are on this PC — converted back instantly, nothing transferred.</li>{/if}
-              {#if revert.dehydrated}<li><b>{revert.dehydrated.toLocaleString()}</b> are online-only — they'll download through normal syncing after the switch ({mb(revert.downloadBytes)}).</li>{/if}
+              {#if revert.dehydrated}<li><b>{revert.dehydrated.toLocaleString()}</b> are online-only. They'll download through normal syncing after the switch ({mb(revert.downloadBytes)}).</li>{/if}
+              {#if revert.ignored}<li><b>{revert.ignored.toLocaleString()}</b> {revert.ignored === 1 ? "is" : "are"} online-only in folders that normal syncing skips (your exclusions, such as node_modules). {revert.ignored === 1 ? "It stays" : "They stay"} on the server and won't download.</li>{/if}
             </ul>
             <p class="hint">Your sync folders are restored automatically.</p>
             <div class="addbtns">
@@ -1104,38 +1136,56 @@
         {/if}
 
       {:else if managing && managePair}
-        <!-- Manage view: deselect/re-select subfolders of one connection -->
-        <div class="row"><h3>Choose folders — /{trim(managePair.remoteRoot)}</h3><button class="link" onclick={exitManage}>← Done</button></div>
-        <p class="hint">Untick a folder to stop syncing it. Your copy on the server is always kept — you'll be asked whether to also delete the files already downloaded here to free space. Re-tick to start syncing it again.</p>
-        <div class="crumb">
-          <button onclick={mUp} disabled={trim(mCur) === trim(managePair.remoteRoot)}>⬆ Up</button>
-          <span>/{mCur}</span>
-        </div>
-        {#if mEntries.length === 0}<p class="empty">(empty)</p>{/if}
-        {#each mEntries as e}
-          <div class="frow">
-            {#if e.isDir}
-              <input class="selbox" type="checkbox" checked={mChecked(e.path)} onchange={() => onToggleManage(e)} />
-              <button class="name" onclick={() => mNavigate(e.path)}>📁 {e.name}</button>
+        <!-- Manage view: pick which subfolders of one connection sync. A tree
+             rather than one level at a time, so there's no breadcrumb: where a
+             folder sits is shown by its indent, and the connection's own
+             server and local folders are named once, below the heading.
+             Clicks are staged; nothing changes until Apply. -->
+        <div class="row"><h3>Choose folders</h3><button class="link" onclick={exitManage} disabled={mBusy}>← Back</button></div>
+        <p class="mconn">
+          <span class="remote">/{trim(managePair.remoteRoot)}</span>
+          <span class="arrow">→</span>
+          <span class="local">{managePair.localDir}</span>
+        </p>
+        <p class="hint mhint">Untick a folder to stop syncing it, tick it to sync it again. A half-ticked folder has some folders inside it that don’t sync; tick it to sync all of it. Your files on the server are always kept, and nothing changes until you press <b>Apply</b>.</p>
+        {#key managePair.localDir}
+          <FolderPicker root={managePair.remoteRoot} committed={mCommitted} bind:target={mTarget} bind:sizes={mSizes} disabled={mBusy} />
+        {/key}
+        {#if mErrors.length}
+          <div class="merrs">
+            <div class="merrhead">{mErrors.length === 1 ? "One change didn’t apply" : `${mErrors.length} changes didn’t apply`} (left as you set them, so you can try again):</div>
+            <ul>{#each mErrors as e}<li><b>{nameOf(e.rel)}</b>: {e.msg}</li>{/each}</ul>
+          </div>
+        {/if}
+        <div class="applybar">
+          <div class="applysum">
+            {#if planEmpty(mPlan)}
+              <span class="dmuted">No changes</span>
             {:else}
-              <span class="selspace"></span>
-              <span class="name file">📄 {e.name}</span>
+              <span>{mSummary}</span>
+              {#if mStops && mFreed}<span class="dmuted">Frees about {fmtSize(mFreed)} if you delete the downloaded copies</span>{/if}
+              {#if mStarts && mDownload}<span class="dmuted">About {fmtSize(mDownload)} to download</span>{/if}
             {/if}
           </div>
-        {/each}
-        {#if addErr}<pre class="err">{addErr}</pre>{/if}
+          <div class="applybtns">
+            {#if !planEmpty(mPlan)}<button class="link" onclick={discardManage} disabled={mBusy}>Undo changes</button>{/if}
+            <button class="primary small" onclick={applyManage} disabled={mBusy || planEmpty(mPlan)}>{mBusy ? "Applying…" : "Apply"}</button>
+          </div>
+        </div>
 
-        {#if pending}
+        {#if askKeep}
           <div class="modalback">
             <div class="addpanel modalbox">
-              <div class="addhead">Stop syncing “{pending.name}”?</div>
-              <p class="hint">Your copy on the server is kept. What about the files already downloaded to this computer?</p>
+              <div class="addhead">Stop syncing {mStops === 1 ? `“${nameOf(mPlan.exclude[0])}”` : folders(mStops)}?</div>
+              <p class="hint">Your files on the server are kept. What about the copies already downloaded to this PC?{mFreed ? ` Deleting them frees about ${fmtSize(mFreed)}.` : ""}</p>
+              {#if mStops > 1}
+                <ul class="hint mlist">{#each mPlan.exclude as rel}<li>{nameOf(rel)}{#if mSizes[rel]}{" "}<span class="dmuted">({fmtSize(mSizes[rel])})</span>{/if}</li>{/each}</ul>
+              {/if}
               <div class="addbtns">
-                <button class="primary" onclick={() => confirmDeselect(false)}>Keep files here</button>
-                <button class="danger" onclick={() => confirmDeselect(true)}>
-                  Delete to free space</button>
+                <button class="primary" onclick={() => runApply(false)}>Keep them here</button>
+                <button class="danger" onclick={() => runApply(true)}>Delete them</button>
               </div>
-              <button class="link" onclick={() => (pending = null)}>Cancel</button>
+              <button class="link" onclick={() => (askKeep = false)}>Cancel</button>
             </div>
           </div>
         {/if}
@@ -1641,6 +1691,26 @@ SHA-256: {localTest.fingerprint}</pre>
   .builtins .binfo { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
   .builtins .binfo code { font-size: 11px; background: var(--panel-2); border: 1px solid var(--border-2); border-radius: 4px; padding: 1px 5px; }
   .crumb { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; color: var(--fg2); font-size: 13px; }
+  /* Choose folders (the manage view). Long paths and the hint wrap anywhere
+     rather than pushing the window wider than it is. */
+  .mconn { margin: -4px 0 8px; font-size: 13px; overflow-wrap: anywhere; }
+  .mconn .remote { font-weight: 600; color: var(--accent); }
+  .mconn .arrow { color: var(--muted); margin: 0 4px; }
+  .mconn .local { color: var(--fg2); }
+  .mhint { overflow-wrap: anywhere; }
+  .applybar { position: sticky; bottom: -14px; z-index: 1; display: flex; align-items: center; justify-content: space-between;
+              flex-wrap: wrap; gap: 8px 12px; margin: 10px 0 -14px; padding: 10px 0 14px;
+              border-top: 1px solid var(--border); background: var(--bg); font-size: 13px; color: var(--fg); }
+  .applysum { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 200px; }
+  .applysum .dmuted { font-size: 12px; }
+  .applybtns { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; margin-left: auto; }
+  .applybtns .primary:disabled { opacity: .45; cursor: not-allowed; }
+  .addbtns button.danger { color: #c0392b; }
+  .merrs { margin-top: 10px; padding: 8px 10px; border: 1px solid #e6b3ad; background: #fdf3f2; color: #7a2f26;
+           border-radius: 8px; font-size: 12.5px; overflow-wrap: anywhere; }
+  .merrs ul { margin: 4px 0 0; padding-left: 18px; }
+  .merrhead { font-weight: 600; }
+  .mlist { margin: -4px 0 8px; padding-left: 18px; max-height: 120px; overflow-y: auto; overflow-wrap: anywhere; }
   h3 { font-size: 12px; text-transform: uppercase; color: var(--muted); margin: 18px 0 8px; }
   h3:first-of-type { margin-top: 0; }
   /* Section header: heading left, action (Add folder / Back / Done) right, with
