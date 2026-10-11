@@ -5549,9 +5549,13 @@ type BrowseEntry struct {
 	Name  string `json:"name"`
 	Path  string `json:"path"`
 	IsDir bool   `json:"isDir"`
+	// Size is the server's size in bytes. For a folder it is everything inside
+	// it, all the way down (oc:size); 0 when the server didn't say.
+	Size int64 `json:"size"`
 }
 
-// BrowseRemote lists a remote directory (one level), excluding the dir itself.
+// BrowseRemote lists a remote directory (one level), excluding the dir itself
+// and anything the account's ignore rules exclude; folders first, then A-Z.
 func (a *App) BrowseRemote(path string) []BrowseEntry {
 	if a.eng == nil {
 		return nil
@@ -5561,15 +5565,8 @@ func (a *App) BrowseRemote(path string) []BrowseEntry {
 		slog.Warn("browse failed", "path", path, "err", err)
 		return nil
 	}
-	trimmed := strings.Trim(path, "/")
-	out := make([]BrowseEntry, 0, len(entries))
-	for _, e := range entries {
-		if strings.Trim(e.Path, "/") == trimmed {
-			continue
-		}
-		out = append(out, BrowseEntry{Name: filepath.Base(e.Path), Path: strings.Trim(e.Path, "/"), IsDir: e.IsDir})
-	}
-	return out
+	pairs, _ := a.eng.Pairs()
+	return browseEntries(path, entries, pairRelFunc(pairs), a.eng.GlobalIgnoreMatcher())
 }
 
 // PairDTO describes a configured sync pair.

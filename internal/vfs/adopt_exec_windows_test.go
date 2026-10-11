@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -32,13 +34,24 @@ func recordMarks(t *testing.T) *[]string {
 		return nil
 	}
 	t.Cleanup(func() { stopTestWatchers(t); cfMarkInSync = orig })
-	// UpdateIdentity is attempted before marking (repointing a foreign hydrated
-	// placeholder); on plain test files the real one would error, which is fine,
-	// but stub it so tests don't depend on cfapi behaviour.
+	// UpdateIdentity is attempted before marking a file that is already a
+	// placeholder (repointing a foreign hydrated one). Test files are plain, so
+	// stub the probe to say so and the repoint to fail, so tests don't depend
+	// on cfapi behaviour.
 	origU := cfUpdateIdentity
 	cfUpdateIdentity = func(path string, identity []byte) error { return errors.New("not a placeholder") }
-	t.Cleanup(func() { stopTestWatchers(t); cfUpdateIdentity = origU })
+	origP := cfIsPlaceholderPath
+	cfIsPlaceholderPath = func(string) (bool, error) { return false, nil }
+	t.Cleanup(func() { stopTestWatchers(t); cfUpdateIdentity = origU; cfIsPlaceholderPath = origP })
 	return &marked
+}
+
+// withAdoptWorkers sets Apply's pool size for one test.
+func withAdoptWorkers(t *testing.T, n int) {
+	t.Helper()
+	orig := adoptWorkers
+	adoptWorkers = n
+	t.Cleanup(func() { adoptWorkers = orig })
 }
 
 func markedHas(marked []string, dir, rel string) bool {
@@ -281,6 +294,9 @@ func TestAdoptApplyProgressAndCancel(t *testing.T) {
 	}
 
 	// Cancelled run: cancel fires after the 2nd entry; the run must stop there.
+	// With one worker the stop is exact; TestAdoptApplyParallelCancel covers
+	// the pool.
+	withAdoptWorkers(t, 1)
 	dir2 := adoptTree(t, "a.txt:1:0", "b.txt:1:0", "c.txt:1:0", "d.txt:1:0")
 	plan2, err := Scan(dir2, remote, nil, nil)
 	if err != nil {
@@ -380,5 +396,165 @@ func TestAdoptResumeFinishesConflictsAndStubs(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, rel)); err != nil {
 			t.Errorf("%s disturbed by the resume: %v", rel, err)
 		}
+	}
+}
+
+// adoptMark repoints the identity only on a file that is already a placeholder
+// (Deck #510). On a plain file, nearly every file an adopt converts, the
+// repoint is an open plus a CfUpdatePlaceholder bound to fail, so it is skipped
+// and MarkInSync's convert sets the identity. A placeholder (another client's
+// hydrated one) still gets the repoint, BEFORE the mark, or it would keep the
+// foreign identity. A failed probe falls back to trying the repoint.
+func TestAdoptMarkRepointsOnlyPlaceholders(t *testing.T) {
+	var calls []string
+	origU, origM, origP := cfUpdateIdentity, cfMarkInSync, cfIsPlaceholderPath
+	t.Cleanup(func() { cfUpdateIdentity, cfMarkInSync, cfIsPlaceholderPath = origU, origM, origP })
+	cfUpdateIdentity = func(path string, identity []byte) error {
+		calls = append(calls, "repoint "+filepath.Base(path)+" "+string(identity))
+		return nil
+	}
+	cfMarkInSync = func(path string, identity []byte) error {
+		calls = append(calls, "mark "+filepath.Base(path)+" "+string(identity))
+		return nil
+	}
+	cfIsPlaceholderPath = func(path string) (bool, error) {
+		switch filepath.Base(path) {
+		case "foreign.txt":
+			return true, nil
+		case "unprobed.txt":
+			return false, errors.New("probe failed")
+		}
+		return false, nil
+	}
+	for _, name := range []string{"plain.txt", "foreign.txt", "unprobed.txt"} {
+		calls = nil
+		if err := adoptMark(filepath.Join(t.TempDir(), name), "Root", "sub/"+name); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"mark " + name + " Root/sub/" + name}
+		if name != "plain.txt" {
+			want = append([]string{"repoint " + name + " Root/sub/" + name}, want...)
+		}
+		if strings.Join(calls, "|") != strings.Join(want, "|") {
+			t.Errorf("%s: calls %v, want %v", name, calls, want)
+		}
+	}
+}
+
+// The Keep entries are marked by a worker pool (Deck #510). Every entry must
+// still be marked exactly once, progress must still count 1..total in order
+// from one caller at a time, and the rare entries (conflicts, uploads) keep
+// plan order in Uploads.
+func TestAdoptApplyParallel(t *testing.T) {
+	withAdoptWorkers(t, 8)
+	var specs []string
+	remote := map[string]engine.RemoteState{}
+	const n = 200
+	for i := 0; i < n; i++ {
+		rel := fmt.Sprintf("d%d/f%03d.txt", i%7, i)
+		specs = append(specs, rel+":10:0")
+		remote[rel] = remoteFile(10, 0)
+	}
+	specs = append(specs, "up1.txt:4:0", "conf.txt:99:0", "up2.txt:4:0")
+	remote["conf.txt"] = remoteFile(10, 0)
+	dir := adoptTree(t, specs...)
+	plan, err := Scan(dir, remote, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	marked := recordMarks(t)
+	// Hold each mark until a second one is in flight (or a short timeout), so
+	// the test sees the pool actually overlap work.
+	var inFlight, maxInFlight atomic.Int32
+	recorder := cfMarkInSync
+	cfMarkInSync = func(path string, identity []byte) error {
+		cur := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			m := maxInFlight.Load()
+			if cur <= m || maxInFlight.CompareAndSwap(m, cur) {
+				break
+			}
+		}
+		deadline := time.Now().Add(200 * time.Millisecond)
+		for maxInFlight.Load() < 2 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		return recorder(path, identity)
+	}
+
+	var busy atomic.Bool
+	var seen []int
+	res := plan.Apply(context.Background(), dir, "", func(done, total int) {
+		if !busy.CompareAndSwap(false, true) {
+			t.Error("progress called concurrently")
+			return
+		}
+		seen = append(seen, done)
+		busy.Store(false)
+	})
+	if res.Kept != n || res.Failed != 0 || res.Skipped != 0 || res.Renamed != 1 {
+		t.Fatalf("kept=%d failed=%d skipped=%d renamed=%d, want %d/0/0/1", res.Kept, res.Failed, res.Skipped, res.Renamed, n)
+	}
+	if len(*marked) != n {
+		t.Fatalf("marked %d files, want %d", len(*marked), n)
+	}
+	once := map[string]bool{}
+	for _, m := range *marked {
+		if once[m] {
+			t.Errorf("marked twice: %s", m)
+		}
+		once[m] = true
+	}
+	if len(seen) != n+3 {
+		t.Fatalf("progress called %d times, want %d", len(seen), n+3)
+	}
+	for i, d := range seen {
+		if d != i+1 {
+			t.Fatalf("progress not monotonic: call %d reported %d", i, d)
+		}
+	}
+	if maxInFlight.Load() < 2 {
+		t.Errorf("max marks in flight = %d, want the pool to overlap them", maxInFlight.Load())
+	}
+	if len(res.Uploads) != 3 || !strings.HasPrefix(res.Uploads[0].Rel, "conf (conflicted copy") ||
+		res.Uploads[1].Rel != "up1.txt" || res.Uploads[2].Rel != "up2.txt" {
+		t.Errorf("Uploads = %v, want [conflicted copy of conf.txt, up1.txt, up2.txt] in plan order", res.Uploads)
+	}
+}
+
+// Cancelling the pool stops it at the next entry boundary: only entries
+// already started finish (at most one per other worker past the cancel), every
+// one that finished is counted, and the rest are left as untouched plain files.
+func TestAdoptApplyParallelCancel(t *testing.T) {
+	const workers = 4
+	withAdoptWorkers(t, workers)
+	var specs []string
+	remote := map[string]engine.RemoteState{}
+	const n = 100
+	for i := 0; i < n; i++ {
+		rel := fmt.Sprintf("f%03d.txt", i)
+		specs = append(specs, rel+":10:0")
+		remote[rel] = remoteFile(10, 0)
+	}
+	dir := adoptTree(t, specs...)
+	plan, err := Scan(dir, remote, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked := recordMarks(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	const cancelAt = 10
+	res := plan.Apply(ctx, dir, "", func(done, _ int) {
+		if done == cancelAt {
+			cancel()
+		}
+	})
+	if res.Kept < cancelAt || res.Kept > cancelAt+workers-1 {
+		t.Errorf("kept %d after a cancel at %d with %d workers, want %d..%d", res.Kept, cancelAt, workers, cancelAt, cancelAt+workers-1)
+	}
+	if len(*marked) != res.Kept {
+		t.Errorf("marked %d files but reported kept=%d", len(*marked), res.Kept)
 	}
 }
