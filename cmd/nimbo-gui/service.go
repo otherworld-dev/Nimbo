@@ -879,6 +879,10 @@ func (a *App) SetSyncMode(mode string) string {
 	switch {
 	case strings.HasPrefix(mode, "guard-resume:"):
 		return a.resumeFrozen(strings.TrimPrefix(mode, "guard-resume:"))
+	case strings.HasPrefix(mode, cloneFirstPrefix):
+		// The order a running first sync downloads in: not a file-availability
+		// mode either, so the policy below has no say over it.
+		return a.setCloneFirst(strings.TrimPrefix(mode, cloneFirstPrefix))
 	}
 	if a.policyNow().SyncMode != "" {
 		return "File availability is managed by your organisation."
@@ -2193,6 +2197,8 @@ type ProgressDTO struct {
 	DoneBytes   int64  `json:"doneBytes"`
 	TotalBytes  int64  `json:"totalBytes"`
 	Enumerating bool   `json:"enumerating"`
+	// Clones are the first syncs running (Status → First sync).
+	Clones []CloneRunDTO `json:"clones"`
 }
 
 func toProgressDTO(p agent.SyncProgress) ProgressDTO {
@@ -2206,6 +2212,7 @@ func toProgressDTO(p agent.SyncProgress) ProgressDTO {
 		DoneBytes:   p.DoneBytes,
 		TotalBytes:  p.TotalBytes,
 		Enumerating: p.Enumerating,
+		Clones:      toCloneRunDTOs(p.Clones),
 	}
 }
 
@@ -5364,7 +5371,8 @@ func (a *App) EnterSetup() {
 // CompleteSetup applies the chosen initial-sync option for the whole account
 // into localDir, then finishes onboarding. mode is one of:
 //
-//	"everything" — classic two-way sync of the entire account
+//	"everything" — classic two-way sync of the entire account; may be
+//	               "everything:" + a JSON array of folders to download first
 //	"choose"     — set the base dir only; the caller opens Sync settings to pick
 //	"ondemand"   — virtual files (Cloud Files placeholders, download on open)
 //
@@ -5389,13 +5397,14 @@ func (a *App) completeSetup(localDir, mode string) string {
 	if msg := a.folderClashFor(localDir); msg != "" {
 		return msg
 	}
+	mode, first := parseSetupMode(mode)
 	switch mode {
 	case "everything":
 		if msg := a.SetSyncMode("live"); msg != "" {
 			return msg
 		}
 		_ = a.eng.SetBaseDir(localDir)
-		return a.AddSyncPair(localDir, "")
+		return a.addSyncPair(localDir, "", first)
 	case "choose":
 		_ = a.eng.SetBaseDir(localDir)
 		return a.SetSyncMode("live")
@@ -5647,13 +5656,19 @@ func (a *App) AddSyncFolder(remotePath string) {
 // AddSyncPair sets up a sync connection from a remote folder to an explicit
 // local directory. Returns "" on success or an error message for the UI.
 func (a *App) AddSyncPair(localDir, remotePath string) string {
+	return a.addSyncPair(localDir, remotePath, nil)
+}
+
+// addSyncPair is AddSyncPair with folders for the first sync to download
+// first (setup's "Download these first").
+func (a *App) addSyncPair(localDir, remotePath string, first []string) string {
 	if a.eng == nil {
 		return "not signed in"
 	}
 	if msg := a.folderClashFor(localDir); msg != "" {
 		return msg
 	}
-	if err := a.eng.AddSyncPair(localDir, remotePath); err != nil {
+	if err := a.eng.AddSyncPairFirst(localDir, remotePath, first); err != nil {
 		return err.Error()
 	}
 	// A whole-account pair (empty remote root) defines the account root; keep the

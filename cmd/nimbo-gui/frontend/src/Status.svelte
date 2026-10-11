@@ -24,7 +24,7 @@
   type LaneEntry = { account: string; path: string; abs: string; dir: "up" | "down"; size: number; doneBytes: number;
                      state: "running" | "waiting" | "paused" | "setaside"; position: number; until: string };
 
-  let tab = $state<"activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "large" | "detached" | "trash">("activity");
+  let tab = $state<"activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "large" | "first" | "detached" | "trash">("activity");
   let activity = $state<Activity[]>([]);
   let conflicts = $state<Conflict[]>([]);
   let notifs = $state<Notif[]>([]);
@@ -80,6 +80,56 @@
       default: return "Set aside " + untilText(l.until);
     }
   }
+  // First sync (Deck #766): while a sync folder downloads for the first time,
+  // the user can pick folders for it to download before everything else.
+  // The running first syncs ride the progress snapshot; a choice goes back
+  // through SetSyncMode's "clone-first:" sub-command (no bindings regen).
+  type CloneRun = { localDir: string; remoteRoot: string; first: string[] };
+  type Entry = { name: string; path: string; isDir: boolean };
+  let clones = $state<CloneRun[]>([]);
+  let clonesKey = "";
+  function takeClones(p: any) {
+    const next = ((p?.active && p?.clones) || []) as CloneRun[];
+    const key = JSON.stringify(next);
+    if (key !== clonesKey) { clonesKey = key; clones = next; }
+  }
+  (async () => takeClones(await App.Progress()))();
+  Events.On("progress", (e: any) => takeClones(e.data));
+
+  const trimSlash = (s: string) => s.replace(/^\/+|\/+$/g, "");
+  const folderName = (d: string) => d.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || d;
+  // Browse paths are account paths; a choice is relative to the sync folder's remote root.
+  const relTo = (p: string, root: string) => (trimSlash(root) === "" ? trimSlash(p) : trimSlash(p).slice(trimSlash(root).length + 1));
+
+  let pickFor = $state(""); // localDir of the run whose folder picker is open
+  let pickCur = $state("");
+  let pickEntries = $state<Entry[]>([]);
+  let pickLoading = $state(false);
+  async function pickGo(path: string) {
+    pickCur = trimSlash(path);
+    pickLoading = true;
+    pickEntries = (((await App.BrowseRemote(pickCur)) ?? []) as Entry[]).filter(e => e.isDir);
+    pickLoading = false;
+  }
+  function openPick(c: CloneRun) {
+    if (pickFor === c.localDir) { pickFor = ""; return; }
+    pickFor = c.localDir;
+    pickGo(c.remoteRoot);
+  }
+  function pickUp(c: CloneRun) {
+    if (trimSlash(pickCur) !== trimSlash(c.remoteRoot)) pickGo(pickCur.split("/").slice(0, -1).join("/"));
+  }
+  async function setFirst(c: CloneRun, paths: string[]) {
+    const err = await App.SetSyncMode("clone-first:" + JSON.stringify({ localDir: c.localDir, paths }));
+    if (err) { await tell({ title: "Couldn't change the order", message: err }); return; }
+    // Replace rather than mutate: a run from App.Progress() is a generated
+    // class instance, which Svelte does not make reactive.
+    clones = clones.map(x => (x.localDir === c.localDir ? { ...x, first: paths } : x));
+    clonesKey = JSON.stringify(clones); // the progress event confirms it a moment later
+  }
+  const addFirst = (c: CloneRun, e: Entry) => setFirst(c, [...c.first, relTo(e.path, c.remoteRoot)]);
+  const removeFirst = (c: CloneRun, f: string) => setFirst(c, c.first.filter(x => x !== f));
+
   async function syncFirst(l: LaneEntry) { await App.LaneSyncFirst(l.abs); loadLane(); }
   async function setAside(l: LaneEntry, minutes: number) { asideMenu = ""; await App.LaneSetAside(l.abs, minutes); loadLane(); }
   async function resumeLane(l: LaneEntry) { await App.LaneResume(l.abs); loadLane(); }
@@ -151,7 +201,7 @@
   // bare "<tab>" or "<tab>" + newline + "<highlight-key>": the flyout newline-
   // joins the target row's key into OpenStatusTab's one string arg (so no extra
   // Go binding is needed), and we flash + scroll to the matching row.
-  type Tab = "activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "large" | "detached" | "trash";
+  type Tab = "activity" | "conflicts" | "notifications" | "blocked" | "inuse" | "large" | "first" | "detached" | "trash";
   const NL = String.fromCharCode(10); // newline — never occurs in a tab name or file path
   let highlight = $state("");
   let hlTimer: ReturnType<typeof setTimeout>;
@@ -292,6 +342,10 @@
     <!-- Only while there are large files, like "No longer shared". -->
     {#if lane.length || tab === "large"}
       <button class:active={tab==="large"} onclick={() => tab="large"}>Large files{lane.length ? ` (${lane.length})` : ""}</button>
+    {/if}
+    <!-- Only while a sync folder is downloading for the first time. -->
+    {#if clones.length || tab === "first"}
+      <button class:active={tab==="first"} onclick={() => tab="first"}>First sync</button>
     {/if}
     <!-- Rare, so the tab only appears while there is something to decide. -->
     {#if detached.length || tab === "detached"}
@@ -466,6 +520,53 @@
         {/each}
       {/if}
 
+    {:else if tab === "first"}
+      <p class="laneintro">Your files are downloading for the first time. Pick the folders you need now and they download before everything else.</p>
+      {#if clones.length === 0}<p class="empty">The first sync has finished.</p>{/if}
+      {#each clones as c (c.localDir)}
+        <div class="card">
+          <div class="title">📁 {folderName(c.localDir)}</div>
+          <div class="lanesub" title={c.localDir}>{c.localDir}</div>
+          {#if c.first.length}
+            <div class="desc">Downloading first, in this order:</div>
+            {#each c.first as f, i (f)}
+              <div class="frow">
+                <span class="fname">{i + 1}. {f}</span>
+                <button class="flink" onclick={() => removeFirst(c, f)}>Remove</button>
+              </div>
+            {/each}
+          {:else}
+            <div class="desc">Nothing chosen, so files download in the usual order.</div>
+          {/if}
+          <div class="btns fbtns">
+            <button class:primary={pickFor !== c.localDir} onclick={() => openPick(c)}>{pickFor === c.localDir ? "Done" : "Choose folders…"}</button>
+            {#if c.first.length}<button onclick={() => setFirst(c, [])}>Clear</button>{/if}
+          </div>
+          {#if pickFor === c.localDir}
+            <div class="picker">
+              <div class="crumb">
+                <button class="flink" onclick={() => pickUp(c)} disabled={trimSlash(pickCur) === trimSlash(c.remoteRoot)}>⬆ Up</button>
+                <span>/{pickCur}</span>
+              </div>
+              {#if pickLoading}<p class="empty">Loading…</p>
+              {:else if pickEntries.length === 0}<p class="empty">No folders here.</p>{/if}
+              {#each pickEntries as e (e.path)}
+                {@const rel = relTo(e.path, c.remoteRoot)}
+                <div class="frow">
+                  <button class="fname nav" onclick={() => pickGo(e.path)} title="Open">📁 {e.name}</button>
+                  {#if c.first.includes(rel)}
+                    <span class="ftag">✓ First</span>
+                    <button class="flink" onclick={() => removeFirst(c, rel)}>Remove</button>
+                  {:else}
+                    <button class="flink" onclick={() => addFirst(c, e)}>Download first</button>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/each}
+
     {:else if tab === "large"}
       <p class="laneintro">Files of 64 MB or more sync here, two at a time, next to the normal sync, so smaller changes never wait behind them.</p>
       {#if lane.length === 0}<p class="empty">No large files syncing.</p>{/if}
@@ -553,6 +654,18 @@
   .lanebar { height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; margin: -4px 0 10px; }
   .lanebar div { height: 100%; background: var(--accent); }
   .asidemenu { margin-top: 8px; }
+  .frow { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0;
+          border-bottom: 1px solid var(--border-soft); font-size: 13px; }
+  .frow .fname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .frow .nav { background: none; border: none; padding: 0; text-align: left; color: var(--fg); cursor: pointer; font-size: 13px; }
+  .frow .nav:hover { color: var(--accent); }
+  .flink { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 12px; padding: 2px 4px; white-space: nowrap; }
+  .flink:hover { text-decoration: underline; }
+  .flink:disabled { color: var(--muted); cursor: default; text-decoration: none; }
+  .ftag { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .fbtns { margin-top: 10px; }
+  .picker { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+  .crumb { display: flex; gap: 10px; align-items: center; margin-bottom: 4px; color: var(--fg2); font-size: 12.5px; }
   .versions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0 0 12px; }
   .ver { border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; background: var(--panel); }
   .ver.newest { border-color: var(--accent); background: var(--tint); }

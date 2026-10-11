@@ -263,7 +263,8 @@ export function CloseLogin() {
  * CompleteSetup applies the chosen initial-sync option for the whole account
  * into localDir, then finishes onboarding. mode is one of:
  * 
- * 	"everything" — classic two-way sync of the entire account
+ * 	"everything" — classic two-way sync of the entire account; may be
+ * 	               "everything:" + a JSON array of folders to download first
  * 	"choose"     — set the base dir only; the caller opens Sync settings to pick
  * 	"ondemand"   — virtual files (Cloud Files placeholders, download on open)
  * 

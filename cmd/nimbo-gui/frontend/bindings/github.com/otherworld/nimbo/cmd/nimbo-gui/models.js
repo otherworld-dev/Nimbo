@@ -547,6 +547,56 @@ export class BrowseEntry {
 }
 
 /**
+ * CloneRunDTO is a first sync in progress, for the Status window.
+ */
+export class CloneRunDTO {
+    /**
+     * Creates a new CloneRunDTO instance.
+     * @param {Partial<CloneRunDTO>} [$$source = {}] - The source object to create the CloneRunDTO.
+     */
+    constructor($$source = {}) {
+        if (!("localDir" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["localDir"] = "";
+        }
+        if (!("remoteRoot" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["remoteRoot"] = "";
+        }
+        if (!("first" in $$source)) {
+            /**
+             * pair-relative, in order
+             * @member
+             * @type {string[]}
+             */
+            this["first"] = [];
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new CloneRunDTO instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {CloneRunDTO}
+     */
+    static createFrom($$source = {}) {
+        const $$createField2_0 = $$createType0;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("first" in $$parsedSource) {
+            $$parsedSource["first"] = $$createField2_0($$parsedSource["first"]);
+        }
+        return new CloneRunDTO(/** @type {Partial<CloneRunDTO>} */($$parsedSource));
+    }
+}
+
+/**
  * ConflictItem is a pending conflict awaiting a choice, with both versions'
  * size and modified time so the user can decide.
  */
@@ -669,8 +719,8 @@ export class ConflictPreview {
      * @returns {ConflictPreview}
      */
     static createFrom($$source = {}) {
-        const $$createField0_0 = $$createType0;
-        const $$createField1_0 = $$createType0;
+        const $$createField0_0 = $$createType1;
+        const $$createField1_0 = $$createType1;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("local" in $$parsedSource) {
             $$parsedSource["local"] = $$createField0_0($$parsedSource["local"]);
@@ -956,7 +1006,7 @@ export class DiagnosticsDTO {
      * @returns {DiagnosticsDTO}
      */
     static createFrom($$source = {}) {
-        const $$createField13_0 = $$createType1;
+        const $$createField13_0 = $$createType0;
         const $$createField15_0 = $$createType3;
         const $$createField19_0 = $$createType3;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
@@ -1024,7 +1074,7 @@ export class FlyoutAppearanceDTO {
      * @returns {FlyoutAppearanceDTO}
      */
     static createFrom($$source = {}) {
-        const $$createField3_0 = $$createType1;
+        const $$createField3_0 = $$createType0;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("sections" in $$parsedSource) {
             $$parsedSource["sections"] = $$createField3_0($$parsedSource["sections"]);
@@ -1736,8 +1786,8 @@ export class PairDTO {
      * @returns {PairDTO}
      */
     static createFrom($$source = {}) {
-        const $$createField2_0 = $$createType1;
-        const $$createField5_0 = $$createType1;
+        const $$createField2_0 = $$createType0;
+        const $$createField5_0 = $$createType0;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("excludes" in $$parsedSource) {
             $$parsedSource["excludes"] = $$createField2_0($$parsedSource["excludes"]);
@@ -1932,6 +1982,14 @@ export class ProgressDTO {
              */
             this["enumerating"] = false;
         }
+        if (!("clones" in $$source)) {
+            /**
+             * Clones are the first syncs running (Status → First sync).
+             * @member
+             * @type {CloneRunDTO[]}
+             */
+            this["clones"] = [];
+        }
 
         Object.assign(this, $$source);
     }
@@ -1942,7 +2000,11 @@ export class ProgressDTO {
      * @returns {ProgressDTO}
      */
     static createFrom($$source = {}) {
+        const $$createField9_0 = $$createType7;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("clones" in $$parsedSource) {
+            $$parsedSource["clones"] = $$createField9_0($$parsedSource["clones"]);
+        }
         return new ProgressDTO(/** @type {Partial<ProgressDTO>} */($$parsedSource));
     }
 }
@@ -2435,9 +2497,11 @@ export class VersionDTO {
 }
 
 // Private type creation functions
-const $$createType0 = SidePreview.createFrom;
-const $$createType1 = $Create.Array($Create.Any);
+const $$createType0 = $Create.Array($Create.Any);
+const $$createType1 = SidePreview.createFrom;
 const $$createType2 = LockDTO.createFrom;
 const $$createType3 = $Create.Array($$createType2);
 const $$createType4 = NotifAction.createFrom;
 const $$createType5 = $Create.Array($$createType4);
+const $$createType6 = CloneRunDTO.createFrom;
+const $$createType7 = $Create.Array($$createType6);
