@@ -61,6 +61,11 @@ All notable changes to Nimbo are recorded here. The format follows
 - On Linux, deleting a folder that held read-only files no longer fails with
   permission denied and leaves folders that can't be opened, and folders an
   earlier build left that way are fixed on the next delete.
+- In on-demand mode, opening an online-only file in the first moments after Nimbo
+  starts now gets the same handling as any other download, it can be cancelled and
+  is given up on if the server stops sending, rather than possibly leaving the app
+  that opened it waiting. Before, a file opened while the folder was still being
+  set up went through an older download path that had neither (#701).
 - Switching from on-demand back to live mode no longer says that online-only files
   in excluded folders, such as an old `node_modules` on the server, will download
   after the switch. Live mode never syncs those, so the dialog now counts them
