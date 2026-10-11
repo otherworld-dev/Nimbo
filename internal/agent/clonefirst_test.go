@@ -187,6 +187,74 @@ func TestCloneSchedWaitsForListings(t *testing.T) {
 	}
 }
 
+// A choice made after a listing failed, or after every listing finished, is
+// never carved: no listing worker is left to run it, and the download workers
+// would wait for it for ever (the first sync stuck at "Syncing").
+func TestCloneSchedNoCarveWithNobodyToListIt(t *testing.T) {
+	s := newCloneSched("", nil)
+	s.addListing("A")
+	s.addListing("B")
+	a := s.nextListing()
+	b := s.nextListing()
+	if a.rel != "A" || b.rel != "B" {
+		t.Fatalf("listings = %s, %s", a.rel, b.rel)
+	}
+	s.failedListing(a, false) // A's PROPFIND failed
+	s.listingDone()
+	s.setFirst([]string{"A/Sub"})
+	s.mu.Lock()
+	n := len(s.pending)
+	s.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("a choice inside a failed listing was carved (%d waiting)", n)
+	}
+
+	s.seal(b)
+	s.listingDone()
+	if l := s.nextListing(); l != nil {
+		t.Fatalf("listing after all done = %v", l.rel)
+	}
+	// Listing is over; B was never planned with a carve, but a choice now
+	// still must not queue one.
+	b.sealed = false
+	s.setFirst([]string{"B/Sub"})
+	done := make(chan bool, 1)
+	go func() { _, _, ok := s.nextDownload(); done <- ok }()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("a download handed out from an empty queue")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("download worker waits for a listing nobody will run")
+	}
+}
+
+// A carved folder that 404s is only lost if the listing around it saw it: its
+// contents were left to the carve, so nobody fetched them and the clone must
+// not count as done. A 404 for a folder the server doesn't have is fine.
+func TestCloneSchedLostCarves(t *testing.T) {
+	s := newCloneSched("", nil)
+	s.addListing("Big")
+	s.setFirst([]string{"Big/Sub", "Big/Gone"})
+	var sub, gone *cloneListing
+	for i := 0; i < 3; i++ {
+		l := s.nextListing()
+		switch l.rel {
+		case "Big/Sub":
+			sub = l
+		case "Big/Gone":
+			gone = l
+		}
+	}
+	s.failedListing(sub, true)
+	s.failedListing(gone, true)
+	s.sawRow("Big/Sub") // Big listed Sub; Gone wasn't there
+	if got := s.lostCarves(); !reflect.DeepEqual(got, []string{"Big/Sub"}) {
+		t.Fatalf("lostCarves = %v, want [Big/Sub]", got)
+	}
+}
+
 // cloneTree is a remote account for the order tests: no files at the root, so
 // nothing is queued before the listings start.
 func cloneTree(files ...string) map[string]davNode {

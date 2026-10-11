@@ -3614,7 +3614,12 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 	list := func(l *cloneListing) {
 		entries, perr := e.client.PropFindRecursive(ctx, l.full)
 		if perr != nil {
-			if !(l.carved && errors.Is(perr, transport.ErrNotFound)) {
+			notFound := errors.Is(perr, transport.ErrNotFound)
+			sched.failedListing(l, notFound)
+			// A carved folder's 404 is only a failure if the listing holding
+			// it saw the folder (lostCarves, after listing): then its contents
+			// were left to this listing and nobody fetched them.
+			if !(l.carved && notFound) {
 				note(transfer.Stats{}, perr)
 			}
 			return
@@ -3636,6 +3641,9 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 				continue
 			}
 			for _, c := range carved {
+				if rel == c {
+					sched.sawRow(c)
+				}
 				if strings.HasPrefix(rel, c+"/") {
 					continue entry
 				}
@@ -3696,6 +3704,10 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 		}()
 	}
 	enwg.Wait() // every folder listed + counted
+	if lost := sched.lostCarves(); len(lost) > 0 {
+		// Not "done": the next pass resumes the clone and lists them again.
+		note(transfer.Stats{}, fmt.Errorf("could not list %s, which the server had just listed", strings.Join(lost, ", ")))
+	}
 	e.progMu.Lock()
 	e.prog.Enumerating = false
 	e.progMu.Unlock()

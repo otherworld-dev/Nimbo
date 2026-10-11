@@ -85,12 +85,14 @@ func cloneRank(first []string, rel string) int {
 // cloneListing is one recursive listing the clone still has to make, or has
 // made.
 type cloneListing struct {
-	rel    string // pair-relative folder listed (with everything under it)
-	full   string // files-root-relative, as PROPFIND takes it
-	carved bool   // a chosen folder listed on its own, out of a bigger listing
-	sealed bool   // being (or been) planned: nothing more is carved out of it
-	rank   int
-	seq    int64
+	rel     string // pair-relative folder listed (with everything under it)
+	full    string // files-root-relative, as PROPFIND takes it
+	carved  bool   // a chosen folder listed on its own, out of a bigger listing
+	sealed  bool   // being (or been) planned, or failed: nothing more is carved out of it
+	gone    bool   // carved, and the server said 404
+	rowSeen bool   // carved, and its own row turned up in the listing that holds it
+	rank    int
+	seq     int64
 }
 
 // cloneDir is one directory's downloads from one listing.
@@ -148,6 +150,10 @@ type cloneSched struct {
 	dirs     cloneDirHeap
 	seq      int64
 	stopped  bool
+	// listed is set once every listing has finished and the listing workers
+	// have left: a carve made after that would have no one to run it, and
+	// the download workers would wait for it for ever.
+	listed bool
 }
 
 func newCloneSched(root string, ignored func(string) bool) *cloneSched {
@@ -213,7 +219,7 @@ func (s *cloneSched) carveLocked(p string) {
 			deepest = l
 		}
 	}
-	if deepest == nil || deepest.rel == p || deepest.sealed {
+	if deepest == nil || deepest.rel == p || deepest.sealed || s.listed {
 		return
 	}
 	s.queueListingLocked(p, true)
@@ -243,6 +249,7 @@ func (s *cloneSched) nextListing() *cloneListing {
 			return l
 		}
 		if s.running == 0 {
+			s.listed = true
 			return nil
 		}
 		s.cond.Wait()
@@ -262,6 +269,45 @@ func (s *cloneSched) seal(l *cloneListing) (carved []string) {
 		}
 	}
 	return carved
+}
+
+// failedListing seals a listing whose PROPFIND failed, so nothing is carved
+// out of it afterwards (its files will never be planned, so a carve would
+// only add work that cannot change the outcome), and records a carved
+// folder's 404.
+func (s *cloneSched) failedListing(l *cloneListing, notFound bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l.sealed = true
+	if l.carved && notFound {
+		l.gone = true
+	}
+}
+
+// sawRow records that a listing holding the carved folder rel listed the
+// folder itself.
+func (s *cloneSched) sawRow(rel string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range s.listings {
+		if l.carved && l.rel == rel {
+			l.rowSeen = true
+		}
+	}
+}
+
+// lostCarves are carved folders whose own listing came back 404 although the
+// listing holding them listed the folder: their contents were left out of
+// that listing and fetched by nobody. Only meaningful once listing is over.
+func (s *cloneSched) lostCarves() (lost []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range s.listings {
+		if l.carved && l.gone && l.rowSeen {
+			lost = append(lost, l.rel)
+		}
+	}
+	return lost
 }
 
 // listingDone ends a listing handed out by nextListing (after its downloads
