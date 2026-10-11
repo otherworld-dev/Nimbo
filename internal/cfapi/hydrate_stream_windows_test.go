@@ -32,7 +32,7 @@ import (
 
 // streamRoot mounts a temp sync root whose byte-slice HydrateFunc must never
 // be reached: it counts its calls (checked by the caller) and fails the
-// transfer, so a test that accidentally exercises the fallback loop shows up
+// transfer, so a test that accidentally falls back to it shows up
 // as a failed read rather than as a silent pass.
 func streamRoot(t *testing.T, name string) (root string, connKey int64, sliceCalls *atomic.Int64) {
 	t.Helper()

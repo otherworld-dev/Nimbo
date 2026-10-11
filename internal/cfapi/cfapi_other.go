@@ -76,6 +76,11 @@ func Mount(string, string, string, HydrateFunc, ListFunc) (int64, error) {
 	return 0, errors.New("on-demand files are Windows-only")
 }
 
+// MountStream is unavailable off Windows (Supported() gates all callers).
+func MountStream(string, string, string, HydrateStreamFunc, ListFunc) (int64, error) {
+	return 0, errors.New("on-demand files are Windows-only")
+}
+
 // Unmount is a no-op on non-Windows platforms.
 func Unmount(string, int64) {}
 

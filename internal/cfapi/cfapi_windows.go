@@ -471,9 +471,12 @@ func dbg(format string, args ...any) {
 // starting at offset. identity is the blob set when the placeholder was created
 // (we use the UTF-8 remote path).
 //
-// It is the FALLBACK hydration path: one call — and therefore one HTTP request
-// — per transfer chunk. Install a HydrateStreamFunc instead (SetHydrateStream)
-// to serve a whole request from a single reader.
+// It is the older, simpler form: one call — and therefore, for a network
+// source, one HTTP request — per transfer chunk, with no context to abandon a
+// withdrawn request by. Prefer a HydrateStreamFunc (MountStream) to serve a
+// whole request from a single reader. A HydrateFunc is still served through
+// the same streaming path (see sliceStream), so it gets the stall watchdog and
+// CANCEL_FETCH_DATA all the same; it just cannot be interrupted mid-call.
 type HydrateFunc func(identity []byte, offset, length int64) ([]byte, error)
 
 // HydrateStreamFunc opens a reader over the byte range [offset, offset+length)
@@ -513,7 +516,7 @@ type provider struct {
 	// CANCEL_FETCH_DATA callbacks run on threads the OS is waiting on and
 	// must never queue behind rename delivery.
 	fetchMu       sync.Mutex
-	hydrateStream HydrateStreamFunc       // set after Mount via SetHydrateStream; nil = use hydrate
+	hydrateStream HydrateStreamFunc       // from MountStream or SetHydrateStream; nil = serve hydrate through sliceStream
 	inflight      map[int64]*fetchRequest // transferKey -> the download serving it
 	fetchClosed   bool                    // cancelFetches has run; no new download may start
 }
@@ -564,7 +567,25 @@ const (
 // Mount registers path as a sync root and connects a provider that hydrates
 // files (hydrate) and populates directories on demand (list). Returns a
 // connection key used to unmount.
+//
+// hydrate is served through the streaming path (see sliceStream). For a
+// network source use MountStream, which takes the streaming function from the
+// start.
 func Mount(path, displayName, iconPath string, hydrate HydrateFunc, list ListFunc) (int64, error) {
+	return mount(path, displayName, iconPath, &provider{path: path, hydrate: hydrate, list: list})
+}
+
+// MountStream is Mount with a streaming hydration function. The function is
+// in place before the provider is connected, so it serves the very first
+// FETCH_DATA: calling SetHydrateStream after Mount left a window — Mount
+// itself seeds the root from list, a network round trip — in which requests
+// were served by whatever byte-slice function Mount had been given.
+func MountStream(path, displayName, iconPath string, stream HydrateStreamFunc, list ListFunc) (int64, error) {
+	return mount(path, displayName, iconPath, &provider{path: path, hydrateStream: stream, list: list})
+}
+
+func mount(path, displayName, iconPath string, p *provider) (int64, error) {
+	list := p.list
 	// Step-by-step breadcrumbs: a mode switch once went silent for good inside
 	// this function on a live install with no stack obtainable (packaged app).
 	// If it happens again, the last line printed names the hung call.
@@ -611,7 +632,7 @@ func Mount(path, displayName, iconPath string, hydrate HydrateFunc, list ListFun
 		_ = UnregisterSyncRoot(path)
 		return 0, fmt.Errorf("CfConnectSyncRoot: 0x%08x", uint32(hr))
 	}
-	providers.Store(connKey, &provider{path: path, hydrate: hydrate, list: list})
+	providers.Store(connKey, p)
 	dbg("Mount %q: connected (conn=%d), checking root seed", path, connKey)
 
 	// Seed only the root's top level (its on-demand population is disabled).
@@ -712,15 +733,15 @@ func Purge(path string) error {
 		_ = UnregisterSyncRoot(path)
 		return nil
 	}
-	hydrate := func(identity []byte, offset, length int64) ([]byte, error) {
+	hydrate := func(context.Context, []byte, int64, int64) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("cfapi: purge (hydration disabled)")
 	}
-	connKey, err := Mount(path, "Nimbo", "", hydrate, nil)
+	connKey, err := MountStream(path, "Nimbo", "", hydrate, nil)
 	if err != nil {
 		// A stale registration can block re-register; clear it and retry once.
 		UnregisterShellSyncRoot(path)
 		_ = UnregisterSyncRoot(path)
-		connKey, err = Mount(path, "Nimbo", "", hydrate, nil)
+		connKey, err = MountStream(path, "Nimbo", "", hydrate, nil)
 	}
 	if err != nil {
 		// No provider available; unregister and remove best-effort.
@@ -1085,64 +1106,162 @@ func fetchDataCallback(info, params uintptr) uintptr {
 
 	pv, ok := providers.Load(connKey)
 	if !ok {
-		dbg("FETCH_DATA: no provider for conn=%d", connKey)
+		// Answer it anyway — failed — rather than leave the caller's open
+		// waiting out the filter's time-out. One synchronous CfExecute, no
+		// network, so it is as cheap as returning.
+		dbg("FETCH_DATA: no provider for conn=%d, failing the request", connKey)
+		failFetch(connKey, transferKey, reqOffset, reqLength)
 		return 0
 	}
 	p := pv.(*provider)
-	p.fetchMu.Lock()
-	stream := p.hydrateStream
-	p.fetchMu.Unlock()
 
 	identity := make([]byte, idLen) // copy — the OS buffer is only valid during the callback
 	if idLen > 0 {
 		copy(identity, unsafe.Slice((*byte)(unsafe.Pointer(idPtr)), idLen))
 	}
 
-	if stream != nil {
-		ctx, cancel := context.WithCancel(context.Background())
-		req, ok := p.trackFetch(transferKey, cancel)
-		if !ok {
-			// The mount is going away; the connection key is already dead, so
-			// there is nothing to complete and nothing worth downloading.
-			dbg("FETCH_DATA %q: the provider is shutting down, dropped", idStr)
-			return 0
-		}
-		go func() {
-			defer p.untrackFetch(transferKey, req)
-			defer cancel()
-			p.streamFetch(ctx, stream, connKey, transferKey, idStr, identity, reqOffset, reqLength)
-		}()
+	// ONE path for every request, whichever kind of hydration function the
+	// mount was given: tracked so CANCEL_FETCH_DATA and teardown can stop it,
+	// on its own context, under streamFetch's stall watchdog. (A byte-slice
+	// HydrateFunc used to run in a loop of its own with none of the three.)
+	ctx, cancel := context.WithCancel(context.Background())
+	req, ok := p.trackFetch(transferKey, cancel)
+	if !ok {
+		// The mount is going away; the connection key is already dead, so
+		// there is nothing to complete and nothing worth downloading.
+		dbg("FETCH_DATA %q: the provider is shutting down, dropped", idStr)
 		return 0
 	}
-
-	hyd := p.hydrate
+	stream := p.fetchStream()
 	go func() {
-		off := reqOffset
-		remaining := reqLength
-		for remaining > 0 {
-			n := int64(cfTransferChunk)
-			if n > remaining {
-				n = remaining
-			}
-			data, err := hyd(identity, off, n)
-			if err != nil || len(data) == 0 {
-				// Complete the request as FAILED rather than walking away:
-				// an abandoned request leaves the caller's open blocked
-				// until the filter's own time-out (measured: 180s).
-				dbg("FETCH_DATA %q: hydrate offset=%d len=%d: %v", idStr, off, n, err)
-				cfTransferFail(connKey, transferKey, off, remaining)
-				return
-			}
-			if !cfTransfer(connKey, transferKey, off, data) {
-				cfTransferFail(connKey, transferKey, off, remaining)
-				return
-			}
-			off += int64(len(data))
-			remaining -= int64(len(data))
-		}
+		defer p.untrackFetch(transferKey, req)
+		defer cancel()
+		p.streamFetch(ctx, stream, connKey, transferKey, idStr, identity, reqOffset, reqLength)
 	}()
 	return 0
 }
+
+// fetchStream is the hydration function to serve the next FETCH_DATA with: the
+// streaming one when the mount has one, else the byte-slice HydrateFunc
+// adapted to stream (sliceStream), else nil (streamFetch fails the request).
+func (p *provider) fetchStream() HydrateStreamFunc {
+	p.fetchMu.Lock()
+	stream := p.hydrateStream
+	p.fetchMu.Unlock()
+	if stream != nil {
+		return stream
+	}
+	if p.hydrate != nil {
+		return sliceStream(p.hydrate)
+	}
+	return nil
+}
+
+// cfEOF is cfapi.h's CF_EOF: a length meaning "to the end of the file".
+const cfEOF = int64(-1)
+
+// failFetch completes as failed a request with no usable range (a
+// RequiredLength of zero or less) or one there is nothing to serve with.
+//
+// Why a failure, and why Length = CF_EOF — both measured live (2026-10-11,
+// Windows 11 26200): CfExecute(TRANSFER_DATA) rejects ANY completion whose
+// Length is 0, success and failure alike, with 0x8007017C
+// (ERROR_CLOUD_FILE_INVALID_REQUEST), and the request stays open. So the
+// zero-length success a zero-length request seems to call for is not one the
+// filter will take; sending it would leave the caller waiting out the
+// filter's time-out exactly as returning silently did. A failure with
+// Length = CF_EOF ("from offset to the end of the file") IS accepted and
+// fails the open at once. The filter has not been seen to send such a
+// request — a zero-size placeholder is read without any FETCH_DATA — so this
+// is a guard rather than a path real files take. What it must never do is
+// open a stream: a range with no length reads to the end of the file
+// (transport's GetRange sends an un-ranged GET at offset 0, an open-ended
+// "bytes=<offset>-" past it), and then nothing is transferred. Pinned live by
+// TestZeroLengthCompletionIsRejectedButAnEOFFailIsNot.
+//
+// A request with a real length is failed for that length, as everywhere else.
+func failFetch(connKey, transferKey, offset, length int64) {
+	if length <= 0 {
+		length = cfEOF
+	}
+	execTransferFail(connKey, transferKey, offset, length)
+}
+
+// sliceStream adapts a byte-slice HydrateFunc to a HydrateStreamFunc so it is
+// served by streamFetch like any other: one hydrate call per cfTransferChunk
+// of the requested range, as the old loop made, but with the request tracked
+// for CANCEL_FETCH_DATA and under the stall watchdog.
+func sliceStream(hydrate HydrateFunc) HydrateStreamFunc {
+	return func(ctx context.Context, identity []byte, offset, length int64) (io.ReadCloser, error) {
+		return &sliceReader{ctx: ctx, hydrate: hydrate, identity: identity, off: offset, remaining: length}, nil
+	}
+}
+
+// sliceReader reads a byte range through repeated HydrateFunc calls.
+//
+// A HydrateFunc takes no context, so a call cannot be interrupted: each one
+// runs on its own goroutine and Read stops waiting for it once ctx is done —
+// the request withdrawn, or the stall watchdog fired — so the request is
+// still answered on time. The abandoned call finishes in the background and
+// its bytes are dropped.
+type sliceReader struct {
+	ctx       context.Context
+	hydrate   HydrateFunc
+	identity  []byte
+	off       int64 // next offset to ask hydrate for
+	remaining int64 // bytes of the range not yet asked for
+	pending   []byte
+}
+
+type sliceResult struct {
+	data []byte
+	err  error
+}
+
+func (r *sliceReader) Read(p []byte) (int, error) {
+	if len(r.pending) == 0 {
+		if r.remaining <= 0 {
+			return 0, io.EOF
+		}
+		if err := r.ctx.Err(); err != nil {
+			return 0, err
+		}
+		n := int64(cfTransferChunk)
+		if n > r.remaining {
+			n = r.remaining
+		}
+		done := make(chan sliceResult, 1) // buffered: an abandoned call must not block for ever
+		off := r.off
+		go func() {
+			data, err := r.hydrate(r.identity, off, n)
+			done <- sliceResult{data, err}
+		}()
+		var got sliceResult
+		select {
+		case <-r.ctx.Done():
+			return 0, r.ctx.Err()
+		case got = <-done:
+		}
+		if got.err != nil {
+			return 0, fmt.Errorf("hydrate offset=%d len=%d: %w", off, n, got.err)
+		}
+		if len(got.data) == 0 {
+			// Nothing and no error: the old loop failed the request here too.
+			return 0, fmt.Errorf("hydrate offset=%d len=%d returned no data: %w", off, n, io.ErrUnexpectedEOF)
+		}
+		if int64(len(got.data)) > n {
+			got.data = got.data[:n] // never more than was asked for
+		}
+		r.pending = got.data
+		r.off += int64(len(got.data))
+		r.remaining -= int64(len(got.data))
+	}
+	c := copy(p, r.pending)
+	r.pending = r.pending[c:]
+	return c, nil
+}
+
+func (r *sliceReader) Close() error { return nil }
 
 // streamFetch serves one whole FETCH_DATA request from a single reader,
 // handing the bytes to the filter a piece at a time. A piece is up to
@@ -1167,7 +1286,20 @@ func fetchDataCallback(info, params uintptr) uintptr {
 //
 // A stream that delivers nothing for readStallLimit, opening included, is
 // cancelled here and the request failed (see cfReadStallLimit).
+//
+// A request with no length, or with no stream to serve it, is failed without
+// opening anything (see failFetch).
 func (p *provider) streamFetch(ctx context.Context, stream HydrateStreamFunc, connKey, transferKey int64, idStr string, identity []byte, reqOffset, reqLength int64) {
+	if reqLength <= 0 {
+		dbg("FETCH_DATA %q: no range to serve (offset=%d length=%d), failing the request", idStr, reqOffset, reqLength)
+		failFetch(connKey, transferKey, reqOffset, reqLength)
+		return
+	}
+	if stream == nil {
+		dbg("FETCH_DATA %q: the mount has no hydration function, failing the request", idStr)
+		failFetch(connKey, transferKey, reqOffset, reqLength)
+		return
+	}
 	ctx, stop := context.WithCancelCause(ctx)
 	defer stop(nil)
 	limit := readStallLimit()
@@ -1519,8 +1651,9 @@ func fetchPlaceholdersCallback(info, params uintptr) uintptr {
 // SetHydrateStream installs (nil clears) the streaming hydration function for
 // the mount identified by connKey. While one is installed it serves every
 // FETCH_DATA request — one reader per request — and the byte-slice HydrateFunc
-// passed to Mount is not used at all. Set it right after Mount, before
-// anything can open a placeholder.
+// passed to Mount is not used at all; cleared, requests go back to that
+// HydrateFunc, or fail if the mount has none. To have it serve the very first
+// request, mount with MountStream rather than setting it afterwards.
 func SetHydrateStream(connKey int64, f HydrateStreamFunc) {
 	pv, ok := providers.Load(connKey)
 	if !ok {
