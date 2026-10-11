@@ -570,7 +570,7 @@
       let sum: any = null;
       try { sum = JSON.parse(raw); } catch { sum = null; }
       if (sum?.error) { tell({ title: "File availability", message: sum.error }); syncMode = await App.GetSyncMode(); return; }
-      if (sum && (sum.hydrated || sum.dehydrated)) { revert = sum; return; }
+      if (sum && (sum.hydrated || sum.dehydrated || sum.ignored)) { revert = sum; return; }
       // Nothing mounted/nothing to revert — plain switch below.
     }
     if (syncMode === "ondemand") {
@@ -693,7 +693,7 @@
     if (!revert) return;
     fresh = {
       target: "live", dir: revert.dir,
-      total: (revert.hydrated || 0) + (revert.dehydrated || 0),
+      total: (revert.hydrated || 0) + (revert.dehydrated || 0) + (revert.ignored || 0),
       localOnly: 0, changed: 0,
     };
     revert = null;
@@ -921,7 +921,8 @@
             <p class="hint">Your files in <b>{revert.dir}</b> go back to being ordinary files, in place.</p>
             <ul class="hint">
               {#if revert.hydrated}<li><b>{revert.hydrated.toLocaleString()}</b> are on this PC — converted back instantly, nothing transferred.</li>{/if}
-              {#if revert.dehydrated}<li><b>{revert.dehydrated.toLocaleString()}</b> are online-only — they'll download through normal syncing after the switch ({mb(revert.downloadBytes)}).</li>{/if}
+              {#if revert.dehydrated}<li><b>{revert.dehydrated.toLocaleString()}</b> are online-only. They'll download through normal syncing after the switch ({mb(revert.downloadBytes)}).</li>{/if}
+              {#if revert.ignored}<li><b>{revert.ignored.toLocaleString()}</b> {revert.ignored === 1 ? "is" : "are"} online-only in folders that normal syncing skips (your exclusions, such as node_modules). {revert.ignored === 1 ? "It stays" : "They stay"} on the server and won't download.</li>{/if}
             </ul>
             <p class="hint">Your sync folders are restored automatically.</p>
             <div class="addbtns">
