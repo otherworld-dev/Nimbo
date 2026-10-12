@@ -1132,7 +1132,9 @@ func (a *App) resumeFrozen(localDir string) string {
 	if err := a.eng.ClearFreeze(localDir); err != nil {
 		return err.Error()
 	}
-	a.eng.TriggerSync() // run the pass the user just approved, rather than waiting for the poll
+	// Run the pass the user just approved. The pause itself counted as a failed
+	// pass, so a plain trigger would be dropped by the backoff that started.
+	a.eng.TriggerUserSync()
 	return ""
 }
 
@@ -1771,13 +1773,24 @@ func parkServerCopy(eng *agent.Engine, ctx context.Context, remotePath string) e
 	return nil
 }
 
+// parkMu serialises parkName.
+var parkMu sync.Mutex
+
 // parkName moves a file aside under a conflicted-copy name that is free on the
 // server and returns the name it got. move must refuse a destination that
 // exists (transport.ErrDestinationExists); the next name, a second on, is then
 // tried. The name alone is not unique: a file and an older conflicted copy of
 // it, both parked within one second, map to the same one, and a MOVE that
 // replaces its destination destroyed the copy parked first (Deck #924).
+//
+// Parks run one at a time (parkMu). Uploads run in parallel, so two files that
+// map to the same name sent their MOVEs in the same instant, before either
+// could find the name taken: Nextcloud's file locking then refused BOTH with a
+// 500 (LockedException on the destination) and both retried together, for
+// ever. Measured on the test VM against a real server, 2026-10-12.
 func parkName(remotePath string, now time.Time, move func(dst string) error) (string, error) {
+	parkMu.Lock()
+	defer parkMu.Unlock()
 	src := strings.Trim(remotePath, "/")
 	for i := 0; i < transfer.ConflictNameTries; i++ {
 		dst := conflictNameAt(remotePath, now.Add(time.Duration(i)*time.Second))
@@ -2473,7 +2486,7 @@ func (a *App) ClearStatusMessage() {
 // SyncNow triggers an immediate sync of all folders.
 func (a *App) SyncNow() {
 	if a.eng != nil {
-		a.eng.TriggerSync()
+		a.eng.TriggerUserSync() // asked for by name: not held back by a failure backoff
 	}
 }
 
