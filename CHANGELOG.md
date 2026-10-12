@@ -37,6 +37,12 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ### Changed
 
+- Syncing now also pauses for review when a single change from the server would
+  remove or replace more than 1,000 of your files, however large the folder is.
+  Until now it only paused when 50 or more files and at least half of the whole
+  sync folder were affected, which on a large account meant losing over half of
+  everything. If you clear out that many files yourself on another device, check
+  the list and press Resume syncing (#947).
 - Choose folders (Settings → Folders) is now a tree you can expand, with the size
   of each folder next to it and a part-ticked box on any folder with something
   unticked inside it. It only lists folders, sorted A-Z, and leaves out anything
@@ -93,6 +99,11 @@ All notable changes to Nimbo are recorded here. The format follows
   the sync straight away. Both could be ignored for several minutes, up to an
   hour, because the paused folder counted as a failed sync and Nimbo was waiting
   before trying again (#589).
+- A folder renamed or moved on the server is now just renamed on this PC when the
+  change arrives. Nimbo was deleting the folder's files and downloading them all
+  again, and a big rename could pause syncing for review as if the files had been
+  lost. Only the hourly full check handled a rename properly, the quick checks
+  that follow most changes did not (#947).
 
 ## [0.2.0] - 2026-09-26
 

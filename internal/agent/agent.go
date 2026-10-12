@@ -4244,7 +4244,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 				if counts.Deletions, err = deletionWeight(st, pk, actions, engine.ActDeleteLocal); err != nil {
 					return transfer.Stats{}, fmt.Errorf("damage guard: cannot weigh deletions: %w", err)
 				}
-				if reason, trips := syncguard.Trips(counts, known, syncguard.DefaultFloor, syncguard.DefaultPct); trips {
+				if reason, trips := syncguard.Trips(counts, known, syncguard.DefaultFloor, syncguard.DefaultPct, syncguard.DefaultCeiling); trips {
 					return transfer.Stats{}, e.tripGuard(p, reason, counts, known)
 				}
 			}
@@ -4835,7 +4835,13 @@ func (e *Engine) syncRemoteDelta(ctx context.Context, p Pair) (transfer.Stats, e
 	ig.FilterLocal(local)
 	ig.FilterRemote(remoteSub)
 
-	actions := engine.Diff(baseSub, remoteSub, local)
+	// Coalesce server-side renames, as the full pass does: a file that moved
+	// keeps its oc:fileid, so DeleteLocal(old) + Download(new) is rewritten to a
+	// local rename. Without it a folder renamed in the web UI was deleted here
+	// and downloaded again in full, and the deletions it was planned as tripped
+	// the damage guard (61 of 91 files on the test VM, Deck #947). Local
+	// renames are the watcher's business (planPaths), so no hashing here.
+	actions := engine.CoalesceRenames(engine.Diff(baseSub, remoteSub, local), baseSub, remoteSub, local, nil)
 	pruneDeadBaselines(st, pk, baseSub, remoteSub, local)
 	deltaCompute := time.Since(tDelta)
 	slog.Info("remote-delta timing",

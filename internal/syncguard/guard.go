@@ -27,6 +27,11 @@ const sampleLimit = 20
 const (
 	DefaultFloor = 50
 	DefaultPct   = 50
+	// DefaultCeiling pauses any one pass that would delete or replace more
+	// than this many files, however small a share of the folder that is. A
+	// deliberate clear-out that large, made on another device, pauses once for
+	// review; a server-side rename is a move and is not counted at all.
+	DefaultCeiling = 1000
 )
 
 // Counts summarises how destructive a plan is for the local copy.
@@ -72,21 +77,32 @@ func Count(actions []engine.Action, base map[string]engine.BaselineState) Counts
 // Trips reports whether a plan looks like server-side damage rather than
 // intentional change, and why.
 //
-// Both thresholds must be cleared. The floor stops a four-file folder freezing
-// the moment two files change; the percentage stops a big folder freezing over
-// routine churn. Same shape as the existing server-side guard in internal/agent,
-// so there is one concept in the product rather than two.
-func Trips(c Counts, known, floor, pct int) (reason string, trips bool) {
+// The floor and the percentage must both be cleared. The floor stops a
+// four-file folder freezing the moment two files change; the percentage stops
+// a big folder freezing over routine churn. Same shape as the existing
+// server-side guard in internal/agent, so there is one concept in the product
+// rather than two.
+//
+// The ceiling is a second, independent rule: a pass that would remove or
+// replace MORE than ceiling files trips whatever share of the folder that is
+// (0 switches it off). The percentage is of the whole sync folder, so with one
+// whole-account folder it only ever caught losing over half the account.
+func Trips(c Counts, known, floor, pct, ceiling int) (reason string, trips bool) {
 	total := c.Total()
 	if known <= 0 || total < floor {
 		return "", false
 	}
-	if total*100 < known*pct {
-		return "", false
+	if total*100 >= known*pct {
+		return fmt.Sprintf(
+			"this run would remove %d and replace %d of %d known file(s) (%d%%)",
+			c.Deletions, c.Overwrites, known, total*100/known), true
 	}
-	return fmt.Sprintf(
-		"this run would remove %d and replace %d of %d known file(s) (%d%%)",
-		c.Deletions, c.Overwrites, known, total*100/known), true
+	if ceiling > 0 && total > ceiling {
+		return fmt.Sprintf(
+			"this run would remove %d and replace %d of %d known file(s), more than %d in one go",
+			c.Deletions, c.Overwrites, known, ceiling), true
+	}
+	return "", false
 }
 
 // ScanTrips reports whether a remote listing itself looks wrong, before any
