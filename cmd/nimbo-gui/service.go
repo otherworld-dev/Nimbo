@@ -1758,8 +1758,10 @@ func (a *App) uploadWithConflictFor(eng *agent.Engine, etags *etagStore) func(ct
 // parkServerCopy moves the server's version of remotePath aside as a
 // "conflicted copy" sibling, surfacing the conflict to the user.
 func parkServerCopy(eng *agent.Engine, ctx context.Context, remotePath string) error {
-	conflict := conflictName(remotePath)
-	if err := eng.MoveRemote(ctx, remotePath, conflict); err != nil {
+	conflict, err := parkName(remotePath, time.Now(), func(dst string) error {
+		return eng.MoveRemoteNoReplace(ctx, remotePath, dst)
+	})
+	if err != nil {
 		slog.Warn("vfs conflict: could not park server copy", "remote", remotePath, "err", err)
 		return err
 	}
@@ -1769,10 +1771,38 @@ func parkServerCopy(eng *agent.Engine, ctx context.Context, remotePath string) e
 	return nil
 }
 
+// parkName moves a file aside under a conflicted-copy name that is free on the
+// server and returns the name it got. move must refuse a destination that
+// exists (transport.ErrDestinationExists); the next name, a second on, is then
+// tried. The name alone is not unique: a file and an older conflicted copy of
+// it, both parked within one second, map to the same one, and a MOVE that
+// replaces its destination destroyed the copy parked first (Deck #924).
+func parkName(remotePath string, now time.Time, move func(dst string) error) (string, error) {
+	src := strings.Trim(remotePath, "/")
+	for i := 0; i < transfer.ConflictNameTries; i++ {
+		dst := conflictNameAt(remotePath, now.Add(time.Duration(i)*time.Second))
+		if dst == src {
+			continue // a copy parked this very second: its new name is its own
+		}
+		err := move(dst)
+		if errors.Is(err, transport.ErrDestinationExists) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		return dst, nil
+	}
+	return "", fmt.Errorf("no free conflicted-copy name for %s", remotePath)
+}
+
 // conflictName builds a "<name> (conflicted copy <date>)<ext>" sibling path.
 // A marker already in the name is replaced, never stacked (transfer.conflictName
 // has the same rule): stacking grew one field filename past MAX_PATH.
-func conflictName(remote string) string {
+func conflictName(remote string) string { return conflictNameAt(remote, time.Now()) }
+
+// conflictNameAt is conflictName with the marker's timestamp given.
+func conflictNameAt(remote string, t time.Time) string {
 	dir, file := "", strings.Trim(remote, "/")
 	if i := strings.LastIndex(file, "/"); i >= 0 {
 		dir, file = file[:i+1], file[i+1:]
@@ -1782,7 +1812,7 @@ func conflictName(remote string) string {
 	if j := strings.LastIndex(file, "."); j > 0 {
 		stem, ext = file[:j], file[j:]
 	}
-	return dir + stem + " (conflicted copy " + time.Now().Format("2006-01-02 150405") + ")" + ext
+	return dir + stem + " (conflicted copy " + t.Format("2006-01-02 150405") + ")" + ext
 }
 
 // OfflineEntry is one folder in the "available offline" browser.

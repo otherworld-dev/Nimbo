@@ -84,6 +84,11 @@ All notable changes to Nimbo are recorded here. The format follows
   server path impossible to open or delete, and Nimbo now creates any entry with a
   path of 64 bytes or more on its own rather than only those of 128 or more, as a
   margin for Windows versions the fault wasn't measured on (#685).
+- Two conflicts in the same folder can no longer be given the same "conflicted
+  copy" name. A file and an older conflicted copy of it, both in conflict within
+  the same second, got one name between them and the second replaced the first,
+  so one of your versions was lost. Each now gets a name of its own, on this PC
+  and on the server, in both live and on-demand mode.
 
 ## [0.2.0] - 2026-09-26
 

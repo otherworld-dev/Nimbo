@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/otherworld/nimbo/internal/engine"
@@ -364,12 +365,7 @@ func (e *Executor) resolveConflict(ctx context.Context, a engine.Action) (res re
 // aside (as a conflicted copy) and clearing the baseline, so the next reconcile
 // brings the remote version down fresh and uploads the aside copy as new.
 func (e *Executor) resolveTypeConflict(rel string) error {
-	localP := e.localPath(rel)
-	confLocal := e.localPath(conflictName(rel))
-	if err := os.MkdirAll(filepath.Dir(confLocal), 0o755); err != nil {
-		return err
-	}
-	if err := os.Rename(localP, confLocal); err != nil {
+	if _, err := SetAsideAsConflict(e.LocalRoot, rel); err != nil {
 		return err
 	}
 	return e.deleteBaseline(rel)
@@ -392,17 +388,12 @@ func (e *Executor) keepBoth(ctx context.Context, rel string) error {
 // keepBothFrom is keepBoth with the server's version already downloaded to tmp.
 func (e *Executor) keepBothFrom(ctx context.Context, rel, tmp string, dres FileResult) error {
 	localP := e.localPath(rel)
-	confRel := conflictName(rel)
+	confRel, err := SetAsideAsConflict(e.LocalRoot, rel)
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
 	confLocal := e.localPath(confRel)
-
-	if err := os.MkdirAll(filepath.Dir(confLocal), 0o755); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(localP, confLocal); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
 	if err := os.Rename(tmp, localP); err != nil {
 		_ = os.Rename(confLocal, localP) // put the user's file back under its name
 		_ = os.Remove(tmp)
@@ -463,9 +454,54 @@ func StripConflictMarkers(s string) string { return conflictMarker.ReplaceAllStr
 // conflictName inserts a " (conflicted copy <timestamp>)" marker before the file
 // extension, mirroring the convention users recognise from other sync clients.
 // Any marker already in the name is replaced, never stacked.
-func conflictName(rel string) string {
+func conflictName(rel string) string { return conflictNameAt(rel, time.Now()) }
+
+// conflictNameAt is conflictName with the marker's timestamp given.
+func conflictNameAt(rel string, t time.Time) string {
 	ext := path.Ext(rel)
 	stem := StripConflictMarkers(strings.TrimSuffix(rel, ext))
-	ts := time.Now().Format("2006-01-02 150405")
-	return stem + " (conflicted copy " + ts + ")" + ext
+	return stem + " (conflicted copy " + t.Format("2006-01-02 150405") + ")" + ext
+}
+
+// ConflictNameTries is how many names, one second apart, are tried for a free
+// conflicted-copy name before giving up.
+const ConflictNameTries = 60
+
+// conflictMu serialises SetAsideAsConflict: choosing a free name and renaming
+// onto it are two steps, and conflicts are resolved by several workers at once.
+var conflictMu sync.Mutex
+
+// SetAsideAsConflict renames the file or folder at rel (slash-separated, under
+// root) to a conflicted-copy name that is not in use, and returns that name.
+//
+// The name alone is not unique: conflictName strips an older marker and stamps
+// the current second, so a file and an earlier conflicted copy of it, both in
+// conflict within one second, map to the same name, and a rename replaces an
+// existing target. The second rename then destroyed the first conflicted copy,
+// the only place that version of the user's file was kept (Deck #924). So the
+// name is checked first, and when it is taken the timestamp moves on a second
+// at a time until one is free. The marker keeps its one format that way, and
+// the copy is off by a few seconds at most.
+func SetAsideAsConflict(root, rel string) (string, error) {
+	conflictMu.Lock()
+	defer conflictMu.Unlock()
+	src := filepath.Join(root, filepath.FromSlash(rel))
+	now := time.Now()
+	for i := 0; i < ConflictNameTries; i++ {
+		conf := conflictNameAt(rel, now.Add(time.Duration(i)*time.Second))
+		dst := filepath.Join(root, filepath.FromSlash(conf))
+		if _, err := os.Lstat(dst); err == nil {
+			continue // taken (it may be rel itself, a conflicted copy made this second)
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return "", err
+		}
+		if err := os.Rename(src, dst); err != nil {
+			return "", err
+		}
+		return conf, nil
+	}
+	return "", fmt.Errorf("no free conflicted-copy name for %s", rel)
 }

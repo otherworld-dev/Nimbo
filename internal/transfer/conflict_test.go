@@ -2,10 +2,13 @@ package transfer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/engine"
 )
@@ -129,4 +132,91 @@ func writeTemp(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// SetAsideAsConflict never renames onto a name in use. Every file below maps to
+// the same conflicted-copy name within one second; set aside at once by
+// several workers, as the executor does, each must keep its own content.
+func TestSetAsideAsConflictGivesEachFileItsOwnName(t *testing.T) {
+	root := t.TempDir()
+	rels := []string{"a/doc.txt"}
+	for i := 0; i < 7; i++ {
+		rels = append(rels, fmt.Sprintf("a/doc (conflicted copy 2026-08-16 00072%d).txt", i))
+	}
+	if err := os.MkdirAll(filepath.Join(root, "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i, rel := range rels {
+		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(rel)), []byte(fmt.Sprintf("version %d", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var wg sync.WaitGroup
+	names := make([]string, len(rels))
+	errs := make([]error, len(rels))
+	for i, rel := range rels {
+		wg.Add(1)
+		go func(i int, rel string) {
+			defer wg.Done()
+			names[i], errs[i] = SetAsideAsConflict(root, rel)
+		}(i, rel)
+	}
+	wg.Wait()
+	seen := map[string]bool{}
+	for i, name := range names {
+		if errs[i] != nil {
+			t.Fatalf("%s: %v", rels[i], errs[i])
+		}
+		if seen[name] {
+			t.Fatalf("the name %q was given out twice", name)
+		}
+		seen[name] = true
+		if strings.Count(name, "(conflicted copy") != 1 {
+			t.Errorf("%q does not carry exactly one marker", name)
+		}
+		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil || string(b) != fmt.Sprintf("version %d", i) {
+			t.Errorf("%s -> %s holds %q (err %v), want version %d", rels[i], name, b, err, i)
+		}
+	}
+	entries, _ := os.ReadDir(filepath.Join(root, "a"))
+	if len(entries) != len(rels) {
+		t.Errorf("%d files left, want %d", len(entries), len(rels))
+	}
+}
+
+// A conflicted copy made this very second conflicts again: its new name would
+// be its own, so it moves on to the next second rather than staying put under
+// a name the caller then treats as a fresh copy. A folder is set aside the same
+// way (the file/folder type conflict).
+func TestSetAsideAsConflictSkipsItsOwnNameAndTakesFolders(t *testing.T) {
+	root := t.TempDir()
+	self := conflictNameAt("doc.txt", time.Now().Add(time.Second))
+	// Cover this second and the next, whichever the call lands in.
+	for _, rel := range []string{conflictNameAt("doc.txt", time.Now()), self} {
+		if err := os.WriteFile(filepath.Join(root, rel), []byte(rel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := SetAsideAsConflict(root, self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == self {
+		t.Fatalf("set aside onto its own name %q", got)
+	}
+	if b, err := os.ReadFile(filepath.Join(root, got)); err != nil || string(b) != self {
+		t.Fatalf("content after the move = %q err=%v", b, err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(root, "dir", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	name, err := SetAsideAsConflict(root, "dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(filepath.Join(root, name, "sub")); err != nil || !fi.IsDir() {
+		t.Fatalf("the folder's contents did not move with it: %v", err)
+	}
 }
