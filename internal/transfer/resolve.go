@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -22,26 +23,19 @@ func (e *Executor) applyMove(ctx context.Context, a engine.Action) error {
 	switch a.Kind {
 	case engine.ActMoveLocal:
 		from, to := e.localPath(a.Path), e.localPath(a.Dest)
-		// Never onto something that is already there: a rename replaces its
-		// target. The plan only moves onto a free path (CoalesceRenames), so a
-		// file here appeared since; fail and let the next pass plan it again
-		// with that file in view.
-		//
-		// On a case-insensitive disk a rename that only changes the capitals
-		// (Report.txt to report.txt) finds "something" at the new name: the
-		// file itself. That one is the move asked for, so it goes ahead.
-		if there, err := os.Lstat(to); err == nil {
-			self, serr := os.Lstat(from)
-			if serr != nil || !os.SameFile(self, there) {
-				return fmt.Errorf("cannot rename %s to %s: something is already there", a.Path, a.Dest)
-			}
-		} else if !os.IsNotExist(err) {
-			return err
-		}
 		if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
 			return err
 		}
-		if err := os.Rename(from, to); err != nil {
+		// Never onto something that is already there: a plain rename replaces
+		// its target. The plan only moves onto a free path (CoalesceRenames), so
+		// a file here appeared since; fail and let the next pass plan it again
+		// with that file in view. renameNoReplace leaves the refusing to the OS,
+		// in the same call as the rename, and lets through a rename that only
+		// changes the capitals of the file itself (Report.txt to report.txt).
+		if err := renameNoReplace(from, to); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return fmt.Errorf("cannot rename %s to %s: something is already there", a.Path, a.Dest)
+			}
 			return err
 		}
 	case engine.ActMoveRemote:
@@ -506,15 +500,16 @@ func SetAsideAsConflict(root, rel string) (string, error) {
 	for i := 0; i < ConflictNameTries; i++ {
 		conf := conflictNameAt(rel, now.Add(time.Duration(i)*time.Second))
 		dst := filepath.Join(root, filepath.FromSlash(conf))
-		if _, err := os.Lstat(dst); err == nil {
-			continue // taken (it may be rel itself, a conflicted copy made this second)
-		} else if !os.IsNotExist(err) {
-			return "", err
+		if conf == rel {
+			continue // a conflicted copy made this very second: its new name is its own
 		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return "", err
 		}
-		if err := os.Rename(src, dst); err != nil {
+		if err := renameNoReplace(src, dst); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue // taken: the next second's name
+			}
 			return "", err
 		}
 		return conf, nil
