@@ -129,3 +129,24 @@ func TestKeepBothNeverOverwritesAnotherConflictedCopy(t *testing.T) {
 		}
 	}
 }
+
+// A local move (a rename made on the server) never replaces a file that is
+// already at the destination: the rename would destroy it with no download
+// planned and nothing counted by the damage guard (Deck #947).
+func TestApplyMoveLocalRefusesAnExistingDestination(t *testing.T) {
+	c, _ := conflictServer(t, 0)
+	ex := conflictExecutor(t, c)
+	if err := os.WriteFile(filepath.Join(ex.LocalRoot, "taken.txt"), []byte("mine, not synced"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := ex.applyMove(context.Background(), engine.Action{Kind: engine.ActMoveLocal, Path: "doc.txt", Dest: "taken.txt"})
+	if err == nil {
+		t.Fatal("the move replaced a file that was already there")
+	}
+	if b, _ := os.ReadFile(filepath.Join(ex.LocalRoot, "taken.txt")); string(b) != "mine, not synced" {
+		t.Fatalf("the file at the destination was changed: %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(ex.LocalRoot, "doc.txt")); string(b) != "local edit" {
+		t.Fatalf("the file being moved was lost: %q", b)
+	}
+}
