@@ -26,8 +26,15 @@ func (e *Executor) applyMove(ctx context.Context, a engine.Action) error {
 		// target. The plan only moves onto a free path (CoalesceRenames), so a
 		// file here appeared since; fail and let the next pass plan it again
 		// with that file in view.
-		if _, err := os.Lstat(to); err == nil {
-			return fmt.Errorf("cannot rename %s to %s: something is already there", a.Path, a.Dest)
+		//
+		// On a case-insensitive disk a rename that only changes the capitals
+		// (Report.txt to report.txt) finds "something" at the new name: the
+		// file itself. That one is the move asked for, so it goes ahead.
+		if there, err := os.Lstat(to); err == nil {
+			self, serr := os.Lstat(from)
+			if serr != nil || !os.SameFile(self, there) {
+				return fmt.Errorf("cannot rename %s to %s: something is already there", a.Path, a.Dest)
+			}
 		} else if !os.IsNotExist(err) {
 			return err
 		}

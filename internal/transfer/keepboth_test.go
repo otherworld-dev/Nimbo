@@ -150,3 +150,25 @@ func TestApplyMoveLocalRefusesAnExistingDestination(t *testing.T) {
 		t.Fatalf("the file being moved was lost: %q", b)
 	}
 }
+
+// A rename that only changes the capitals is not "something already there":
+// on a case-insensitive disk the new name resolves to the file being moved.
+// Refusing it left a server-side Report.txt -> report.txt unapplied for ever.
+func TestApplyMoveLocalAllowsACaseOnlyRename(t *testing.T) {
+	c, _ := conflictServer(t, 0)
+	ex := conflictExecutor(t, c)
+	if err := ex.applyMove(context.Background(), engine.Action{Kind: engine.ActMoveLocal, Path: "doc.txt", Dest: "DOC.txt"}); err != nil {
+		t.Fatalf("a case-only rename was refused: %v", err)
+	}
+	entries, _ := os.ReadDir(ex.LocalRoot)
+	var names []string
+	for _, en := range entries {
+		names = append(names, en.Name())
+	}
+	if len(names) != 1 || names[0] != "DOC.txt" {
+		t.Fatalf("folder holds %v, want just DOC.txt", names)
+	}
+	if b, _ := os.ReadFile(filepath.Join(ex.LocalRoot, "DOC.txt")); string(b) != "local edit" {
+		t.Fatalf("content after the rename = %q", b)
+	}
+}
