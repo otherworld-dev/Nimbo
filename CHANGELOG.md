@@ -104,6 +104,11 @@ All notable changes to Nimbo are recorded here. The format follows
   again, and a big rename could pause syncing for review as if the files had been
   lost. Only the hourly full check handled a rename properly, the quick checks
   that follow most changes did not (#947).
+- Switching from on-demand back to live mode no longer says your sync folders are
+  restored, or that online-only files will download, when no sync folder is set up
+  (after a "Start fresh", for example). The dialog now counts the online-only
+  files that no sync folder covers separately and says nothing will sync until
+  you add a folder, and the notification at the end says the same (#948).
 
 ## [0.2.0] - 2026-09-26
 

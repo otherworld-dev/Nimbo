@@ -6,8 +6,9 @@ package vfs
 // root is put back the way live mode expects it — hydrated placeholders are
 // REVERTED in place (data kept, placeholder metadata removed), dehydrated ones
 // are DELETED (they hold no bytes; live sync re-downloads them through its
-// normal pipeline, unless they sit under a path live sync ignores, in which
-// case they stay on the server only). Plain files are untouched. The pass must run while the
+// normal pipeline, unless they sit under a path live sync ignores or outside
+// every sync folder, in which case they stay on the server only). Plain files
+// are untouched. The pass must run while the
 // sync root is STILL REGISTERED (CfRevertPlaceholder needs it) — i.e. before
 // Unmount — the mirror of adopt's mutations-before-watcher rule.
 
@@ -48,9 +49,15 @@ type RevertPlan struct {
 	// NOT come back: the server copy is left alone. Kept apart so the dialog
 	// doesn't promise a download that never happens (Deck #512).
 	Ignored []string
+	// Unsynced are online-only stubs that no sync folder covers: after the
+	// switch nothing syncs their path, so they are deleted like any stub and
+	// do NOT come back either. A different reason from Ignored (there is no
+	// folder at all, rather than a folder that skips them), so the dialog
+	// words it differently (Deck #948).
+	Unsynced []string
 	// DownloadBytes is the Dehydrated stubs' total logical size: what live
 	// sync will re-download after the switch. Shown to the user before
-	// confirming. Ignored stubs are not in it.
+	// confirming. Ignored and Unsynced stubs are not in it.
 	DownloadBytes int64
 }
 
@@ -66,12 +73,13 @@ type RevertResult struct {
 // (attributes, no server, no cfapi calls) — effectively instant even on huge
 // trees, so it can run inline before the confirm dialog.
 //
-// skip (optional) is the ignore predicate live sync will apply after the
-// switch (root-relative forward-slash paths). It only sorts online-only stubs
-// into Ignored instead of Dehydrated. Ignored trees are still walked, because
-// their stubs must be deleted all the same: left behind, they would be stubs
-// with no provider once the root is unregistered.
-func ScanRevert(localDir string, skip func(rel string) bool) (RevertPlan, error) {
+// fate (optional) says what live sync will do with an online-only stub after
+// the switch (root-relative forward-slash paths); nil means every stub
+// downloads. It only sorts stubs between Dehydrated, Ignored and Unsynced.
+// Ignored and unsynced trees are still walked, because their stubs must be
+// deleted all the same: left behind, they would be stubs with no provider
+// once the root is unregistered.
+func ScanRevert(localDir string, fate func(rel string) StubFate) (RevertPlan, error) {
 	var plan RevertPlan
 	err := filepath.WalkDir(localDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -99,12 +107,19 @@ func ScanRevert(localDir string, skip func(rel string) bool) (RevertPlan, error)
 			return nil // plain file — live mode already understands it
 		}
 		if cfIsDehydrated(fi, path) {
-			if skip != nil && skip(rel) {
-				plan.Ignored = append(plan.Ignored, rel)
-				return nil
+			f := StubDownloads
+			if fate != nil {
+				f = fate(rel)
 			}
-			plan.Dehydrated = append(plan.Dehydrated, rel)
-			plan.DownloadBytes += fi.Size()
+			switch f {
+			case StubIgnored:
+				plan.Ignored = append(plan.Ignored, rel)
+			case StubUnsynced:
+				plan.Unsynced = append(plan.Unsynced, rel)
+			default:
+				plan.Dehydrated = append(plan.Dehydrated, rel)
+				plan.DownloadBytes += fi.Size()
+			}
 		} else {
 			plan.Hydrated = append(plan.Hydrated, rel)
 		}
@@ -117,7 +132,9 @@ func ScanRevert(localDir string, skip func(rel string) bool) (RevertPlan, error)
 }
 
 // Total is how many entries Run works through.
-func (p RevertPlan) Total() int { return len(p.Hydrated) + len(p.Dehydrated) + len(p.Ignored) }
+func (p RevertPlan) Total() int {
+	return len(p.Hydrated) + len(p.Dehydrated) + len(p.Ignored) + len(p.Unsynced)
+}
 
 // Run executes the plan: revert hydrated, delete every stub. progress gets
 // (done, total) per entry; ctx cancellation stops at the next entry (reverted
@@ -147,14 +164,14 @@ func (p RevertPlan) Run(ctx context.Context, localDir string, progress func(done
 		}
 		res.Reverted++
 	}
-	stubs := append(append([]string(nil), p.Dehydrated...), p.Ignored...)
+	stubs := append(append(append([]string(nil), p.Dehydrated...), p.Ignored...), p.Unsynced...)
 	for _, rel := range stubs {
 		if !step() {
 			return res
 		}
 		// A stub holds no content; deleting it cannot lose data. Live sync
 		// restores it from the server as a real file, or, under an ignored
-		// path, leaves it on the server only.
+		// path or outside every sync folder, leaves it on the server only.
 		if err := os.Remove(filepath.Join(localDir, filepath.FromSlash(rel))); err != nil && !os.IsNotExist(err) {
 			res.Failed++
 			continue
