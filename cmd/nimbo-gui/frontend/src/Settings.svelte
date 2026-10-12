@@ -601,7 +601,7 @@
       let sum: any = null;
       try { sum = JSON.parse(raw); } catch { sum = null; }
       if (sum?.error) { tell({ title: "File availability", message: sum.error }); syncMode = await App.GetSyncMode(); return; }
-      if (sum && (sum.hydrated || sum.dehydrated || sum.ignored)) { revert = sum; return; }
+      if (sum && (sum.hydrated || sum.dehydrated || sum.ignored || sum.unsynced)) { revert = sum; return; }
       // Nothing mounted/nothing to revert — plain switch below.
     }
     if (syncMode === "ondemand") {
@@ -724,7 +724,7 @@
     if (!revert) return;
     fresh = {
       target: "live", dir: revert.dir,
-      total: (revert.hydrated || 0) + (revert.dehydrated || 0) + (revert.ignored || 0),
+      total: (revert.hydrated || 0) + (revert.dehydrated || 0) + (revert.ignored || 0) + (revert.unsynced || 0),
       localOnly: 0, changed: 0,
     };
     revert = null;
@@ -954,8 +954,13 @@
               {#if revert.hydrated}<li><b>{revert.hydrated.toLocaleString()}</b> are on this PC — converted back instantly, nothing transferred.</li>{/if}
               {#if revert.dehydrated}<li><b>{revert.dehydrated.toLocaleString()}</b> are online-only. They'll download through normal syncing after the switch ({mb(revert.downloadBytes)}).</li>{/if}
               {#if revert.ignored}<li><b>{revert.ignored.toLocaleString()}</b> {revert.ignored === 1 ? "is" : "are"} online-only in folders that normal syncing skips (your exclusions, such as node_modules). {revert.ignored === 1 ? "It stays" : "They stay"} on the server and won't download.</li>{/if}
+              {#if revert.unsynced}<li><b>{revert.unsynced.toLocaleString()}</b> {revert.unsynced === 1 ? "is" : "are"} online-only and no sync folder covers {revert.unsynced === 1 ? "it, so it" : "them, so they"} won't download. {revert.unsynced === 1 ? "It stays" : "They stay"} on the server.</li>{/if}
             </ul>
-            <p class="hint">Your sync folders are restored automatically.</p>
+            {#if revert.folders}
+              <p class="hint">Your sync folders are restored automatically.</p>
+            {:else}
+              <p class="hint">No sync folder is set up, so nothing will sync after the switch until you add one (Settings → Folders → Add folder).</p>
+            {/if}
             <div class="addbtns">
               <button class="primary" onclick={confirmRevert}>Switch to normal files</button>
               <button onclick={askFreshFromRevert}>Start fresh…</button>
