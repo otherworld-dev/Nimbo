@@ -94,6 +94,7 @@ type Engine struct {
 	watchers     map[string]context.CancelFunc
 	triggers     map[string]chan struct{}
 	triggersFull map[string]chan struct{} // key -> force-a-full-local-pass trigger (name-rule changes)
+	triggersUser map[string]chan struct{} // key -> a sync the user asked for (not held back by the failure backoff)
 	nudges       map[string]chan string   // key -> paths to sync as if the watcher saw them (see inuse.go)
 	awaiting     map[string]bool          // absolute paths awaitClosed is watching
 	tl           *lane                    // long transfers (lane.go, lanejobs.go); created on first use
@@ -3030,6 +3031,25 @@ func (e *Engine) TriggerSync() {
 	}
 }
 
+// TriggerUserSync is TriggerSync for a sync the user asked for by name: "Sync
+// now", or "Resume syncing" on a paused folder. Unlike TriggerSync it is not
+// held back while a failed pass is being backed off from (see
+// watch.Options.UserSync). No-op until Run has started.
+func (e *Engine) TriggerUserSync() {
+	e.watchMu.Lock()
+	chans := make([]chan struct{}, 0, len(e.triggersUser))
+	for _, ch := range e.triggersUser {
+		chans = append(chans, ch)
+	}
+	e.watchMu.Unlock()
+	for _, ch := range chans {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
 // TriggerFullSync forces every pair to do a FULL local-walking reconcile now,
 // rather than the fast remote-delta a plain TriggerSync fires. Needed after a
 // change to the name rules (allow-list / escape-list) that reclassifies LOCAL
@@ -5024,6 +5044,7 @@ func (e *Engine) Run(ctx context.Context, pairs []Pair, onSync func(Pair, transf
 	e.watchers = make(map[string]context.CancelFunc)
 	e.triggers = make(map[string]chan struct{})
 	e.triggersFull = make(map[string]chan struct{})
+	e.triggersUser = make(map[string]chan struct{})
 	e.nudges = make(map[string]chan string)
 	e.watchDone = make(map[string]chan struct{})
 	e.watchMu.Unlock()
@@ -5176,11 +5197,16 @@ func (e *Engine) startWatcher(p Pair) {
 	cctx, cancel := context.WithCancel(e.runCtx)
 	ext := make(chan struct{}, 1)
 	fullExt := make(chan struct{}, 1)
+	userExt := make(chan struct{}, 1)
 	nudge := make(chan string, 16)
 	done := make(chan struct{})
 	e.watchers[key] = cancel
 	e.triggers[key] = ext
 	e.triggersFull[key] = fullExt
+	if e.triggersUser == nil {
+		e.triggersUser = make(map[string]chan struct{})
+	}
+	e.triggersUser[key] = userExt
 	e.nudges[key] = nudge
 	e.watchDone[key] = done
 	e.watchMu.Unlock()
@@ -5241,6 +5267,7 @@ func (e *Engine) startWatcher(p Pair) {
 			Debounce:      500 * time.Millisecond, // snappy local→server; still coalesces a burst
 			External:      ext,
 			FullSync:      fullExt,
+			UserSync:      userExt,
 			Nudge:         nudge,
 			OnPush:        pushFn,
 			FullSyncEvery: time.Hour, // most polls are fast remote-deltas; full walk hourly
@@ -5250,6 +5277,7 @@ func (e *Engine) startWatcher(p Pair) {
 		delete(e.watchers, key)
 		delete(e.triggers, key)
 		delete(e.triggersFull, key)
+		delete(e.triggersUser, key)
 		delete(e.nudges, key)
 		delete(e.watchDone, key)
 		e.watchMu.Unlock()

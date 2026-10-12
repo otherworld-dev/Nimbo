@@ -1132,7 +1132,9 @@ func (a *App) resumeFrozen(localDir string) string {
 	if err := a.eng.ClearFreeze(localDir); err != nil {
 		return err.Error()
 	}
-	a.eng.TriggerSync() // run the pass the user just approved, rather than waiting for the poll
+	// Run the pass the user just approved. The pause itself counted as a failed
+	// pass, so a plain trigger would be dropped by the backoff that started.
+	a.eng.TriggerUserSync()
 	return ""
 }
 
@@ -2473,7 +2475,7 @@ func (a *App) ClearStatusMessage() {
 // SyncNow triggers an immediate sync of all folders.
 func (a *App) SyncNow() {
 	if a.eng != nil {
-		a.eng.TriggerSync()
+		a.eng.TriggerUserSync() // asked for by name: not held back by a failure backoff
 	}
 }
 

@@ -34,6 +34,14 @@ type Options struct {
 	// changes that reclassify LOCAL files (name allow-list / escape-list), which a
 	// remote-delta trigger wouldn't pick up.
 	FullSync <-chan struct{}
+	// UserSync, if non-nil, is a sync the user asked for: "Sync now", or
+	// "Resume syncing" on a folder the damage guard had paused. It runs like an
+	// External trigger, but it also lifts the failure backoff. The backoff
+	// spaces out automatic retries to spare a struggling server; it must not
+	// swallow a request somebody is waiting on, and a paused folder is itself
+	// counted as a failed pass, so a resume sent down External did nothing
+	// until the hold ran out, up to an hour later (Deck #589).
+	UserSync <-chan struct{}
 	// Nudge, if non-nil, carries absolute local paths to sync exactly as if the
 	// watcher had reported them: an upload put off while another program had
 	// the file open is nudged once that program lets go, since closing a file
@@ -181,6 +189,12 @@ func runLoop(ctx context.Context, opts Options, sync SyncFunc, events <-chan str
 
 		case <-opts.External:
 			pushed = true // remote push: reconcile the server delta on the next fire
+			debounce = time.After(opts.Debounce)
+
+		case <-opts.UserSync:
+			failStreak = 0 // asked for by the user: not a retry to space out
+			holdUntil = time.Time{}
+			pushed = true
 			debounce = time.After(opts.Debounce)
 
 		case <-opts.FullSync:
