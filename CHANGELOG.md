@@ -89,6 +89,10 @@ All notable changes to Nimbo are recorded here. The format follows
   the same second, got one name between them and the second replaced the first,
   so one of your versions was lost. Each now gets a name of its own, on this PC
   and on the server, in both live and on-demand mode.
+- "Resume syncing" on a folder that was paused for review, and "Sync now", start
+  the sync straight away. Both could be ignored for several minutes, up to an
+  hour, because the paused folder counted as a failed sync and Nimbo was waiting
+  before trying again (#589).
 
 ## [0.2.0] - 2026-09-26
 
