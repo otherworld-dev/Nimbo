@@ -751,19 +751,37 @@ func (c *Client) Delete(ctx context.Context, remotePath string) error {
 	return nil
 }
 
-// Move renames/moves src to dst (both files-root-relative paths).
+// Move renames/moves src to dst (both files-root-relative paths), replacing
+// whatever is at dst.
 func (c *Client) Move(ctx context.Context, src, dst string) error {
+	return c.move(ctx, src, dst, true)
+}
+
+// MoveNoReplace is Move that leaves an existing dst alone: it fails with
+// ErrDestinationExists instead of replacing it.
+func (c *Client) MoveNoReplace(ctx context.Context, src, dst string) error {
+	return c.move(ctx, src, dst, false)
+}
+
+func (c *Client) move(ctx context.Context, src, dst string, replace bool) error {
 	req, err := c.NewRequest(ctx, "MOVE", c.davURL(src), nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Destination", c.davURL(dst))
-	req.Header.Set("Overwrite", "T")
+	if replace {
+		req.Header.Set("Overwrite", "T")
+	} else {
+		req.Header.Set("Overwrite", "F")
+	}
 	resp, err := c.DoOnce(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if !replace && resp.StatusCode == http.StatusPreconditionFailed {
+		return fmt.Errorf("MOVE %s to %s: %w", src, dst, ErrDestinationExists)
+	}
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
 		return statusError("MOVE", src, resp)
 	}

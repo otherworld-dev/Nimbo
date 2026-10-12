@@ -94,3 +94,38 @@ func TestResolveConflictFetchesTheServerCopyOnce(t *testing.T) {
 		t.Fatalf("the server's version did not take the original name: %q", b)
 	}
 }
+
+// Two files that end up with the SAME conflicted-copy name must both survive.
+// conflictName strips an older marker and stamps the current second, so a file
+// and an earlier conflicted copy of it, both in conflict within one second,
+// were given one name, and the second rename replaced the first copy: the
+// user's version of one of them was gone (Deck #924).
+func TestKeepBothNeverOverwritesAnotherConflictedCopy(t *testing.T) {
+	c, _ := conflictServer(t, 0)
+	ex := conflictExecutor(t, c)
+	old := "doc (conflicted copy 2026-08-16 000722).txt"
+	if err := os.WriteFile(filepath.Join(ex.LocalRoot, old), []byte("older local edit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ex.Remote[old] = engine.RemoteState{Path: old, ETag: "e3", FileID: "fid2"}
+	for _, rel := range []string{"doc.txt", old} {
+		if err := ex.keepBoth(context.Background(), rel); err != nil {
+			t.Fatalf("keepBoth(%s): %v", rel, err)
+		}
+	}
+	got := map[string]bool{}
+	entries, _ := os.ReadDir(ex.LocalRoot)
+	for _, en := range entries {
+		b, _ := os.ReadFile(filepath.Join(ex.LocalRoot, en.Name()))
+		got[string(b)] = true
+	}
+	for _, want := range []string{"local edit", "older local edit"} {
+		if !got[want] {
+			names := make([]string, 0, len(entries))
+			for _, en := range entries {
+				names = append(names, en.Name())
+			}
+			t.Errorf("the local version %q is gone; folder now holds %v", want, names)
+		}
+	}
+}

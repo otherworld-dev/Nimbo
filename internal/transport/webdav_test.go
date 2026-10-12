@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -614,5 +615,38 @@ func TestParseResponseSize(t *testing.T) {
 		if e.IsDir != w.dir || e.Size != w.size {
 			t.Errorf("%s: dir=%v size=%d, want dir=%v size=%d", p, e.IsDir, e.Size, w.dir, w.size)
 		}
+	}
+}
+
+// MoveNoReplace sends Overwrite: F and reports a destination that already
+// exists as ErrDestinationExists, so a caller can pick another name instead of
+// replacing what is there (Deck #924).
+func TestMoveNoReplace(t *testing.T) {
+	var overwrite []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "MOVE" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		overwrite = append(overwrite, r.Header.Get("Overwrite"))
+		if strings.HasSuffix(r.Header.Get("Destination"), "/taken.txt") {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "u", "p")
+	if err := c.MoveNoReplace(context.Background(), "a.txt", "taken.txt"); !errors.Is(err, ErrDestinationExists) {
+		t.Fatalf("move onto an existing file: err = %v, want ErrDestinationExists", err)
+	}
+	if err := c.MoveNoReplace(context.Background(), "a.txt", "free.txt"); err != nil {
+		t.Fatalf("move onto a free name: %v", err)
+	}
+	if err := c.Move(context.Background(), "a.txt", "free.txt"); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	if want := []string{"F", "F", "T"}; !reflect.DeepEqual(overwrite, want) {
+		t.Errorf("Overwrite headers = %v, want %v", overwrite, want)
 	}
 }

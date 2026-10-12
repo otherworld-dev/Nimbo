@@ -632,6 +632,18 @@ func (e *Engine) MoveRemote(ctx context.Context, src, dst string) error {
 	return e.client.Move(ctx, strings.Trim(src, "/"), dst)
 }
 
+// MoveRemoteNoReplace is MoveRemote that fails with
+// transport.ErrDestinationExists rather than replace what is already at dst.
+func (e *Engine) MoveRemoteNoReplace(ctx context.Context, src, dst string) error {
+	dst = strings.Trim(dst, "/")
+	if i := strings.LastIndex(dst, "/"); i > 0 {
+		if err := e.client.EnsureCollection(ctx, dst[:i]); err != nil {
+			return err
+		}
+	}
+	return e.client.MoveNoReplace(ctx, strings.Trim(src, "/"), dst)
+}
+
 // SearchFiles queries the server's unified search for files matching term.
 func (e *Engine) SearchFiles(ctx context.Context, term string, limit int) ([]transport.SearchResult, error) {
 	return e.client.SearchFiles(ctx, term, limit)

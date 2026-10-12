@@ -558,3 +558,35 @@ func TestAdoptApplyParallelCancel(t *testing.T) {
 		t.Errorf("marked %d files but reported kept=%d", len(*marked), res.Kept)
 	}
 }
+
+// Two conflicts that map to the same conflicted-copy name (a file and an older
+// conflicted copy of it) must both be kept: the second rename used to replace
+// the first copy (Deck #924).
+func TestAdoptKeepBothNeverOverwritesAnotherConflictedCopy(t *testing.T) {
+	old := "differs (conflicted copy 2026-08-16 000722).txt"
+	dir := adoptTree(t, "differs.txt:99:0", old+":55:0")
+	remote := map[string]engine.RemoteState{"differs.txt": remoteFile(10, 0), old: remoteFile(11, 0)}
+	plan, err := Scan(dir, remote, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordMarks(t)
+	res := plan.Apply(context.Background(), dir, "", nil)
+	if res.Renamed != 2 || len(res.Uploads) != 2 {
+		t.Fatalf("renamed=%d uploads=%v, want both conflicts set aside", res.Renamed, res.Uploads)
+	}
+	if res.Uploads[0].Rel == res.Uploads[1].Rel {
+		t.Fatalf("both conflicts were given the name %q", res.Uploads[0].Rel)
+	}
+	sizes := map[int64]bool{}
+	for _, u := range res.Uploads {
+		fi, err := os.Stat(filepath.Join(dir, filepath.FromSlash(u.Rel)))
+		if err != nil {
+			t.Fatalf("conflicted copy %q missing: %v", u.Rel, err)
+		}
+		sizes[fi.Size()] = true
+	}
+	if !sizes[99] || !sizes[55] {
+		t.Errorf("a local version was lost: sizes kept = %v, want 99 and 55", sizes)
+	}
+}

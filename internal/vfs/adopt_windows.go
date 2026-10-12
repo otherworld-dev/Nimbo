@@ -316,10 +316,7 @@ var adoptWorkers = 8
 //
 // The run has two passes. First, in plan order and one at a time, the rare
 // entries: conflict renames, dead-stub deletes and the upload list. They stay
-// sequential so Uploads keeps plan order and so conflict renames never race
-// each other: two conflicts can be given the same conflicted-copy name
-// (ConflictName strips any old marker and stamps the current second, and a
-// rename replaces an existing target). They go first so a cancel during the
+// sequential so Uploads keeps plan order. They go first so a cancel during the
 // long second pass leaves them done.
 // Second, the Keep entries — nearly all of a real folder — are marked by
 // adoptWorkers goroutines. Each touches only its own file, and Apply never
@@ -362,8 +359,10 @@ func (p Plan) Apply(ctx context.Context, localDir, remoteRoot string, progress f
 				res.Skipped++
 				continue
 			}
-			conf := transfer.ConflictName(e.Rel)
-			if err := os.Rename(full, filepath.Join(localDir, filepath.FromSlash(conf))); err != nil {
+			// Never onto a name already in use: two conflicts can map to the
+			// same conflicted-copy name (see transfer.SetAsideAsConflict).
+			conf, err := transfer.SetAsideAsConflict(localDir, e.Rel)
+			if err != nil {
 				res.Failed++
 				continue
 			}
