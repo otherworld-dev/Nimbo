@@ -22,6 +22,15 @@ func (e *Executor) applyMove(ctx context.Context, a engine.Action) error {
 	switch a.Kind {
 	case engine.ActMoveLocal:
 		from, to := e.localPath(a.Path), e.localPath(a.Dest)
+		// Never onto something that is already there: a rename replaces its
+		// target. The plan only moves onto a free path (CoalesceRenames), so a
+		// file here appeared since; fail and let the next pass plan it again
+		// with that file in view.
+		if _, err := os.Lstat(to); err == nil {
+			return fmt.Errorf("cannot rename %s to %s: something is already there", a.Path, a.Dest)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
 		if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
 			return err
 		}

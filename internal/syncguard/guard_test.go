@@ -55,22 +55,22 @@ func TestCountCollectsASample(t *testing.T) {
 
 func TestTripsNeedsBothFloorAndPercentage(t *testing.T) {
 	// Over the percentage but under the floor: a small folder churning is normal.
-	if _, trips := Trips(Counts{Deletions: 10}, 10, 50, 50); trips {
+	if _, trips := Trips(Counts{Deletions: 10}, 10, 50, 50, 0); trips {
 		t.Fatal("10 files is under the floor of 50 — must not trip")
 	}
 	// Over the floor but a small fraction: a big folder losing a few files is normal.
-	if _, trips := Trips(Counts{Deletions: 60}, 10000, 50, 50); trips {
+	if _, trips := Trips(Counts{Deletions: 60}, 10000, 50, 50, 0); trips {
 		t.Fatal("60 of 10000 is under 50% — must not trip")
 	}
 	// Both: this is the damage signature.
-	if _, trips := Trips(Counts{Deletions: 60}, 100, 50, 50); !trips {
+	if _, trips := Trips(Counts{Deletions: 60}, 100, 50, 50, 0); !trips {
 		t.Fatal("60 of 100 clears both thresholds — must trip")
 	}
 }
 
 func TestTripsCountsOverwritesTowardTheThreshold(t *testing.T) {
 	// Nothing deleted at all — every file rewritten. This is ransomware.
-	reason, trips := Trips(Counts{Overwrites: 900}, 1000, 50, 50)
+	reason, trips := Trips(Counts{Overwrites: 900}, 1000, 50, 50, 0)
 	if !trips {
 		t.Fatal("900 of 1000 files rewritten must trip — a deletions-only guard is the bug this exists to prevent")
 	}
@@ -80,7 +80,7 @@ func TestTripsCountsOverwritesTowardTheThreshold(t *testing.T) {
 }
 
 func TestTripsWithNoKnownFilesNeverTrips(t *testing.T) {
-	if _, trips := Trips(Counts{Deletions: 1000}, 0, 50, 50); trips {
+	if _, trips := Trips(Counts{Deletions: 1000}, 0, 50, 50, 0); trips {
 		t.Fatal("a pair with no baseline has nothing to protect — must not trip")
 	}
 }
@@ -124,5 +124,34 @@ func TestGuardAppliesOnlyAfterAFirstCompletedPass(t *testing.T) {
 	}
 	if GuardApplies("done", true) {
 		t.Fatal("an approved resume grants a one-pass exemption")
+	}
+}
+
+// The percentage is of the whole sync folder, so on a big one it only catches
+// losing over half of everything: a 10,000-file folder emptied on the server
+// is 3% of a 332,000-file account and went through (Deck #947). The ceiling
+// pauses any single pass over a fixed number of files, whatever the share.
+func TestTripsAtTheCeilingWhateverThePercentage(t *testing.T) {
+	if _, trips := Trips(Counts{Deletions: 1000}, 332000, 50, 50, 1000); trips {
+		t.Error("exactly the ceiling tripped; it is 'more than'")
+	}
+	reason, trips := Trips(Counts{Deletions: 900, Overwrites: 101}, 332000, 50, 50, 1000)
+	if !trips {
+		t.Fatal("1,001 files of a big folder did not trip the ceiling")
+	}
+	if !strings.Contains(reason, "900") || !strings.Contains(reason, "101") || !strings.Contains(reason, "1000") {
+		t.Errorf("reason should give the counts and the ceiling: %q", reason)
+	}
+	// Under the ceiling a big folder's routine churn still passes.
+	if _, trips := Trips(Counts{Deletions: 600}, 332000, 50, 50, 1000); trips {
+		t.Error("600 of 332,000 tripped")
+	}
+	// A ceiling of zero is no ceiling.
+	if _, trips := Trips(Counts{Deletions: 5000}, 332000, 50, 50, 0); trips {
+		t.Error("tripped with the ceiling switched off")
+	}
+	// The percentage rule still gives its own reason when both apply.
+	if reason, _ := Trips(Counts{Deletions: 2000}, 2500, 50, 50, 1000); !strings.Contains(reason, "80%") {
+		t.Errorf("reason for a majority loss should keep the percentage: %q", reason)
 	}
 }

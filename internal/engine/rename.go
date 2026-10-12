@@ -10,7 +10,9 @@ import "strconv"
 //     Y carries the same oc:fileid as a baseline entry X that is now gone
 //     remotely but still present locally — which the diff expresses as
 //     DeleteLocal(X) + Download(Y). Rewritten to MoveLocal(X→Y): just rename the
-//     local file. This is reliable because oc:fileid is stable across moves.
+//     local file. oc:fileid is stable across moves, but the id alone is not
+//     enough (see matchRemoteRename): the content must be the same version and
+//     Y must be free, or the pair is left as delete + download.
 //
 //   - Local rename (the user moved X→Y): the new local Y has the same content
 //     hash and size as a baseline entry X that is now gone locally — expressed
@@ -58,7 +60,7 @@ func CoalesceRenames(
 		}
 		switch a.Kind {
 		case ActDownload:
-			if x, ok := matchRemoteRename(a.Path, remote, byFileID, delLocalIdx, consumed); ok {
+			if x, ok := matchRemoteRename(a.Path, base, remote, local, byFileID, delLocalIdx, consumed); ok {
 				consumed[delLocalIdx[x]] = true
 				consumed[i] = true
 				out = append(out, Action{Kind: ActMoveLocal, Path: x, Dest: a.Path, Reason: "renamed on server"})
@@ -79,7 +81,18 @@ func CoalesceRenames(
 
 // matchRemoteRename finds the baseline path X that the new remote Y was renamed
 // from, via a shared oc:fileid and a pending DeleteLocal(X).
-func matchRemoteRename(y string, remote map[string]RemoteState, byFileID map[string]string, delLocalIdx map[string]int, consumed []bool) (string, bool) {
+//
+// The id alone is not enough, and a move is not counted by the damage guard
+// (it replaces nothing), so two cases must stay delete + download, which the
+// guard does count (Deck #947):
+//
+//   - Y already has a file, tracked or just sitting there locally. The local
+//     rename replaces its target, so that file's copy on this PC would be
+//     destroyed with no download planned and nothing counted.
+//   - The file kept its id but not its content (rewritten as it was renamed).
+//     Renamed in place, its OLD bytes would be recorded as in sync with the
+//     server's NEW version.
+func matchRemoteRename(y string, base map[string]BaselineState, remote map[string]RemoteState, local map[string]LocalState, byFileID map[string]string, delLocalIdx map[string]int, consumed []bool) (string, bool) {
 	r, ok := remote[y]
 	if !ok || r.FileID == "" {
 		return "", false
@@ -91,7 +104,30 @@ func matchRemoteRename(y string, remote map[string]RemoteState, byFileID map[str
 	if di, ok := delLocalIdx[x]; !ok || consumed[di] {
 		return "", false
 	}
+	if _, tracked := base[y]; tracked {
+		return "", false
+	}
+	if _, inTheWay := local[y]; inTheWay {
+		return "", false
+	}
+	if !sameRemoteVersion(base[x], r) {
+		return "", false
+	}
 	return x, true
+}
+
+// sameRemoteVersion reports whether r is provably the version of the file the
+// baseline row b recorded: the same ETag, or, since Nextcloud changes the ETag
+// for locks and tags while the bytes stay put, the same content key or the
+// same checksum. With nothing to vouch for it the answer is no.
+func sameRemoteVersion(b BaselineState, r RemoteState) bool {
+	if b.RemoteETag != "" && b.RemoteETag == r.ETag {
+		return true
+	}
+	if k := r.ContentKey(); k != "" && k == b.ContentKey {
+		return true
+	}
+	return r.SHA1 != "" && r.SHA1 == b.ContentSHA1
 }
 
 // matchLocalRename finds the baseline path X that the new local Y was renamed

@@ -222,3 +222,34 @@ func TestForgetSyncFolderDropsTheGuardEntry(t *testing.T) {
 		t.Fatalf("the guard entry must go with the folder, still holds %v", set)
 	}
 }
+
+// The ceiling (Deck #947): on a big folder the percentage only catches losing
+// over half of it, so a pass removing more than syncguard.DefaultCeiling files
+// pauses whatever share that is, and a smaller loss still goes through.
+func TestGuardFreezesAPassOverTheCeilingOnABigFolder(t *testing.T) {
+	f, e, p := seededPair(t, 3000)
+	for i := 0; i < 600; i++ { // 20%: under both rules
+		f.delNode(fmt.Sprintf("f%03d.txt", i))
+	}
+	f.setNode("", davNode{isDir: true, etag: "e-root2"})
+	if _, err := e.SyncOnce(context.Background(), p); err != nil {
+		t.Fatalf("600 of 3,000 files removed on the server paused the folder: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(p.LocalDir, "f000.txt")); !os.IsNotExist(err) {
+		t.Fatalf("the allowed deletion was not applied (err %v)", err)
+	}
+
+	for i := 600; i < 1700; i++ { // 1,100 of the 2,400 left: 45%, over the ceiling
+		f.delNode(fmt.Sprintf("f%03d.txt", i))
+	}
+	f.setNode("", davNode{isDir: true, etag: "e-root3"})
+	_, err := e.SyncOnce(context.Background(), p)
+	if err == nil || !strings.Contains(err.Error(), "paused") || !strings.Contains(err.Error(), "more than 1000") {
+		t.Fatalf("1,100 files removed in one pass must pause the folder, got err=%v", err)
+	}
+	for _, i := range []int{600, 1699} {
+		if _, err := os.Stat(filepath.Join(p.LocalDir, fmt.Sprintf("f%03d.txt", i))); err != nil {
+			t.Fatalf("local file %d was touched by a refused pass: %v", i, err)
+		}
+	}
+}

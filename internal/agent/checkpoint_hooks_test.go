@@ -48,6 +48,7 @@ type davNode struct {
 	body     string
 	perm     string
 	checksum string // SHA1 hex sent as OC-Checksum on GET; need not match body
+	fileid   string // oc:fileid served in listings ("" = none); stable across a move
 }
 
 // fakeDAV serves just enough WebDAV for real sync passes: PROPFIND depth 1
@@ -253,14 +254,21 @@ func (f *fakeDAV) row(p string, n davNode) string {
 		if perm == "" {
 			perm = "RGDNVCK"
 		}
-		return fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:resourcetype><d:collection/></d:resourcetype><d:getetag>&quot;%s&quot;</d:getetag><oc:permissions>%s</oc:permissions></d:prop></d:propstat></d:response>`, href, n.etag, perm)
+		return fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:resourcetype><d:collection/></d:resourcetype><d:getetag>&quot;%s&quot;</d:getetag>%s<oc:permissions>%s</oc:permissions></d:prop></d:propstat></d:response>`, href, n.etag, davFileID(n), perm)
 	}
 	if perm == "" {
 		perm = "RGDNVW"
 	}
 	// Files carry a fixed Last-Modified (unix 1700000000): the adopt scan
 	// classifies against it, so tests must see it survive cold AND warm scans.
-	return fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:resourcetype/><d:getetag>&quot;%s&quot;</d:getetag><d:getcontentlength>%d</d:getcontentlength><d:getlastmodified>Tue, 14 Nov 2023 22:13:20 GMT</d:getlastmodified><oc:permissions>%s</oc:permissions></d:prop></d:propstat></d:response>`, href, n.etag, len(n.body), perm)
+	return fmt.Sprintf(`<d:response><d:href>%s</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status><d:prop><d:resourcetype/><d:getetag>&quot;%s&quot;</d:getetag><d:getcontentlength>%d</d:getcontentlength><d:getlastmodified>Tue, 14 Nov 2023 22:13:20 GMT</d:getlastmodified>%s<oc:permissions>%s</oc:permissions></d:prop></d:propstat></d:response>`, href, n.etag, len(n.body), davFileID(n), perm)
+}
+
+func davFileID(n davNode) string {
+	if n.fileid == "" {
+		return ""
+	}
+	return "<oc:fileid>" + n.fileid + "</oc:fileid>"
 }
 
 func davUnder(p, dir string) bool {
