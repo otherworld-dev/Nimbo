@@ -109,6 +109,10 @@ All notable changes to Nimbo are recorded here. The format follows
   (after a "Start fresh", for example). The dialog now counts the online-only
   files that no sync folder covers separately and says nothing will sync until
   you add a folder, and the notification at the end says the same (#948).
+- A file that fails to download during the first sync of a folder is now tried
+  again on the next check. It was being left out for good, with Nimbo showing "Up
+  to date", until something else changed in the same folder on the server. A
+  server that was briefly busy or a dropped connection was enough to cause it.
 
 ## [0.2.0] - 2026-09-26
 
