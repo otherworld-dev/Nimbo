@@ -119,7 +119,15 @@ type Watcher struct {
 	// the same file is never requested twice.
 	hydratePending []string
 	hydrateWake    chan struct{}
-	hydrating      map[string]bool
+	// hydrateFirst holds the pending downloads the user asked to go first
+	// (SyncFirst). The workers take from it before hydratePending, and it has
+	// one worker of its own (hydrateFirstLoop, woken through
+	// hydrateFirstWake), so an asked-for file starts at once even while every
+	// other worker is on a large one. Its paths are in hydrating like any
+	// pending one.
+	hydrateFirst     []string
+	hydrateFirstWake chan struct{}
+	hydrating        map[string]bool
 	// hydrateFails/hydrateNext back off a repeatedly-failing hydration (a
 	// server outage, a file the server has since deleted) so reconcile
 	// doesn't retry and re-report it on every pass; both keyed lower-cased,
@@ -209,6 +217,8 @@ const (
 	// hydrateWorkers bounds how many pinned files download at once. Any
 	// number may be waiting their turn: a waiting request costs one path
 	// string, and dropping one loses the file for good (see requestHydration).
+	// One more worker takes only the downloads the user asked to go first
+	// (hydrateFirstLoop), so at most three run at once.
 	hydrateWorkers = 2
 )
 
@@ -253,7 +263,8 @@ func New(parent context.Context, root, remoteRoot string, pollEvery time.Duratio
 		forced:      map[string]bool{},
 		loopDone:    make(chan struct{}),
 		hydrateWake: make(chan struct{}, 1), hydrating: map[string]bool{},
-		hydrateFails: map[string]int{}, hydrateNext: map[string]time.Time{},
+		hydrateFirstWake: make(chan struct{}, 1),
+		hydrateFails:     map[string]int{}, hydrateNext: map[string]time.Time{},
 	}
 	if w.ops.Log == nil {
 		w.ops.Log = func(string, ...any) {}
@@ -261,6 +272,7 @@ func New(parent context.Context, root, remoteRoot string, pollEvery time.Duratio
 	for i := 0; i < hydrateWorkers; i++ {
 		w.spawn(w.hydrateLoop)
 	}
+	w.spawn(w.hydrateFirstLoop)
 	go w.loop()
 	if w.ops.List != nil {
 		w.spawn(w.pollLoop)
@@ -838,6 +850,7 @@ func (w *Watcher) releaseHeld() {
 		w.scheduleUpload(path)
 	}
 	w.wakeHydrator()
+	w.wakeFirstHydrator()
 }
 
 // scheduleDelete debounces a server-side delete so a transient remove (rename
@@ -2011,13 +2024,19 @@ func (w *Watcher) wakeHydrator() {
 // draining the whole list alone.
 func (w *Watcher) nextHydration() (string, bool) {
 	w.mu.Lock()
-	if len(w.hydratePending) == 0 {
+	var path string
+	switch {
+	case len(w.hydrateFirst) > 0: // asked for by name: ahead of the rest
+		path = w.hydrateFirst[0]
+		w.hydrateFirst = w.hydrateFirst[1:]
+	case len(w.hydratePending) > 0:
+		path = w.hydratePending[0]
+		w.hydratePending = w.hydratePending[1:]
+	default:
 		w.mu.Unlock()
 		return "", false
 	}
-	path := w.hydratePending[0]
-	w.hydratePending = w.hydratePending[1:]
-	more := len(w.hydratePending) > 0
+	more := len(w.hydrateFirst)+len(w.hydratePending) > 0
 	w.mu.Unlock()
 	if more {
 		w.wakeHydrator()

@@ -26,6 +26,14 @@ All notable changes to Nimbo are recorded here. The format follows
   listed and downloaded before everything else, even one deep inside a bigger
   folder, a change counts straight away, and the choice is kept if Nimbo is
   restarted part way through (#766).
+- "Sync this first" in the Explorer right-click menu, under Nimbo, for a file or
+  a folder. A large file waiting in the queue moves to the front (one that is
+  already transferring is never interrupted) and one you had set aside comes
+  back. Anything else with changes still to send is synced straight away, even
+  while Nimbo is waiting to retry after a failed sync. In on-demand mode a
+  waiting upload starts now, and a file you have set to always keep on this
+  device jumps the download queue. It never downloads a file that is only
+  online, and it does nothing while syncing is paused (#702).
 - The Explorer sidebar entry is now named after the account, "Nimbo - adam" rather
   than just "Nimbo", so with more than one account you can tell which entry is
   which. If two accounts have the same login on different servers the server is

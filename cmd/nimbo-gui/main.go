@@ -168,6 +168,9 @@ func main() {
 	if p := argValue(os.Args, "--free"); p != "" {
 		svc.pendingFree = p
 	}
+	if p := argValue(os.Args, "--sync-first"); p != "" {
+		svc.queueSyncFirst(p)
+	}
 	if p := argValue(os.Args, "--app"); p != "" {
 		svc.pendingApp = p // a Start-menu app shortcut launched us
 	}

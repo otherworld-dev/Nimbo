@@ -1,11 +1,12 @@
 // NimboCtxMenu.dll — Windows 11 modern context-menu handler for Nimbo.
 //
 // Implements IExplorerCommand: a top-level "Nimbo" command with sub-commands
-// (Share / Version history / Always keep on this device / Free up space). Each
-// leaf relaunches the packaged GUI exe with the matching verb and the selected
-// path(s) — the same verbs the legacy registry submenu uses. The COM server is
-// registered by the MSIX AppxManifest (windows.comServer + windows.fileExplorer
-// ContextMenus), so this DLL only exposes DllGetClassObject / DllCanUnloadNow.
+// (Share / Version history / Always keep on this device / Free up space / Sync
+// this first). Each leaf relaunches the packaged GUI exe with the matching verb
+// and the selected path(s) — the same verbs the legacy registry submenu uses.
+// The COM server is registered by the MSIX AppxManifest (windows.comServer +
+// windows.fileExplorerContextMenus), so this DLL only exposes DllGetClassObject
+// / DllCanUnloadNow.
 //
 // Built with MinGW (w64devkit), statically linked so it has no runtime deps when
 // loaded into explorer.exe.
@@ -72,8 +73,9 @@ static const Leaf kLeaves[] = {
     {L"Version history",            L"--versions"},
     {L"Always keep on this device", L"--keep"},
     {L"Free up space",              L"--free"},
+    {L"Sync this first",            L"--sync-first"},
 };
-static const int kLeafCount = 4;
+static const int kLeafCount = 5;
 static const int KIND_ROOT = -1;
 
 // Full path to the packaged GUI exe (sits next to this DLL in the package).
