@@ -1487,7 +1487,9 @@ SHA-256: {localTest.fingerprint}</pre>
           </div>
         {/if}
       {:else}
-        <p class="empty">Signed out — use the sign-in window to connect an account.</p>
+        <!-- A button rather than pointing at "the sign-in window": once that
+             window was closed, nothing here led back to it (GitHub #20). -->
+        <p class="empty">Signed out. <button class="link" onclick={() => App.AddAccount()}>Sign in</button></p>
       {/if}
       {#if accounts.length > 1}
         <p class="fhint">All accounts sync at the same time. The <b>shown</b> account is the one the menus, folder settings, and search use — switch to manage a different one.</p>
