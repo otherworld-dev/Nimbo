@@ -130,7 +130,13 @@ func (a *App) syncFirstLocalPath(localAbs string) {
 		slog.Info("sync this first", "path", localAbs, "outcome", int(outcome))
 		name := filepath.Base(localAbs)
 		if outcome == sfOutside {
-			// A dialog, as the menu's other entries show for the same thing.
+			// A dialog, as the menu's other entries show for the same thing,
+			// but one for a whole selection: the menu is offered on every
+			// file, and thirty files chosen outside a sync folder asked for
+			// thirty dialogs.
+			if !a.syncFirstMaySay("outside", time.Now()) {
+				return
+			}
 			application.InvokeAsync(func() {
 				if a.app != nil {
 					a.app.Dialog.Warning().

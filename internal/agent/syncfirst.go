@@ -118,6 +118,11 @@ func (e *Engine) SyncFirst(abs string) SyncFirstResult {
 			// puts it at the front when that pass hands it back.
 			if l.unpark(abs) {
 				res.Lane = 1
+				// Leaving the lane nudges the path too, but that nudge is
+				// dropped when the folder's nudge queue is full. This one
+				// waits its turn, so the file is planned in a quick pass
+				// rather than left for the next full one.
+				e.nudgeAll(pk, []string{abs})
 			}
 		default:
 			res.Paths = e.nudgeAll(pk, []string{abs})
