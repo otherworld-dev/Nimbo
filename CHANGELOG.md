@@ -120,6 +120,10 @@ All notable changes to Nimbo are recorded here. The format follows
   again on the next check. It was being left out for good, with Nimbo showing "Up
   to date", until something else changed in the same folder on the server. A
   server that was briefly busy or a dropped connection was enough to cause it.
+- A download the server refuses because it is busy with the file for a moment
+  (a 423 answer) is now tried again a few times before it counts as failed, and
+  if it still fails it no longer says someone else has the file open. The dialogs
+  shown when switching file mode also say "1 is" rather than "1 are" (#950).
 
 ## [0.2.0] - 2026-09-26
 
