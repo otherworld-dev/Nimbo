@@ -3878,12 +3878,21 @@ func deletionWeight(st *state.Store, pk string, actions []engine.Action, kind en
 // which carries the file's path: a timeout uploading IMG_4012.jpg read as a
 // rejected sign-in, and one for Scans/20240409.pdf as a missing parent folder
 // (Deck #691).
+//
+// A 423 has two meanings, told apart by the request it answered. To a write it
+// is files_lock: somebody has the file open. To a download it is the server's
+// own short lock on the file, which nobody is holding: saying "someone else has
+// this file open" for five downloads refused during a first sync was untrue
+// (Deck #950). The download has already been tried a few times by then (see
+// transport.LockedGETWaits) and the next pass tries it again.
 func humanActionErr(a engine.Action, err error) string {
 	s := err.Error()
 	code := transport.StatusCode(err)
 	switch {
 	case strings.HasPrefix(a.Path, ".Collectives") || strings.Contains(s, ".Collectives"):
 		return "can't sync inside “.Collectives” — it's managed by the Collectives app and won't accept items created here; move this out of .Collectives to sync it"
+	case transport.LockedDownload(err) || (a.Kind == engine.ActDownload && transport.IsLocked(err)):
+		return lockedDownloadMsg
 	case transport.IsLocked(err):
 		return "someone else has this file open — it's locked on the server"
 	case errors.As(err, new(*transfer.ChecksumMismatchError)):
@@ -3902,6 +3911,10 @@ func humanActionErr(a engine.Action, err error) string {
 		return s
 	}
 }
+
+// lockedDownloadMsg is the reason shown for a download the server answered 423
+// to on every try (see humanActionErr).
+const lockedDownloadMsg = "the server had this file locked for a moment, so it couldn't be downloaded; it will be tried again"
 
 // recordActionResult logs a failed action ONCE (deduped per path+reason, with a
 // human-readable message) and returns that message for the activity feed; a later

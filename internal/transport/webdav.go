@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -514,18 +515,63 @@ func (c *Client) Get(ctx context.Context, remotePath string) (io.ReadCloser, htt
 	return body, hdr, err
 }
 
+// LockedGETWaits is how long to wait before each further try of a file
+// download the server answered 423 Locked to: one try, then one more after
+// each wait. A var so tests can shorten it.
+//
+// A 423 to a GET is not somebody's files_lock lock, which only refuses writes.
+// It is the server's own short lock on the file while another request touches
+// it: five of some 1,690 downloads got one during a first sync running 32 at a
+// time (2026-10-13).
+var LockedGETWaits = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+
+// lockedGETWait is the wait before the next try of a download whose answer was
+// resp, a 423, after try earlier waits: what the server asked for in
+// Retry-After, else the next of LockedGETWaits. ok is false when the tries are
+// used up.
+func lockedGETWait(try int, resp *http.Response) (wait time.Duration, ok bool) {
+	if try >= len(LockedGETWaits) {
+		return 0, false
+	}
+	if asked := retryAfter(resp); asked > 0 {
+		return asked, true
+	}
+	return LockedGETWaits[try], true
+}
+
 // getRequest builds a GET request for remotePath, optionally carrying a Range
 // header, and sends it. The caller owns resp.Body (on a nil error) and must
 // close it.
+//
+// A 423 is tried again after a short wait (see LockedGETWaits), here rather
+// than in Do because only a download's 423 passes by itself: to a PUT, MOVE,
+// DELETE or LOCK it means somebody holds the file, and those do not come
+// through here. Each try sends the same Range, and a 423 carries none of the
+// file, so nothing has reached the caller that a later try could repeat. When
+// every try is refused the last 423 goes back to the caller as it always did.
 func (c *Client) getRequest(ctx context.Context, remotePath, rangeHeader string) (*http.Response, error) {
-	req, err := c.NewRequest(ctx, http.MethodGet, c.davURL(remotePath), nil)
-	if err != nil {
-		return nil, err
+	for try := 0; ; try++ {
+		req, err := c.NewRequest(ctx, http.MethodGet, c.davURL(remotePath), nil)
+		if err != nil {
+			return nil, err
+		}
+		if rangeHeader != "" {
+			req.Header.Set("Range", rangeHeader)
+		}
+		resp, err := c.Do(req)
+		if err != nil || resp.StatusCode != http.StatusLocked {
+			return resp, err
+		}
+		wait, ok := lockedGETWait(try, resp)
+		if !ok {
+			return resp, nil
+		}
+		drain(resp)
+		slog.Debug("download answered 423, trying again", "path", remotePath, "try", try+1, "wait", wait)
+		if err := sleep(ctx, wait); err != nil {
+			return nil, err
+		}
 	}
-	if rangeHeader != "" {
-		req.Header.Set("Range", rangeHeader)
-	}
-	return c.Do(req)
 }
 
 // GetFrom opens the file at remotePath for reading starting at byte offset. When
@@ -882,7 +928,8 @@ func (c *Client) Unlock(ctx context.Context, remotePath string) error {
 // statusError builds a descriptive error from an unexpected response, including
 // a short snippet of the body.
 // IsLocked reports whether err is a 423 Locked from the server — files_lock
-// refusing a write because somebody else holds the file.
+// refusing a write because somebody else holds the file. A download can be
+// answered 423 too, and there it means something else: see LockedDownload.
 //
 // This package returns untyped errors with the status formatted into the
 // message, so a substring match is the only option; it keys on the exact phrase
@@ -892,6 +939,16 @@ func (c *Client) Unlock(ctx context.Context, remotePath string) error {
 func IsLocked(err error) bool {
 	return StatusCode(err) == http.StatusLocked ||
 		(err != nil && strings.Contains(err.Error(), "server returned 423"))
+}
+
+// LockedDownload reports whether err is a 423 Locked to a GET of a file's
+// content. Nobody's lock refuses a read, so this is the server holding the file
+// for a moment while another request touches it, and it passes by itself (see
+// LockedGETWaits). It is told apart from a refused write by the request that
+// was answered, which the error carries.
+func LockedDownload(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.Code == http.StatusLocked && se.Op == http.MethodGet
 }
 
 func statusError(op, path string, resp *http.Response) error {

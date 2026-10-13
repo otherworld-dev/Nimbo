@@ -3,8 +3,9 @@
  *
  * Created once in NimboApp, so Play's billing connection (or the direct
  * build's key check) starts with the process and the first screen already
- * knows the cached tier. Nothing here touches the sync engine, and a failure
- * in any supporter task is logged, never fatal.
+ * knows the cached tier. The launcher icon is switched from here too, so that
+ * doesn't depend on a screen being alive. Nothing here touches the sync
+ * engine, and a failure in any supporter task is logged, never fatal.
  */
 package dev.otherworld.nimbo.supporter
 
@@ -27,5 +28,6 @@ object Supporter {
     fun init(app: Application) {
         repository = createSupporterRepository(app, scope)
         scope.launch { repository.refresh(force = false) }
+        AppIconSwitcher.watch(app)
     }
 }

@@ -7,7 +7,6 @@ package dev.otherworld.nimbo.supporter
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -16,7 +15,6 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 class SupporterViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -41,18 +39,6 @@ class SupporterViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /**
-     * The icon follows the perks (a lapsed Backer gets the default back), but
-     * is only applied when the app leaves the screen: disabling the launcher
-     * alias a task started from makes Android close that task.
-     */
-    fun applyIcon() {
-        val icon = ui.value.effectiveIcon
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) { AppIconSwitcher.apply(getApplication(), icon) }
-        }
-    }
-
     /** The user is looking at the Support screen: always ask. */
     fun refresh() {
         viewModelScope.launch { repo.refresh(force = true) }
@@ -73,6 +59,7 @@ class SupporterViewModel(app: Application) : AndroidViewModel(app) {
         choices.value = choices.value.copy(firstSeenAt = now)
     }
 
+    /** Saved at once; AppIconSwitcher changes the launcher icon when it is safe to. */
     fun setIcon(icon: AppIcon) {
         prefs.icon = icon
         choices.value = choices.value.copy(icon = icon)
