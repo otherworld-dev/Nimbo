@@ -3518,6 +3518,11 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 		}
 		return rel
 	}
+	// Paths whose action failed, for the dirtying after the downloads (below).
+	var (
+		unfinishedMu sync.Mutex
+		unfinished   []string
+	)
 	// One Executor per call: the download pool runs each file through its own
 	// (Workers 1), so the pool's size alone sets how many are in flight.
 	newExec := func(remote map[string]engine.RemoteState) *transfer.Executor {
@@ -3540,6 +3545,11 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 				var damaged *transfer.ChecksumMismatchError
 				if a.Kind == engine.ActDownload && errors.As(aerr, &damaged) {
 					e.noteDamaged(pk, a.Path, remote[a.Path].ETag) // see damaged.go
+				}
+				if aerr != nil {
+					unfinishedMu.Lock()
+					unfinished = append(unfinished, a.Path)
+					unfinishedMu.Unlock()
 				}
 				ev := activity.Event{Local: p.LocalDir, Path: a.Path, Kind: a.Kind.String()}
 				ev.Err = e.recordActionResult(a, aerr) // humanised + deduped; "" on success
@@ -3745,6 +3755,20 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 	e.progMu.Unlock()
 	e.emitProgress()
 	dlwg.Wait() // wait for the download pool to drain
+
+	// A folder row is written with the etag its listing gave, so a folder whose
+	// download or mkdir failed would look unchanged from now on and the scan
+	// would prune it: the file was never tried again (five files on the test
+	// VM after the server answered 423, with the status "Up to date"). Dirty
+	// the folders above every failed path, as later passes do, so the next
+	// scan lists them again, and ask for that pass now rather than at the poll.
+	unfinishedMu.Lock()
+	retry := append([]string(nil), unfinished...)
+	unfinishedMu.Unlock()
+	if len(retry) > 0 {
+		maintainDirBaselines(st, pk, nil, nil, retry)
+		defer e.TriggerSync()
+	}
 
 	if failed != nil {
 		e.status("Error")

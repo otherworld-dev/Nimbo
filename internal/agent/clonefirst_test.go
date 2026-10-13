@@ -422,3 +422,39 @@ func TestCloneChoiceSurvivesInterruption(t *testing.T) {
 		t.Errorf("choice left after the clone finished: %v", first)
 	}
 }
+
+// A download that fails during the first sync must be tried again. Later
+// passes dirty the folders above a failed path so the next scan lists them
+// again (maintainDirBaselines); the first sync never did, so its folder rows
+// kept the etag the listing gave them, the folder looked unchanged from then
+// on, and the file it was missing was never fetched: five files on the test VM
+// after the server answered 423 to their downloads, with the app saying "Up to
+// date" (2026-10-13).
+func TestCloneRetriesADownloadThatFailed(t *testing.T) {
+	f := newFakeDAV(cloneTree("A/a1", "A/a2", "A/deep/d1", "B/b1"))
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	e, _ := newHookEngine(t, srv.URL)
+	local := t.TempDir()
+	pair := Pair{LocalDir: local, RemoteRoot: ""}
+	ctx := context.Background()
+
+	f.setFailGET("A/deep/d1", 423) // locked on the server while the first sync runs
+	if _, err := e.SyncOnce(ctx, pair); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(local, "A", "a1")); err != nil {
+		t.Fatalf("the rest of the first sync did not arrive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(local, "A", "deep", "d1")); !os.IsNotExist(err) {
+		t.Fatalf("the failing download is here already (err %v)", err)
+	}
+
+	f.clearFailGET("A/deep/d1") // the lock is gone; nothing else changed on the server
+	if _, err := e.syncRemoteDelta(ctx, pair); err != nil {
+		t.Fatalf("the pass after the first sync: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(local, "A", "deep", "d1")); err != nil || string(b) != "body of A/deep/d1" {
+		t.Fatalf("the file whose download failed was not tried again: %q, %v", b, err)
+	}
+}
