@@ -951,8 +951,8 @@
             <div class="addhead">Switch back to normal files?</div>
             <p class="hint">Your files in <b>{revert.dir}</b> go back to being ordinary files, in place.</p>
             <ul class="hint">
-              {#if revert.hydrated}<li><b>{revert.hydrated.toLocaleString()}</b> are on this PC — converted back instantly, nothing transferred.</li>{/if}
-              {#if revert.dehydrated}<li><b>{revert.dehydrated.toLocaleString()}</b> are online-only. They'll download through normal syncing after the switch ({mb(revert.downloadBytes)}).</li>{/if}
+              {#if revert.hydrated}<li><b>{revert.hydrated.toLocaleString()}</b> {revert.hydrated === 1 ? "is" : "are"} on this PC — converted back instantly, nothing transferred.</li>{/if}
+              {#if revert.dehydrated}<li><b>{revert.dehydrated.toLocaleString()}</b> {revert.dehydrated === 1 ? "is" : "are"} online-only. {revert.dehydrated === 1 ? "It'll" : "They'll"} download through normal syncing after the switch ({mb(revert.downloadBytes)}).</li>{/if}
               {#if revert.ignored}<li><b>{revert.ignored.toLocaleString()}</b> {revert.ignored === 1 ? "is" : "are"} online-only in folders that normal syncing skips (your exclusions, such as node_modules). {revert.ignored === 1 ? "It stays" : "They stay"} on the server and won't download.</li>{/if}
               {#if revert.unsynced}<li><b>{revert.unsynced.toLocaleString()}</b> {revert.unsynced === 1 ? "is" : "are"} online-only and no sync folder covers {revert.unsynced === 1 ? "it, so it" : "them, so they"} won't download. {revert.unsynced === 1 ? "It stays" : "They stay"} on the server.</li>{/if}
             </ul>
@@ -1017,10 +1017,10 @@
             <div class="addhead">Keep the files already in this folder?</div>
             <p class="hint">There are already files in <b>{adopt.dir}</b>. Nimbo can keep them where they are instead of downloading everything again.</p>
             <ul class="hint">
-              {#if adopt.keep}<li><b>{adopt.keep}</b> already match your server — kept on this PC, nothing re-downloaded.</li>{/if}
-              {#if adopt.replace}<li><b>{adopt.replace}</b> are online-only leftovers from another client — replaced with Nimbo placeholders.</li>{/if}
-              {#if adopt.upload}<li><b>{adopt.upload}</b> aren’t on your server yet — uploaded.</li>{/if}
-              {#if adopt.conflict}<li><b>{adopt.conflict}</b> differ from your server — both versions kept (your copy is uploaded as a “conflicted copy”).</li>{/if}
+              {#if adopt.keep}<li><b>{adopt.keep}</b> already {adopt.keep === 1 ? "matches" : "match"} your server — kept on this PC, nothing re-downloaded.</li>{/if}
+              {#if adopt.replace}<li><b>{adopt.replace}</b> {adopt.replace === 1 ? "is an online-only leftover" : "are online-only leftovers"} from another client — replaced with {adopt.replace === 1 ? "a Nimbo placeholder" : "Nimbo placeholders"}.</li>{/if}
+              {#if adopt.upload}<li><b>{adopt.upload}</b> {adopt.upload === 1 ? "isn’t" : "aren’t"} on your server yet — uploaded.</li>{/if}
+              {#if adopt.conflict}<li><b>{adopt.conflict}</b> {adopt.conflict === 1 ? "differs" : "differ"} from your server — both versions kept (your copy is uploaded as a “conflicted copy”).</li>{/if}
             </ul>
             {#if adopt.uploadBytes}<p class="hint">Upload size: {mb(adopt.uploadBytes)}</p>{/if}
             <div class="addbtns">

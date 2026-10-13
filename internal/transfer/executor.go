@@ -382,6 +382,8 @@ func (e *Executor) applyTransfer(ctx context.Context, a engine.Action) error {
 		}
 		// A lock is not a transient failure — somebody else has the file and will
 		// have it for as long as they have it. Retrying just delays the message.
+		// (A download's 423 is the server's own short lock instead, and the
+		// transport has tried that again already: transport.LockedGETWaits.)
 		// The same goes for every other deliberate refusal (quota, forbidden,
 		// auth): re-hashing a huge file two more times won't change the answer.
 		// And for a file another program is writing: Outlook keeps an attached

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/otherworld/nimbo/internal/engine"
+	"github.com/otherworld/nimbo/internal/transport"
 )
 
 func dl(paths ...string) []engine.Action {
@@ -439,6 +440,7 @@ func TestCloneRetriesADownloadThatFailed(t *testing.T) {
 	pair := Pair{LocalDir: local, RemoteRoot: ""}
 	ctx := context.Background()
 
+	shortLockedGETWaits(t)         // the 423 outlasts the download's own tries (Deck #950)
 	f.setFailGET("A/deep/d1", 423) // locked on the server while the first sync runs
 	if _, err := e.SyncOnce(ctx, pair); err != nil {
 		t.Fatalf("first sync: %v", err)
@@ -456,5 +458,55 @@ func TestCloneRetriesADownloadThatFailed(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(local, "A", "deep", "d1")); err != nil || string(b) != "body of A/deep/d1" {
 		t.Fatalf("the file whose download failed was not tried again: %q, %v", b, err)
+	}
+}
+
+// shortLockedGETWaits makes the waits between tries of a download the server
+// answered 423 to too short to slow a test.
+func shortLockedGETWaits(t *testing.T) {
+	t.Helper()
+	old := transport.LockedGETWaits
+	transport.LockedGETWaits = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { transport.LockedGETWaits = old })
+}
+
+// A 423 to a download is the server's own lock on the file for a moment, and
+// the download is asked for again a moment later. So the five files the test
+// VM's first sync left behind (above) now arrive in the first sync itself, with
+// no failure to show for them (Deck #950).
+func TestCloneDownloadsAFileTheServerHadLockedForAMoment(t *testing.T) {
+	shortLockedGETWaits(t)
+	f := newFakeDAV(cloneTree("A/a1", "A/deep/d1", "B/b1"))
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	e, _ := newHookEngine(t, srv.URL)
+	local := t.TempDir()
+
+	f.setFailGET("A/deep/d1", 423)
+	var mu sync.Mutex
+	asked := 0
+	f.onGET = func(rel string) {
+		if rel != "A/deep/d1" {
+			return
+		}
+		mu.Lock()
+		asked++
+		third := asked == 3
+		mu.Unlock()
+		if third {
+			f.clearFailGET("A/deep/d1") // the server lets go before the third try
+		}
+	}
+	if _, err := e.SyncOnce(context.Background(), Pair{LocalDir: local, RemoteRoot: ""}); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(local, "A", "deep", "d1")); err != nil || string(b) != "body of A/deep/d1" {
+		t.Fatalf("the briefly locked file did not arrive in the first sync: %q, %v", b, err)
+	}
+	if n := f.getCount("A/deep/d1"); n != 3 {
+		t.Errorf("the file was asked for %d times, want 3", n)
+	}
+	for _, ev := range e.recorder.Errors() {
+		t.Errorf("activity shows a failure for %s: %s", ev.Path, ev.Err)
 	}
 }

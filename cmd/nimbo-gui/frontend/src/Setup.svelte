@@ -232,10 +232,10 @@
           <div class="mhead">Keep the files already in this folder?</div>
           <p class="sub left">There are already files in <b>{localDir}</b>. Nimbo can keep them where they are instead of downloading everything again.</p>
           <ul class="sub mlist">
-            {#if adopt.keep}<li><b>{adopt.keep}</b> already match your server — kept on this PC.</li>{/if}
-            {#if adopt.replace}<li><b>{adopt.replace}</b> are online-only leftovers from another app — replaced with Nimbo placeholders.</li>{/if}
-            {#if adopt.upload}<li><b>{adopt.upload}</b> aren’t on your server yet — uploaded.</li>{/if}
-            {#if adopt.conflict}<li><b>{adopt.conflict}</b> differ from your server — both versions kept.</li>{/if}
+            {#if adopt.keep}<li><b>{adopt.keep}</b> already {adopt.keep === 1 ? "matches" : "match"} your server — kept on this PC.</li>{/if}
+            {#if adopt.replace}<li><b>{adopt.replace}</b> {adopt.replace === 1 ? "is an online-only leftover" : "are online-only leftovers"} from another app — replaced with {adopt.replace === 1 ? "a Nimbo placeholder" : "Nimbo placeholders"}.</li>{/if}
+            {#if adopt.upload}<li><b>{adopt.upload}</b> {adopt.upload === 1 ? "isn’t" : "aren’t"} on your server yet — uploaded.</li>{/if}
+            {#if adopt.conflict}<li><b>{adopt.conflict}</b> {adopt.conflict === 1 ? "differs" : "differ"} from your server — both versions kept.</li>{/if}
           </ul>
           {#if adopt.uploadBytes}<p class="sub left">Upload size: {fmt(adopt.uploadBytes)}</p>{/if}
           <div class="actions">
