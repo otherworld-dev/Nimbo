@@ -29,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.otherworld.nimbo.LocalNimboHost
 import dev.otherworld.nimbo.core.absoluteUrl
+import dev.otherworld.nimbo.core.isWebLink
 import dev.otherworld.nimbo.supporter.SupportActions
 import dev.otherworld.nimbo.supporter.Supporter
 import dev.otherworld.nimbo.supporter.SupporterViewModel
@@ -275,7 +276,17 @@ fun NimboNav(vm: NimboViewModel, supporterVm: SupporterViewModel) {
                     busy = state.busy,
                     focusedId = state.focusedNotificationId,
                     onFocusShown = { vm.clearNotificationFocus() },
-                    onRunAction = { action -> vm.runNotificationAction(action) },
+                    // A WEB action is a link to open, not a request to send
+                    // (GitHub #20): sent as one it went nowhere, with the
+                    // account's login attached for whatever host it named.
+                    onRunAction = { action ->
+                        if (action.type.equals("WEB", ignoreCase = true)) {
+                            val url = absoluteUrl(state.serverUrl, action.link)
+                            if (isWebLink(url)) host.openUrl(url)
+                        } else {
+                            vm.runNotificationAction(action)
+                        }
+                    },
                     // Notification links point into the web UI, so they open
                     // there rather than pretending the app can render them.
                     onOpenLink = { item ->

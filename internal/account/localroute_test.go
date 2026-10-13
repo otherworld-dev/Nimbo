@@ -111,3 +111,15 @@ func TestCompleteKeepsLocalRoute(t *testing.T) {
 		t.Fatalf("re-login duplicated the account: %d entries", len(st.Accounts))
 	}
 }
+
+func TestAddress(t *testing.T) {
+	for _, tc := range []struct{ server, login, want string }{
+		{"https://cloud.example.com", "alice", "alice@cloud.example.com"},
+		{"https://example.com/nextcloud/", "bob", "bob@example.com/nextcloud"},
+		{"http://192.168.1.5:8080", "carol", "carol@192.168.1.5:8080"},
+	} {
+		if got := (Account{ServerURL: tc.server, LoginName: tc.login}).Address(); got != tc.want {
+			t.Errorf("Address(%q, %q) = %q, want %q", tc.server, tc.login, got, tc.want)
+		}
+	}
+}

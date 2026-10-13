@@ -85,7 +85,8 @@ func sanitizeToastText(s string) string {
 // showToast displays a Nextcloud notification as a toast. Its server-side actions
 // (Accept/Decline a share, etc.) become toast buttons that call DoNotificationAction
 // via the toast activator; clicking the body opens the in-app notifications tab.
-func showToast(n transport.Notification, accountID string) {
+// address names the account ("login@host") on the toast's attribution line.
+func showToast(n transport.Notification, accountID, address string) {
 	title := n.Subject
 	if title == "" {
 		title = "Nextcloud"
@@ -102,5 +103,5 @@ func showToast(n transport.Notification, accountID string) {
 			Args:  "action=notify" + acct + "&id=" + strconv.Itoa(n.ID) + "&label=" + url.QueryEscape(act.Label),
 		})
 	}
-	RaiseActionable(title, strings.TrimSpace(n.Message), bodyArgs, buttons)
+	raiseActionable(title, strings.TrimSpace(n.Message), address, bodyArgs, buttons)
 }

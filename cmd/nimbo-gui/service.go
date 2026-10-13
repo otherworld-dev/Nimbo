@@ -2774,6 +2774,13 @@ func (a *App) absURL(href string) string {
 	return resolveServerHref(a.eng.Account.ServerURL, href)
 }
 
+// isWebLink reports whether href is an absolute http(s) URL, the only kind a
+// server-supplied link is allowed to hand the shell to open.
+func isWebLink(href string) bool {
+	u, err := url.Parse(href)
+	return err == nil && u.Host != "" && (strings.EqualFold(u.Scheme, "https") || strings.EqualFold(u.Scheme, "http"))
+}
+
 // resolveServerHref joins a Nextcloud href onto the server URL. Hrefs come in
 // two shapes: our own paths are relative to the webroot ("/index.php/..."),
 // but the server's navigation API returns paths that already carry it
@@ -3585,6 +3592,7 @@ type NotifItem struct {
 	Message string        `json:"message"`
 	Link    string        `json:"link"`
 	Actions []NotifAction `json:"actions"`
+	Account string        `json:"account"` // "login@host" of the account it came to (GitHub #20)
 }
 
 // NotificationList returns the current notifications.
@@ -3593,12 +3601,14 @@ func (a *App) NotificationList() []NotifItem {
 		return nil
 	}
 	var out []NotifItem
+	acct := a.eng.Account.Address()
 	for _, n := range a.eng.Notifier().List() {
 		acts := make([]NotifAction, 0, len(n.Actions))
 		for _, ac := range n.Actions {
 			acts = append(acts, NotifAction{Label: ac.Label})
 		}
-		out = append(out, NotifItem{ID: n.ID, App: n.App, Subject: n.Subject, Message: n.Message, Link: n.Link, Actions: acts})
+		out = append(out, NotifItem{ID: n.ID, App: n.App, Subject: n.Subject, Message: n.Message, Link: n.Link,
+			Actions: acts, Account: acct})
 	}
 	return out
 }
@@ -3650,7 +3660,16 @@ func (a *App) doNotificationActionFor(acct string, id int, label string) {
 		}
 		for _, ac := range n.Actions {
 			if ac.Label == label {
-				_ = eng.DoNotificationAction(context.Background(), ac)
+				if ac.IsWeb() {
+					// A link to open, not a request to send (GitHub #20).
+					if href := resolveServerHref(eng.Account.ServerURL, ac.Link); isWebLink(href) {
+						openURL(href)
+					}
+					return
+				}
+				if err := eng.DoNotificationAction(context.Background(), ac); err != nil {
+					slog.Warn("notification action failed", "label", label, "err", err)
+				}
 				a.emit("notifications")
 				return
 			}

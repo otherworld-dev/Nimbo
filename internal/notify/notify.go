@@ -36,6 +36,7 @@ func Enabled() bool { return enabled.Load() }
 type Notifier struct {
 	client    *transport.Client
 	accountID string // owning account — carried into toast args so a click acts on the right account
+	address   string // "login@host", shown on the toast so the user knows which account (GitHub #20)
 
 	mu      sync.Mutex
 	seen    map[int]bool
@@ -44,9 +45,22 @@ type Notifier struct {
 }
 
 // New creates a Notifier for the given account client. accountID identifies the
-// account so a toast's Accept/Decline routes back to it (multi-account setups).
-func New(client *transport.Client, accountID string) *Notifier {
-	return &Notifier{client: client, accountID: accountID, seen: make(map[int]bool)}
+// account so a toast's Accept/Decline routes back to it (multi-account setups);
+// address ("login@host") names it on the toast.
+func New(client *transport.Client, accountID, address string) *Notifier {
+	return &Notifier{client: client, accountID: accountID, address: address, seen: make(map[int]bool)}
+}
+
+// withAttribution puts the attribution on its own line under message, for
+// toasts that have no separate attribution line.
+func withAttribution(message, attribution string) string {
+	switch {
+	case attribution == "":
+		return message
+	case message == "":
+		return attribution
+	}
+	return message + "\n" + attribution
 }
 
 // Prime records the currently-pending notifications without toasting them (so a
@@ -79,7 +93,7 @@ func (n *Notifier) refresh(ctx context.Context, toast bool) (int, error) {
 	for _, it := range items {
 		if !n.seen[it.ID] {
 			if toast {
-				showToast(it, n.accountID)
+				showToast(it, n.accountID, n.address)
 				slog.Info("notification", "app", it.App, "subject", it.Subject)
 			}
 			newCount++

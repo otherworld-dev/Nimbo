@@ -354,7 +354,7 @@ func NewEngineFor(ctx context.Context, accountID string) (*Engine, error) {
 		client:    client,
 		secret:    secret,
 		caps:      caps,
-		notifier:  notify.New(client, acc.ID),
+		notifier:  notify.New(client, acc.ID, acc.Address()),
 		recorder:  activity.New(),
 		blocked:   make(map[string][]engine.Blocked),
 		conflicts: make(map[string][]ConflictItem),

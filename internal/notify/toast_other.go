@@ -32,10 +32,11 @@ func RaiseActionable(title, message, _ string, _ []ToastButton) {
 
 // showToast displays a Nextcloud notification as a toast. accountID is unused
 // off-Windows (no clickable activation); the GUI panel provides click-through.
-func showToast(n transport.Notification, _ string) {
+// address ("login@host") goes under the message so the account is named.
+func showToast(n transport.Notification, _, address string) {
 	title := n.Subject
 	if title == "" {
 		title = "Nextcloud"
 	}
-	Toast(title, strings.TrimSpace(n.Message), n.Link)
+	Toast(title, withAttribution(strings.TrimSpace(n.Message), address), n.Link)
 }
