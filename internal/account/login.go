@@ -168,6 +168,23 @@ func (f *Flow) pollOnce(ctx context.Context) (creds Credentials, done bool, err 
 // account ID, stores the app password in the OS keychain, and records the
 // account in the store at path as the active one. It returns the saved account.
 func Complete(path string, creds Credentials) (Account, error) {
+	return complete(path, creds, true)
+}
+
+// Reauthorize is Complete for an account signing in again in the background:
+// it saves the new app password and record but leaves the shown account as it
+// is, so signing a background account back in doesn't switch to it (GitHub #20).
+func Reauthorize(path string, creds Credentials) (Account, error) {
+	return complete(path, creds, false)
+}
+
+// IDFor returns the ID an account for this server and login has, or would get
+// on signing in, so a caller can tell an account it already holds from a new one.
+func IDFor(server, loginName string) string {
+	return newID(strings.TrimRight(server, "/"), loginName)
+}
+
+func complete(path string, creds Credentials, makeDefault bool) (Account, error) {
 	server := strings.TrimRight(creds.Server, "/")
 	a := Account{
 		ID:        newID(server, creds.LoginName),
@@ -189,6 +206,9 @@ func Complete(path string, creds Credentials) (Account, error) {
 			a.Label = prev.Label
 		}
 		store.Upsert(a)
+		if !makeDefault {
+			return nil
+		}
 		// A fresh sign-in becomes the active account — both on first run and
 		// when adding a second account (the natural "switch to what I just
 		// added").

@@ -3,14 +3,41 @@
   import { App } from "../bindings/github.com/otherworld/nimbo/cmd/nimbo-gui";
   import Setup from "./Setup.svelte";
 
+  const startMsg = "Enter your Nextcloud server address to begin.";
   let server = $state("");
-  let msg = $state("Enter your Nextcloud server address to begin.");
+  let msg = $state(startMsg);
   let busy = $state(false);
   let phase = $state<"signin" | "setup">("signin");
 
+  // An account signing in again rather than a new one (GitHub #20): the window
+  // names it and fills in its server, so it doesn't look like adding an account
+  // that might overwrite the one already set up. "different" drops back to a
+  // plain sign-in for some other account.
+  let target = $state<{ id: string; address: string; server: string } | null>(null);
+  let different = $state(false);
+  const again = $derived(!!target && !different);
+
+  async function loadTarget() {
+    const t = await App.SignInTarget();
+    target = t?.id ? t : null;
+    different = false;
+    if (!busy) {
+      server = target ? target.server : "";
+      msg = target ? "" : startMsg;
+    }
+  }
+  loadTarget();
+  Events.On("login:target", loadTarget);
+
   Events.On("login:error", (e: any) => { if (!busy) return; msg = "Sign-in failed: " + e.data; busy = false; });
-  Events.On("login:done", async () => {
+  Events.On("login:done", async (e: any) => {
     busy = false;
+    // An account Nimbo already has keeps its folders and settings: no setup.
+    if (e.data === true) {
+      msg = "Signed in again.";
+      await App.CloseLogin();
+      return;
+    }
     await App.EnterSetup(); // grow the window for the configuration screen
     phase = "setup";
   });
@@ -29,7 +56,13 @@
   // also stops it).
   function cancel() {
     busy = false;
-    msg = "Enter your Nextcloud server address to begin.";
+    msg = again ? "" : startMsg;
+  }
+
+  function signInSomeoneElse() {
+    different = true;
+    server = "";
+    msg = startMsg;
   }
 </script>
 
@@ -37,14 +70,26 @@
   <Setup done={() => App.CloseLogin()} />
 {:else}
   <div class="login">
-    <h1>Sign in to Nextcloud</h1>
-    <input placeholder="https://cloud.example.com" bind:value={server} disabled={busy}
-           onkeydown={(e) => e.key === "Enter" && login()} />
-    <button class="primary" onclick={login} disabled={busy}>Log in</button>
+    {#if again && target}
+      <h1>Sign in again</h1>
+      <p class="who">{target.address}</p>
+      <p class="note">Nimbo can't sign in to this account any more, for example because its access was
+        removed in Nextcloud. Sign in again and it carries on where it left off: your folders and
+        settings are kept, and nothing needs setting up again.</p>
+      <button class="primary" onclick={login} disabled={busy}>Sign in again</button>
+    {:else}
+      <h1>Sign in to Nextcloud</h1>
+      <input placeholder="https://cloud.example.com" bind:value={server} disabled={busy}
+             onkeydown={(e) => e.key === "Enter" && login()} />
+      <button class="primary" onclick={login} disabled={busy}>Log in</button>
+    {/if}
     {#if busy}
       <button class="secondary" onclick={cancel}>Cancel</button>
     {/if}
-    <p class="msg">{msg}</p>
+    {#if msg}<p class="msg">{msg}</p>{/if}
+    {#if again && !busy}
+      <button class="link" onclick={signInSomeoneElse}>Sign in to a different account instead</button>
+    {/if}
   </div>
 {/if}
 
@@ -61,4 +106,10 @@
   button.secondary:hover { color: var(--fg); border-color: var(--fg2); }
   button:disabled { opacity: 0.6; cursor: default; }
   .msg { color: var(--fg2); font-size: 13px; margin: 0; }
+  .who { margin: -4px 0 0; font-size: 13px; font-weight: 600; color: var(--fg); word-break: break-all;
+         user-select: text; -webkit-user-select: text; }
+  .note { margin: 0; font-size: 12.5px; line-height: 1.45; color: var(--fg2); }
+  button.link { align-self: flex-start; padding: 0; border: none; background: none; color: var(--accent);
+                font-size: 12.5px; cursor: pointer; }
+  button.link:hover { text-decoration: underline; }
 </style>

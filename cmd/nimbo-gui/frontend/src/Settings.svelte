@@ -1502,6 +1502,9 @@ SHA-256: {localTest.fingerprint}</pre>
             </div>
             <div class="connacts">
               {#if ac.status && !ac.active}<span class="acctstatus" title={ac.status}>{ac.status}</span>{/if}
+              {#if ac.status === "Sign in again"}
+                <button class="link" onclick={() => App.SignInAgain(ac.id)}>Sign in again</button>
+              {/if}
               {#if !ac.active}
                 <button class="link" disabled={acctBusy} onclick={() => switchAccount(ac.id)}>Show</button>
                 <button class="link danger" title="Remove this account from this device (its local files are kept)" onclick={() => removeAccount(ac.id)}>Remove</button>

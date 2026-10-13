@@ -2326,6 +2326,60 @@ export class SidePreview {
 }
 
 /**
+ * SignInTargetDTO is the account the sign-in window asks to sign in again.
+ * An empty ID means none in particular: the window signs in a new account.
+ */
+export class SignInTargetDTO {
+    /**
+     * Creates a new SignInTargetDTO instance.
+     * @param {Partial<SignInTargetDTO>} [$$source = {}] - The source object to create the SignInTargetDTO.
+     */
+    constructor($$source = {}) {
+        if (!("id" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["id"] = "";
+        }
+        if (!("user" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["user"] = "";
+        }
+        if (!("server" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["server"] = "";
+        }
+        if (!("address" in $$source)) {
+            /**
+             * "login@host"
+             * @member
+             * @type {string}
+             */
+            this["address"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new SignInTargetDTO instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {SignInTargetDTO}
+     */
+    static createFrom($$source = {}) {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new SignInTargetDTO(/** @type {Partial<SignInTargetDTO>} */($$parsedSource));
+    }
+}
+
+/**
  * TrashDTO is a deleted item in the Nextcloud trashbin.
  */
 export class TrashDTO {
