@@ -97,7 +97,7 @@
 {/if}
 
 <style>
-  .login { height: 100%; background: var(--bg); color: var(--fg); padding: 22px; box-sizing: border-box;
+  .login { height: 100%; overflow-y: auto; background: var(--bg); color: var(--fg); padding: 22px; box-sizing: border-box;
            display: flex; flex-direction: column; gap: 12px; }
   h1 { font-size: 17px; margin: 0; }
   input { padding: 9px 10px; border: 1px solid var(--border-2); border-radius: 6px; font-size: 13px; background: var(--bg); color: var(--fg); }

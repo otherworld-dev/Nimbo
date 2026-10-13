@@ -266,7 +266,7 @@ func (a *App) completeSignIn(creds account.Credentials, want SignInTargetDTO) (a
 		// password, which nothing will use.
 		go revokeAppPassword(creds)
 		got := account.Account{ServerURL: creds.Server, LoginName: creds.LoginName}.Address()
-		return false, fmt.Errorf("your browser signed in to Nextcloud as %s, not %s. Log out of Nextcloud in your browser, then sign in again", got, want.Address)
+		return false, fmt.Errorf("your browser signed in to Nextcloud as %s, not %s. Log out of Nextcloud in your browser, then sign in again.", got, want.Address)
 	}
 	if !again {
 		acct, err := account.Complete(d.AccountsFile(), creds)

@@ -5306,7 +5306,7 @@ func (a *App) showLogin() {
 	// one in use rather than let it take focus (GitHub #20 testing). It drops
 	// back to an ordinary window a moment later, staying in front.
 	w := a.app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name: "login", Title: brand.Current.Name + " — Sign in", Width: 440, Height: 340, URL: "/#login",
+		Name: "login", Title: brand.Current.Name + " — Sign in", Width: 440, Height: 400, URL: "/#login",
 		AlwaysOnTop: true,
 	})
 	a.loginWin = w
