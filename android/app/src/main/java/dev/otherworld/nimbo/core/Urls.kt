@@ -23,3 +23,15 @@ fun absoluteUrl(serverUrl: String, href: String): String {
     if (base.isEmpty()) return target
     return base + "/" + target.trimStart('/')
 }
+
+/**
+ * Whether [url] is an absolute http(s) link, the only kind a server-supplied link
+ * (a notification's WEB action) is allowed to hand the system to open: never an
+ * intent:, file: or other app's scheme (GitHub #20). Same rule as the desktop's
+ * isWebLink.
+ */
+fun isWebLink(url: String): Boolean {
+    val scheme = url.substringBefore("://", missingDelimiterValue = "")
+    if (!scheme.equals("https", ignoreCase = true) && !scheme.equals("http", ignoreCase = true)) return false
+    return url.substringAfter("://").substringBefore('/').isNotEmpty()
+}

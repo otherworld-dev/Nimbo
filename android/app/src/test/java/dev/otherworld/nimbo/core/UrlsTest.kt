@@ -12,6 +12,8 @@ package dev.otherworld.nimbo.core
  */
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class UrlsTest {
@@ -65,5 +67,17 @@ class UrlsTest {
     @Test
     fun `a blank server leaves the href untouched`() {
         assertEquals("/index.php/apps/files/", absoluteUrl("", "/index.php/apps/files/"))
+    }
+
+    @Test
+    fun `only absolute http and https links count as web links`() {
+        assertTrue(isWebLink("https://iplookup.flagfox.net/?ip=1.2.3.4"))
+        assertTrue(isWebLink("HTTP://cloud.example.com/apps/files/"))
+        assertFalse(isWebLink("/index.php/apps/files/"))
+        assertFalse(isWebLink("intent://scan/#Intent;scheme=zxing;end"))
+        assertFalse(isWebLink("file:///sdcard/secret"))
+        assertFalse(isWebLink("javascript:alert(1)"))
+        assertFalse(isWebLink("https:///nohost"))
+        assertFalse(isWebLink(""))
     }
 }

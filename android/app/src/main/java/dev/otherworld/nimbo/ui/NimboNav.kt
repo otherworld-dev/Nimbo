@@ -29,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.otherworld.nimbo.LocalNimboHost
 import dev.otherworld.nimbo.core.absoluteUrl
+import dev.otherworld.nimbo.core.isWebLink
 import dev.otherworld.nimbo.supporter.SupportActions
 import dev.otherworld.nimbo.supporter.Supporter
 import dev.otherworld.nimbo.supporter.SupporterViewModel
@@ -280,7 +281,8 @@ fun NimboNav(vm: NimboViewModel, supporterVm: SupporterViewModel) {
                     // account's login attached for whatever host it named.
                     onRunAction = { action ->
                         if (action.type.equals("WEB", ignoreCase = true)) {
-                            host.openUrl(absoluteUrl(state.serverUrl, action.link))
+                            val url = absoluteUrl(state.serverUrl, action.link)
+                            if (isWebLink(url)) host.openUrl(url)
                         } else {
                             vm.runNotificationAction(action)
                         }
