@@ -26,3 +26,6 @@ func (*Watcher) PauseChanged() {}
 
 // NotifyRenamed does nothing off Windows.
 func (*Watcher) NotifyRenamed(string, string) {}
+
+// SyncFirst does nothing off Windows.
+func (*Watcher) SyncFirst(string) SyncFirstResult { return SyncFirstResult{} }

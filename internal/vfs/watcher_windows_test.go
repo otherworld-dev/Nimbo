@@ -913,7 +913,8 @@ func bareWatcher(root string, ops Ops) *Watcher {
 		verifying:   map[string]bool{},
 		forced:      map[string]bool{},
 		hydrateWake: make(chan struct{}, 1), hydrating: map[string]bool{},
-		hydrateFails: map[string]int{}, hydrateNext: map[string]time.Time{},
+		hydrateFirstWake: make(chan struct{}, 1),
+		hydrateFails:     map[string]int{}, hydrateNext: map[string]time.Time{},
 	}
 	if w.ops.Log == nil {
 		w.ops.Log = func(string, ...any) {}
@@ -921,6 +922,7 @@ func bareWatcher(root string, ops Ops) *Watcher {
 	for i := 0; i < hydrateWorkers; i++ {
 		w.spawn(w.hydrateLoop) // New starts these too; they exit with w.cancel()
 	}
+	w.spawn(w.hydrateFirstLoop)
 	testWatchers.Lock()
 	testWatchers.ws = append(testWatchers.ws, w)
 	testWatchers.Unlock()
