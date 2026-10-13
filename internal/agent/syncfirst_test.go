@@ -489,7 +489,7 @@ func TestLanePreferRunsOut(t *testing.T) {
 	l := newLane(true)
 	t.Cleanup(l.close)
 	l.add(newTestJob("pk", "a").j)
-	l.prefer(`C:\Sync\late`, time.Millisecond)
+	l.prefer(filepath.Join(`C:\Sync`, "late"), time.Millisecond)
 	time.Sleep(20 * time.Millisecond)
 	l.add(newTestJob("pk", "late").j)
 	if ents := l.entries(); ents[0].rel != "a" || ents[1].rel != "late" {
@@ -501,7 +501,9 @@ func TestLanePreferKeepsAFoldersFilesInOrder(t *testing.T) {
 	l := newLane(true)
 	t.Cleanup(l.close)
 	l.add(newTestJob("pk", "other").j)
-	l.prefer(`C:\Sync\F`, time.Minute)
+	// Joined like newTestJob's paths: on Linux a backslash is no separator, so
+	// a literal `C:\Sync\F` never contains `C:\Sync/F/1` (CI, 2026-10-13).
+	l.prefer(filepath.Join(`C:\Sync`, "F"), time.Minute)
 	for _, rel := range []string{"F/1", "F/2", "Fother", "F/3"} {
 		l.add(newTestJob("pk", rel).j)
 	}
