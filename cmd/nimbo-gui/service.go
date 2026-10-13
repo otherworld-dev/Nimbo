@@ -86,6 +86,12 @@ type App struct {
 	onDemandMounts  map[string]*odMount // local dir -> active mount
 	pendingKeep     string              // on-demand path to pin once mounts are ready
 	pendingFree     string              // on-demand path to free up once mounts are ready
+	// "Sync this first" from the Explorer menu (syncfirst.go): the paths asked
+	// for before the engine was ready, and when each kind of toast was last
+	// shown. All three guarded by syncFirstMu.
+	syncFirstMu      sync.Mutex
+	pendingSyncFirst []string
+	syncFirstSaid    map[string]time.Time
 	// pendingAdopt holds the plan from the last "ondemand-scan" so the confirmed
 	// "ondemand-adopt" acts on exactly what the user was shown. preMountAdopt is
 	// the confirmed plan staged for mountOnDemandWith, which runs its Apply
@@ -317,6 +323,9 @@ func (a *App) start(ctx context.Context) {
 		p := a.pendingFree
 		a.pendingFree = ""
 		application.InvokeAsync(func() { a.freeLocalPath(p) })
+	}
+	for _, p := range a.takePendingSyncFirst() {
+		application.InvokeAsync(func() { a.syncFirstLocalPath(p) })
 	}
 	if a.pendingApp != "" {
 		id := a.pendingApp
@@ -4126,6 +4135,10 @@ func (a *App) onSecondInstance(args []string) {
 	}
 	if p := argValue(args, "--free"); p != "" {
 		application.InvokeAsync(func() { a.freeLocalPath(p) })
+		return
+	}
+	if p := argValue(args, "--sync-first"); p != "" {
+		application.InvokeAsync(func() { a.syncFirstLocalPath(p) })
 	}
 }
 
