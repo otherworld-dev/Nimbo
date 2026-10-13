@@ -167,6 +167,11 @@ func localFileChanged(l LocalState, b BaselineState) bool {
 	return l.Size != b.LocalSize || l.MTime.UnixNano() != b.LocalMTimeNanos
 }
 
+// LocalFileChanged is the diff's own test of whether a local file differs
+// from its baseline row (size and modification time), for a caller that looks
+// for unsent local changes without planning anything.
+func LocalFileChanged(l LocalState, b BaselineState) bool { return localFileChanged(l, b) }
+
 // act builds a single-path action with a reason.
 func act(kind ActionKind, path, reason string) Action {
 	return Action{Kind: kind, Path: path, Reason: reason}

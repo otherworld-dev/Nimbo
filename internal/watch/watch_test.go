@@ -398,3 +398,52 @@ func TestAUserSyncIsNotHeldBackByTheBackoff(t *testing.T) {
 	ext <- struct{}{}
 	wait(3, "the backoff was still in force after the user's sync succeeded")
 }
+
+// Explorer's "Sync this first" hands its paths in as nudges (Deck #702). They
+// must sync while a failed pass is being backed off from, the same as a local
+// change does: the backoff spaces out the polls and pushes that walk the
+// server, never a sync of named paths somebody is waiting on.
+func TestNudgedPathsSyncDuringTheBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ext := make(chan struct{}, 1)
+	nudge := make(chan string, 4)
+	var pushes atomic.Int32
+	onPush := func(context.Context) error {
+		pushes.Add(1)
+		return errors.New("server unreachable") // every push fails: an hour's hold
+	}
+	got := make(chan []string, 4)
+	syncFn := func(_ context.Context, changed []string) error {
+		if changed != nil {
+			got <- changed
+		}
+		return nil
+	}
+	go func() {
+		_ = runLoop(ctx, Options{Root: t.TempDir(), Debounce: 10 * time.Millisecond, PollInterval: time.Hour,
+			OnPush: onPush, External: ext, Nudge: nudge}, syncFn, make(chan string))
+	}()
+	ext <- struct{}{}
+	deadline := time.After(2 * time.Second)
+	for pushes.Load() < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("the first push never ran")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	// A folder's worth, sent one after another, arrives as one batch.
+	nudge <- `C:\Sync\D\a.txt`
+	nudge <- `C:\Sync\D\b.txt`
+	nudge <- `C:\Sync\D\c.txt`
+	select {
+	case changed := <-got:
+		if len(changed) != 3 {
+			t.Fatalf("synced %v, want the three nudged paths in one pass", changed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the nudged paths were held back by the backoff")
+	}
+}

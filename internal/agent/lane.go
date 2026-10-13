@@ -20,7 +20,8 @@ import (
 // pass that planned them. The pass ends in seconds and the next one can start.
 // Since stage 2 the user can also move a waiting job to the front and set a
 // job aside for a while; a set-aside job is still held, so passes keep
-// leaving its file alone.
+// leaving its file alone. Since stage 3 a path can also be asked for before
+// the lane holds it (prefer), for Explorer's "Sync this first".
 //
 // The lane knows nothing about syncing. A job is an identity (pair key and
 // pair-relative path, plus the local path for stops by folder), a run that
@@ -33,7 +34,23 @@ var (
 	laneMinBytes int64 = 64 << 20
 	// laneWorkers is how many lane transfers run at once per engine.
 	laneWorkers = 2
+	// lanePreferFor is how long a "Sync this first" keeps applying to
+	// transfers the lane does not hold yet (prefer). Long enough for the pass
+	// that plans them to run behind a busy one, short enough that the request
+	// is forgotten once it is no longer what the user is waiting for.
+	lanePreferFor = 10 * time.Minute
 )
+
+// lanePrefsMax bounds the paths prefer remembers at once. Far more than a
+// person asks for by hand; a huge selection keeps its newest ones.
+const lanePrefsMax = 64
+
+// lanePref is one path the user asked to sync first: a file, or a folder and
+// everything beneath it.
+type lanePref struct {
+	abs   string
+	until time.Time
+}
 
 // errLaneStopped is what done hears for a job that left the lane unfinished:
 // stopped because its file is being moved or deleted, its folder is going
@@ -92,8 +109,11 @@ type lane struct {
 	// moved, held back) takes no new transfers from a pass that was already
 	// planning it.
 	stoppedPairs map[string]bool
-	seq          uint64
-	wg           sync.WaitGroup
+	// prefs are the paths the user asked to sync first (prefer): a job added
+	// at or beneath one joins the front of the queue instead of the back.
+	prefs []lanePref
+	seq   uint64
+	wg    sync.WaitGroup
 	// onChange is told, without mu held, whenever a job arrives, starts,
 	// moves, is set aside or leaves. Set once, before the lane is used.
 	onChange func()
@@ -125,11 +145,64 @@ func (l *lane) add(j *laneJob) bool {
 	}
 	l.seq++
 	j.seq = l.seq
-	l.queue = append(l.queue, j)
+	if l.preferredLocked(j.abs) {
+		// The user asked for it before the lane had it: to the front, behind
+		// the other jobs that were asked for, so a folder's files keep the
+		// order they were planned in.
+		i := 0
+		for i < len(l.queue) && l.preferredLocked(l.queue[i].abs) {
+			i++
+		}
+		l.queue = append(l.queue, nil)
+		copy(l.queue[i+1:], l.queue[i:])
+		l.queue[i] = j
+	} else {
+		l.queue = append(l.queue, j)
+	}
 	l.dispatchLocked()
 	l.mu.Unlock()
 	l.changed()
 	return true
+}
+
+// preferredLocked reports whether abs is, or lies beneath, a path the user
+// asked to sync first, while that request still stands. Requests whose time
+// has run out are dropped as it looks.
+func (l *lane) preferredLocked(abs string) bool {
+	now := time.Now()
+	kept := l.prefs[:0]
+	hit := false
+	for _, p := range l.prefs {
+		if !now.Before(p.until) {
+			continue
+		}
+		kept = append(kept, p)
+		if within(abs, p.abs) {
+			hit = true
+		}
+	}
+	l.prefs = kept
+	return hit
+}
+
+// prefer remembers, for d, that the user asked for abs (a file, or a folder
+// and everything beneath it) to sync first: a job added for it meanwhile
+// joins the front of the queue. It is for a file the lane does not hold yet,
+// which a pass still has to plan. Asking again restarts the time.
+func (l *lane) prefer(abs string, d time.Duration) {
+	key := config.PathKey(abs)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	kept := l.prefs[:0]
+	for _, p := range l.prefs {
+		if config.PathKey(p.abs) != key {
+			kept = append(kept, p)
+		}
+	}
+	if len(kept) >= lanePrefsMax {
+		kept = kept[len(kept)-lanePrefsMax+1:]
+	}
+	l.prefs = append(kept, lanePref{abs: abs, until: time.Now().Add(d)})
 }
 
 func (l *lane) holdsLocked(match func(*laneJob) bool) bool {
@@ -430,6 +503,45 @@ func (l *lane) first(abs string) bool {
 	l.mu.Unlock()
 	l.changed()
 	return true
+}
+
+// firstUnder moves every waiting job at abs or beneath it to the front of the
+// queue, in path order, and returns how many it moved. Like first, it never
+// interrupts a running job, and it leaves set-aside ones set aside.
+func (l *lane) firstUnder(abs string) int {
+	l.mu.Lock()
+	var moved, rest []*laneJob
+	for _, j := range l.queue {
+		if within(j.abs, abs) {
+			moved = append(moved, j)
+		} else {
+			rest = append(rest, j)
+		}
+	}
+	if len(moved) == 0 {
+		l.mu.Unlock()
+		return 0
+	}
+	sort.SliceStable(moved, func(a, b int) bool {
+		return config.PathKey(moved[a].abs) < config.PathKey(moved[b].abs)
+	})
+	l.queue = append(moved, rest...)
+	l.mu.Unlock()
+	l.changed()
+	return len(moved)
+}
+
+// stateAt is where the job at the local path abs is: laneWaiting, laneRunning
+// or laneParked, or 0 when the lane does not hold it. A running job on its
+// way to being set aside counts as set aside.
+func (l *lane) stateAt(abs string) laneState {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	j, st := l.findLocked(abs)
+	if st == laneRunning && j.parking {
+		return laneParked
+	}
+	return st
 }
 
 // park sets the job at abs aside until until (zero: until unpark). A waiting
