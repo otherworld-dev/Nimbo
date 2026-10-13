@@ -37,6 +37,13 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ### Changed
 
+- The first time this version runs, Nimbo checks every folder in each of your sync
+  folders once. Earlier versions could leave a file out for good if its download
+  failed during the first sync, and this is how the ones already missing are
+  found. It lists the folders on the server again, downloads anything that isn't
+  on this PC, and leaves everything else alone. On a large account it can take a
+  few minutes, you can keep working while it runs, and a notification says when
+  it starts and what it found. On-demand mode isn't affected (#949).
 - Syncing now also pauses for review when a single change from the server would
   remove or replace more than 1,000 of your files, however large the folder is.
   Until now it only paused when 50 or more files and at least half of the whole

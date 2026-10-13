@@ -66,6 +66,13 @@ CREATE TABLE IF NOT EXISTS clone_first (
   paths      TEXT NOT NULL,  -- JSON array of pair-relative folders the initial clone downloads first, in order
   PRIMARY KEY (account_id, pair_key)
 );
+CREATE TABLE IF NOT EXISTS pair_meta (
+  account_id TEXT NOT NULL,
+  pair_key   TEXT NOT NULL,
+  name       TEXT NOT NULL,  -- what the value is about (e.g. a one-off maintenance step)
+  value      TEXT NOT NULL,
+  PRIMARY KEY (account_id, pair_key, name)
+);
 CREATE TABLE IF NOT EXISTS scan_checkpoint (
   account_id TEXT    NOT NULL,
   pair_key   TEXT    NOT NULL,
@@ -486,7 +493,7 @@ func (s *Store) SetCloneStatus(pairKey, status string) error {
 // The folders chosen to download first go with it. Clearing a pair with no row
 // is a no-op.
 func (s *Store) ClearCloneStatus(pairKey string) error {
-	for _, table := range []string{"clone_state", "clone_first"} {
+	for _, table := range []string{"clone_state", "clone_first", "pair_meta"} {
 		if _, err := s.db.Exec(
 			`DELETE FROM `+table+` WHERE account_id = ? AND pair_key = ?`,
 			s.accountID, pairKey,
@@ -495,6 +502,58 @@ func (s *Store) ClearCloneStatus(pairKey string) error {
 		}
 	}
 	return nil
+}
+
+// PairMeta returns a named value kept for a pair, "" when there is none. It
+// goes with the pair: dropped when the pair is removed or reset
+// (ClearCloneStatus) and carried over when it moves (RekeyPair).
+func (s *Store) PairMeta(pairKey, name string) (string, error) {
+	var v string
+	err := s.db.QueryRow(
+		`SELECT value FROM pair_meta WHERE account_id = ? AND pair_key = ? AND name = ?`,
+		s.accountID, pairKey, name,
+	).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return v, err
+}
+
+// SetPairMeta records a named value for a pair.
+func (s *Store) SetPairMeta(pairKey, name, value string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO pair_meta (account_id, pair_key, name, value) VALUES (?, ?, ?, ?)
+		   ON CONFLICT(account_id, pair_key, name) DO UPDATE SET value = excluded.value`,
+		s.accountID, pairKey, name, value,
+	)
+	return err
+}
+
+// BlankDirETags empties the recorded etag of every folder row of a pair and
+// returns how many it changed. A folder with no etag never matches the
+// server's, so the next remote scan lists every folder again instead of
+// pruning the ones that look unchanged. Nothing else about the rows changes.
+func (s *Store) BlankDirETags(pairKey string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		`UPDATE baseline SET remote_etag = ''
+		  WHERE account_id = ? AND pair_key = ? AND is_dir = 1 AND remote_etag <> ''`,
+		s.accountID, pairKey,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("blank dir etags: %w", err)
+	}
+	if m, ok := s.cache[pairKey]; ok { // keep the resident copy current
+		for p, b := range m {
+			if b.IsDir && b.RemoteETag != "" {
+				b.RemoteETag = ""
+				m[p] = b
+			}
+		}
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 // CloneFirst returns the folders a pair's initial clone downloads before
@@ -712,7 +771,7 @@ func (s *Store) RekeyPair(oldKey, newKey string) error {
 		return fmt.Errorf("probe destination: %w", err)
 	}
 
-	for _, table := range []string{"baseline", "clone_state", "clone_first"} {
+	for _, table := range []string{"baseline", "clone_state", "clone_first", "pair_meta"} {
 		if _, err := tx.Exec(
 			`UPDATE `+table+` SET pair_key=? WHERE account_id=? AND pair_key=?`,
 			newKey, s.accountID, oldKey,

@@ -95,9 +95,12 @@ type Engine struct {
 	triggers     map[string]chan struct{}
 	triggersFull map[string]chan struct{} // key -> force-a-full-local-pass trigger (name-rule changes)
 	triggersUser map[string]chan struct{} // key -> a sync the user asked for (not held back by the failure backoff)
-	nudges       map[string]chan string   // key -> paths to sync as if the watcher saw them (see inuse.go)
-	awaiting     map[string]bool          // absolute paths awaitClosed is watching
-	tl           *lane                    // long transfers (lane.go, lanejobs.go); created on first use
+
+	relistMu     sync.Mutex
+	relistActive string                 // pair key whose one-off re-list is running ("" = none); see relist.go
+	nudges       map[string]chan string // key -> paths to sync as if the watcher saw them (see inuse.go)
+	awaiting     map[string]bool        // absolute paths awaitClosed is watching
+	tl           *lane                  // long transfers (lane.go, lanejobs.go); created on first use
 	busyMu       sync.Mutex
 	busy         map[string]string        // absolute path -> pair-relative: uploads waiting on a program (inuse.go)
 	watchDone    map[string]chan struct{} // key -> closed when the watcher goroutine exits (for a synchronous, drained stop)
@@ -3437,6 +3440,9 @@ func (e *Engine) SyncOnce(ctx context.Context, p Pair) (transfer.Stats, error) {
 		e.markPairSynced(pk) // baseline present = synced before; seed the config-side marker
 	}
 
+	// Before the scan, and so before the baseline it prunes against is read.
+	relisting := e.relistBegin(st, pk, p)
+
 	// A full pass scans both trees before any transfer; on a large sync the
 	// discovery alone takes minutes, so surface it rather than looking idle.
 	e.status("Scanning…")
@@ -3446,6 +3452,7 @@ func (e *Engine) SyncOnce(ctx context.Context, p Pair) (transfer.Stats, error) {
 		return transfer.Stats{}, err
 	}
 	planStats, err := e.applyPlan(ctx, st, p, actions, remote, base, true) // full reconcile
+	e.relistEnd(st, pk, p, relisting, planStats, err)
 	// cloneStats is non-zero only when this pass also ran a clone first, so the
 	// caller sees one set of totals for the whole pass.
 	return cloneStats.Plus(planStats), err
@@ -3779,6 +3786,9 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 	}
 	_ = st.SetCloneStatus(pk, "done")
 	_ = st.SetCloneFirst(pk, nil) // nothing left to put first
+	// A first sync finished by this build retries what failed (above), so it
+	// has no holes for the one-off re-list to find.
+	_ = st.SetPairMeta(pk, relistMeta, relistDone)
 	e.markPairSynced(pk)
 	e.status("Up to date")
 	return stats, nil
@@ -4779,6 +4789,8 @@ func (e *Engine) syncRemoteDelta(ctx context.Context, p Pair) (transfer.Stats, e
 	if status, _ := st.CloneStatus(pk); status != "done" {
 		return e.SyncOnce(ctx, p)
 	}
+	// Before the baseline the scan prunes against is read.
+	relisting := e.relistBegin(st, pk, p)
 
 	tBase := time.Now()
 	base, err := st.LoadBaseline(pk)
@@ -4832,6 +4844,7 @@ func (e *Engine) syncRemoteDelta(ctx context.Context, p Pair) (transfer.Stats, e
 			"baseline_rows", len(base))
 		e.clearCheckpoint(st, pk) // a quiet delta is a clean pass
 		e.status("Up to date")
+		e.relistEnd(st, pk, p, relisting, transfer.Stats{}, nil)
 		return transfer.Stats{}, nil
 	}
 
@@ -4873,7 +4886,9 @@ func (e *Engine) syncRemoteDelta(ctx context.Context, p Pair) (transfer.Stats, e
 		"remote_scan", remoteScan.Round(time.Millisecond),
 		"delta_compute", deltaCompute.Round(time.Millisecond),
 		"baseline_rows", len(base), "changed_paths", len(remoteSub)+len(baseSub), "actions", len(actions))
-	return e.applyPlan(ctx, st, p, actions, remoteSub, base, false) // remote-delta — merge blocks, don't clear
+	stats, err := e.applyPlan(ctx, st, p, actions, remoteSub, base, false) // remote-delta — merge blocks, don't clear
+	e.relistEnd(st, pk, p, relisting, stats, err)
+	return stats, err
 }
 
 // maxScopes caps how many distinct subtrees one change-batch will sync before
