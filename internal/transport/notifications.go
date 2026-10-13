@@ -2,8 +2,10 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -56,18 +58,55 @@ func (c *Client) DismissAllNotifications(ctx context.Context) error {
 	return c.ocsAction(ctx, http.MethodDelete, url)
 }
 
+// IsWeb reports whether the action is a link for the user to open in a browser
+// (type WEB in the notifications API) rather than a request for the client to
+// send. Suspicious-login warnings carry one pointing at an IP lookup site.
+func (a NotificationAction) IsWeb() bool { return strings.EqualFold(a.Type, "WEB") }
+
 // ExecuteAction performs a notification action (Accept/Decline/etc.) by calling
 // its link with its method. The link may be absolute or server-relative.
+//
+// The request carries the account's login, so it is only ever sent to the
+// account's own server: a link to any other host is refused, as is a WEB
+// action, which the UI opens in the browser instead. Before GitHub #20 a WEB
+// action went out as a "WEB" request to the site it named, login attached.
 func (c *Client) ExecuteAction(ctx context.Context, a NotificationAction) error {
+	if a.IsWeb() {
+		return errors.New("notification action: a WEB action is opened in the browser, not sent")
+	}
 	method := strings.ToUpper(a.Type)
 	if method == "" {
 		method = http.MethodGet
 	}
-	url := a.Link
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-		url = c.server + url
+	target := a.Link
+	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+		target = c.server + target
 	}
-	return c.ocsAction(ctx, method, url)
+	if !c.sameServer(target) {
+		return fmt.Errorf("notification action: refusing to send the login to %s, which is not this account's server", hostOf(target))
+	}
+	return c.ocsAction(ctx, method, target)
+}
+
+// sameServer reports whether target is on the account's server: same scheme
+// and host (port included) as the configured server URL.
+func (c *Client) sameServer(target string) bool {
+	t, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	s, err := url.Parse(c.server)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(t.Scheme, s.Scheme) && strings.EqualFold(t.Host, s.Host)
+}
+
+func hostOf(target string) string {
+	if u, err := url.Parse(target); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return "another host"
 }
 
 // ocsAction issues an authenticated OCS request with no response body of

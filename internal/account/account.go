@@ -46,3 +46,14 @@ func newID(serverURL, loginName string) string {
 func (a Account) DAVRoot() string {
 	return a.ServerURL + "/remote.php/dav/files/" + a.LoginName
 }
+
+// Address names the account the way Nextcloud's own clients do, "login@host"
+// (host without the scheme, subpath kept), for telling a user which account
+// something belongs to.
+func (a Account) Address() string {
+	host := a.ServerURL
+	if _, rest, ok := strings.Cut(host, "://"); ok {
+		host = rest
+	}
+	return a.LoginName + "@" + strings.TrimRight(host, "/")
+}

@@ -275,7 +275,16 @@ fun NimboNav(vm: NimboViewModel, supporterVm: SupporterViewModel) {
                     busy = state.busy,
                     focusedId = state.focusedNotificationId,
                     onFocusShown = { vm.clearNotificationFocus() },
-                    onRunAction = { action -> vm.runNotificationAction(action) },
+                    // A WEB action is a link to open, not a request to send
+                    // (GitHub #20): sent as one it went nowhere, with the
+                    // account's login attached for whatever host it named.
+                    onRunAction = { action ->
+                        if (action.type.equals("WEB", ignoreCase = true)) {
+                            host.openUrl(absoluteUrl(state.serverUrl, action.link))
+                        } else {
+                            vm.runNotificationAction(action)
+                        }
+                    },
                     // Notification links point into the web UI, so they open
                     // there rather than pretending the app can render them.
                     onOpenLink = { item ->

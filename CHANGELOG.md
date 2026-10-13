@@ -72,6 +72,14 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ### Fixed
 
+- A notification button that links to a website, such as "Open iplookup.flagfox.net"
+  on Nextcloud's suspicious login warning, now opens in your browser. It used to do
+  nothing, and Nimbo sent the link a request with your login and app password
+  attached, so if you clicked one, revoke Nimbo's app password in Nextcloud
+  (Personal settings → Security) and sign in again. Nimbo now only ever sends your
+  login to your own server. Notifications also say which account they came to, in
+  Status and on the Windows notification, and their text can be selected and
+  copied. The Android app had the same button problem and is fixed too (#952).
 - Pausing now stops large uploads and downloads, they carried on regardless in
   0.2.0 even though the notes for that release said pausing covered them. Removing
   or moving a sync folder, blacklisting a file, or unticking a folder now stops its

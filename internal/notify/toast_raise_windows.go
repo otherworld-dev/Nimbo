@@ -350,8 +350,9 @@ func buildToastXML(title, message, link string) string {
 // buildToastXMLActions builds a toast whose body and buttons activate the app
 // (foreground activation → our COM activator → dispatchToastActivation). bodyArgs
 // is the activation string for a click on the toast body; each button carries its
-// own args.
-func buildToastXMLActions(title, message, bodyArgs string, buttons []ToastButton) string {
+// own args. attribution, when set, is the small line under the body (which
+// account a Nextcloud notification came to, GitHub #20).
+func buildToastXMLActions(title, message, attribution, bodyArgs string, buttons []ToastButton) string {
 	var b strings.Builder
 	b.WriteString(`<toast activationType="foreground" launch="`)
 	b.WriteString(xmlEscapeAttr(bodyArgs))
@@ -364,6 +365,11 @@ func buildToastXMLActions(title, message, bodyArgs string, buttons []ToastButton
 	if message != "" {
 		b.WriteString(`<text>`)
 		b.WriteString(xmlEscapeText(message))
+		b.WriteString(`</text>`)
+	}
+	if attribution != "" {
+		b.WriteString(`<text placement="attribution">`)
+		b.WriteString(xmlEscapeText(attribution))
 		b.WriteString(`</text>`)
 	}
 	b.WriteString(`</binding></visual>`)
@@ -386,6 +392,11 @@ func buildToastXMLActions(title, message, bodyArgs string, buttons []ToastButton
 // clicked. Native in-process on a packaged install; on an unpackaged/dev build
 // (no AUMID) it degrades to a plain buttonless toast.
 func RaiseActionable(title, message, bodyArgs string, buttons []ToastButton) {
+	raiseActionable(title, message, "", bodyArgs, buttons)
+}
+
+// raiseActionable is RaiseActionable with an attribution line under the body.
+func raiseActionable(title, message, attribution, bodyArgs string, buttons []ToastButton) {
 	if !enabled.Load() {
 		return
 	}
@@ -395,9 +406,9 @@ func RaiseActionable(title, message, bodyArgs string, buttons []ToastButton) {
 	for i := range buttons {
 		buttons[i].Label = sanitizeToastText(buttons[i].Label)
 	}
-	xml := buildToastXMLActions(title, message, bodyArgs, buttons)
+	xml := buildToastXMLActions(title, message, attribution, bodyArgs, buttons)
 	if err := raiseNativeXML(xml); err != nil {
-		Toast(title, message, "") // unpackaged/dev fallback (no buttons)
+		Toast(title, withAttribution(message, attribution), "") // unpackaged/dev fallback (no buttons)
 	}
 }
 

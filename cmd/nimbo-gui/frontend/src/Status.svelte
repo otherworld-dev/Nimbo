@@ -10,7 +10,8 @@
     localExists: boolean; remoteExists: boolean;
     localSize: number; localMTime: string; remoteSize: number; remoteMTime: string;
   };
-  type Notif = { id: number; app: string; subject: string; message: string; link: string; actions: { label: string }[] };
+  type Notif = { id: number; app: string; subject: string; message: string; link: string; actions: { label: string }[];
+                 account: string };
   type Blocked = { abs: string; path: string; reason: string; ext: string; escapable: boolean; escaping: boolean };
   type Lock = { path: string; owner: string; summary: string; ownerType: number; since: string; account: string;
                 localDir: string; canUnlock: boolean };
@@ -450,8 +451,11 @@
       {/if}
       {#each notifs as n}
         <div class="card" class:hl={("notif" + NL + n.id) === highlight}>
-          <div class="title">{n.subject || n.app}</div>
-          {#if n.message}<div class="desc">{n.message}</div>{/if}
+          <div class="notiftext">
+            <div class="title">{n.subject || n.app}</div>
+            {#if n.account}<div class="notifacct">{n.account}</div>{/if}
+            {#if n.message}<div class="desc">{n.message}</div>{/if}
+          </div>
           <div class="btns">
             {#each n.actions as ac}<button onclick={() => App.DoNotificationAction(n.id, ac.label)}>{ac.label}</button>{/each}
             {#if n.link}<button onclick={() => App.OpenURL(n.link)}>Open</button>{/if}
@@ -646,6 +650,10 @@
   .card { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
   .card .title { font-weight: 600; font-size: 13px; }
   .card .desc { color: var(--fg2); font-size: 12px; margin: 4px 0 10px; }
+  /* A notification's text can be copied (an IP address, a share name); the
+     app turns selection off everywhere else (GitHub #20). */
+  .notiftext { user-select: text; -webkit-user-select: text; cursor: text; }
+  .notifacct { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
   .locksub { font-size: 11.5px; color: var(--muted); }
   .lockbtns { margin-top: 8px; }
   .laneintro { font-size: 12px; color: var(--muted); margin: 0 0 10px; }

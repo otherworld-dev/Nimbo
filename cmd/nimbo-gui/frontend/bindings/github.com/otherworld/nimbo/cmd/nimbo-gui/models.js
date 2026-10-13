@@ -1601,6 +1601,14 @@ export class NotifItem {
              */
             this["actions"] = [];
         }
+        if (!("account" in $$source)) {
+            /**
+             * "login@host" of the account it came to (GitHub #20)
+             * @member
+             * @type {string}
+             */
+            this["account"] = "";
+        }
 
         Object.assign(this, $$source);
     }
