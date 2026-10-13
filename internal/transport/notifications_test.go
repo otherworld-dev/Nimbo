@@ -71,3 +71,20 @@ func TestSameServer(t *testing.T) {
 		}
 	}
 }
+
+// An app password a sign-in produced but the caller isn't keeping is revoked
+// with the password itself, on the account's server.
+func TestDeleteAppPassword(t *testing.T) {
+	var method, path, pass string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path = r.Method, r.URL.Path
+		_, pass, _ = r.BasicAuth()
+	}))
+	defer srv.Close()
+	if err := New(srv.URL, "alice", "unused-pw").DeleteAppPassword(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if method != http.MethodDelete || path != "/ocs/v2.php/core/apppassword" || pass != "unused-pw" {
+		t.Fatalf("sent %s %s with password %q", method, path, pass)
+	}
+}

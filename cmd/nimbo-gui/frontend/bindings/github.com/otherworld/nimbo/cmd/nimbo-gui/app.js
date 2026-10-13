@@ -1429,6 +1429,16 @@ export function SignInAgain(id) {
 }
 
 /**
+ * SignInSomeoneElse is the sign-in window's "Sign in to a different account
+ * instead": until the window closes, it signs in whichever account the user
+ * picks rather than the one it was opened for.
+ * @returns {$CancellablePromise<void>}
+ */
+export function SignInSomeoneElse() {
+    return $Call.ByID(1324364904);
+}
+
+/**
  * SignInTarget tells the sign-in window which account it is for: the one it was
  * opened for, or with nothing running because the shown account was turned
  * down, that account.

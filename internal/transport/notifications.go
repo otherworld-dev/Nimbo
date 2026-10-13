@@ -63,6 +63,13 @@ func (c *Client) DismissAllNotifications(ctx context.Context) error {
 // send. Suspicious-login warnings carry one pointing at an IP lookup site.
 func (a NotificationAction) IsWeb() bool { return strings.EqualFold(a.Type, "WEB") }
 
+// DeleteAppPassword revokes the app password this client signs in with
+// (Nextcloud's core/apppassword endpoint), for one a sign-in produced that the
+// caller isn't keeping. A 404 (already gone) counts as done.
+func (c *Client) DeleteAppPassword(ctx context.Context) error {
+	return c.ocsAction(ctx, http.MethodDelete, c.server+"/ocs/v2.php/core/apppassword")
+}
+
 // ExecuteAction performs a notification action (Accept/Decline/etc.) by calling
 // its link with its method. The link may be absolute or server-relative.
 //

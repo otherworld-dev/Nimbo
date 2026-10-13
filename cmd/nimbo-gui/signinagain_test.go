@@ -36,3 +36,29 @@ func TestSignInArgs(t *testing.T) {
 		t.Fatalf("parsed %v", v)
 	}
 }
+
+// The browser decides who signs in, so a window asking for one account can get
+// a grant for another (GitHub #20 testing: Edge was still logged in as test
+// while the window asked for Test Account 2). That grant is refused unless the
+// window was asking for any account.
+func TestWrongAccount(t *testing.T) {
+	ta2 := account.Account{ID: "ta2"}
+	test := account.Account{ID: "test"}
+	for _, c := range []struct {
+		name  string
+		want  string
+		got   account.Account
+		known bool
+		wrong bool
+	}{
+		{"the account asked for", "ta2", ta2, true, false},
+		{"another account Nimbo has", "ta2", test, true, true},
+		{"an account Nimbo doesn't have", "ta2", account.Account{}, false, true},
+		{"any account, a known one", "", test, true, false},
+		{"any account, a new one", "", account.Account{}, false, false},
+	} {
+		if got := wrongAccount(c.want, c.got, c.known); got != c.wrong {
+			t.Errorf("%s: wrongAccount = %v, want %v", c.name, got, c.wrong)
+		}
+	}
+}

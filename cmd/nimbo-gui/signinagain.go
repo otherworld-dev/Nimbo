@@ -13,9 +13,12 @@ package main
 //     already has skips setup.
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/url"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/account"
 	"github.com/otherworld/nimbo/internal/config"
@@ -38,8 +41,11 @@ type SignInTargetDTO struct {
 // down, that account.
 func (a *App) SignInTarget() SignInTargetDTO {
 	a.acctMu.Lock()
-	id := a.signInFor
+	id, other := a.signInFor, a.signInOther
 	a.acctMu.Unlock()
+	if other {
+		return SignInTargetDTO{}
+	}
 	_, st, ok := accountsAndDirs()
 	if !ok {
 		return SignInTargetDTO{}
@@ -58,6 +64,15 @@ func (a *App) SignInTarget() SignInTargetDTO {
 
 // SignInAgain opens the sign-in window for one account (its row in Settings).
 func (a *App) SignInAgain(id string) { a.showLoginFor(id) }
+
+// SignInSomeoneElse is the sign-in window's "Sign in to a different account
+// instead": until the window closes, it signs in whichever account the user
+// picks rather than the one it was opened for.
+func (a *App) SignInSomeoneElse() {
+	a.acctMu.Lock()
+	a.signInOther = true
+	a.acctMu.Unlock()
+}
 
 // showLoginFor opens the sign-in window asking account id to sign in again
 // ("" = a new account, or whichever account needs it).
@@ -78,8 +93,47 @@ func (a *App) setShowOnSignIn(id string) {
 
 func (a *App) setSignInFor(id string) {
 	a.acctMu.Lock()
-	a.signInFor = id
+	a.signInFor, a.signInOther = id, false
 	a.acctMu.Unlock()
+}
+
+// raiseLogin brings the sign-in window back and in front of whatever is in
+// use. A topmost round trip puts it above other windows even when Windows
+// won't hand Nimbo the focus.
+func (a *App) raiseLogin() {
+	w := a.loginWin
+	if w == nil {
+		return
+	}
+	w.UnMinimise()
+	w.Show()
+	w.SetAlwaysOnTop(true)
+	w.SetAlwaysOnTop(false)
+	w.Focus()
+}
+
+// loginStepAside minimises the sign-in window while the browser sign-in runs.
+// Left in place it sat over the browser's Grant access button, and closing it
+// to get at the button cancelled the sign-in (GitHub #20 testing). It comes
+// back for setup or an error; an account signing in again just closes it.
+func (a *App) loginStepAside() {
+	if w := a.loginWin; w != nil {
+		w.Minimise()
+	}
+}
+
+// loginFailed reports a failed browser sign-in in the sign-in window, brought
+// back so the message is seen.
+func (a *App) loginFailed(msg string) {
+	a.raiseLogin()
+	a.app.Event.Emit("login:error", msg)
+}
+
+// wrongAccount reports whether a finished sign-in is for some other account
+// than the one the window asked for (want, "" = any). The browser decides who
+// signs in: one still logged in to Nextcloud as someone else grants for them.
+func wrongAccount(want string, got account.Account, known bool) bool {
+	return want != "" && (!known || got.ID != want)
 }
 
 // signInArgs is the toast activation that opens the sign-in window for id.
@@ -193,7 +247,7 @@ func (a *App) carryOnWith(lost, next account.Account) {
 // shown account only if it was the shown one before it lost its sign-in, was
 // picked in the account switcher, or nothing else is running.
 // Runs on the sign-in poll's goroutine.
-func (a *App) completeSignIn(creds account.Credentials) (again bool, err error) {
+func (a *App) completeSignIn(creds account.Credentials, want SignInTargetDTO) (again bool, err error) {
 	d, err := config.Resolve()
 	if err != nil {
 		return false, err
@@ -206,6 +260,14 @@ func (a *App) completeSignIn(creds account.Credentials) (again bool, err error) 
 	// back what was typed, and "test account 2" is still "Test Account 2".
 	prev, again := st.FindLogin(creds.Server, creds.LoginName)
 	id := prev.ID
+	if wrongAccount(want.ID, prev, again) {
+		// Saved, it would sign in an account nobody asked for here and leave
+		// the one asked for signed out. Give the server back its new app
+		// password, which nothing will use.
+		go revokeAppPassword(creds)
+		got := account.Account{ServerURL: creds.Server, LoginName: creds.LoginName}.Address()
+		return false, fmt.Errorf("your browser signed in to Nextcloud as %s, not %s. Log out of Nextcloud in your browser, then sign in again", got, want.Address)
+	}
 	if !again {
 		acct, err := account.Complete(d.AccountsFile(), creds)
 		if err != nil {
@@ -258,4 +320,15 @@ func (a *App) restartShown() {
 		a.stopEngine()
 	}
 	a.start(a.ctx)
+}
+
+// revokeAppPassword deletes an app password a sign-in produced but Nimbo isn't
+// keeping, so it doesn't linger in the user's Devices & sessions list.
+func revokeAppPassword(creds account.Credentials) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c := transport.New(creds.Server, creds.LoginName, creds.AppPassword)
+	if err := c.DeleteAppPassword(ctx); err != nil {
+		slog.Warn("could not revoke an unused app password", "login", creds.LoginName, "err", err)
+	}
 }

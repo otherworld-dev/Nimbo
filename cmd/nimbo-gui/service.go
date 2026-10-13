@@ -144,6 +144,7 @@ type App struct {
 	// one picked in the account switcher that had to sign in first.
 	authLostIDs  map[string]bool
 	signInFor    string
+	signInOther  bool // the window's "Sign in to a different account instead" was chosen
 	showOnSignIn string
 
 	licMu sync.Mutex
@@ -5297,13 +5298,22 @@ func (a *App) stopEngine() {
 // showLogin opens (or focuses) the sign-in window.
 func (a *App) showLogin() {
 	if a.loginWin != nil {
-		a.loginWin.Show()
-		a.loginWin.Focus()
+		a.raiseLogin()
 		return
 	}
-	a.loginWin = a.app.Window.NewWithOptions(application.WebviewWindowOptions{
+	// Created on top: opened by a password the server turned down, Nimbo is
+	// rarely the foreground app, and Windows then puts a new window behind the
+	// one in use rather than let it take focus (GitHub #20 testing). It drops
+	// back to an ordinary window a moment later, staying in front.
+	w := a.app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name: "login", Title: brand.Current.Name + " — Sign in", Width: 440, Height: 340, URL: "/#login",
+		AlwaysOnTop: true,
 	})
+	a.loginWin = w
+	go func() {
+		time.Sleep(2 * time.Second)
+		w.SetAlwaysOnTop(false)
+	}()
 	// Closing the window abandons any in-flight browser login — stop polling so
 	// the goroutine doesn't leak (an unapproved flow polls 404 forever).
 	a.loginWin.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) {
@@ -5373,12 +5383,17 @@ func (a *App) BeginLogin(server string) string {
 	// window would wait forever — hence the timeout backstop plus cancel-on-close
 	// and the frontend Cancel button.
 	a.cancelLoginPoll()
-	lctx, lcancel := context.WithTimeout(a.ctx, 10*time.Minute)
+	// 20 minutes: as long as Nextcloud keeps a login flow open. Ten cut off a
+	// slow sign-in on the VM (GitHub #20 testing).
+	lctx, lcancel := context.WithTimeout(a.ctx, 20*time.Minute)
 	a.loginMu.Lock()
 	a.loginCancel = lcancel
 	a.loginMu.Unlock()
 
+	// The account the window asked for, fixed now: the grant must be for it.
+	want := a.SignInTarget()
 	openURL(flow.LoginURL)
+	a.loginStepAside()
 	go func() {
 		defer lcancel()
 		creds, perr := flow.Poll(lctx)
@@ -5387,15 +5402,15 @@ func (a *App) BeginLogin(server string) string {
 			case errors.Is(lctx.Err(), context.Canceled):
 				return // superseded by a newer attempt or the window closed — stay silent
 			case errors.Is(lctx.Err(), context.DeadlineExceeded):
-				a.app.Event.Emit("login:error", "timed out waiting for browser sign-in — please try again")
+				a.loginFailed("timed out waiting for browser sign-in — please try again")
 			default:
-				a.app.Event.Emit("login:error", perr.Error())
+				a.loginFailed(perr.Error())
 			}
 			return
 		}
-		again, cerr := a.completeSignIn(creds)
+		again, cerr := a.completeSignIn(creds, want)
 		if cerr != nil {
-			a.app.Event.Emit("login:error", cerr.Error())
+			a.loginFailed(cerr.Error())
 			return
 		}
 		// true = an account signing in again: the window closes instead of
@@ -5470,6 +5485,7 @@ func (a *App) FreeSpace(dir string) int64 { return int64(diskFree(dir)) }
 
 // EnterSetup resizes the sign-in window to fit the configuration screen.
 func (a *App) EnterSetup() {
+	a.raiseLogin() // it stepped aside for the browser; setup needs it back
 	if a.loginWin != nil {
 		a.loginWin.SetSize(560, 640)
 		a.loginWin.Center()

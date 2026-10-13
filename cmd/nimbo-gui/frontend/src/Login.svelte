@@ -48,7 +48,9 @@
     msg = "Connecting…";
     const url = await App.BeginLogin(server);
     if (url.startsWith("error:")) { msg = url; busy = false; return; }
-    msg = "Approve access in the browser that just opened, then come back here.";
+    // The window minimises itself meanwhile (it covered the browser's Grant
+    // access button) and comes back for setup or an error.
+    msg = "Finish signing in in the browser that just opened. This window steps aside until you have.";
   }
 
   // Give up on a browser sign-in the user abandoned: re-enable the form so they
@@ -60,6 +62,7 @@
   }
 
   function signInSomeoneElse() {
+    App.SignInSomeoneElse(); // the grant may now be for any account
     different = true;
     server = "";
     msg = startMsg;
