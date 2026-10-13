@@ -202,8 +202,11 @@ func (a *App) completeSignIn(creds account.Credentials) (again bool, err error) 
 	if err != nil {
 		return false, err
 	}
-	id := account.IDFor(creds.Server, creds.LoginName)
-	if _, again = st.Find(id); !again {
+	// Matched ignoring case: Nextcloud takes the login in any case and hands
+	// back what was typed, and "test account 2" is still "Test Account 2".
+	prev, again := st.FindLogin(creds.Server, creds.LoginName)
+	id := prev.ID
+	if !again {
 		acct, err := account.Complete(d.AccountsFile(), creds)
 		if err != nil {
 			return false, err

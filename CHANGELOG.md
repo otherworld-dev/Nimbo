@@ -79,8 +79,9 @@ All notable changes to Nimbo are recorded here. The format follows
   out. The sign-in window names the account, says its folders and settings are
   kept, and once you have signed in it carries on without going through setup
   again. An account that needs signing in has a Sign in again button in Settings →
-  Account, and the notification's Sign in button opens the window for that account
-  (#953).
+  Account, and the notification's Sign in button opens the window for that account.
+  Signing in with your login typed in a different case (Nextcloud accepts either)
+  no longer adds the same account a second time (#953).
 - A notification button that links to a website, such as "Open iplookup.flagfox.net"
   on Nextcloud's suspicious login warning, now opens in your browser. It used to do
   nothing, and Nimbo sent the link a request with your login and app password

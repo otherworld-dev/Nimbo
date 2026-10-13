@@ -178,18 +178,20 @@ func Reauthorize(path string, creds Credentials) (Account, error) {
 	return complete(path, creds, false)
 }
 
-// IDFor returns the ID an account for this server and login has, or would get
-// on signing in, so a caller can tell an account it already holds from a new one.
-func IDFor(server, loginName string) string {
-	return newID(strings.TrimRight(server, "/"), loginName)
-}
-
 func complete(path string, creds Credentials, makeDefault bool) (Account, error) {
 	server := strings.TrimRight(creds.Server, "/")
 	a := Account{
 		ID:        newID(server, creds.LoginName),
 		ServerURL: server,
 		LoginName: creds.LoginName,
+	}
+	// The same account signing in again, whatever case the login was typed in
+	// this time: keep its ID and stored login, which its folders, state
+	// database and keychain entry hang off (GitHub #20).
+	if st, err := LoadStore(path); err == nil {
+		if prev, ok := st.FindLogin(server, creds.LoginName); ok {
+			a.ID, a.ServerURL, a.LoginName = prev.ID, prev.ServerURL, prev.LoginName
+		}
 	}
 	// The secret goes in first: an account record whose password is missing
 	// shows up as "sign in again", which is recoverable, whereas the reverse
