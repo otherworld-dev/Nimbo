@@ -26,6 +26,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.otherworld.nimbo.LocalNimboHost
 import dev.otherworld.nimbo.core.absoluteUrl
@@ -102,9 +103,13 @@ fun NimboNav(vm: NimboViewModel, supporterVm: SupporterViewModel) {
         }
     }
 
-    // Refresh whenever the Support screen opens: the user is looking, so ask.
-    LaunchedEffect(state.route) {
+    // Refresh whenever the Support screen opens or the app comes back to it:
+    // the user is looking, so ask. Buying, switching and cancelling all
+    // happen in the browser, and coming back from there is a resume, not a
+    // route change.
+    LifecycleResumeEffect(state.route) {
         if (state.route == Route.SUPPORT) supporterVm.refresh()
+        onPauseOrDispose { }
     }
 
     LaunchedEffect(state.route, state.account) {
