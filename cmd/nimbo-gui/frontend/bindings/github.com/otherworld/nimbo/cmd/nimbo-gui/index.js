@@ -41,6 +41,7 @@ export {
     SetupInfo,
     ShareDTO,
     SidePreview,
+    SignInTargetDTO,
     TrashDTO,
     UpdateDTO,
     VersionDTO

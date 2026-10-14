@@ -135,6 +135,17 @@ type App struct {
 	secondaries map[string]*secondaryEngine // account ID -> background engine
 	acctMu      sync.Mutex
 	acctStatus  map[string]string // account ID -> latest engine status line
+	// Signing in again (signinagain.go), all under acctMu. authLostIDs holds
+	// the accounts whose credentials the server turned down; they are not
+	// started again until they sign in. signInFor is the account the sign-in
+	// window is asking to sign in again ("" = whichever needs it, else a new
+	// account), and showOnSignIn the account to show once it has signed in
+	// again: the shown one that lost its sign-in while another carried on, or
+	// one picked in the account switcher that had to sign in first.
+	authLostIDs  map[string]bool
+	signInFor    string
+	signInOther  bool // the window's "Sign in to a different account instead" was chosen
+	showOnSignIn string
 
 	licMu sync.Mutex
 	lic   license.Info  // current business-licence state (gates business-tier features)
@@ -181,7 +192,7 @@ func (a *App) start(ctx context.Context) {
 		// the VM, and the rejected one sent the server a failed login every 15 s
 		// (GitHub #12 testing). It is the auth-lost case: ask for a sign-in.
 		if a.hasConfiguredAccount() {
-			if errors.Is(err, account.ErrNoSecret) || errors.Is(err, transport.ErrUnauthorized) {
+			if isSignInRejected(err) {
 				a.afterStart(a.onAuthLost)
 				return
 			}
@@ -198,6 +209,7 @@ func (a *App) start(ctx context.Context) {
 	}
 	a.eng = eng
 	a.authLost.Store(false)
+	a.clearAuthLost(eng.Account.ID)
 	a.appsCacheMu.Lock()
 	a.appsCache, a.appsCacheAt = nil, time.Time{} // stale across engine/account changes
 	a.appsCacheMu.Unlock()
@@ -387,9 +399,20 @@ func (a *App) startSecondaries(ctx context.Context) {
 		if _, running := a.secondaries[ac.ID]; running {
 			continue
 		}
+		// Turned down already: starting it would only send the server another
+		// failed login. It starts again once it signs in (completeSignIn).
+		if a.isAuthLost(ac.ID) {
+			continue
+		}
 		eng, err := agent.NewEngineFor(ctx, ac.ID)
 		if err != nil {
 			slog.Warn("secondary account engine not started", "account", ac.LoginName, "err", err)
+			if isSignInRejected(err) {
+				a.markAuthLost(ac.ID)
+				notify.RaiseActionable("Sign in required", ac.Address()+" needs signing in again.",
+					signInArgs(ac.ID), []notify.ToastButton{{Label: "Sign in", Args: signInArgs(ac.ID)}})
+				continue
+			}
 			a.recordAcctStatus(ac.ID, "Not running: "+err.Error())
 			continue
 		}
@@ -400,9 +423,9 @@ func (a *App) startSecondaries(ctx context.Context) {
 		eng.SetToastFunc(notify.Toast)
 		eng.SetAuthLostFunc(func() {
 			// Only this account's sync stops — don't sign the whole app out.
-			a.recordAcctStatus(id, "Sign in again")
-			notify.RaiseActionable("Sign in required", eng.Account.LoginName+" couldn't authenticate — switch to that account and sign in again.", "action=login",
-				[]notify.ToastButton{{Label: "Sign in", Args: "action=login"}})
+			a.markAuthLost(id)
+			notify.RaiseActionable("Sign in required", eng.Account.Address()+" needs signing in again.",
+				signInArgs(id), []notify.ToastButton{{Label: "Sign in", Args: signInArgs(id)}})
 			a.stopSecondary(id)
 		})
 		eng.SetConflictPolicy(conflictPolicy(""))
@@ -4097,7 +4120,8 @@ func (a *App) dispatchToastActivation(args string) {
 		// restart by clicking. Off the UI thread — it waits on processes.
 		go restartExplorer()
 	case "login":
-		application.InvokeAsync(func() { a.showLogin() })
+		acct := v.Get("acct") // the account to sign in again; "" = whichever needs it
+		application.InvokeAsync(func() { a.showLoginFor(acct) })
 	case "update":
 		application.InvokeAsync(func() {
 			// On success the app restarts; a non-empty return is an error or
@@ -4878,18 +4902,27 @@ func (a *App) SwitchAccount(id string) string {
 	if cur, ok := st.Default(); ok && cur.ID == id {
 		return "" // already active
 	}
+	// Turned down by its server: showing it would fail the same way, so ask it
+	// to sign in again instead (that shows it once it has).
+	if a.isAuthLost(id) {
+		a.setShowOnSignIn(id)
+		application.InvokeAsync(func() { a.showLoginFor(id) })
+		return ""
+	}
 	// An account whose app password is gone from the keychain can't be shown
 	// until it signs in again, so ask for that and change nothing yet: the
 	// sign-in makes it the active account itself (account.Complete, then
 	// BeginLogin restarts the engine), and cancelling it must leave the
 	// current account shown and syncing.
 	if _, err := account.LoadSecret(id); err != nil {
-		application.InvokeAsync(a.showLogin)
+		a.setShowOnSignIn(id)
+		application.InvokeAsync(func() { a.showLoginFor(id) })
 		return ""
 	}
 	if err := account.Update(d.AccountsFile(), func(s *account.Store) error { return s.SetDefault(id) }); err != nil {
 		return err.Error()
 	}
+	a.setShowOnSignIn("") // chosen now: an earlier wish to show another account is gone
 	a.disconnectAllOnDemand()
 	a.stopEngine()
 	a.start(a.ctx)
@@ -4903,7 +4936,7 @@ func (a *App) SwitchAccount(id string) string {
 
 // AddAccount opens the sign-in window to connect another Nextcloud account.
 // The completed login becomes the active account (see account.Complete).
-func (a *App) AddAccount() { a.showLogin() }
+func (a *App) AddAccount() { a.showLoginFor("") }
 
 // RemoveAccount disconnects a NON-active account: its keychain secret, account
 // entry, sync-folder setup and local sync state are removed (local files are
@@ -4966,6 +4999,7 @@ func (a *App) SignOut(clearData bool) string {
 	}
 	a.disconnectAllOnDemand()
 	a.stopEngine()
+	a.setShowOnSignIn("")
 	moreAccounts := false
 	if d, err := config.Resolve(); err == nil {
 		var accID string
@@ -5220,16 +5254,30 @@ func (a *App) clearSyncData(d config.Dirs, accountID string) {
 // onAuthLost is invoked by the engine when the server rejects our credentials:
 // stop the failing engine and prompt re-authentication (the account is kept so
 // the user just signs in again to the same server).
+//
+// The shown account is the one that failed. When another account can still
+// sign in, it becomes the shown one and everything else keeps syncing, the way
+// a background account losing its sign-in only ever stopped itself. Before
+// GitHub #20 this stopped every account and the app read as signed out until
+// the one account signed in again.
 func (a *App) onAuthLost() {
 	application.InvokeAsync(func() {
+		lost, _ := defaultAccount()
 		a.disconnectAllOnDemand()
 		a.stopEngine()
+		if lost.ID != "" {
+			a.markAuthLost(lost.ID)
+			if next, ok := a.fallbackAccount(); ok {
+				a.carryOnWith(lost, next)
+				return
+			}
+		}
 		a.authLost.Store(true) // before the status event: the flyout re-checks NeedsLogin on it
 		a.setStatus("Sign in again")
 		a.rebuildTrayMenu()
 		notify.RaiseActionable("Sign in required", brand.Current.Name+" couldn't authenticate — please sign in again.", "action=login",
 			[]notify.ToastButton{{Label: "Sign in", Args: "action=login"}})
-		a.showLogin()
+		a.showLoginFor(lost.ID)
 	})
 }
 
@@ -5250,18 +5298,28 @@ func (a *App) stopEngine() {
 // showLogin opens (or focuses) the sign-in window.
 func (a *App) showLogin() {
 	if a.loginWin != nil {
-		a.loginWin.Show()
-		a.loginWin.Focus()
+		a.raiseLogin()
 		return
 	}
-	a.loginWin = a.app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name: "login", Title: brand.Current.Name + " — Sign in", Width: 440, Height: 300, URL: "/#login",
+	// Created on top: opened by a password the server turned down, Nimbo is
+	// rarely the foreground app, and Windows then puts a new window behind the
+	// one in use rather than let it take focus (GitHub #20 testing). It drops
+	// back to an ordinary window a moment later, staying in front.
+	w := a.app.Window.NewWithOptions(application.WebviewWindowOptions{
+		Name: "login", Title: brand.Current.Name + " — Sign in", Width: 440, Height: 400, URL: "/#login",
+		AlwaysOnTop: true,
 	})
+	a.loginWin = w
+	go func() {
+		time.Sleep(2 * time.Second)
+		w.SetAlwaysOnTop(false)
+	}()
 	// Closing the window abandons any in-flight browser login — stop polling so
 	// the goroutine doesn't leak (an unapproved flow polls 404 forever).
 	a.loginWin.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) {
 		a.cancelLoginPoll()
 		a.loginWin = nil
+		a.setSignInFor("")
 		a.setupClosed()
 	})
 }
@@ -5325,12 +5383,17 @@ func (a *App) BeginLogin(server string) string {
 	// window would wait forever — hence the timeout backstop plus cancel-on-close
 	// and the frontend Cancel button.
 	a.cancelLoginPoll()
-	lctx, lcancel := context.WithTimeout(a.ctx, 10*time.Minute)
+	// 20 minutes: as long as Nextcloud keeps a login flow open. Ten cut off a
+	// slow sign-in on the VM (GitHub #20 testing).
+	lctx, lcancel := context.WithTimeout(a.ctx, 20*time.Minute)
 	a.loginMu.Lock()
 	a.loginCancel = lcancel
 	a.loginMu.Unlock()
 
+	// The account the window asked for, fixed now: the grant must be for it.
+	want := a.SignInTarget()
 	openURL(flow.LoginURL)
+	a.loginStepAside()
 	go func() {
 		defer lcancel()
 		creds, perr := flow.Poll(lctx)
@@ -5339,33 +5402,20 @@ func (a *App) BeginLogin(server string) string {
 			case errors.Is(lctx.Err(), context.Canceled):
 				return // superseded by a newer attempt or the window closed — stay silent
 			case errors.Is(lctx.Err(), context.DeadlineExceeded):
-				a.app.Event.Emit("login:error", "timed out waiting for browser sign-in — please try again")
+				a.loginFailed("timed out waiting for browser sign-in — please try again")
 			default:
-				a.app.Event.Emit("login:error", perr.Error())
+				a.loginFailed(perr.Error())
 			}
 			return
 		}
-		d, cerr := config.Resolve()
-		var acct account.Account
-		if cerr == nil {
-			acct, cerr = account.Complete(d.AccountsFile(), creds)
-		}
+		again, cerr := a.completeSignIn(creds, want)
 		if cerr != nil {
-			a.app.Event.Emit("login:error", cerr.Error())
+			a.loginFailed(cerr.Error())
 			return
 		}
-		// The setup screen comes next and chooses the account's folder, so the
-		// start below must not mount a default one ahead of it (GitHub #11).
-		a.beginSetup(acct.ID)
-		// Adding an account while one is already syncing: tear the old engine
-		// down first — the fresh login is now the default account (Complete
-		// sets it) and start() binds to the default.
-		if a.eng != nil {
-			a.disconnectAllOnDemand()
-			a.stopEngine()
-		}
-		a.start(a.ctx)
-		a.app.Event.Emit("login:done", nil)
+		// true = an account signing in again: the window closes instead of
+		// going on to setup.
+		a.app.Event.Emit("login:done", again)
 		a.emit("account")
 	}()
 	return flow.LoginURL
@@ -5435,6 +5485,7 @@ func (a *App) FreeSpace(dir string) int64 { return int64(diskFree(dir)) }
 
 // EnterSetup resizes the sign-in window to fit the configuration screen.
 func (a *App) EnterSetup() {
+	a.raiseLogin() // it stepped aside for the browser; setup needs it back
 	if a.loginWin != nil {
 		a.loginWin.SetSize(560, 640)
 		a.loginWin.Center()

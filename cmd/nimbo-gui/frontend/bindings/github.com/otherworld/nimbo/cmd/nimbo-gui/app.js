@@ -1420,6 +1420,37 @@ export function SidebarSupported() {
 }
 
 /**
+ * SignInAgain opens the sign-in window for one account (its row in Settings).
+ * @param {string} id
+ * @returns {$CancellablePromise<void>}
+ */
+export function SignInAgain(id) {
+    return $Call.ByID(3782040665, id);
+}
+
+/**
+ * SignInSomeoneElse is the sign-in window's "Sign in to a different account
+ * instead": until the window closes, it signs in whichever account the user
+ * picks rather than the one it was opened for.
+ * @returns {$CancellablePromise<void>}
+ */
+export function SignInSomeoneElse() {
+    return $Call.ByID(1324364904);
+}
+
+/**
+ * SignInTarget tells the sign-in window which account it is for: the one it was
+ * opened for, or with nothing running because the shown account was turned
+ * down, that account.
+ * @returns {$CancellablePromise<$models.SignInTargetDTO>}
+ */
+export function SignInTarget() {
+    return $Call.ByID(2489164518).then(/** @type {($result: any) => any} */(($result) => {
+        return $$createType46($result);
+    }));
+}
+
+/**
  * SignOut forgets the account (store + keychain), tears down syncing and any
  * on-demand mount, closes the signed-in windows, and shows the sign-in window —
  * a clean reset to the not-signed-in state. Local files are left untouched.
@@ -1493,7 +1524,7 @@ export function TailLog() {
  */
 export function TestLocalAddress(addr, pin) {
     return $Call.ByID(176774928, addr, pin).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType46($result);
+        return $$createType47($result);
     }));
 }
 
@@ -1520,7 +1551,7 @@ export function TogglePause() {
  */
 export function TrashList() {
     return $Call.ByID(2716350569).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType48($result);
+        return $$createType49($result);
     }));
 }
 
@@ -1567,7 +1598,7 @@ export function Version() {
  */
 export function VersionList() {
     return $Call.ByID(3868762695).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType50($result);
+        return $$createType51($result);
     }));
 }
 
@@ -1626,8 +1657,9 @@ const $$createType42 = $models.SearchItem.createFrom;
 const $$createType43 = $Create.Array($$createType42);
 const $$createType44 = $models.ShareDTO.createFrom;
 const $$createType45 = $Create.Array($$createType44);
-const $$createType46 = $models.LocalTestDTO.createFrom;
-const $$createType47 = $models.TrashDTO.createFrom;
-const $$createType48 = $Create.Array($$createType47);
-const $$createType49 = $models.VersionDTO.createFrom;
-const $$createType50 = $Create.Array($$createType49);
+const $$createType46 = $models.SignInTargetDTO.createFrom;
+const $$createType47 = $models.LocalTestDTO.createFrom;
+const $$createType48 = $models.TrashDTO.createFrom;
+const $$createType49 = $Create.Array($$createType48);
+const $$createType50 = $models.VersionDTO.createFrom;
+const $$createType51 = $Create.Array($$createType50);

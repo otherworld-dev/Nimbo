@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/otherworld/nimbo/internal/atomicfile"
 )
@@ -102,6 +103,21 @@ func (s *Store) encode() ([]byte, error) {
 func (s *Store) Find(id string) (Account, bool) {
 	for _, a := range s.Accounts {
 		if a.ID == id {
+			return a, true
+		}
+	}
+	return Account{}, false
+}
+
+// FindLogin returns the account for this server and login, ignoring case and a
+// trailing slash. Nextcloud accepts a login in any case and the login flow
+// hands back what was typed, so an exact match (or the ID derived from it) took
+// "test account 2" signing in again for a new account beside the stored
+// "Test Account 2" (GitHub #20).
+func (s *Store) FindLogin(server, loginName string) (Account, bool) {
+	server = strings.TrimRight(server, "/")
+	for _, a := range s.Accounts {
+		if strings.EqualFold(strings.TrimRight(a.ServerURL, "/"), server) && strings.EqualFold(a.LoginName, loginName) {
 			return a, true
 		}
 	}

@@ -168,11 +168,30 @@ func (f *Flow) pollOnce(ctx context.Context) (creds Credentials, done bool, err 
 // account ID, stores the app password in the OS keychain, and records the
 // account in the store at path as the active one. It returns the saved account.
 func Complete(path string, creds Credentials) (Account, error) {
+	return complete(path, creds, true)
+}
+
+// Reauthorize is Complete for an account signing in again in the background:
+// it saves the new app password and record but leaves the shown account as it
+// is, so signing a background account back in doesn't switch to it (GitHub #20).
+func Reauthorize(path string, creds Credentials) (Account, error) {
+	return complete(path, creds, false)
+}
+
+func complete(path string, creds Credentials, makeDefault bool) (Account, error) {
 	server := strings.TrimRight(creds.Server, "/")
 	a := Account{
 		ID:        newID(server, creds.LoginName),
 		ServerURL: server,
 		LoginName: creds.LoginName,
+	}
+	// The same account signing in again, whatever case the login was typed in
+	// this time: keep its ID and stored login, which its folders, state
+	// database and keychain entry hang off (GitHub #20).
+	if st, err := LoadStore(path); err == nil {
+		if prev, ok := st.FindLogin(server, creds.LoginName); ok {
+			a.ID, a.ServerURL, a.LoginName = prev.ID, prev.ServerURL, prev.LoginName
+		}
 	}
 	// The secret goes in first: an account record whose password is missing
 	// shows up as "sign in again", which is recoverable, whereas the reverse
@@ -189,6 +208,9 @@ func Complete(path string, creds Credentials) (Account, error) {
 			a.Label = prev.Label
 		}
 		store.Upsert(a)
+		if !makeDefault {
+			return nil
+		}
 		// A fresh sign-in becomes the active account — both on first run and
 		// when adding a second account (the natural "switch to what I just
 		// added").
