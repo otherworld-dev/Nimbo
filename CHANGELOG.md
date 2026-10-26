@@ -72,6 +72,24 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ### Fixed
 
+- A folder or file renamed on the server where only the capitals changed (for
+  example "14 days" to "14 Days") is now renamed on this PC too, and online-only
+  files in it still open. Before, Nimbo kept looking for the old name, which also
+  made every sync pass in on-demand mode recheck the whole account, so changes made
+  by other people could take up to an hour to arrive. A folder that can't be read
+  no longer forces those full rechecks, and a change that arrives while a pass is
+  running is no longer missed (#984).
+- Names that end in a space or a full stop, which Windows can't use, no longer get
+  mixed up with the same name without it. In on-demand mode Nimbo could put a
+  colleague's file into the look-alike folder and then move it there on the server
+  too. Such items are not synced (Windows can't hold them), but they are no longer
+  just missing: they are listed in Status → Can't sync, in both modes, with a
+  "Rename on server" button that suggests a name without the trailing space or full
+  stop and never replaces anything already there. A leftover folder of this kind
+  that an earlier version made is cleared automatically when it holds nothing but
+  online-only files. The tray icon now shows an amber "!" while anything needs
+  you (files that can't sync, conflicts, folders no longer shared), so they don't
+  go unnoticed with the Nimbo window closed (#984).
 - Signing in again after Nextcloud stops accepting an account (its access removed
   under Security, or a changed password) is clearer. If the account you were
   looking at is the one affected, your other accounts carry on syncing and one of

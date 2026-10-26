@@ -14,14 +14,16 @@ var (
 	trayGoldL  = color.RGBA{0xFF, 0xD5, 0x5F, 0xff} // nimbus body
 	trayGoldD  = color.RGBA{0xEF, 0xA5, 0x3A, 0xff} // nimbus underside
 	trayRed    = color.RGBA{0xd6, 0x39, 0x39, 0xff}
+	trayAmber  = color.RGBA{0xE8, 0x8A, 0x00, 0xff} // "needs attention", the flyout's amber bar
 	trayGray   = color.RGBA{0x88, 0x90, 0x96, 0xff}
 	trayWhite  = color.RGBA{0xff, 0xff, 0xff, 0xff}
 )
 
 // trayIcon renders the system-tray icon for a sync state ("idle", "sync",
-// "paused", "error") as PNG bytes: the Nimbo tile (indigo rounded square with
+// "paused", "error", "warning") as PNG bytes: the Nimbo tile (indigo rounded square with
 // the white swoosh cloud) plus a small state badge bottom-right — spinner while
-// syncing (frame rotates it), pause bars, or a red !. badge draws a red dot
+// syncing (frame rotates it), pause bars, a red ! (error) or an amber ! (items
+// that need the user, Deck #984). badge draws a red dot
 // top-right (pending notifications). Wails accepts PNG tray icons on Windows.
 func trayIcon(state string, frame int, badge bool) []byte {
 	const sz = 32
@@ -73,9 +75,13 @@ func trayIcon(state string, frame int, badge bool) []byte {
 		disc(img, bx, by, br+1.2, trayWhite)
 		fillRect(img, bx-br*0.42, by-br*0.5, bx-br*0.10, by+br*0.5, trayGray)
 		fillRect(img, bx+br*0.10, by-br*0.5, bx+br*0.42, by+br*0.5, trayGray)
-	case "error":
+	case "error", "warning":
+		fill := trayRed
+		if state == "warning" {
+			fill = trayAmber
+		}
 		disc(img, bx, by, br+1.2, trayWhite)
-		disc(img, bx, by, br, trayRed)
+		disc(img, bx, by, br, fill)
 		thick(img, bx, by-br*0.5, bx, by+br*0.12, br*0.26, trayWhite)
 		disc(img, bx, by+br*0.48, br*0.14, trayWhite)
 	}

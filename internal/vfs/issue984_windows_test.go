@@ -493,3 +493,125 @@ func containsPair(list [][2]string, p [2]string) bool {
 	}
 	return false
 }
+
+// --- leftover alias folders on PCs that ran an older version ------------------
+
+// aliasSetup builds a root with the real "Pilot Validation" (one file) and a
+// leftover "Pilot Validation " an older version created through \?\, and a
+// server that has since renamed the space folder away.
+func aliasSetup(t *testing.T) (*fakeCf, *recorder, *Watcher, string, string) {
+	t.Helper()
+	f := installFakeCf(t)
+	root := t.TempDir()
+	pv := filepath.Join(root, "Pilot Validation")
+	if err := os.MkdirAll(pv, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	doc := filepath.Join(pv, "doc.pdf")
+	if err := os.WriteFile(doc, []byte("real"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "Pilot Validation ")
+	mkdirRaw(t, alias)
+	f.setIdentity(pv, "Pilot Validation")
+	f.setIdentity(doc, "Pilot Validation/doc.pdf")
+
+	rec := newRecorder()
+	d := ph("doc.pdf", false, "e-doc", "f-doc")
+	d.Identity = []byte("Pilot Validation/doc.pdf")
+	rec.listing[""] = []cfapi.PlaceholderInfo{ph("Pilot Validation", true, "e-pv", ""), ph("Pilot Validationn", true, "e-n", "")}
+	rec.listing["Pilot Validation"] = []cfapi.PlaceholderInfo{d}
+	rec.baselines["Pilot Validation/doc.pdf"] = "e-doc"
+	w := bareWatcher(root, rec.ops())
+	return f, rec, w, alias, doc
+}
+
+func rawExists(p string) bool {
+	_, err := os.Lstat(`\\?\` + p)
+	return err == nil
+}
+
+// An empty leftover alias is removed by its exact name, without touching the
+// real folder or the server: the user must never have to delete it, because
+// deleting it in Explorer goes through Win32 and can reach the real folder.
+func TestReconcileRemovesAnEmptyLeftoverAlias(t *testing.T) {
+	_, rec, w, alias, doc := aliasSetup(t)
+	defer w.cancel()
+
+	w.Reconcile()
+
+	if rawExists(alias) {
+		t.Error("the leftover alias folder is still there")
+	}
+	if b, err := os.ReadFile(doc); err != nil || string(b) != "real" {
+		t.Errorf("the real folder's file was touched: %q, %v", b, err)
+	}
+	assertNoServerOps(t, rec)
+}
+
+// One holding only online-only stubs has nothing to lose either.
+func TestReconcileRemovesALeftoverAliasHoldingOnlyStubs(t *testing.T) {
+	f, rec, w, alias, _ := aliasSetup(t)
+	defer w.cancel()
+	stub := filepath.Join(alias, "x.pdf")
+	if err := os.WriteFile(`\\?\`+stub, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.markDehydrated(stub)
+
+	w.Reconcile()
+
+	if rawExists(alias) {
+		t.Error("an alias holding only online-only stubs was kept")
+	}
+	assertNoServerOps(t, rec)
+}
+
+// One holding real bytes is kept: they may be the only copy.
+func TestReconcileKeepsALeftoverAliasHoldingData(t *testing.T) {
+	_, rec, w, alias, _ := aliasSetup(t)
+	defer w.cancel()
+	if err := os.WriteFile(`\\?\`+filepath.Join(alias, "mine.txt"), []byte("local only"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w.Reconcile()
+
+	if !rawExists(filepath.Join(alias, "mine.txt")) {
+		t.Error("a file with data inside the alias was removed")
+	}
+	if !rec.logged("Pilot Validation ") {
+		t.Error("keeping it was not logged")
+	}
+	assertNoServerOps(t, rec)
+}
+
+// Local events for such a path are not the user's: whatever the watcher hears
+// about one (its removal above, or anything else) must not reach the server,
+// where "Pilot Validation " may still exist.
+func TestParseIgnoresEventsUnderANameWindowsCannotHold(t *testing.T) {
+	root := t.TempDir()
+	rec := newRecorder()
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	w.parse(notifyBuf(t, []struct {
+		action uint32
+		name   string
+	}{
+		{fileActionRemoved, `Pilot Validation `},
+		{fileActionRemoved, `Pilot Validation \x.pdf`},
+		{fileActionAdded, `report.`},
+	}))
+	w.NotifyRenamed(filepath.Join(root, "Pilot Validation "), filepath.Join(root, "Pilot Validation 2"))
+
+	select {
+	case d := <-rec.deleted:
+		t.Fatalf("server DELETE %q from an event under an unholdable name", d)
+	case mv := <-rec.moved:
+		t.Fatalf("server MOVE %v from an event under an unholdable name", mv)
+	case u := <-rec.uploaded:
+		t.Fatalf("upload %q from an event under an unholdable name", u)
+	case <-time.After(3 * time.Second):
+	}
+}
