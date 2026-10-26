@@ -419,6 +419,15 @@ export class BlockedItem {
              */
             this["escaping"] = false;
         }
+        if (/** @type {any} */(false)) {
+            /**
+             * Remote is set for a SERVER item whose name Windows cannot hold (Deck
+             * #984): it can only be renamed on the server (RenameOnServer).
+             * @member
+             * @type {string | undefined}
+             */
+            this["remote"] = undefined;
+        }
 
         Object.assign(this, $$source);
     }

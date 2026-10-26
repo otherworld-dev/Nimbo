@@ -123,6 +123,13 @@ type Engine struct {
 	blocked     map[string][]engine.Blocked // key = pair LocalDir
 	blockedSubs []chan struct{}
 
+	// unhold is the saved list of server items this PC cannot sync because
+	// Windows cannot hold their names (Deck #984), keyed by server path. It is
+	// shown in "Can't sync" next to blocked; see unholdable.go.
+	unholdMu     sync.Mutex
+	unhold       map[string]config.Unholdable
+	unholdLoaded bool
+
 	lockedMu   sync.Mutex
 	locked     map[string][]LockedFile // key = pair LocalDir — files OTHER users hold locked
 	lockedSubs []chan struct{}
@@ -739,6 +746,10 @@ type BlockedFile struct {
 	Abs      string // absolute local path
 	Reason   string
 	IsDir    bool
+	// Remote is set for a SERVER item that cannot come down (its name ends
+	// in a space or a dot): the files-root-relative path to rename on the
+	// server. Abs is then only where it would be, never an existing file.
+	Remote string
 }
 
 // BlockedFiles returns all currently-blocked files across pairs.
@@ -757,7 +768,7 @@ func (e *Engine) BlockedFiles() []BlockedFile {
 			})
 		}
 	}
-	return out
+	return append(out, e.unholdableFiles()...)
 }
 
 // LockedFile is a file another user currently holds a files_lock lock on.
@@ -3150,7 +3161,7 @@ func (e *Engine) computePlan(ctx context.Context, st *state.Store, p Pair) ([]en
 	e.scanPhase("Checking server…")
 	remote, err := engine.RemoteScan(ctx, e.client, p.RemoteRoot, engine.ScanOpts{
 		Base: base, Skip: ig.Match, OnEncrypted: e.noteEncrypted, Esc: e.escaper.Load(),
-		Checkpoint: cp,
+		Checkpoint: cp, OnUnholdable: e.unholdableFor(p),
 		Progress: func(dirs int) {
 			e.scanTick("Checking server… " + commas(dirs) + " folders")
 		},
@@ -3215,10 +3226,11 @@ func (e *Engine) computePlanScoped(ctx context.Context, st *state.Store, p Pair,
 	// when consulting the ignore matcher to prune the descent.
 	subRoot := strings.Trim(p.RemoteRoot+"/"+scope, "/")
 	subRemote, err := engine.RemoteScan(ctx, e.client, subRoot, engine.ScanOpts{
-		Base:        stripScopePrefix(base, scope),
-		Skip:        func(rel string) bool { return ig.Match(scope + "/" + rel) },
-		OnEncrypted: e.noteEncrypted,
-		Esc:         e.escaper.Load(),
+		Base:         stripScopePrefix(base, scope),
+		Skip:         func(rel string) bool { return ig.Match(scope + "/" + rel) },
+		OnEncrypted:  e.noteEncrypted,
+		Esc:          e.escaper.Load(),
+		OnUnholdable: e.unholdableFor(p),
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("remote scan: %w", err)
@@ -4818,7 +4830,7 @@ func (e *Engine) syncRemoteDelta(ctx context.Context, p Pair) (transfer.Stats, e
 	cp := newScanCheckpoint(st, pk)
 	remote, err := engine.RemoteScan(ctx, e.client, p.RemoteRoot, engine.ScanOpts{
 		Base: base, Skip: ig.Match, OnEncrypted: e.noteEncrypted, Esc: e.escaper.Load(),
-		Checkpoint: cp,
+		Checkpoint: cp, OnUnholdable: e.unholdableFor(p),
 	})
 	cp.logSummary()
 	if _, _, saves := cp.stats(); saves > 0 {

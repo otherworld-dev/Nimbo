@@ -26,6 +26,7 @@ import (
 	"github.com/otherworld/nimbo/internal/psquote"
 	"github.com/otherworld/nimbo/internal/transfer"
 	"github.com/otherworld/nimbo/internal/transport"
+	"github.com/otherworld/nimbo/internal/winname"
 )
 
 // cfapi seams — package-level function vars so tests can substitute an
@@ -169,10 +170,24 @@ type Watcher struct {
 	lostEvents atomic.Bool // events were lost (overflow/reopen) — next pass sweeps
 
 	reconMu sync.Mutex // serialises reconcile passes
-	// firstPassDone and fullSweep are guarded by reconMu (only reconcile
-	// passes touch them):
+	// reconAgain asks for one more pass: a Reconcile that found a pass
+	// already running sets it instead of being dropped (Deck #984: a push
+	// arriving during an hour-long sweep was lost until the next poll).
+	reconAgain atomic.Bool
+	// firstPassDone, fullSweep, sweepOwed, owedMarks and unholdableNoted are
+	// guarded by reconMu (only reconcile passes touch them):
 	firstPassDone bool // a full (skip-free) pass has completed since start
 	fullSweep     bool // the running pass ignores the ETag subtree skip
+	// sweepOwed holds the folders (sync-root-relative) a full sweep could not
+	// reconcile. Each is swept in full whenever a pass reaches it, until it
+	// succeeds, instead of the whole account being swept again on every pass
+	// for as long as one folder keeps failing (Deck #984: one 404ing folder
+	// made every pass a ~55-minute walk of the whole account, for a day).
+	sweepOwed map[string]bool
+	owedMarks int // bumped on every sweepOwed mark, to find the deepest failure
+	// unholdableNoted holds server paths with a name Windows cannot hold that
+	// were already logged as skipped.
+	unholdableNoted map[string]bool
 	// corruptReported remembers entries already reported by noteCorrupt (lower-
 	// cased local paths), so a permanently broken entry is announced once. It
 	// is guarded by w.mu, NOT reconMu: noteCorrupt is callable from anywhere.
@@ -1366,7 +1381,7 @@ func (w *Watcher) recordBaselines(m map[string]string) {
 func (w *Watcher) moveBaselines(pairs [][2]string) {
 	keep := make([][2]string, 0, len(pairs))
 	for _, p := range pairs {
-		if p[0] == "" || p[1] == "" || strings.EqualFold(p[0], p[1]) {
+		if p[0] == "" || p[1] == "" || p[0] == p[1] {
 			continue
 		}
 		keep = append(keep, p)
@@ -1392,7 +1407,7 @@ func (w *Watcher) moveBaselines(pairs [][2]string) {
 // server's copy as a spurious "conflicted copy"; every plain move was also
 // followed by a needless "refreshed (server changed)" of the new path.
 func (w *Watcher) moveBaseline(srcRemote, dstRemote string) {
-	if srcRemote == "" || dstRemote == "" || strings.EqualFold(srcRemote, dstRemote) {
+	if srcRemote == "" || dstRemote == "" || srcRemote == dstRemote {
 		return
 	}
 	if base, ok := w.baselineFor(srcRemote); ok && base != "" {
@@ -1461,6 +1476,108 @@ func (w *Watcher) pullRename(localDir, oldFull string, y cfapi.PlaceholderInfo, 
 	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(y.Identity))
 	w.report("move", w.localName(string(y.Identity)), nil) // user-visible name
 	return true
+}
+
+// pullCaseRename applies a server-side rename that changed only the case of a
+// folder's name ("14 days" -> "14 Days", Deck #984): the local folder takes
+// the server's spelling and every identity beneath it is repointed, or
+// online-only files in it would open the old, now-404 path. The server
+// already has the new name, so nothing is sent; our own rename events are
+// suppressed so they don't bounce back as a MOVE.
+func (w *Watcher) pullCaseRename(localDir, oldFull string, r cfapi.PlaceholderInfo) {
+	newFull := filepath.Join(localDir, r.Name)
+	oldRemote := w.serverFor(oldFull, true)
+	w.suppressDelete(oldFull) // case-insensitive: covers the new spelling too
+	if err := os.Rename(oldFull, newFull); err != nil {
+		w.ops.Log("vfs pull case rename %s -> %s: %v", oldRemote, string(r.Identity), err)
+		return
+	}
+	if err := cfUpdateIdentity(newFull, r.Identity); err != nil {
+		w.ops.Log("vfs pull case rename repoint %s: %v", string(r.Identity), err)
+	}
+	pairs, pending := w.repointTree(newFull)
+	w.moveBaselines(append([][2]string{{oldRemote, string(r.Identity)}}, pairs...))
+	w.uploadAfterSuppression(pending...)
+	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(r.Identity))
+	w.report("move", w.remoteFor(newFull), nil)
+}
+
+// pullFileCaseRename is pullCaseRename for a FILE. The identity is repointed
+// WITHOUT marking the file in sync: one holding a local edit must stay dirty,
+// so the reconcile code after it sends the edit under the new spelling. It
+// returns the new local path and whether the rename happened.
+func (w *Watcher) pullFileCaseRename(localDir, oldFull string, r cfapi.PlaceholderInfo) (string, bool) {
+	oldName := filepath.Base(oldFull)
+	newName := filepath.Base(filepath.FromSlash(w.localName(r.Name)))
+	if newName == oldName || !strings.EqualFold(newName, oldName) {
+		return oldFull, false // not a case-only difference of the local name
+	}
+	newFull := filepath.Join(localDir, newName)
+	oldRemote := w.serverFor(oldFull, false)
+	w.suppressDelete(oldFull) // case-insensitive: covers the new spelling too
+	if err := os.Rename(oldFull, newFull); err != nil {
+		w.ops.Log("vfs pull case rename %s -> %s: %v", oldRemote, string(r.Identity), err)
+		return oldFull, false
+	}
+	if fi, err := os.Lstat(newFull); err == nil && cfIsPlaceholder(fi, newFull) {
+		if err := cfUpdateIdentityKeep(newFull, r.Identity); err != nil {
+			w.ops.Log("vfs pull case rename repoint %s: %v", string(r.Identity), err)
+		}
+	}
+	w.moveBaselines([][2]string{{oldRemote, string(r.Identity)}})
+	if fid, ok := w.fileIDFor(oldRemote); ok {
+		w.recordFileID(string(r.Identity), fid)
+		w.dropFileID(oldRemote)
+	}
+	if w.unsyncedContent(newFull) {
+		w.uploadAfterSuppression(newFull)
+	}
+	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(r.Identity))
+	w.report("move", w.remoteFor(newFull), nil)
+	return newFull, true
+}
+
+// uploadAfterSuppression schedules uploads for paths a pulled rename just
+// suppressed: handleChange ignores a suppressed path, so an edit waiting under
+// the renamed spelling would otherwise be dropped, and the reconcile that
+// could rescue it is skipped once the folder's ETag is recorded.
+func (w *Watcher) uploadAfterSuppression(paths ...string) {
+	for _, p := range paths {
+		p := p
+		w.after(suppressFor+time.Second, func() { w.scheduleUploadIfIdle(p) })
+	}
+}
+
+// dropUnholdable removes the entries Windows cannot hold (see winname.CannotHold)
+// from a listing of rel and hands them to Ops.Unholdable, which keeps them in
+// "Can't sync" until they are renamed: never shown here, never quietly missing.
+func (w *Watcher) dropUnholdable(rel string, remote []cfapi.PlaceholderInfo) []cfapi.PlaceholderInfo {
+	out := remote[:0:0]
+	var dropped []cfapi.PlaceholderInfo
+	for _, r := range remote {
+		if !winname.CannotHold(r.Name) {
+			out = append(out, r)
+			continue
+		}
+		dropped = append(dropped, r)
+		p := r.Name
+		if rel != "" {
+			p = rel + "/" + r.Name
+		}
+		if w.unholdableNoted == nil {
+			w.unholdableNoted = map[string]bool{}
+		}
+		if !w.unholdableNoted[p] {
+			w.unholdableNoted[p] = true
+			w.ops.Log("vfs cannot sync %q: Windows cannot hold a name ending in a space or a dot", p)
+		}
+	}
+	// Every listing reports, an empty one included, so an item renamed on the
+	// server drops off "Can't sync" the next time its folder is listed.
+	if w.ops.Unholdable != nil {
+		w.ops.Unholdable(strings.Trim(w.remoteRoot+"/"+rel, "/"), dropped)
+	}
+	return out
 }
 
 // serverChanged reports whether the remote copy r differs from the local file —
@@ -2838,10 +2955,26 @@ func (w *Watcher) Reconcile() {
 	if w.ops.List == nil {
 		return
 	}
-	if !w.reconMu.TryLock() {
-		return // a pass is already running
+	for {
+		if !w.reconMu.TryLock() {
+			// A pass is already running and may have walked past whatever
+			// prompted this call: run one more when it ends.
+			w.reconAgain.Store(true)
+			return
+		}
+		w.reconcilePass()
+		w.reconMu.Unlock()
+		if !w.reconAgain.Swap(false) || w.ctx.Err() != nil {
+			return
+		}
 	}
-	defer w.reconMu.Unlock()
+}
+
+// reconcilePass is one pass of Reconcile; the caller holds reconMu.
+func (w *Watcher) reconcilePass() {
+	if w.sweepOwed == nil {
+		w.sweepOwed = map[string]bool{}
+	}
 	// The first pass after start ignores the ETag subtree skip. The skip assumes
 	// local state is good wherever the server is unchanged — but #580 flattening
 	// (placeholders losing their cloud state across a provider shutdown) breaks
@@ -2850,8 +2983,15 @@ func (w *Watcher) Reconcile() {
 	// steady state, once.
 	// Lost events (buffer overflow, a reopened watch) also force a skip-free
 	// pass: a local change in the gap invalidates the skip's assumption.
+	//
+	// A sweep that reached everything but could not reconcile some folders
+	// still counts as done: those folders are recorded in sweepOwed and get
+	// their full sweep when they next reconcile. Only a pass that failed for
+	// another reason (the root itself, a cancelled context) is repeated.
 	w.fullSweep = !w.firstPassDone || w.lostEvents.Swap(false)
-	if w.reconcileDir("", "") && w.fullSweep {
+	marks := w.owedMarks
+	ok := w.reconcileDir("", "")
+	if w.fullSweep && w.ctx.Err() == nil && (ok || w.owedMarks > marks) {
 		w.firstPassDone = true
 	}
 	w.fullSweep = false
@@ -2875,10 +3015,17 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		return false
 	}
 	dirRemote := strings.Trim(w.remoteRoot+"/"+rel, "/")
-	if knownETag != "" && !w.fullSweep {
+	owed := rel != "" && w.sweepOwed[rel]
+	if knownETag != "" && !w.fullSweep && !owed {
 		if base, ok := w.baselineFor(dirRemote); ok && base == knownETag {
 			return true // unchanged subtree (ETag propagation guarantees nothing below changed)
 		}
+	}
+	if owed && !w.fullSweep {
+		// The full sweep could not reconcile this folder: it gets that sweep
+		// now, subtree skip off, however long ago the rest of the tree had it.
+		w.fullSweep = true
+		defer func() { w.fullSweep = false }()
 	}
 	localDir := w.root
 	if rel != "" {
@@ -2936,6 +3083,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		w.ops.Log("vfs reconcile list %q: %v", rel, err)
 		return false // unknown listing — never treat as "all deleted"
 	}
+	remote = w.dropUnholdable(rel, remote)
 	// nameKey normalises a name for MATCHING only — never for an actual operation,
 	// which always uses the name verbatim. Windows filenames are case-insensitive,
 	// so a server entry differing only in case IS the local file; matching it
@@ -2966,7 +3114,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 	}
 	localByName := map[string]bool{}
 	for _, e := range entries {
-		if !skipName(e.Name()) {
+		if !skipName(e.Name()) && !winname.CannotHold(e.Name()) {
 			localByName[nameKey(serverName(e))] = true
 		}
 	}
@@ -2997,6 +3145,15 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 					w.ops.Log("vfs exclude %s: %v", name, xerr)
 				}
 			}
+			continue
+		}
+		if winname.CannotHold(name) {
+			// An item by a name Windows cannot hold, created by an older
+			// version. Every Win32 call through it reaches ANOTHER item (the
+			// name with its trailing spaces and dots trimmed): inspecting it
+			// reads that item, and the "mismatched identity" found there was
+			// MOVEd on the server, renaming the real folder onto the alias
+			// (Deck #984). Nothing here can address it safely; leave it be.
 			continue
 		}
 		full := filepath.Join(localDir, name)
@@ -3059,6 +3216,26 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 				}
 			} else if id := cid; len(id) > 0 {
 				if want := w.serverFor(full, ch.IsDir); !strings.EqualFold(string(id), want) {
+					if winname.Equivalent(string(id), want) {
+						// Not a move: the identity names a path Windows treats
+						// as this one (a trailing space or dot an older version
+						// let through). The item was put here through that
+						// alias, not by the user; MOVEing it relocated a
+						// colleague's file on the server (Deck #984). A clean
+						// file mirrors nothing this folder has, so it goes; a
+						// dirty one or a folder is left for the user.
+						if !ch.NeedsUpload && !ch.IsDir {
+							w.suppressDelete(full)
+							if rerr := os.Remove(full); rerr != nil {
+								w.ops.Log("vfs remove stray %s (identity %q): %v", w.remoteFor(full), string(id), rerr)
+							} else {
+								w.ops.Log("vfs removed stray %s: its identity %q is a name Windows cannot hold", w.remoteFor(full), string(id))
+							}
+						} else {
+							w.ops.Log("vfs left %s alone: its identity %q is a name Windows cannot hold", w.remoteFor(full), string(id))
+						}
+						continue
+					}
 					if w.moveInFlightOrAbove(full) {
 						// A live move (the filter's callback, or a REMOVED +
 						// ADDED pair) already owns this path and is reading
@@ -3185,12 +3362,31 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 					}
 				}
 			}
+			// Renamed on the server in case only ("14 days" -> "14 Days"):
+			// the name still matches here, but the server knows the folder
+			// only by its new spelling. Listing the old one is a 404 on every
+			// pass, which also kept every pass a full sweep (Deck #984). Take
+			// the server's spelling locally, then recurse by it.
+			if r.IsDir && r.Name != name {
+				w.pullCaseRename(localDir, full, r)
+				name = r.Name
+			}
 			child := name
 			if rel != "" {
 				child = rel + "/" + name
 			}
 			subdirs = append(subdirs, subdir{rel: child, etag: r.ETag})
 			continue
+		}
+		// Renamed on the server in case only ("report.pdf" -> "Report.pdf"):
+		// the listing still matches, but the server knows the file only by
+		// its new spelling, so an online-only copy would open a 404 and an
+		// edit would be PUT as a second file under the old one. Take the
+		// server's spelling first; everything below then works on it.
+		if serverName(e) != r.Name {
+			if nf, ok := w.pullFileCaseRename(localDir, full, r); ok {
+				full, name = nf, filepath.Base(nf)
+			}
 		}
 		fi, statErr := e.Info()
 		if statErr != nil {
@@ -3444,8 +3640,23 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 
 	ok := dirOK
 	for _, sd := range subdirs {
-		if !w.reconcileDir(sd.rel, sd.etag) {
-			ok = false
+		marks := w.owedMarks
+		if w.reconcileDir(sd.rel, sd.etag) {
+			delete(w.sweepOwed, sd.rel)
+			continue
+		}
+		ok = false
+		if !w.fullSweep || w.ctx.Err() != nil {
+			continue // an ordinary retry: the missing ETag brings the pass back
+		}
+		// Owe the sweep to the DEEPEST folder that failed, not to each of its
+		// ancestors: owing it to an ancestor would sweep that whole subtree
+		// again on every pass.
+		if w.owedMarks > marks {
+			delete(w.sweepOwed, sd.rel)
+		} else {
+			w.sweepOwed[sd.rel] = true
+			w.owedMarks++
 		}
 	}
 	// Record this directory's ETag only once it AND its whole subtree reconciled,
@@ -3499,6 +3710,10 @@ func editedAfter(fi os.FileInfo, r cfapi.PlaceholderInfo) bool {
 	return !r.ModTime.IsZero() && fi.ModTime().Sub(r.ModTime) > 2*time.Second
 }
 
+// suppressFor is how long suppressDelete keeps a path's events from being read
+// as the user's (a variable so tests can shorten it).
+var suppressFor = 10 * time.Second
+
 // suppressDelete marks a path (and its subtree) as removed by us, so the
 // watcher's own REMOVED notification doesn't bounce back as a server delete.
 func (w *Watcher) suppressDelete(path string) {
@@ -3512,7 +3727,7 @@ func (w *Watcher) isSuppressed(path string) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for p, t := range w.suppress {
-		if time.Since(t) > 10*time.Second {
+		if time.Since(t) > suppressFor {
 			delete(w.suppress, p)
 			continue
 		}

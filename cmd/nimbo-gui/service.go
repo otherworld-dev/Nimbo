@@ -34,6 +34,7 @@ import (
 	"github.com/otherworld/nimbo/internal/brand"
 	"github.com/otherworld/nimbo/internal/cfapi"
 	"github.com/otherworld/nimbo/internal/config"
+	"github.com/otherworld/nimbo/internal/engine"
 	"github.com/otherworld/nimbo/internal/license"
 	"github.com/otherworld/nimbo/internal/notify"
 	"github.com/otherworld/nimbo/internal/overlay"
@@ -45,6 +46,7 @@ import (
 	"github.com/otherworld/nimbo/internal/transport"
 	"github.com/otherworld/nimbo/internal/update"
 	"github.com/otherworld/nimbo/internal/vfs"
+	"github.com/otherworld/nimbo/internal/winname"
 )
 
 // App is the Wails-bound service: its exported methods are callable from the
@@ -97,7 +99,7 @@ type App struct {
 	// the confirmed plan staged for mountOnDemandWith, which runs its Apply
 	// between registering the sync root and starting the write-back watcher —
 	// the watcher must never see adopt's local mutations as user actions.
-	pendingAdopt  *adoptPending
+	pendingAdopt *adoptPending
 	// mountRefused is why the last account-folder mount was refused (it overlaps
 	// another account's folder), so a mode switch can say so; "" otherwise.
 	mountRefused string
@@ -106,7 +108,7 @@ type App struct {
 	setupPrev map[string]setupFolder
 	// leftoversSwept: the once-per-launch clean-up of leftover roots has run.
 	leftoversSwept atomic.Bool
-	preMountAdopt *adoptPending
+	preMountAdopt  *adoptPending
 	// adoptScanDirs is the live directory count of an in-flight adopt scan
 	// (0 = none), surfaced via Diagnostics so the scanning overlay has a moving
 	// number. adoptScanCancel aborts that scan; guarded by adoptScanMu because
@@ -1438,6 +1440,17 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			slog.Warn("on-demand list failed", "rel", rel, "err", err)
 			return nil
 		}
+		// A trailing space or dot: every Win32 path through such a name
+		// reaches the trimmed one instead, which can be another item (Deck
+		// #984), so the shell is never handed one. Reconcile gets the full
+		// listing and drops them itself, which is where the user is told.
+		shown := items[:0]
+		for _, it := range items {
+			if !winname.CannotHold(it.Name) {
+				shown = append(shown, it)
+			}
+		}
+		items = shown
 		base := make(map[string]string, len(items))
 		fids := make(map[string]string, len(items))
 		keys := make(map[string]string, len(items))
@@ -1533,7 +1546,15 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 				_, ok, err := eng.StatRemote(sctx, remote)
 				return ok, err
 			},
-			Report:         report,
+			Report: report,
+			// Server items Windows cannot hold go to "Can't sync" (Deck #984).
+			Unholdable: func(parent string, items []cfapi.PlaceholderInfo) {
+				conv := make([]engine.Unholdable, 0, len(items))
+				for _, it := range items {
+					conv = append(conv, engine.Unholdable{Remote: string(it.Identity), IsDir: it.IsDir})
+				}
+				eng.SetUnholdable(localDir, root, parent, conv)
+			},
 			RecordBaseline: func(remote, etag string) { etags.set(remote, etag) },
 			Baseline:       func(remote string) (string, bool) { e := etags.get(remote); return e, e != "" },
 			ForgetBaseline: func(remote string) { etags.del(remote) },
@@ -3710,6 +3731,9 @@ type BlockedItem struct {
 	Ext       string `json:"ext"`       // file extension (for the escape opt-in label)
 	Escapable bool   `json:"escapable"` // opting Ext in would let this file sync
 	Escaping  bool   `json:"escaping"`  // synthetic row: this Ext is currently escaped
+	// Remote is set for a SERVER item whose name Windows cannot hold (Deck
+	// #984): it can only be renamed on the server (RenameOnServer).
+	Remote string `json:"remote,omitempty"`
 }
 
 // BlockedList returns files that can't sync, plus a synthetic row per
@@ -3744,6 +3768,27 @@ const (
 	escapeOptIn  = "//escape"    // opt in the blocked file's extension
 	escapeOptOut = "//unescape:" // + <ext>: stop escaping that extension
 )
+
+// RenameOnServer renames a "Can't sync" server item (a row with Remote set,
+// identified by its Abs) to newName in the same server folder, never replacing
+// anything there. It returns "" on success, else a message for the user.
+func (a *App) RenameOnServer(abs, newName string) string {
+	if a.eng == nil {
+		return "Not signed in."
+	}
+	for _, b := range a.eng.BlockedFiles() {
+		if b.Remote == "" || b.Abs != abs {
+			continue
+		}
+		if err := a.eng.RenameOnServer(b.Remote, strings.TrimSpace(newName)); err != nil {
+			return "Couldn't rename it: " + err.Error()
+		}
+		a.pokeOnDemand() // on-demand: list the folder now so it appears
+		a.emit("blocked")
+		return ""
+	}
+	return "It is no longer in the list."
+}
 
 // RenameBlocked renames a blocked file so it can sync — or, when newName is an
 // escape-control sentinel, opts the file's extension into (or out of) escaping.
