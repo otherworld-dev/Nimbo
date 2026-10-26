@@ -58,9 +58,12 @@ if ($base -match '^(?<root>.*)/releases/latest/download$') {
     $msixUri = "$($Matches.root)/releases/download/$Tag/$Name.msix"
 }
 
+# The 2017/2 schema, not a newer one: Windows 10's App Installer rejects the
+# 2021 namespace outright (0x8008020C, Deck #985), and nothing here needs more
+# than MainPackage + OnLaunch, which 2017/2 already has.
 $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
-<AppInstaller xmlns="http://schemas.microsoft.com/appx/appinstaller/2021"
+<AppInstaller xmlns="http://schemas.microsoft.com/appx/appinstaller/2017/2"
               Version="$ver"
               Uri="$base/$Name.appinstaller">
   <MainPackage Name="$Name"

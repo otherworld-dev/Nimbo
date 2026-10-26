@@ -36,8 +36,12 @@
   </Properties>
 
   <Dependencies>
-    <!-- windows.fileExplorerContextMenus requires Windows 11 (22000+). -->
-    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" />
+    <!-- Windows 10 2004 (19041) and later. Every extension below is 1803-1809
+         era (fileExplorerContextMenus shows in the classic menu on Windows 10)
+         except virtualization:FileSystemWriteVirtualization (20348+), which an
+         older OS skips as an ignorable namespace. The 22000 floor this used to
+         carry locked Windows 10 out for no reason (Deck #985). -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
   </Dependencies>
 
   <Resources>
@@ -112,7 +116,8 @@
           <desktop:ToastNotificationActivation ToastActivatorCLSID="00EEDCE7-5C4E-4573-85C2-98790F8F98AE" />
         </desktop:Extension>
 
-        <!-- Windows 11 main context menu: the "Nimbo" command on files and folders. -->
+        <!-- The "Nimbo" command on files and folders: the main menu on Windows 11,
+             the classic menu on Windows 10. -->
         <desktop4:Extension Category="windows.fileExplorerContextMenus">
           <desktop4:FileExplorerContextMenus>
             <desktop5:ItemType Type="*">
