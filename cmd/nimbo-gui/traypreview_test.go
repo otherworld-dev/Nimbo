@@ -12,7 +12,7 @@ func TestRenderTrayPreview(t *testing.T) {
 		t.Skip("set NIMBO_ICON_PREVIEW=1 to render")
 	}
 	_ = os.MkdirAll("../../.icon-preview", 0o755)
-	for _, st := range []string{"idle", "sync", "paused", "error"} {
+	for _, st := range []string{"idle", "sync", "paused", "error", "warning"} {
 		_ = os.WriteFile("../../.icon-preview/tray-"+st+".png", trayIcon(st, 3, st == "idle"), 0o644)
 	}
 }

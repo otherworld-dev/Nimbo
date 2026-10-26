@@ -52,6 +52,11 @@ import (
 // App is the Wails-bound service: its exported methods are callable from the
 // frontend, and it forwards engine changes to the UI as events.
 type App struct {
+	// trayAttnAt/trayAttnN cache the tray's attention count (trayAttention);
+	// only animateTray's goroutine touches them.
+	trayAttnAt time.Time
+	trayAttnN  int
+
 	app             *application.App
 	ctx             context.Context
 	eng             *agent.Engine
@@ -2341,6 +2346,9 @@ func (a *App) animateTray() {
 			state := a.trayState()
 			badge := a.trayBadge()
 			tip := trayTooltip(brand.Current.Name, a.status, a.eng != nil && a.eng.Paused())
+			if state == "warning" {
+				tip += "\n" + trayAttentionLine(a.trayAttnN)
+			}
 			key := state
 			if badge {
 				key += "+badge"
@@ -2406,18 +2414,48 @@ func isBusyStatus(status string) bool {
 }
 
 func (a *App) trayState() string {
-	if a.eng != nil && a.eng.Paused() {
+	return trayStateFor(a.eng != nil && a.eng.Paused(), a.status, a.trayAttention())
+}
+
+// trayStateFor picks the tray state: paused, syncing and a real error first,
+// then "warning" while anything needs the user (can't sync, conflicts, no
+// longer shared) so it can't go unnoticed with the flyout closed (Deck #984).
+func trayStateFor(paused bool, status string, attention int) string {
+	if paused {
 		return "paused"
 	}
-	s := strings.ToLower(a.status)
+	s := strings.ToLower(status)
 	switch {
 	case isBusyStatus(s):
 		return "sync"
 	case strings.Contains(s, "error"):
 		return "error"
+	case attention > 0:
+		return "warning"
 	default:
 		return "idle"
 	}
+}
+
+// trayAttention is how many items need the user, the count the flyout's amber
+// bar shows (locks are informational, not counted). The tray redraws every
+// 120 ms and Attention reads files, so the count is refreshed at most every two
+// seconds. Only animateTray's goroutine calls it.
+func (a *App) trayAttention() int {
+	if time.Since(a.trayAttnAt) > 2*time.Second {
+		at := a.Attention()
+		a.trayAttnN = at.Conflicts + at.Blocked + at.Detached
+		a.trayAttnAt = time.Now()
+	}
+	return a.trayAttnN
+}
+
+// trayAttentionLine is the tooltip's line for the warning state.
+func trayAttentionLine(n int) string {
+	if n == 1 {
+		return "1 item needs attention"
+	}
+	return fmt.Sprintf("%d items need attention", n)
 }
 
 // trayBadge reports whether there are pending Nextcloud notifications.
