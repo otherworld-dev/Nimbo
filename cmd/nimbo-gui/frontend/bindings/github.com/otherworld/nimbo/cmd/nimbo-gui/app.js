@@ -990,6 +990,18 @@ export function RenameBlocked(abs, newName) {
 }
 
 /**
+ * RenameOnServer renames a "Can't sync" server item (a row with Remote set,
+ * identified by its Abs) to newName in the same server folder, never replacing
+ * anything there. It returns "" on success, else a message for the user.
+ * @param {string} abs
+ * @param {string} newName
+ * @returns {$CancellablePromise<string>}
+ */
+export function RenameOnServer(abs, newName) {
+    return $Call.ByID(3560832081, abs, newName);
+}
+
+/**
  * OpenLogs opens (or focuses) the in-app log viewer window.
  * ReportProblem bundles everything a bug report needs — the log files, a
  * diagnostics snapshot, the version, and the (secret-free) settings — into a

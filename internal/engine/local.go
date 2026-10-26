@@ -57,7 +57,7 @@ func LocalScanProgress(root, scope string, progress func(files int)) (map[string
 			return nil
 		}
 		name := d.Name()
-		if isIgnoredName(name) {
+		if isIgnoredName(name) || unholdable(name) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}

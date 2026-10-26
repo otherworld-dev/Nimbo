@@ -12,7 +12,9 @@
   };
   type Notif = { id: number; app: string; subject: string; message: string; link: string; actions: { label: string }[];
                  account: string };
-  type Blocked = { abs: string; path: string; reason: string; ext: string; escapable: boolean; escaping: boolean };
+  // remote: a SERVER item whose name Windows can't hold (Deck #984); it can
+  // only be renamed on the server.
+  type Blocked = { abs: string; path: string; reason: string; ext: string; escapable: boolean; escaping: boolean; remote?: string };
   type Lock = { path: string; owner: string; summary: string; ownerType: number; since: string; account: string;
                 localDir: string; canUnlock: boolean };
   type Trash = { href: string; name: string; originalLocation: string; deletedAt: string; size: number; isDir: boolean };
@@ -290,6 +292,20 @@
     const name = await askText({ title: "Rename file", message: "Pick a name the server allows.", value: base, ok: "Rename" });
     if (name && name !== base) App.RenameBlocked(b.abs, name);
   }
+  // A server item ending in a space or a full stop: rename it ON THE SERVER
+  // (the fix for every device), suggesting the name without the trailing part.
+  async function renameOnServer(b: Blocked) {
+    const base = (b.remote ?? b.path).split("/").pop() ?? b.path;
+    const name = await askText({
+      title: "Rename on server",
+      message: "Windows can't use a name that ends in a space or a full stop. Pick a new name; it changes on the server for everyone, and nothing is replaced.",
+      value: base.replace(/[ .]+$/, ""), ok: "Rename",
+    });
+    if (!name) return;
+    const err = await App.RenameOnServer(b.abs, name);
+    if (err) { await tell({ title: "Couldn't rename", message: err }); return; }
+    loadBlocked();
+  }
   async function deleteBlocked(b: Blocked) {
     if (await ask({
       title: "Delete file?",
@@ -300,7 +316,7 @@
     }
   }
   async function deleteAllBlocked() {
-    const n = realBlocked.length;
+    const n = localBlocked.length;
     if (await ask({
       title: `Delete ${n} file${n === 1 ? "" : "s"}?`,
       message: `This deletes all ${n} can't-sync file${n === 1 ? "" : "s"} from this device. They can't sync because of their names and aren't on the server, so this only removes them locally.`,
@@ -312,6 +328,8 @@
   }
   // Real blocked files (excludes the synthetic "currently escaping" rows).
   const realBlocked = $derived(blocked.filter((b) => !b.escaping));
+  // Only these are local files "Delete all" can remove; a server item can't be.
+  const localBlocked = $derived(realBlocked.filter((b) => !b.remote));
   // Opt this file's type into escaping: it'll sync stored under a renamed copy.
   function syncEscape(b: Blocked) {
     App.RenameBlocked(b.abs, "//escape");
@@ -466,9 +484,9 @@
 
     {:else if tab === "blocked"}
       {#if blocked.length === 0}<p class="empty">Nothing blocked.</p>{/if}
-      {#if realBlocked.length > 1}
+      {#if localBlocked.length > 1}
         <div class="bulkrow">
-          <span class="bulkcount">{realBlocked.length} files can't sync</span>
+          <span class="bulkcount">{localBlocked.length} files can't sync</span>
           <button class="danger" onclick={deleteAllBlocked}>Delete all</button>
         </div>
       {/if}
@@ -479,6 +497,14 @@
             <div class="desc">{b.reason}. Stored on the server under a “{b.ext}{'…'}” copy and shown here with their real name.</div>
             <div class="btns">
               <button onclick={() => stopEscape(b)}>Stop</button>
+            </div>
+          </div>
+        {:else if b.remote}
+          <div class="card" class:hl={b.abs === highlight}>
+            <div class="title">“{b.path}”</div>
+            <div class="desc">{b.reason}</div>
+            <div class="btns">
+              <button class="primary" onclick={() => renameOnServer(b)}>Rename on server…</button>
             </div>
           </div>
         {:else}

@@ -32,6 +32,11 @@ type Ops struct {
 	// (kind e.g. "upload"/"delete-remote"/"move"/"delete-local"; err non-nil on
 	// failure).
 	Report func(kind, remotePath string, err error)
+	// Unholdable is called for every server folder reconcile lists, with its
+	// files-root-relative path and the children skipped because Windows cannot
+	// hold their names (a trailing space or dot, Deck #984), empty when there
+	// were none. The receiver keeps them in "Can't sync". Nil: not reported.
+	Unholdable func(parentRemote string, items []cfapi.PlaceholderInfo)
 	// RecordBaseline records the server ETag a placeholder now mirrors (the
 	// conflict baseline), set when we create/refresh an in-sync placeholder.
 	RecordBaseline func(remotePath, etag string)

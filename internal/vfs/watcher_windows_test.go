@@ -584,6 +584,8 @@ type recorder struct {
 	listCalls map[string]int
 	listing   map[string][]cfapi.PlaceholderInfo
 	listErr   error
+	listErrs  map[string]error // per-directory listing failures (rel -> error)
+	listGate  chan struct{}    // when non-nil, List("") blocks until it closes
 	// checkStrict wires Ops.CheckList, which answers ErrNotFound for any path
 	// the listing does not hold instead of an empty folder, so a guard that
 	// asks for the wrong path cannot pass by accident.
@@ -620,6 +622,10 @@ type recorder struct {
 	uploadSawBase map[string]string   // the baseline each Upload saw at call time
 
 	logs []string // Ops.Log lines (formatted)
+
+	// unholdable records Ops.Unholdable calls as (parent, child) pairs; a
+	// clean listing is recorded as (parent, "").
+	unholdable [][2]string
 }
 
 // logLines returns the log lines the watcher has emitted so far.
@@ -668,7 +674,7 @@ type reportRec struct {
 func newRecorder() *recorder {
 	return &recorder{
 		baselines: map[string]string{}, contents: map[string]string{}, fileids: map[string]string{},
-		listCalls: map[string]int{}, listing: map[string][]cfapi.PlaceholderInfo{},
+		listCalls: map[string]int{}, listing: map[string][]cfapi.PlaceholderInfo{}, listErrs: map[string]error{},
 		uploadSawBase: map[string]string{},
 		uploaded:      make(chan string, 16), deleted: make(chan string, 16), moved: make(chan [2]string, 16),
 	}
@@ -785,14 +791,34 @@ func (r *recorder) ops() Ops {
 			r.moved <- [2]string{src, dst}
 			return nil
 		},
+		Unholdable: func(parent string, items []cfapi.PlaceholderInfo) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if len(items) == 0 {
+				r.unholdable = append(r.unholdable, [2]string{parent, ""})
+			}
+			for _, it := range items {
+				r.unholdable = append(r.unholdable, [2]string{parent, it.Name})
+			}
+		},
 		List: func(rel string) ([]cfapi.PlaceholderInfo, error) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			r.listCalls[rel]++
+			gate := r.listGate
 			if r.listErr != nil {
 				return nil, r.listErr
 			}
-			return r.listing[rel], nil
+			if err := r.listErrs[rel]; err != nil {
+				return nil, err
+			}
+			out := r.listing[rel]
+			if gate != nil && rel == "" {
+				r.mu.Unlock()
+				<-gate
+				r.mu.Lock()
+			}
+			return out, nil
 		},
 		CheckList: func() func(string) ([]cfapi.PlaceholderInfo, error) {
 			if !r.checkStrict {
