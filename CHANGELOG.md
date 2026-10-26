@@ -87,7 +87,9 @@ All notable changes to Nimbo are recorded here. The format follows
   "Rename on server" button that suggests a name without the trailing space or full
   stop and never replaces anything already there. A leftover folder of this kind
   that an earlier version made is cleared automatically when it holds nothing but
-  online-only files (#984).
+  online-only files. The tray icon now shows an amber "!" while anything needs
+  you (files that can't sync, conflicts, folders no longer shared), so they don't
+  go unnoticed with the Nimbo window closed (#984).
 - Signing in again after Nextcloud stops accepting an account (its access removed
   under Security, or a changed password) is clearer. If the account you were
   looking at is the one affected, your other accounts carry on syncing and one of
