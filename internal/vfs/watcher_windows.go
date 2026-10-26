@@ -478,6 +478,21 @@ func (w *Watcher) parse(b []byte) {
 			break
 		}
 		name := windows.UTF16ToString(unsafe.Slice((*uint16)(unsafe.Pointer(&b[nameStart])), nameLen/2))
+		if winname.PathCannotHold(filepath.ToSlash(name)) {
+			// Under a name Windows cannot hold (Deck #984): never the user's
+			// change, since Explorer cannot make one, and every Win32 call
+			// through the path reaches ANOTHER item. Reconcile removing a
+			// leftover alias lands here too; pushed, it would delete the
+			// server's item of that name.
+			if action == fileActionRenamedOld {
+				renameOld = ""
+			}
+			if next == 0 {
+				break
+			}
+			off += int(next)
+			continue
+		}
 		if skipName(name) {
 			if isEditorLockName(name) {
 				editorLocks = append(editorLocks, filepath.Join(w.root, name))
@@ -954,6 +969,11 @@ func (w *Watcher) NotifyRenamed(oldPath, newPath string) {
 	// pair or REMOVED for the old name (a delete, cancelled when the saved copy
 	// arrives) and a RENAMED_NEW or ADDED for the new one (an upload).
 	if skipName(oldPath) || skipName(newPath) { // skipName judges the base name only
+		return
+	}
+	// Either end under a name Windows cannot hold: not a move to push (see
+	// parse, Deck #984).
+	if winname.PathCannotHold(filepath.ToSlash(w.remoteFor(oldPath))) || winname.PathCannotHold(filepath.ToSlash(w.remoteFor(newPath))) {
 		return
 	}
 	claimed := w.beginRename(oldPath, newPath)
@@ -1546,6 +1566,46 @@ func (w *Watcher) uploadAfterSuppression(paths ...string) {
 		p := p
 		w.after(suppressFor+time.Second, func() { w.scheduleUploadIfIdle(p) })
 	}
+}
+
+// clearAlias removes a leftover item whose name Windows cannot hold (a
+// trailing space or dot), always by its exact \\?\ path: through Win32 the
+// same path reaches the item with the trailing part trimmed, which can be the
+// user's real folder. It goes only if nothing in it holds data (empty, or
+// online-only stubs whose server copies are listed under their real names);
+// otherwise it is kept and said once in the log. Its removal events are
+// dropped by parse, so nothing reaches the server.
+func (w *Watcher) clearAlias(full string) {
+	raw := `\\?\` + full
+	hasData := false
+	_ = filepath.WalkDir(raw, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		fi, ierr := d.Info()
+		if ierr != nil || fi.Size() > 0 && !cfIsDehydrated(fi, strings.TrimPrefix(p, `\\?\`)) {
+			hasData = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if hasData {
+		if w.unholdableNoted == nil {
+			w.unholdableNoted = map[string]bool{}
+		}
+		if key := "local:" + strings.ToLower(full); !w.unholdableNoted[key] {
+			w.unholdableNoted[key] = true
+			w.ops.Log("vfs kept %q: its name ends in a space or a dot, which Windows cannot hold, and it holds files with data", w.remoteFor(full))
+		}
+		return
+	}
+	w.suppressDelete(full)
+	if err := os.RemoveAll(raw); err != nil {
+		w.ops.Log("vfs remove leftover %q: %v", w.remoteFor(full), err)
+		return
+	}
+	w.ops.Log("vfs removed leftover %q: its name ends in a space or a dot, which Windows cannot hold", w.remoteFor(full))
+	cfShellNotify(filepath.Dir(full))
 }
 
 // dropUnholdable removes the entries Windows cannot hold (see winname.CannotHold)
@@ -3153,7 +3213,9 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 			// name with its trailing spaces and dots trimmed): inspecting it
 			// reads that item, and the "mismatched identity" found there was
 			// MOVEd on the server, renaming the real folder onto the alias
-			// (Deck #984). Nothing here can address it safely; leave it be.
+			// (Deck #984). Only its exact \\?\ path is safe, so it is cleared
+			// that way here; the user deleting it in Explorer might not be.
+			w.clearAlias(filepath.Join(localDir, name))
 			continue
 		}
 		full := filepath.Join(localDir, name)

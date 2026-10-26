@@ -1435,6 +1435,12 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 	// instead would strand the folder empty forever.
 	// It also records the conflict baseline (server ETag) for each placeholder.
 	list := func(rel string) []cfapi.PlaceholderInfo {
+		// A folder under a name Windows cannot hold (a leftover from an older
+		// version, Deck #984) is never filled in: answer empty without asking
+		// the server, so opening or clearing it can't pull anything into it.
+		if winname.PathCannotHold(rel) {
+			return []cfapi.PlaceholderInfo{}
+		}
 		items, err := listRemote(rel)
 		if err != nil {
 			slog.Warn("on-demand list failed", "rel", rel, "err", err)
