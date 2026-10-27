@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -52,5 +54,67 @@ func TestLastFullCheckIgnoresFailedPasses(t *testing.T) {
 	at, incomplete := e.LastFullCheck()
 	if !at.Equal(t1) || !incomplete {
 		t.Fatalf("got (%v, %v), want (%v, true)", at, incomplete, t1)
+	}
+}
+
+func TestJobStartRecordsPairAndRelativePath(t *testing.T) {
+	root := t.TempDir()
+	e := newNowTestEngine()
+	e.nowPairDirs = func() []string { return []string{root} }
+
+	inPair := filepath.Join(root, "sub", "a.txt")
+	e.jobStart(inPair, "upload", 10)
+	outside := filepath.Join(t.TempDir(), "mount", "b.txt")
+	e.jobStart(outside, "upload", 10)
+
+	for _, j := range e.NowJobs() {
+		got := j.Path
+		if j.LocalDir != "" {
+			got = filepath.Join(j.LocalDir, filepath.FromSlash(j.Path))
+		}
+		switch got {
+		case inPair:
+			if j.LocalDir != root || j.Path != "sub/a.txt" {
+				t.Fatalf("in-pair job: %+v", j)
+			}
+		case outside:
+			if j.LocalDir != "" || j.Path != outside {
+				t.Fatalf("no-pair job: %+v", j)
+			}
+		default:
+			t.Fatalf("job does not map back to an absolute path: %+v", j)
+		}
+	}
+	if len(e.NowJobs()) != 2 {
+		t.Fatalf("want 2 jobs, got %+v", e.NowJobs())
+	}
+}
+
+func TestPausedSyncOnceDoesNotCountAsACheck(t *testing.T) {
+	e := newNowTestEngine()
+	t1 := time.Date(2026, 10, 27, 9, 0, 0, 0, time.UTC)
+	e.noteFullCheck(t1, true)
+	e.paused = true
+	if _, err := e.SyncOnce(context.Background(), Pair{LocalDir: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if at, inc := e.LastFullCheck(); !at.Equal(t1) || inc {
+		t.Fatalf("a skipped pass changed LastFullCheck: (%v, %v)", at, inc)
+	}
+}
+
+func TestScanNowStaysActiveWhileAnotherPairScans(t *testing.T) {
+	e := newNowTestEngine()
+	e.scanTickCountFor("A", "local", 5, "")
+	e.scanTickCountFor("B", "server", 7, "x")
+	e.scanEndFor("A")
+	got := e.ScanNow()
+	want := ScanNow{Active: true, Phase: "server", Count: 7, Folder: "x"}
+	if got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	e.scanEndFor("B")
+	if e.ScanNow().Active {
+		t.Fatal("should be idle once every pair ended")
 	}
 }

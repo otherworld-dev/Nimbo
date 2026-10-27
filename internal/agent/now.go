@@ -3,6 +3,7 @@ package agent
 import (
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,7 +45,8 @@ type nowState struct {
 	mu      sync.Mutex
 	jobs    map[string]*nowJob
 	seq     uint64
-	scan    ScanNow
+	scans   map[string]*scanEntry // by pair key; "" for an unkeyed scan
+	scanSeq uint64
 	lastOK  time.Time
 	lastBad bool // the most recent pass finished with something failing
 }
@@ -57,7 +59,38 @@ func (e *Engine) nowSt() *nowState {
 // jobStart records a small transfer as running and returns the function that
 // ends it. Safe to call done more than once.
 func (e *Engine) jobStart(abs, kind string, size int64) (done func(err error)) {
-	return e.jobStartIn("", filepath.Base(abs), abs, kind, size)
+	dir, rel := e.splitByPair(abs)
+	return e.jobStartIn(dir, rel, abs, kind, size)
+}
+
+// splitByPair finds the configured pair whose folder contains abs and returns
+// that folder and the pair-relative, slash-separated path. With no containing
+// pair (an on-demand mount has none) it returns "" and abs itself, so a reader
+// can always rebuild the absolute path: LocalDir joined with Path, or Path.
+func (e *Engine) splitByPair(abs string) (localDir, rel string) {
+	var dirs []string
+	if e.nowPairDirs != nil {
+		dirs = e.nowPairDirs()
+	} else if pairs, err := e.Pairs(); err == nil {
+		for _, p := range pairs {
+			dirs = append(dirs, p.LocalDir)
+		}
+	}
+	best := ""
+	for _, d := range dirs {
+		if d == "" || len(d) <= len(best) {
+			continue
+		}
+		r, err := filepath.Rel(d, abs)
+		if err != nil || r == "." || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+			continue
+		}
+		best, rel = d, filepath.ToSlash(r)
+	}
+	if best == "" {
+		return "", abs
+	}
+	return best, rel
 }
 
 // jobStartIn is jobStart for a transfer whose sync folder and relative path are known.
@@ -167,26 +200,54 @@ func (e *Engine) NowJobs() []NowJob {
 // it is neither throttled nor gated by the quiet period: it is a cheap
 // snapshot, read on demand.
 func (e *Engine) scanTickCount(phase string, count int, folder string) {
-	s := e.nowSt()
-	s.mu.Lock()
-	s.scan = ScanNow{Active: true, Phase: phase, Count: count, Folder: folder}
-	s.mu.Unlock()
+	e.scanTickCountFor("", phase, count, folder)
 }
 
 // scanEnd marks the scan finished (the plan is computed, or failed).
-func (e *Engine) scanEnd() {
+func (e *Engine) scanEnd() { e.scanEndFor("") }
+
+// scanEntry is one pair's scan; pairs scan concurrently, so each has its own.
+type scanEntry struct {
+	ScanNow
+	seq uint64 // last update, to pick the freshest phase/folder
+}
+
+// scanTickCountFor is scanTickCount for the scan of pair pk.
+func (e *Engine) scanTickCountFor(pk, phase string, count int, folder string) {
 	s := e.nowSt()
 	s.mu.Lock()
-	s.scan = ScanNow{}
+	if s.scans == nil {
+		s.scans = map[string]*scanEntry{}
+	}
+	s.scanSeq++
+	s.scans[pk] = &scanEntry{ScanNow: ScanNow{Active: true, Phase: phase, Count: count, Folder: folder}, seq: s.scanSeq}
 	s.mu.Unlock()
 }
 
-// ScanNow returns the scan's current stage; Active is false between scans.
+// scanEndFor ends pair pk's scan only; other pairs may still be scanning.
+func (e *Engine) scanEndFor(pk string) {
+	s := e.nowSt()
+	s.mu.Lock()
+	delete(s.scans, pk)
+	s.mu.Unlock()
+}
+
+// ScanNow returns the scan's current stage: Active while any pair scans, with
+// the counts summed and the most recently updated phase and folder.
 func (e *Engine) ScanNow() ScanNow {
 	s := e.nowSt()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.scan
+	var out ScanNow
+	var newest uint64
+	for _, en := range s.scans {
+		out.Active = true
+		out.Count += en.Count
+		if en.seq >= newest {
+			newest, out.Phase, out.Folder = en.seq, en.Phase, en.Folder
+		}
+	}
+	return out
 }
 
 // noteFullCheck records the end of a full pass: ok = nothing failed.
@@ -207,4 +268,15 @@ func (e *Engine) LastFullCheck() (at time.Time, incomplete bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastOK, s.lastBad
+}
+
+// otherPairsHealthy is true when no folder other than p is failing. SyncOnce
+// asks it before notePairResult has recorded p's own outcome.
+func (e *Engine) otherPairsHealthy(p Pair) bool {
+	for dir := range e.PairHealths() {
+		if dir != p.LocalDir {
+			return false
+		}
+	}
+	return true
 }
