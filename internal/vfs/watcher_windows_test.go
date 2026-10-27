@@ -552,10 +552,13 @@ func (f *fakeCf) hydrateCallCount(path string) int {
 }
 
 // markHydrateErr makes the hydrate-if-pinned seam fail for path with err.
+// Only a pinned, online-only file is ever downloaded (the real seam checks
+// first, and hydratePinned asks before listing it), so it reads as one.
 func (f *fakeCf) markHydrateErr(path string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hydrateErr[strings.ToLower(path)] = err
+	f.pinned[strings.ToLower(path)] = true
 }
 
 // eventIndex returns the position of the first occurrence of event ("refresh:

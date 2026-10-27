@@ -159,8 +159,8 @@ func (a *App) revertAndSwitch() string {
 	// closing it FIRST also stops reconcile creating new placeholders, which is
 	// why the pass re-scans below: the dialog's plan goes stale within minutes
 	// on a live mount (reconcile pulled ~1.8k new stubs while one sat open).
-	if m.watcher != nil {
-		m.watcher.Close()
+	if w := a.watcherOf(m); w != nil {
+		w.Close()
 		a.setWatcher(m, nil)
 	}
 	slog.Info("leaving virtual files: reverting placeholders in the background", "dir", dir)

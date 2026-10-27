@@ -410,8 +410,8 @@ func (a *App) unmountOnDemandFor(accountID string) {
 		if m.convertCancel != nil {
 			m.convertCancel()
 		}
-		if m.watcher != nil {
-			m.watcher.Close()
+		if w := a.watcherOf(m); w != nil {
+			w.Close()
 		}
 		if m.healCancel != nil {
 			m.healCancel()

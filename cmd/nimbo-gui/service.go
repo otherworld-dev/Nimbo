@@ -68,11 +68,13 @@ type App struct {
 	hjobs     hydrateJobs
 	nowEmOnce sync.Once
 	nowEm     *nowEmitter
+	revealMu  sync.Mutex // guards revealAt
+	revealAt  time.Time  // when the pending nudgeAfter fires (past = none)
 
 	app             *application.App
 	ctx             context.Context
 	eng             *agent.Engine
-	status          string
+	status          statusLine // the shown engine's status text; only via setStatus/Status/status.get
 	statusWin       *application.WebviewWindow
 	statusTab       string // tab the status window should open on ("" = default)
 	settingsWin     *application.WebviewWindow
@@ -155,6 +157,9 @@ type App struct {
 	secondaries map[string]*secondaryEngine // account ID -> background engine; only via secs()/addSecondary/… (mapsMu)
 	acctMu      sync.Mutex
 	acctStatus  map[string]string // account ID -> latest engine status line
+	// acctStatusAt is when recordAcctStatus last changed an account's line
+	// (for the quiet period on "Scanning…"/"Syncing…"); guarded by acctMu.
+	acctStatusAt map[string]time.Time
 	// Signing in again (signinagain.go), all under acctMu. authLostIDs holds
 	// the accounts whose credentials the server turned down; they are not
 	// started again until they sign in. signInFor is the account the sign-in
@@ -488,6 +493,12 @@ func (a *App) recordAcctStatus(accountID, s string) {
 	if a.acctStatus == nil {
 		a.acctStatus = map[string]string{}
 	}
+	if a.acctStatus[accountID] != s || a.acctStatusAt[accountID].IsZero() {
+		if a.acctStatusAt == nil {
+			a.acctStatusAt = map[string]time.Time{}
+		}
+		a.acctStatusAt[accountID] = time.Now()
+	}
 	a.acctStatus[accountID] = s
 	a.acctMu.Unlock()
 }
@@ -538,6 +549,10 @@ func (a *App) startSecondaries(ctx context.Context) {
 		id := ac.ID
 		eng.SetStatusFunc(func(s string) { a.recordAcctStatus(id, s); a.emit("account"); a.nudgeNow() })
 		eng.SetLaneFunc(func() { a.emit("lane"); a.nudgeNow() })
+		// Its transfers show in "Right now" and in the line's other-account
+		// mention, so their progress refreshes them (the "progress" event
+		// stays the shown account's).
+		eng.SetProgressFunc(func(agent.SyncProgress) { a.nudgeNow() })
 		eng.SetToastFunc(notify.Toast)
 		eng.SetAuthLostFunc(func() {
 			// Only this account's sync stops — don't sign the whole app out.
@@ -565,6 +580,14 @@ func (a *App) startSecondaries(ctx context.Context) {
 			pairs = a.prepareLivePairs(eng)
 		}
 		a.addSecondary(id, &secondaryEngine{eng: eng, cancel: cancel})
+		// Its conflicts, can't-sync files and locks count toward "N items
+		// need you": drop the cached counts when they change. Only the
+		// counts: the windows' "conflicts"/"blocked"/... events reload the
+		// shown account's lists.
+		forwardEvents(runCtx, eng.SubscribeConflicts(), a.attentionChanged)
+		forwardEvents(runCtx, eng.SubscribeBlocked(), a.attentionChanged)
+		forwardEvents(runCtx, eng.SubscribeLocked(), a.attentionChanged)
+		forwardEvents(runCtx, eng.SubscribeDetached(), a.attentionChanged)
 		slog.Info("secondary account syncing", "account", ac.LoginName, "server", ac.ServerURL, "pairs", len(pairs))
 		go func() {
 			_ = eng.Run(runCtx, toAgentPairs(pairs), func(agent.Pair, transfer.Stats) {})
@@ -630,8 +653,8 @@ func (a *App) unmountAccount(accountID string) {
 		if m.accountID != accountID {
 			continue
 		}
-		if m.watcher != nil {
-			m.watcher.Close()
+		if w := a.watcherOf(m); w != nil {
+			w.Close()
 		}
 		if m.healCancel != nil {
 			m.healCancel()
@@ -706,7 +729,7 @@ func (a *App) emit(event string) {
 }
 
 func (a *App) setStatus(s string) {
-	a.status = s
+	a.status.set(s, time.Now())
 	if a.app != nil {
 		a.app.Event.Emit("status", s)
 	}
@@ -1401,13 +1424,16 @@ type hydrateReadCloser struct {
 	report     func(kind, remotePath string, err error)
 	reported   bool
 	job        *hjob  // this request's place in "Right now" (nil = not listed)
-	changed    func() // told when the job ends (nil = nobody)
+	changed    func() // told as bytes arrive and when the job ends (nil = nobody)
 }
 
 func (r *hydrateReadCloser) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	r.got += int64(n)
 	r.job.add(int64(n))
+	if n > 0 && r.changed != nil {
+		r.changed() // bytes moving: the "now" emitter throttles this to 2 Hz
+	}
 	switch {
 	case err == nil, errors.Is(err, context.Canceled):
 		// Still going, or withdrawn — neither is a failure.
@@ -2088,8 +2114,8 @@ func (a *App) SetOfflinePin(rel string, pinned bool) string {
 // pokeOnDemand asks every active on-demand mount to reconcile (push-driven).
 func (a *App) pokeOnDemand() {
 	for _, m := range a.mounts() {
-		if m.watcher != nil {
-			m.watcher.Poke()
+		if w := a.watcherOf(m); w != nil {
+			w.Poke()
 		}
 	}
 }
@@ -2099,8 +2125,8 @@ func (a *App) pokeOnDemand() {
 // starts them again (Deck #723).
 func (a *App) pauseChangedOnDemand() {
 	for _, m := range a.mounts() {
-		if m.watcher != nil {
-			m.watcher.PauseChanged()
+		if w := a.watcherOf(m); w != nil {
+			w.PauseChanged()
 		}
 	}
 }
@@ -2115,8 +2141,8 @@ func (a *App) disconnectAllOnDemand() {
 		if m.convertCancel != nil {
 			m.convertCancel()
 		}
-		if m.watcher != nil {
-			m.watcher.Close()
+		if w := a.watcherOf(m); w != nil {
+			w.Close()
 		}
 		if m.healCancel != nil {
 			m.healCancel()
@@ -2136,8 +2162,8 @@ func (a *App) unmountAllOnDemand() {
 		if m.convertCancel != nil {
 			m.convertCancel() // stop a background adopt conversion first
 		}
-		if m.watcher != nil {
-			m.watcher.Close()
+		if w := a.watcherOf(m); w != nil {
+			w.Close()
 		}
 		if m.healCancel != nil {
 			m.healCancel()
@@ -2422,10 +2448,11 @@ func (a *App) SetNotifications(on bool) {
 
 // Status returns the current sync status text.
 func (a *App) Status() string {
-	if a.status == "" {
+	s, _ := a.status.get()
+	if s == "" {
 		return "Starting…"
 	}
-	return a.status
+	return s
 }
 
 // ProgressDTO is a live sync-progress snapshot for the flyout.

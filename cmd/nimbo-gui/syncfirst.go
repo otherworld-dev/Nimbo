@@ -117,8 +117,10 @@ func (a *App) syncFirstLocalPath(localAbs string) {
 	var mount func(string) vfs.SyncFirstResult
 	dir, mounted := a.onDemandMountFor(localAbs)
 	if mounted {
-		if m := a.mount(dir); m != nil && m.watcher != nil {
-			mount = m.watcher.SyncFirst
+		if m := a.mount(dir); m != nil {
+			if w := a.watcherOf(m); w != nil {
+				mount = w.SyncFirst
+			}
 		}
 	}
 	var live []func(string) agent.SyncFirstResult

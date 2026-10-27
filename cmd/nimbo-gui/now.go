@@ -23,19 +23,23 @@ import (
 // NowJobDTO is one transfer in flight (or queued), for "Right now".
 type NowJobDTO struct {
 	Account string `json:"account"` // login; "" with a single account
-	Kind    string `json:"kind"`    // "upload" | "download"
-	Path    string `json:"path"`    // account-relative, slash-separated
-	Size    int64  `json:"size"`    // 0 = unknown
-	Sent    int64  `json:"sent"`
-	Large   bool   `json:"large"`
-	State   string `json:"state"` // "running" | "waiting" | "paused" | "setaside"
+	// AccountID is the account the job belongs to, for matching: two accounts
+	// can share a login on different servers. Never sent to the windows.
+	AccountID string `json:"-"`
+	Kind      string `json:"kind"` // "upload" | "download"
+	Path      string `json:"path"` // account-relative, slash-separated
+	Size      int64  `json:"size"` // 0 = unknown
+	Sent      int64  `json:"sent"`
+	Large     bool   `json:"large"`
+	State     string `json:"state"` // "running" | "waiting" | "paused" | "setaside"
 }
 
 // NowCheckDTO is a folder check (scan or reconcile pass) in progress.
 type NowCheckDTO struct {
-	Account string `json:"account"`
-	Folder  string `json:"folder"` // the folder being listed now, "" when unknown
-	Dirs    int    `json:"dirs"`   // folders listed so far
+	Account   string `json:"account"`
+	AccountID string `json:"-"`      // as NowJobDTO.AccountID
+	Folder    string `json:"folder"` // the folder being listed now, "" when unknown
+	Dirs      int    `json:"dirs"`   // folders listed so far
 }
 
 // NowStatusDTO is the composed status line and the detail behind it.
@@ -52,7 +56,7 @@ type NowStatusDTO struct {
 
 // nowInput is everything composeNow needs, gathered by App.NowStatus.
 type nowInput struct {
-	ShownAccount     string // the account the flyout shows (as in Jobs/Checking Account)
+	ShownAccount     string // the ID of the account the flyout shows (as in Jobs/Checking AccountID)
 	Paused           bool
 	PauseUntil       string // "18:00" for a timed pause, else ""
 	Offline          bool
@@ -84,6 +88,11 @@ type nowInput struct {
 	// OtherProblem: its sync stopped or failed.
 	OtherOffline bool
 	OtherProblem bool
+
+	// revealIn is how long until something kept off the line by the quiet
+	// period would show (0 = nothing waiting), so NowStatus can look again
+	// then rather than wait for an unrelated nudge.
+	revealIn time.Duration
 }
 
 // composeNow picks the status line: needs you, then paused, then offline,
@@ -160,7 +169,7 @@ func composeNow(in nowInput, brandName string) NowStatusDTO {
 	var running []NowJobDTO
 	ups, downs := 0, 0
 	for _, j := range in.Jobs {
-		if j.Account != in.ShownAccount || j.State != "running" {
+		if j.AccountID != in.ShownAccount || j.State != "running" {
 			continue
 		}
 		running = append(running, j)
@@ -175,7 +184,7 @@ func composeNow(in nowInput, brandName string) NowStatusDTO {
 	}
 	dirs, checking := 0, false
 	for _, c := range in.Checking {
-		if c.Account == in.ShownAccount {
+		if c.AccountID == in.ShownAccount {
 			checking = true
 			dirs += c.Dirs
 		}
@@ -223,6 +232,15 @@ func composeNow(in nowInput, brandName string) NowStatusDTO {
 			out.Main = in.Working
 		}
 		out.Sub = strings.Join(append(parts, extras...), " · ")
+		return out
+	}
+
+	if in.Waiting > 0 && in.Holding == "" {
+		// Changes queued to go up (a debounce, a retry after a failure): not
+		// "Up to date" until they have (Deck #988 review).
+		out.State = "busy"
+		out.Main = plural(in.Waiting, "change waiting to upload", "changes waiting to upload")
+		out.Sub = strings.Join(extras, " · ")
 		return out
 	}
 
@@ -454,8 +472,9 @@ func (a *App) nudgeNow() {
 	a.nowEm.nudge()
 }
 
-// checkQuietPeriod is how long a live scan runs before the line shows it, as
-// the engine's own scan narration waits (agent scanQuietPeriod).
+// checkQuietPeriod is how long a check (a live scan, an on-demand pass, the
+// engine's "Scanning…"/"Syncing…") runs before the line shows it, as the
+// engine's own scan narration waits (agent scanQuietPeriod).
 const checkQuietPeriod = 1500 * time.Millisecond
 
 // NowStatus is the flyout's status line and the Status window's "Right now".
@@ -463,6 +482,86 @@ const checkQuietPeriod = 1500 * time.Millisecond
 // read files) come from a cache at most two seconds old.
 func (a *App) NowStatus() NowStatusDTO {
 	return a.nowStatus(a.cachedAttention())
+}
+
+// statusLine is the shown engine's status text and when it last changed.
+// setStatus writes it on engine goroutines while Wails calls and the tray
+// read it, so it is only ever reached through set and get.
+type statusLine struct {
+	mu    sync.Mutex
+	text  string
+	since time.Time
+}
+
+// set records s; the time moves only when the text changes.
+func (l *statusLine) set(s string, now time.Time) {
+	l.mu.Lock()
+	if s != l.text || l.since.IsZero() {
+		l.text, l.since = s, now
+	}
+	l.mu.Unlock()
+}
+
+// get is the text and when it was set.
+func (l *statusLine) get() (string, time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.text, l.since
+}
+
+// routinePassStatus reports the lines SyncOnce sets at the start of every
+// pass, poll or not; most passes are over in milliseconds.
+func routinePassStatus(s string) bool { return s == "Scanning…" || s == "Syncing…" }
+
+// quietWorking keeps a routine pass line ("Scanning…", "Syncing…") off the
+// status line until it has lasted checkQuietPeriod, so the poll every 15 s
+// doesn't flash "Syncing…"; real work shows through NowJobs and ScanNow
+// anyway. It returns the working line to show ("" = none) and, while one is
+// held back, how long until it would show.
+func quietWorking(working string, since, now time.Time) (string, time.Duration) {
+	if !routinePassStatus(working) {
+		return working, 0
+	}
+	if shown, wait := checkShown(true, since, now); !shown {
+		return "", wait
+	}
+	return working, 0
+}
+
+// checkShown reports whether a check that started at since shows yet, and if
+// not, how long until it does.
+func checkShown(active bool, since, now time.Time) (bool, time.Duration) {
+	if !active {
+		return false, 0
+	}
+	if age := now.Sub(since); age < checkQuietPeriod {
+		return false, checkQuietPeriod - age
+	}
+	return true, 0
+}
+
+// soonest keeps the shorter positive wait in *d.
+func soonest(d *time.Duration, wait time.Duration) {
+	if wait > 0 && (*d == 0 || wait < *d) {
+		*d = wait
+	}
+}
+
+// nudgeAfter nudges the windows once d has passed, so a check held back by
+// the quiet period appears when it outlasts it even if nothing else changes
+// meanwhile. A call while an earlier (or as early) one is due is dropped.
+func (a *App) nudgeAfter(d time.Duration) {
+	d += 50 * time.Millisecond // land just past the quiet period, not on it
+	now := time.Now()
+	at := now.Add(d)
+	a.revealMu.Lock()
+	if a.revealAt.After(now) && !a.revealAt.After(at) {
+		a.revealMu.Unlock()
+		return
+	}
+	a.revealAt = at
+	a.revealMu.Unlock()
+	time.AfterFunc(d, a.nudgeNow)
 }
 
 // cachedAttention is Attention, reused for up to two seconds. Safe from any
@@ -508,6 +607,9 @@ func (a *App) nowStatus(att AttentionInfo) NowStatusDTO {
 			Jobs: []NowJobDTO{}, Checking: []NowCheckDTO{}}
 	}
 	in := a.gatherNow(eng, att, now)
+	if in.revealIn > 0 {
+		a.nudgeAfter(in.revealIn)
+	}
 	out := composeNow(in, brand.Current.Name)
 	if a.secondaryCount() == 0 {
 		// One account: no account column (as LaneList).
@@ -524,9 +626,11 @@ func (a *App) nowStatus(att AttentionInfo) NowStatusDTO {
 // nowEngine is one account's engine with what NowStatus needs to know of it.
 type nowEngine struct {
 	eng    *agent.Engine
+	id     string // account ID
 	login  string
 	shown  bool
 	status string
+	since  time.Time           // when status last changed
 	mounts map[string]*odMount // this account's on-demand mounts by local dir
 	down   bool                // one of its mounts can't list the server's root
 }
@@ -535,7 +639,8 @@ type nowEngine struct {
 // plus the shown account's own state. It never holds a lock of its own while
 // calling an engine or a watcher.
 func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) nowInput {
-	engines := []*nowEngine{{eng: shown, login: shown.Account.LoginName, shown: true, status: a.status}}
+	st, since := a.status.get()
+	engines := []*nowEngine{{eng: shown, id: shown.Account.ID, login: shown.Account.LoginName, shown: true, status: st, since: since}}
 	secs := a.secs()
 	ids := make([]string, 0, len(secs))
 	for id := range secs {
@@ -545,14 +650,15 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 	a.acctMu.Lock()
 	for _, id := range ids {
 		if se := secs[id]; se != nil && se.eng != nil {
-			engines = append(engines, &nowEngine{eng: se.eng, login: se.eng.Account.LoginName, status: a.acctStatus[id]})
+			engines = append(engines, &nowEngine{eng: se.eng, id: se.eng.Account.ID, login: se.eng.Account.LoginName,
+				status: a.acctStatus[id], since: a.acctStatusAt[id]})
 		}
 	}
 	a.acctMu.Unlock()
 	byID := map[string]*nowEngine{}
 	for _, ne := range engines {
 		ne.mounts = map[string]*odMount{}
-		byID[ne.eng.Account.ID] = ne
+		byID[ne.id] = ne
 	}
 	for dir, m := range a.mounts() {
 		if ne := byID[m.accountID]; ne != nil {
@@ -560,7 +666,7 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 		}
 	}
 
-	in := nowInput{ShownAccount: engines[0].login, Attention: att, InUse: att.Locked, Now: now}
+	in := nowInput{ShownAccount: engines[0].id, Attention: att, InUse: att.Locked, Now: now}
 	seen := map[string]bool{}
 	add := func(abs string, j NowJobDTO) {
 		if abs != "" {
@@ -596,15 +702,15 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 				abs = j.Path
 				acctPath = mountPath(ne.mounts, abs)
 			}
-			add(abs, NowJobDTO{Account: ne.login, Kind: j.Kind, Path: acctPath, Size: j.Size, Sent: j.Sent, Large: j.Large, State: j.State})
+			add(abs, NowJobDTO{Account: ne.login, AccountID: ne.id, Kind: j.Kind, Path: acctPath, Size: j.Size, Sent: j.Sent, Large: j.Large, State: j.State})
 		}
 		// Files opened through the filter (registered by account ID, raw path).
 		for _, h := range hydr {
-			if h.Account != ne.eng.Account.ID {
+			if h.Account != ne.id {
 				continue
 			}
 			shownPath := vfsDisplayPath(ne.eng.Escaper(), h.Path)
-			h.Account, h.Path = ne.login, shownPath
+			h.Account, h.AccountID, h.Path = ne.login, ne.id, shownPath
 			add(mountLocal(ne.mounts, shownPath), h)
 		}
 		var incomplete, haveCheck bool
@@ -617,15 +723,20 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 			wn := w.Now()
 			ne.down = ne.down || wn.ServerDown
 			for _, p := range wn.Uploading {
-				add(p, NowJobDTO{Account: ne.login, Kind: "upload", Path: mountPath(ne.mounts, p), State: "running"})
+				add(p, NowJobDTO{Account: ne.login, AccountID: ne.id, Kind: "upload", Path: mountPath(ne.mounts, p), State: "running"})
 			}
 			for _, p := range wn.Hydrating {
-				add(p, NowJobDTO{Account: ne.login, Kind: "download", Path: mountPath(ne.mounts, p), State: "running"})
+				add(p, NowJobDTO{Account: ne.login, AccountID: ne.id, Kind: "download", Path: mountPath(ne.mounts, p), State: "running"})
 			}
-			if wn.Checking {
-				in.Checking = append(in.Checking, NowCheckDTO{Account: ne.login, Folder: wn.Folder, Dirs: wn.DirsChecked})
+			// A pass runs every 30 s and most are over at once: like a live
+			// scan, it shows only once it outlasts the quiet period.
+			if shown, wait := checkShown(wn.Checking, wn.CheckingSince, now); shown {
+				in.Checking = append(in.Checking, NowCheckDTO{Account: ne.login, AccountID: ne.id, Folder: wn.Folder, Dirs: wn.DirsChecked})
+			} else {
+				soonest(&in.revealIn, wait)
 			}
 			if ne.shown {
+				in.Waiting += wn.Pending // uploads queued or held, not yet running
 				incomplete = incomplete || wn.CheckIncomplete
 				if !haveCheck || wn.LastFullCheck.Before(oldest) {
 					oldest = wn.LastFullCheck
@@ -633,12 +744,15 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 				haveCheck = true
 			}
 		}
-		if sn := ne.eng.ScanNow(); showScan(sn, now) {
-			c := NowCheckDTO{Account: ne.login, Folder: sn.Folder}
+		sn := ne.eng.ScanNow()
+		if shown, wait := checkShown(sn.Active, sn.Since, now); shown {
+			c := NowCheckDTO{Account: ne.login, AccountID: ne.id, Folder: sn.Folder}
 			if sn.Phase == "server" {
 				c.Dirs = sn.Count // the other stages count files, not folders
 			}
 			in.Checking = append(in.Checking, c)
+		} else {
+			soonest(&in.revealIn, wait)
 		}
 		if ne.shown {
 			if len(ne.mounts) > 0 {
@@ -651,7 +765,7 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 	}
 
 	for _, j := range in.Jobs {
-		if j.Account != in.ShownAccount {
+		if j.AccountID != in.ShownAccount {
 			continue
 		}
 		switch {
@@ -668,6 +782,9 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 	ps := shown.PauseState()
 	in.Paused, in.PauseUntil = ps.Paused, ps.Until
 	in.Offline, in.Problem, in.Working, in.Holding = accountState(engines[0].status, engines[0].down)
+	var wait time.Duration
+	in.Working, wait = quietWorking(in.Working, engines[0].since, now)
+	soonest(&in.revealIn, wait)
 	if p := shown.Progress(); p.Active && len(p.Clones) > 0 {
 		chosen := 0
 		for _, c := range p.Clones {
@@ -679,12 +796,14 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 	// Another account working while this one rests: say so on the second line.
 	for _, ne := range engines[1:] {
 		off, prob, working, _ := accountState(ne.status, ne.down)
+		working, wait := quietWorking(working, ne.since, now)
+		soonest(&in.revealIn, wait)
 		busy := working != ""
 		for _, j := range in.Jobs {
-			busy = busy || (j.Account == ne.login && j.State == "running")
+			busy = busy || (j.AccountID == ne.id && j.State == "running")
 		}
 		for _, c := range in.Checking {
-			busy = busy || c.Account == ne.login
+			busy = busy || c.AccountID == ne.id
 		}
 		if busy || off || prob != "" {
 			in.OtherBusy = ne.login
@@ -733,7 +852,8 @@ func accountState(status string, down bool) (offline bool, problem, working, hol
 // once it has run past the quiet period. A warm pass (every 15 s without
 // notify_push) is over in milliseconds, and the line would flicker.
 func showScan(sn agent.ScanNow, now time.Time) bool {
-	return sn.Active && now.Sub(sn.Since) >= checkQuietPeriod
+	shown, _ := checkShown(sn.Active, sn.Since, now)
+	return shown
 }
 
 // pathKey is a local path's identity for deduping: case-insensitive on Windows.

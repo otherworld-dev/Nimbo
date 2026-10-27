@@ -251,8 +251,16 @@
   const samples = new Map<string, { t: number; sent: number; rate: number }>();
   let rates = $state<Record<string, number>>({});
   const jobKey = (j: NowJob) => j.account + NL + j.kind + NL + j.path;
+  // Calls can overlap (a "now" event during a slow one): only the latest
+  // answer is drawn or sampled for speed, and a failed call changes nothing.
+  let nowSeq = 0;
   async function loadNow() {
-    const n = ((await App.NowStatus()) as unknown as Now | null) ?? { jobs: [], checking: [] };
+    const seq = ++nowSeq;
+    let n: Now;
+    try {
+      n = ((await App.NowStatus()) as unknown as Now | null) ?? { jobs: [], checking: [] };
+    } catch { return; }
+    if (seq !== nowSeq) return;
     const t = Date.now(), live = new Set<string>(), next: Record<string, number> = {};
     for (const j of n.jobs ?? []) {
       const k = jobKey(j); live.add(k);

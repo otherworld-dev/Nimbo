@@ -139,6 +139,7 @@ type Watcher struct {
 	nowChecking   atomic.Bool
 	nowDirs       atomic.Int64
 	nowFolder     string
+	nowSince      time.Time // when the running pass started; zero between passes
 	nowLastFull   time.Time
 	nowIncomplete bool
 	// hydrateFails/hydrateNext back off a repeatedly-failing hydration (a
@@ -2384,14 +2385,26 @@ func (w *Watcher) hydratePinned(path string) {
 		delete(w.hydrating, key)
 		w.mu.Unlock()
 	}()
-	w.nowStart(&w.nowHydrating, key, path)
-	defer w.nowEnd(&w.nowHydrating, key)
 	w.mu.Lock()
 	backedOff := time.Now().Before(w.hydrateNext[key])
 	w.mu.Unlock()
 	if backedOff || w.ctx.Err() != nil {
 		return
 	}
+	if !cfPinnedDehydrated(path) {
+		// Nothing to download (unpinned or already here meanwhile): as
+		// cfHydrateIfPinned answering false, without ever listing it as a
+		// download in progress.
+		w.mu.Lock()
+		delete(w.hydrateFails, key)
+		delete(w.hydrateNext, key)
+		w.mu.Unlock()
+		return
+	}
+	// Listed only now it really downloads, so a skipped one never flashes
+	// up as "Downloading" (Deck #988 review).
+	w.nowStart(&w.nowHydrating, key, path)
+	defer w.nowEnd(&w.nowHydrating, key)
 	remote := w.remoteFor(path)
 	ok, err := cfHydrateIfPinned(path)
 	if err != nil {
@@ -3220,6 +3233,9 @@ func (w *Watcher) reconcilePass() {
 	w.fullSweep = !w.firstPassDone || w.lostEvents.Swap(false)
 	marks := w.owedMarks
 	w.nowDirs.Store(0)
+	w.mu.Lock()
+	w.nowSince = time.Now()
+	w.mu.Unlock()
 	w.nowChecking.Store(true)
 	w.changed()
 	ok := w.reconcileDir("", "")
@@ -3231,6 +3247,7 @@ func (w *Watcher) reconcilePass() {
 	if complete {
 		w.nowLastFull = time.Now()
 	}
+	w.nowSince = time.Time{}
 	w.mu.Unlock()
 	w.nowChecking.Store(false)
 	w.changed()
@@ -4178,12 +4195,21 @@ func (w *Watcher) Now() WatcherNow {
 	n := WatcherNow{
 		Queued:          len(w.hydrateFirst) + len(w.hydratePending),
 		Checking:        w.nowChecking.Load(),
+		CheckingSince:   w.nowSince,
 		DirsChecked:     int(w.nowDirs.Load()),
 		Folder:          w.nowFolder,
 		LastFullCheck:   w.nowLastFull,
 		CheckIncomplete: w.nowIncomplete,
 		ServerDown:      w.nowServerDown.Load(),
 	}
+	pending := make(map[string]bool, len(w.upload)+len(w.held))
+	for p := range w.upload {
+		pending[strings.ToLower(p)] = true
+	}
+	for k := range w.held {
+		pending[k] = true
+	}
+	n.Pending = len(pending)
 	for _, p := range w.nowUploading {
 		n.Uploading = append(n.Uploading, p)
 	}

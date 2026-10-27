@@ -26,7 +26,16 @@
   // side composes it across accounts and modes; we only draw it.
   type Now = { state: string; main: string; sub: string; progress: number; tab: string };
   let now = $state<Now | null>(null);
-  async function loadNow() { now = (await App.NowStatus()) as unknown as Now; }
+  // Calls can overlap (a "now" event during a slow one): only the latest
+  // answer is drawn, and a failed call keeps the line as it was.
+  let nowSeq = 0;
+  async function loadNow() {
+    const s = ++nowSeq;
+    try {
+      const n = (await App.NowStatus()) as unknown as Now;
+      if (s === nowSeq) now = n;
+    } catch {}
+  }
   const nowGlyph = (st: string) =>
     st === "busy" ? "⟳" : st === "attention" ? "!" : st === "paused" ? "❚❚" : st === "offline" ? "⚠" : "✓";
   let pauseInfo = $state<{ paused: boolean; reason: string; until: string }>({ paused: false, reason: "", until: "" });
@@ -190,6 +199,11 @@
   // Everything the status line shows (sync state, attention counts, lanes,
   // first sync) is composed in Go; it fires "now" whenever that changes.
   Events.On("now", loadNow);
+  // "Checked N min ago" ages with nothing changing: look again whenever the
+  // panel is shown (the Go side also nudges on show) and every 30 s while it
+  // is up. It hides as soon as it loses focus, so focus means shown.
+  window.addEventListener("focus", loadNow);
+  setInterval(() => { if (document.hasFocus()) loadNow(); }, 30_000);
   // Activity fires per file — hundreds/sec during a big sync. Coalesce into a
   // light refresh (just the recent list) at most ~2×/sec, so the panel doesn't
   // thrash re-fetching/re-rendering the whole header + app rail on every file.

@@ -207,6 +207,7 @@ func TestComposeNowReadsEngineStatus(t *testing.T) {
 		{"Error", "offline", "Error"},
 		{"Sign in again", "offline", "Sign in again"},
 		{"Syncing…", "busy", "Syncing…"},
+		{"Scanning…", "busy", "Scanning…"},
 		{"Moving your folder…", "busy", "Moving your folder…"},
 		{"Waiting — Report.docx is open in another program", "idle", "Waiting — Report.docx is open in another program"},
 		{"Up to date", "idle", "Up to date"},
@@ -220,6 +221,9 @@ func TestComposeNowReadsEngineStatus(t *testing.T) {
 	} {
 		in := nowInput{Now: time.Now()}
 		in.Offline, in.Problem, in.Working, in.Holding = classifyStatus(tc.status)
+		// Set long enough ago to be past the quiet period (see
+		// TestQuietWorkingHoldsRoutinePassLines for a fresh one).
+		in.Working, _ = quietWorking(in.Working, in.Now.Add(-time.Minute), in.Now)
 		got := composeNow(in, "Nimbo")
 		if got.State != tc.state || got.Main != tc.main {
 			t.Errorf("status %q: got %q / %q, want %q / %q", tc.status, got.State, got.Main, tc.state, tc.main)
@@ -264,9 +268,14 @@ func TestHydrateReadCloserEndsItsJob(t *testing.T) {
 	if s := h.snapshot(); len(s) != 1 || s[0].Sent != 5 {
 		t.Fatalf("snapshot while open = %+v", s)
 	}
+	// Bytes arriving refresh the line (the progress would freeze otherwise).
+	read := changed
+	if read == 0 {
+		t.Error("reading bytes never told anyone")
+	}
 	_ = r.Close()
-	if s := h.snapshot(); len(s) != 0 || changed != 1 {
-		t.Errorf("after Close: %d jobs, changed %d times", len(s), changed)
+	if s := h.snapshot(); len(s) != 0 || changed != read+1 {
+		t.Errorf("after Close: %d jobs, changed %d times, want %d", len(s), changed, read+1)
 	}
 }
 
@@ -346,5 +355,156 @@ func TestMountAndSecondaryMapsAreSafeToReadWhileWritten(t *testing.T) {
 		}
 		_ = len(a.secs()) + a.secondaryCount()
 		_ = a.mount("x") != nil || a.secondary("1") != nil || a.mountsReady()
+	}
+}
+
+// "Scanning…" and "Syncing…" are set at the start of every poll pass, most of
+// them over in milliseconds: they count as work only once they outlast the
+// quiet period. Other working lines show at once (Deck #988 review).
+func TestQuietWorkingHoldsRoutinePassLines(t *testing.T) {
+	now := time.Now()
+	for _, s := range []string{"Scanning…", "Syncing…"} {
+		w, wait := quietWorking(s, now.Add(-100*time.Millisecond), now)
+		if w != "" || wait != checkQuietPeriod-100*time.Millisecond {
+			t.Errorf("%q 100 ms old: working %q, wait %v", s, w, wait)
+		}
+		in := nowInput{Now: now, LastCheck: now.Add(-time.Minute), Working: w}
+		if got := composeNow(in, "Nimbo"); got.State != "idle" || got.Main != "Up to date" {
+			t.Errorf("%q 100 ms old: got %q / %q, want the idle line", s, got.State, got.Main)
+		}
+		if w, wait := quietWorking(s, now.Add(-2*time.Second), now); w != s || wait != 0 {
+			t.Errorf("%q 2 s old: working %q, wait %v", s, w, wait)
+		}
+	}
+	if w, wait := quietWorking("Moving your folder…", now, now); w != "Moving your folder…" || wait != 0 {
+		t.Errorf("Moving your folder… just set: working %q, wait %v, want it at once", w, wait)
+	}
+	if w, wait := quietWorking("", now, now); w != "" || wait != 0 {
+		t.Errorf("no line: working %q, wait %v", w, wait)
+	}
+}
+
+// The status text's time moves only when the text changes, so a pass that
+// re-sets "Syncing…" doesn't restart the quiet period.
+func TestStatusLineSinceMovesOnlyOnChange(t *testing.T) {
+	var l statusLine
+	t0 := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	l.set("Syncing…", t0)
+	l.set("Syncing…", t0.Add(time.Second))
+	if s, since := l.get(); s != "Syncing…" || !since.Equal(t0) {
+		t.Errorf("same text again: %q since %v, want since %v", s, since, t0)
+	}
+	l.set("Up to date", t0.Add(2*time.Second))
+	if s, since := l.get(); s != "Up to date" || !since.Equal(t0.Add(2*time.Second)) {
+		t.Errorf("new text: %q since %v", s, since)
+	}
+}
+
+// setStatus runs on engine goroutines while the tray and Wails calls read
+// the status (run with -race).
+func TestStatusIsSafeToReadWhileSet(t *testing.T) {
+	a := &App{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			a.setStatus("Syncing…")
+			a.setStatus("Up to date")
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			if got := a.Status(); got != "Up to date" {
+				t.Errorf("Status = %q", got)
+			}
+			return
+		default:
+		}
+		_ = a.Status()
+		_, _ = a.status.get()
+	}
+}
+
+// An on-demand pass (like a live scan) shows only past the quiet period, and
+// says when it would.
+func TestCheckShownWaitsOutTheQuietPeriod(t *testing.T) {
+	now := time.Now()
+	if ok, wait := checkShown(true, now.Add(-time.Second), now); ok || wait != checkQuietPeriod-time.Second {
+		t.Errorf("1 s old: shown %v, wait %v", ok, wait)
+	}
+	if ok, wait := checkShown(true, now.Add(-2*time.Second), now); !ok || wait != 0 {
+		t.Errorf("2 s old: shown %v, wait %v", ok, wait)
+	}
+	if ok, wait := checkShown(false, now, now); ok || wait != 0 {
+		t.Errorf("inactive: shown %v, wait %v", ok, wait)
+	}
+	var d time.Duration
+	soonest(&d, 0)
+	soonest(&d, time.Second)
+	soonest(&d, 300*time.Millisecond)
+	soonest(&d, 2*time.Second)
+	if d != 300*time.Millisecond {
+		t.Errorf("soonest = %v, want 300ms", d)
+	}
+}
+
+// A held-back check schedules one look at the moment it would show; a later
+// request while an earlier one is due adds no timer.
+func TestNudgeAfterKeepsTheEarliest(t *testing.T) {
+	a := &App{}
+	a.nudgeAfter(time.Hour)
+	first := a.revealAt
+	a.nudgeAfter(2 * time.Hour)
+	if !a.revealAt.Equal(first) {
+		t.Errorf("a later request moved the pending look from %v to %v", first, a.revealAt)
+	}
+	a.nudgeAfter(time.Millisecond)
+	if !a.revealAt.Before(first) {
+		t.Errorf("an earlier request did not bring the look forward: %v", a.revealAt)
+	}
+}
+
+// Changes queued to go up are not "Up to date" (Deck #988 review: on-demand
+// uploads waiting out a debounce or a retry read as up to date).
+func TestComposeNowWaitingIsNotUpToDate(t *testing.T) {
+	now := time.Now()
+	got := composeNow(nowInput{Waiting: 2, LastCheck: now.Add(-time.Minute), Now: now}, "Nimbo")
+	if got.State != "busy" || got.Main != "2 changes waiting to upload" {
+		t.Errorf("2 waiting: got %q / %q", got.State, got.Main)
+	}
+	got = composeNow(nowInput{Waiting: 1, Now: now}, "Nimbo")
+	if got.Main != "1 change waiting to upload" {
+		t.Errorf("1 waiting: main %q", got.Main)
+	}
+	// A file held open by a program says why instead.
+	hold := "Waiting — Report.docx is open in another program"
+	got = composeNow(nowInput{Waiting: 1, Holding: hold, Now: now}, "Nimbo")
+	if got.State != "idle" || got.Main != hold {
+		t.Errorf("held: got %q / %q", got.State, got.Main)
+	}
+	// Running work still names the transfer.
+	got = composeNow(nowInput{Waiting: 3, Now: now,
+		Jobs: []NowJobDTO{{Kind: "upload", Path: "a.txt", State: "running"}}}, "Nimbo")
+	if got.Main != "Uploading a.txt" {
+		t.Errorf("running and waiting: main %q", got.Main)
+	}
+}
+
+// Two accounts with the same login on different servers stay apart: the
+// shown account's line is matched on the account ID, not the name.
+func TestComposeNowMatchesAccountsByID(t *testing.T) {
+	now := time.Now()
+	other := NowJobDTO{Account: "adam", AccountID: "id-work", Kind: "upload", Path: "x.txt", State: "running"}
+	got := composeNow(nowInput{ShownAccount: "id-home", Jobs: []NowJobDTO{other},
+		Checking: []NowCheckDTO{{Account: "adam", AccountID: "id-work", Dirs: 5}}, Now: now}, "Nimbo")
+	if got.State != "idle" {
+		t.Errorf("the other server's adam drove the line: %q / %q", got.State, got.Main)
+	}
+	mine := other
+	mine.AccountID = "id-home"
+	got = composeNow(nowInput{ShownAccount: "id-home", Jobs: []NowJobDTO{mine}, Now: now}, "Nimbo")
+	if got.State != "busy" || got.Main != "Uploading x.txt" {
+		t.Errorf("own job: got %q / %q", got.State, got.Main)
 	}
 }
