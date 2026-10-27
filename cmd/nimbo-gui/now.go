@@ -235,19 +235,16 @@ func composeNow(in nowInput, brandName string) NowStatusDTO {
 		return out
 	}
 
-	if in.Waiting > 0 && in.Holding == "" {
-		// Changes queued to go up (a debounce, a retry after a failure): not
-		// "Up to date" until they have (Deck #988 review).
-		out.State = "busy"
-		out.Main = plural(in.Waiting, "change waiting to upload", "changes waiting to upload")
-		out.Sub = strings.Join(extras, " · ")
-		return out
-	}
-
 	out.State = "idle"
 	out.Main = "Up to date"
-	if in.Holding != "" {
+	switch {
+	case in.Holding != "":
 		out.Main = in.Holding
+	case in.Waiting > 0:
+		// Changes queued to go up (a debounce, a retry waiting out a failure
+		// backoff): never "Up to date", but nothing is moving, so the tray
+		// stays still (Deck #988 review).
+		out.Main = plural(in.Waiting, "change waiting to upload", "changes waiting to upload")
 	}
 	var parts []string
 	switch {

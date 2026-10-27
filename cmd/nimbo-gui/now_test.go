@@ -76,6 +76,9 @@ func TestComposeNow(t *testing.T) {
 		{name: "offline",
 			in:    nowInput{Offline: true, Waiting: 3},
 			state: "offline", main: "Can't reach the server", sub: "3 changes waiting to upload", tab: "activity"},
+		{name: "uploads waiting, nothing moving",
+			in:    nowInput{Waiting: 2, LastCheck: now.Add(-time.Minute)},
+			state: "idle", main: "2 changes waiting to upload", sub: "Checked 1 min ago", tab: "activity"},
 		{name: "first sync waiting for a choice",
 			in:    nowInput{FirstSyncWaiting: true, Jobs: []NowJobDTO{down("big/map.qgz")}},
 			state: "busy", main: "Downloading map.qgz", subHas: "Choose folders to download first", tab: "first"},
@@ -470,8 +473,21 @@ func TestNudgeAfterKeepsTheEarliest(t *testing.T) {
 func TestComposeNowWaitingIsNotUpToDate(t *testing.T) {
 	now := time.Now()
 	got := composeNow(nowInput{Waiting: 2, LastCheck: now.Add(-time.Minute), Now: now}, "Nimbo")
-	if got.State != "busy" || got.Main != "2 changes waiting to upload" {
-		t.Errorf("2 waiting: got %q / %q", got.State, got.Main)
+	if got.State != "idle" || got.Main != "2 changes waiting to upload" || got.Sub != "Checked 1 min ago" {
+		t.Errorf("2 waiting: got %q / %q / %q", got.State, got.Main, got.Sub)
+	}
+	// Only waiting (a retry backing off for up to 30 min): the tray stays still.
+	if ts := trayStateFor(got.State); ts != "idle" {
+		t.Errorf("2 waiting: tray %q, want idle", ts)
+	}
+	got = composeNow(nowInput{Waiting: 2, CheckIncomplete: true, InUse: 1, Now: now}, "Nimbo")
+	if got.Main != "2 changes waiting to upload" || got.Sub != "Some folders couldn't be checked · 1 file in use" {
+		t.Errorf("2 waiting, incomplete: got %q / %q", got.Main, got.Sub)
+	}
+	// A check showing makes it busy as before.
+	got = composeNow(nowInput{Waiting: 2, Checking: []NowCheckDTO{{Dirs: 3}}, Now: now}, "Nimbo")
+	if got.State != "busy" || got.Main != "Checking folders… 3" {
+		t.Errorf("waiting while checking: got %q / %q", got.State, got.Main)
 	}
 	got = composeNow(nowInput{Waiting: 1, Now: now}, "Nimbo")
 	if got.Main != "1 change waiting to upload" {
@@ -486,7 +502,7 @@ func TestComposeNowWaitingIsNotUpToDate(t *testing.T) {
 	// Running work still names the transfer.
 	got = composeNow(nowInput{Waiting: 3, Now: now,
 		Jobs: []NowJobDTO{{Kind: "upload", Path: "a.txt", State: "running"}}}, "Nimbo")
-	if got.Main != "Uploading a.txt" {
+	if got.State != "busy" || got.Main != "Uploading a.txt" {
 		t.Errorf("running and waiting: main %q", got.Main)
 	}
 }
