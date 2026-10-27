@@ -178,6 +178,7 @@ type Watcher struct {
 	// guarded by reconMu (only reconcile passes touch them):
 	firstPassDone bool // a full (skip-free) pass has completed since start
 	fullSweep     bool // the running pass ignores the ETag subtree skip
+	serverDown    bool // the last root listing failed (see retryNow)
 	// sweepOwed holds the folders (sync-root-relative) a full sweep could not
 	// reconcile. Each is swept in full whenever a pass reaches it, until it
 	// succeeds, instead of the whole account being swept again on every pass
@@ -2398,6 +2399,38 @@ func (w *Watcher) hydratePinned(path string) {
 	}
 }
 
+// retryNowWindow spreads the retries retryNow brings forward, so a long
+// outage's worth of queued uploads doesn't hit the server in one burst (a var
+// so tests can shrink it).
+var retryNowWindow = 10 * time.Second
+
+// retryNow brings every upload and delete that is waiting in a failure backoff
+// forward to within retryNowWindow, spread evenly. Called when the server is
+// reachable again after an outage (Deck #991). Their backoff counts are kept:
+// one that fails again for another reason backs off from where it was.
+func (w *Watcher) retryNow() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var ups, dels []*time.Timer
+	for p, t := range w.upload {
+		if w.attempts[strings.ToLower(p)] > 0 {
+			ups = append(ups, t)
+		}
+	}
+	for p, t := range w.delete {
+		if w.delAttempts[strings.ToLower(p)] > 0 {
+			dels = append(dels, t)
+		}
+	}
+	all := append(ups, dels...)
+	for i, t := range all {
+		t.Reset(retryNowWindow * time.Duration(i+1) / time.Duration(len(all)+1))
+	}
+	if len(all) > 0 {
+		w.ops.Log("vfs server reachable again: retrying %d upload(s) and %d delete(s) now", len(ups), len(dels))
+	}
+}
+
 // retryLater re-arms a failed server op with per-path exponential backoff.
 func (w *Watcher) retryLater(path, key string) {
 	w.mu.Lock()
@@ -3241,7 +3274,17 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 	remote, err := w.ops.List(rel)
 	if err != nil {
 		w.ops.Log("vfs reconcile list %q: %v", rel, err)
+		if rel == "" {
+			w.serverDown = true
+		}
 		return false // unknown listing — never treat as "all deleted"
+	}
+	if rel == "" && w.serverDown {
+		// The root lists again after failing: the outage is over. Uploads and
+		// deletes that failed during it sit in a backoff of up to half an
+		// hour; without this they wait it out (Deck #991).
+		w.serverDown = false
+		w.retryNow()
 	}
 	remote = w.dropUnholdable(rel, remote)
 	// Folder fileids, so a server-side rename of a folder can be recognised
