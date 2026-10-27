@@ -250,7 +250,7 @@
   // samples the last figure is kept so it doesn't flicker.
   const samples = new Map<string, { t: number; sent: number; rate: number }>();
   let rates = $state<Record<string, number>>({});
-  const jobKey = (j: NowJob) => j.account + NL + j.path;
+  const jobKey = (j: NowJob) => j.account + NL + j.kind + NL + j.path;
   async function loadNow() {
     const n = ((await App.NowStatus()) as unknown as Now | null) ?? { jobs: [], checking: [] };
     const t = Date.now(), live = new Set<string>(), next: Record<string, number> = {};
@@ -437,7 +437,7 @@
         <div class="nowrow">
           <span class="ni">⟳</span>
           <div class="nb">
-            <div class="np">{#if nowMulti && c.account}<span class="acct">{c.account}</span>{/if}{checkText(c)}</div>
+            <div class="np">{#if nowMulti && c.account}<span class="nacct">{c.account} · </span>{/if}{checkText(c)}</div>
           </div>
         </div>
       {/each}
@@ -445,7 +445,7 @@
         <div class="nowrow">
           <span class="ni">{kindIcon(j.kind)}</span>
           <div class="nb">
-            <div class="np">{#if nowMulti && j.account}<span class="acct">{j.account}</span>{/if}{j.path}</div>
+            <div class="np">{#if nowMulti && j.account}<span class="nacct">{j.account} · </span>{/if}{j.path}</div>
             <div class="ns">{jobDetail(j)}</div>
             {#if j.size > 0}<div class="nbar"><div style:width="{jobPct(j)}%"></div></div>{/if}
           </div>
@@ -769,8 +769,7 @@
   .nowrow .ni { color: var(--accent); width: 16px; text-align: center; flex: none; }
   .nowrow .nb { flex: 1; min-width: 0; }
   .nowrow .np { overflow-wrap: anywhere; word-break: break-word; }
-  .nowrow .np .acct { color: var(--accent); font-size: 11px; border: 1px solid var(--border); border-radius: 8px;
-    padding: 0 6px; margin-right: 6px; }
+  .nowrow .np .nacct { color: var(--muted); }
   .nowrow .ns { font-size: 11.5px; color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
   .nbar { height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; margin-top: 4px; }
   .nbar div { height: 100%; background: var(--accent); }
