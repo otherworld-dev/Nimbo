@@ -82,6 +82,7 @@ type Engine struct {
 	diagMu     sync.Mutex
 	pushUp     bool      // notify_push WebSocket currently connected
 	pushSince  time.Time // when it last connected (uptime)
+	pushEverUp bool      // it has connected at least once (a later connect is a reconnect)
 	lastStatus string    // most recent status string
 	lastSyncAt time.Time // when the engine last reached "Up to date"
 
@@ -2854,11 +2855,26 @@ func (e *Engine) status(s string) {
 // setPushState records the notify_push connection state for the health panel.
 func (e *Engine) setPushState(up bool) {
 	e.diagMu.Lock()
+	reconnect := up && !e.pushUp && e.pushEverUp
 	if up && !e.pushUp {
 		e.pushSince = time.Now()
 	}
 	e.pushUp = up
+	if up {
+		e.pushEverUp = true
+	}
 	e.diagMu.Unlock()
+	// Push came back after dropping: events may have been missed while it was
+	// down, and an outage may just have ended. Catch up now rather than at the
+	// next poll, up to 5 minutes away (Deck #991; on-demand's reconcile then
+	// also retries uploads that failed during the outage). The first connect
+	// is not a catch-up: startup runs its own full pass.
+	if reconnect {
+		e.TriggerSync()
+		if e.onFilesChanged != nil {
+			e.onFilesChanged()
+		}
+	}
 }
 
 // Diagnostic is a snapshot of Nimbo's connection/sync health for the UI.
