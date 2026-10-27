@@ -623,6 +623,8 @@ type recorder struct {
 
 	logs []string // Ops.Log lines (formatted)
 
+	fileidBatches int // Ops.RecordFileIDs calls
+
 	// unholdable records Ops.Unholdable calls as (parent, child) pairs; a
 	// clean listing is recorded as (parent, "").
 	unholdable [][2]string
@@ -920,6 +922,24 @@ func (r *recorder) ops() Ops {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			delete(r.fileids, remote)
+		},
+		RecordFileIDs: func(m map[string]string) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.fileidBatches++
+			for k, v := range m {
+				r.fileids[k] = v
+			}
+		},
+		MoveFileIDs: func(pairs [][2]string) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			for _, p := range pairs {
+				if v, ok := r.fileids[p[0]]; ok {
+					r.fileids[p[1]] = v
+					delete(r.fileids, p[0])
+				}
+			}
 		},
 	}
 }

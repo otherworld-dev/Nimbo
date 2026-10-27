@@ -1568,6 +1568,106 @@ func (w *Watcher) uploadAfterSuppression(paths ...string) {
 	}
 }
 
+// pullDirRename applies a server-side rename of a FOLDER, recognised by its
+// fileid (Deck #986): the local folder is renamed with everything in it, every
+// identity beneath it repointed, and its baselines and fileids carried. Files
+// with unsent edits keep them and are sent under the new path. It reports
+// whether the rename happened.
+func (w *Watcher) pullDirRename(localDir, oldFull string, y cfapi.PlaceholderInfo, fileid string) bool {
+	newFull := filepath.Join(localDir, y.Name)
+	if _, err := os.Lstat(newFull); err == nil {
+		return false // something is already there: don't clobber it
+	}
+	oldRemote := w.serverFor(oldFull, true)
+	w.suppressDelete(oldFull)
+	w.suppressDelete(newFull)
+	if err := os.Rename(oldFull, newFull); err != nil {
+		w.ops.Log("vfs pull-rename %s -> %s: %v", oldRemote, string(y.Identity), err)
+		return false
+	}
+	if err := cfUpdateIdentity(newFull, y.Identity); err != nil {
+		w.ops.Log("vfs pull-rename repoint %s: %v", string(y.Identity), err)
+	}
+	pairs, pending := w.repointTree(newFull)
+	all := append([][2]string{{oldRemote, string(y.Identity)}}, pairs...)
+	w.moveBaselines(all)
+	w.moveFileIDs(all)
+	w.recordFileID(string(y.Identity), fileid)
+	w.uploadAfterSuppression(pending...)
+	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(y.Identity))
+	w.report("move", w.remoteFor(newFull), nil)
+	return true
+}
+
+// pruneVanished handles a folder the server no longer has (deleted, or moved
+// somewhere this listing can't see): everything that can be fetched again is
+// removed, but a file holding changes this PC never sent is kept where it is
+// and sent, so it comes back on the server rather than being lost (Deck #986).
+// It reports whether anything was kept. A file whose state can't be read is
+// kept too: the delete is the one thing that can't be undone.
+func (w *Watcher) pruneVanished(full string) bool {
+	w.suppressDelete(full)
+	var keep, dirs []string
+	_ = filepath.WalkDir(full, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			dirs = append(dirs, p)
+			return nil
+		}
+		if mod, merr := cfPlaceholderModified(p); merr != nil || mod {
+			keep = append(keep, p)
+			return nil
+		}
+		if rerr := os.Remove(p); rerr != nil && !os.IsNotExist(rerr) {
+			keep = append(keep, p) // still there; don't claim it gone
+		}
+		return nil
+	})
+	for i := len(dirs) - 1; i >= 0; i-- { // deepest first; a folder still holding a kept file stays
+		_ = os.Remove(dirs[i])
+	}
+	server := w.serverFor(full, true)
+	if len(keep) == 0 {
+		w.ops.Log("vfs pulled delete %s", server)
+		w.report("delete-local", w.remoteFor(full), nil)
+		w.dropFileID(server)
+		return false
+	}
+	w.ops.Log("vfs %s is gone from the server, but %d file(s) in it hold changes this PC never sent: kept and sending them", server, len(keep))
+	w.uploadAfterSuppression(keep...)
+	return true
+}
+
+// recordFileIDs records several fileids in one write (see Ops.RecordFileIDs).
+func (w *Watcher) recordFileIDs(m map[string]string) {
+	if len(m) == 0 {
+		return
+	}
+	if w.ops.RecordFileIDs != nil {
+		w.ops.RecordFileIDs(m)
+		return
+	}
+	for k, v := range m {
+		w.recordFileID(k, v)
+	}
+}
+
+// moveFileIDs carries fileids across a rename (see Ops.MoveFileIDs).
+func (w *Watcher) moveFileIDs(pairs [][2]string) {
+	if w.ops.MoveFileIDs != nil {
+		w.ops.MoveFileIDs(pairs)
+		return
+	}
+	for _, p := range pairs {
+		if fid, ok := w.fileIDFor(p[0]); ok && p[0] != p[1] {
+			w.recordFileID(p[1], fid)
+			w.dropFileID(p[0])
+		}
+	}
+}
+
 // clearAlias removes a leftover item whose name Windows cannot hold (a
 // trailing space or dot), always by its exact \\?\ path: through Win32 the
 // same path reaches the item with the trailing part trimmed, which can be the
@@ -3144,6 +3244,20 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		return false // unknown listing — never treat as "all deleted"
 	}
 	remote = w.dropUnholdable(rel, remote)
+	// Folder fileids, so a server-side rename of a folder can be recognised
+	// later (Deck #986; files have long had theirs). Only what is missing or
+	// changed is written, in one batch: the store persists its whole file per
+	// call, and the first pass after an update lists every folder.
+	dirFIDs := map[string]string{}
+	for _, r := range remote {
+		if !r.IsDir || r.FileID == "" {
+			continue
+		}
+		if cur, ok := w.fileIDFor(string(r.Identity)); !ok || cur != r.FileID {
+			dirFIDs[string(r.Identity)] = r.FileID
+		}
+	}
+	w.recordFileIDs(dirFIDs)
 	// nameKey normalises a name for MATCHING only — never for an actual operation,
 	// which always uses the name verbatim. Windows filenames are case-insensitive,
 	// so a server entry differing only in case IS the local file; matching it
@@ -3179,8 +3293,14 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		}
 	}
 	addByFileID := map[string]cfapi.PlaceholderInfo{}
+	addDirByFileID := map[string]cfapi.PlaceholderInfo{}
 	for _, r := range remote {
-		if !r.IsDir && r.FileID != "" && !localByName[nameKey(r.Name)] {
+		if r.FileID == "" || localByName[nameKey(r.Name)] {
+			continue
+		}
+		if r.IsDir {
+			addDirByFileID[r.FileID] = r
+		} else {
 			addByFileID[r.FileID] = r
 		}
 	}
@@ -3352,8 +3472,32 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 						}
 					}
 				}
+			} else if fid, ok := w.fileIDFor(w.serverFor(full, true)); ok {
+				// The same for a FOLDER (Deck #986): renamed on the server,
+				// it was deleted here and its contents fetched again, unsent
+				// edits inside it lost. It is renamed here instead, contents
+				// and all, and its new path is reconciled in this pass.
+				if y, isRename := addDirByFileID[fid]; isRename && !consumed[nameKey(y.Name)] {
+					if w.pullDirRename(localDir, full, y, fid) {
+						consumed[nameKey(y.Name)] = true
+						child := y.Name
+						if rel != "" {
+							child = rel + "/" + y.Name
+						}
+						subdirs = append(subdirs, subdir{rel: child, etag: y.ETag})
+						continue
+					}
+				}
 			}
-			// Not a rename — propagate the server-side delete locally.
+			// Not a rename — propagate the server-side delete locally. A
+			// folder is pruned, not removed whole: a file in it with changes
+			// this PC never sent is kept and sent (Deck #986).
+			if ch.IsDir {
+				if w.pruneVanished(full) {
+					dirOK = false // look again once the kept files are up
+				}
+				continue
+			}
 			w.suppressDelete(full)
 			if rerr := os.RemoveAll(full); rerr != nil {
 				w.ops.Log("vfs reconcile remove %s: %v", name, rerr)
