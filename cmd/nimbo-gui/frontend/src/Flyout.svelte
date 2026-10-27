@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { kindIcon, kindLabel } from "./kinds";
   import { Events } from "@wailsio/runtime";
   import { App } from "../bindings/github.com/otherworld/nimbo/cmd/nimbo-gui";
 
@@ -230,18 +231,6 @@
   let attentionTab = $derived(attention.conflicts > 0 ? "conflicts" : attention.blocked > 0 ? "blocked" : "detached");
 
   const basename = (p: string) => p.replace(/\/+$/, "").split("/").pop() || p;
-  const kindIcon = (k: string) =>
-    ({ download: "↓", upload: "↑", "delete-local": "🗑", "delete-remote": "🗑",
-       "move-local": "↪", "move-remote": "↪", "mkdir-local": "📁", "mkdir-remote": "📁",
-       conflict: "⚠", unshared: "🔗", "delete-kept": "↺", waiting: "⏸" } as Record<string, string>)[k] ?? "•";
-  const kindLabel = (k: string) =>
-    ({ download: "Downloaded", upload: "Uploaded", "delete-local": "Deleted locally",
-       "delete-remote": "Deleted on server", "move-local": "Moved", "move-remote": "Moved",
-       "mkdir-local": "New folder", "mkdir-remote": "New folder", conflict: "Conflict",
-       unshared: "No longer shared with you — copy kept",
-       "delete-kept": "Kept on server (not deleted)",
-       waiting: "Waiting — open in another program",
-       "unshared-empty": "No longer shared with you — nothing was downloaded" } as Record<string, string>)[k] ?? k;
   refresh();
   Events.On("status", async (e: any) => {
     status = e.data;

@@ -199,3 +199,18 @@ func TestReconcileRecordsFolderFileIDsInOneWrite(t *testing.T) {
 		t.Errorf("%d fileid writes for one listing over two passes, want 1 (only what changed is written)", rec.fileidBatches)
 	}
 }
+
+// Deck #987: Nextcloud's own activity calls a same-folder move a rename.
+func TestMoveKind(t *testing.T) {
+	for _, c := range []struct{ from, to, want string }{
+		{"a/x.txt", "a/y.txt", "rename"},
+		{"x.txt", "y.txt", "rename"},
+		{"a/x.txt", "b/x.txt", "move"},
+		{"a/x.txt", "x.txt", "move"},
+		{"A/x.txt", "a/y.txt", "rename"},
+	} {
+		if got := moveKind(c.from, c.to); got != c.want {
+			t.Errorf("moveKind(%q, %q) = %q, want %q", c.from, c.to, got, c.want)
+		}
+	}
+}

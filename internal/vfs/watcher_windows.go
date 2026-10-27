@@ -1495,7 +1495,7 @@ func (w *Watcher) pullRename(localDir, oldFull string, y cfapi.PlaceholderInfo, 
 	w.recordFileID(string(y.Identity), fileid)
 	w.dropFileID(oldRemote)
 	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(y.Identity))
-	w.report("move", w.localName(string(y.Identity)), nil) // user-visible name
+	w.report(moveKind(oldRemote, string(y.Identity)), w.localName(string(y.Identity)), nil) // user-visible name
 	return true
 }
 
@@ -1520,7 +1520,7 @@ func (w *Watcher) pullCaseRename(localDir, oldFull string, r cfapi.PlaceholderIn
 	w.moveBaselines(append([][2]string{{oldRemote, string(r.Identity)}}, pairs...))
 	w.uploadAfterSuppression(pending...)
 	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(r.Identity))
-	w.report("move", w.remoteFor(newFull), nil)
+	w.report("rename", w.remoteFor(newFull), nil)
 }
 
 // pullFileCaseRename is pullCaseRename for a FILE. The identity is repointed
@@ -1554,7 +1554,7 @@ func (w *Watcher) pullFileCaseRename(localDir, oldFull string, r cfapi.Placehold
 		w.uploadAfterSuppression(newFull)
 	}
 	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(r.Identity))
-	w.report("move", w.remoteFor(newFull), nil)
+	w.report("rename", w.remoteFor(newFull), nil)
 	return newFull, true
 }
 
@@ -1596,7 +1596,7 @@ func (w *Watcher) pullDirRename(localDir, oldFull string, y cfapi.PlaceholderInf
 	w.recordFileID(string(y.Identity), fileid)
 	w.uploadAfterSuppression(pending...)
 	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(y.Identity))
-	w.report("move", w.remoteFor(newFull), nil)
+	w.report(moveKind(oldRemote, string(y.Identity)), w.remoteFor(newFull), nil)
 	return true
 }
 
@@ -3017,6 +3017,23 @@ func (w *Watcher) moveInFlightOrAbove(path string) bool {
 	return false
 }
 
+// moveKind is the activity kind for a completed move between two server
+// paths: "rename" when only the name changed (what Nextcloud's own activity
+// calls it), "move" when it went to another folder (Deck #987).
+func moveKind(from, to string) string {
+	parent := func(p string) string {
+		p = strings.Trim(p, "/")
+		if i := strings.LastIndex(p, "/"); i >= 0 {
+			return p[:i]
+		}
+		return ""
+	}
+	if strings.EqualFold(parent(from), parent(to)) {
+		return "rename"
+	}
+	return "move"
+}
+
 // finishRename records a rename the server now agrees with. src is the RAW
 // server path the item moved from.
 func (w *Watcher) finishRename(src, newPath, dst string) {
@@ -3024,7 +3041,7 @@ func (w *Watcher) finishRename(src, newPath, dst string) {
 	delete(w.mvAttempts, strings.ToLower(newPath))
 	w.mu.Unlock()
 	w.ops.Log("vfs moved %s -> %s", src, dst)
-	w.report("move", w.remoteFor(newPath), nil)
+	w.report(moveKind(src, dst), w.remoteFor(newPath), nil)
 	isDir := false
 	if fi, err := os.Lstat(newPath); err == nil {
 		isDir = fi.IsDir()
@@ -3840,7 +3857,11 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 				// name. Not in a pinned folder: its files are about to be
 				// downloaded, and the download reports itself.
 				if !pinned {
-					w.report("download", w.localName(string(r.Identity)), nil)
+					kind := "download"
+					if r.IsDir {
+						kind = "mkdir-local" // nothing was downloaded: "New folder" (Deck #987)
+					}
+					w.report(kind, w.localName(string(r.Identity)), nil)
 				}
 			}
 			w.recordBaselines(base)
