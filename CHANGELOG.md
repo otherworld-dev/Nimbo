@@ -72,6 +72,12 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ### Fixed
 
+- In on-demand mode, a folder renamed on the server is now renamed on this PC
+  too, with everything in it, instead of being deleted here and created again, so
+  files you had downloaded stay downloaded. A folder deleted on the server, or moved
+  somewhere Nimbo can't follow, no longer takes with it any file you changed that
+  hadn't finished uploading: that file is kept and uploaded, and only what can be
+  downloaded again is removed (#986).
 - A folder or file renamed on the server where only the capitals changed (for
   example "14 days" to "14 Days") is now renamed on this PC too, and online-only
   files in it still open. Before, Nimbo kept looking for the old name, which also
