@@ -4194,7 +4194,7 @@ func (w *Watcher) Now() WatcherNow {
 	defer w.mu.Unlock()
 	n := WatcherNow{
 		Queued:          len(w.hydrateFirst) + len(w.hydratePending),
-		Checking:        w.nowChecking.Load(),
+		Checking:        w.nowChecking.Load() && !w.nowSince.IsZero(),
 		CheckingSince:   w.nowSince,
 		DirsChecked:     int(w.nowDirs.Load()),
 		Folder:          w.nowFolder,
