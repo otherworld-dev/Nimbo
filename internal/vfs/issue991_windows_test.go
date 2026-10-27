@@ -91,3 +91,29 @@ func TestRetryNowKeepsTheBackoffCount(t *testing.T) {
 		t.Errorf("attempts = %d after retryNow, want 5 (kept)", n)
 	}
 }
+
+// Deck #988: the status line says "Can't reach the server" during an outage,
+// so Now reports a failed root listing until the root lists again.
+func TestNowReportsServerDownAfterARootListingFailure(t *testing.T) {
+	installFakeCf(t)
+	root := t.TempDir()
+	rec := newRecorder()
+	w := bareWatcher(root, rec.ops())
+	defer w.cancel()
+
+	rec.mu.Lock()
+	rec.listErr = errors.New("dial tcp: lookup server: no such host")
+	rec.mu.Unlock()
+	w.Reconcile()
+	if !w.Now().ServerDown {
+		t.Fatal("Now().ServerDown = false after the root listing failed")
+	}
+
+	rec.mu.Lock()
+	rec.listErr = nil
+	rec.mu.Unlock()
+	w.Reconcile()
+	if w.Now().ServerDown {
+		t.Error("Now().ServerDown still true after the root listed again")
+	}
+}

@@ -736,6 +736,8 @@ export function NotificationsEnabled() {
 
 /**
  * NowStatus is the flyout's status line and the Status window's "Right now".
+ * The windows call it on every "now" event, so the attention counts (which
+ * read files) come from a cache at most two seconds old.
  * @returns {$CancellablePromise<$models.NowStatusDTO>}
  */
 export function NowStatus() {

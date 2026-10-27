@@ -19,6 +19,9 @@ type WatcherNow struct {
 	// CheckIncomplete: the last pass did not reach everywhere (server down,
 	// folders owed a sweep, cancelled), so LastFullCheck is older than it.
 	CheckIncomplete bool
+	// ServerDown: the last root listing failed (the server is unreachable);
+	// cleared when the root lists again.
+	ServerDown bool
 }
 
 // Ops are the server-side actions the watcher performs (backed by the engine).

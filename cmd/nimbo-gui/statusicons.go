@@ -22,7 +22,7 @@ func (a *App) cleanupStatusRoots() {
 		return
 	}
 	for _, p := range pairs {
-		if _, mounted := a.onDemandMounts[p.LocalDir]; mounted {
+		if a.mount(p.LocalDir) != nil {
 			continue // a real on-demand root, not ours to touch
 		}
 		a.eng.DisableStatusIcons(p.LocalDir)

@@ -4,10 +4,13 @@ import (
 	"io"
 	"math"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/otherworld/nimbo/internal/agent"
 )
 
 const mb = int64(1) << 20
@@ -207,6 +210,13 @@ func TestComposeNowReadsEngineStatus(t *testing.T) {
 		{"Moving your folder…", "busy", "Moving your folder…"},
 		{"Waiting — Report.docx is open in another program", "idle", "Waiting — Report.docx is open in another program"},
 		{"Up to date", "idle", "Up to date"},
+		{"Sync paused — needs review", "offline", "Sync paused — needs review"},
+		{"Sync stopped — too many deletions", "offline", "Sync stopped — too many deletions"},
+		// File names in a "Waiting" line never make it a problem.
+		{"Waiting — error-log.xlsx is open in another program", "idle", "Waiting — error-log.xlsx is open in another program"},
+		{"Waiting — stopped-clock.png is in use by someone else", "idle", "Waiting — stopped-clock.png is in use by someone else"},
+		{"Waiting — how to sign in.docx: the copy on the server is damaged", "idle", "Waiting — how to sign in.docx: the copy on the server is damaged"},
+		{"Waiting — Sync notes.txt is open in another program", "idle", "Waiting — Sync notes.txt is open in another program"},
 	} {
 		in := nowInput{Now: time.Now()}
 		in.Offline, in.Problem, in.Working, in.Holding = classifyStatus(tc.status)
@@ -257,5 +267,84 @@ func TestHydrateReadCloserEndsItsJob(t *testing.T) {
 	_ = r.Close()
 	if s := h.snapshot(); len(s) != 0 || changed != 1 {
 		t.Errorf("after Close: %d jobs, changed %d times", len(s), changed)
+	}
+}
+
+// Another account whose sync stopped is not "can't reach its server".
+func TestComposeNowOtherAccountStates(t *testing.T) {
+	for _, tc := range []struct {
+		in   nowInput
+		want string
+	}{
+		{nowInput{OtherBusy: "Work"}, "Work account syncing"},
+		{nowInput{OtherBusy: "Work", OtherOffline: true}, "Work account can't reach its server"},
+		{nowInput{OtherBusy: "Work", OtherProblem: true}, "Work account needs attention"},
+	} {
+		tc.in.Now = time.Now()
+		if got := composeNow(tc.in, "Nimbo"); got.Sub != tc.want {
+			t.Errorf("sub = %q, want %q", got.Sub, tc.want)
+		}
+	}
+}
+
+// On-demand mode: a watcher that can't list the server's root makes the
+// account offline whatever its engine's status says (Deck #988 review).
+func TestAccountStateServerDown(t *testing.T) {
+	in := nowInput{Now: time.Now(), LastCheck: time.Now().Add(-time.Hour), CheckIncomplete: true}
+	in.Offline, in.Problem, in.Working, in.Holding = accountState("Up to date", true)
+	if got := composeNow(in, "Nimbo"); got.State != "offline" || got.Main != "Can't reach the server" {
+		t.Errorf("server down: got %q / %q", got.State, got.Main)
+	}
+	if off, prob, _, _ := accountState("Up to date", false); off || prob != "" {
+		t.Errorf("server up: offline=%v problem=%q", off, prob)
+	}
+	if off, _, _, _ := accountState("Offline", false); !off {
+		t.Error("an engine saying Offline is offline")
+	}
+}
+
+// A live scan shows only once it has run past the quiet period.
+func TestShowScanWaitsOutTheQuietPeriod(t *testing.T) {
+	now := time.Now()
+	if showScan(agent.ScanNow{Active: true, Since: now.Add(-100 * time.Millisecond)}, now) {
+		t.Error("a scan 100 ms old is shown")
+	}
+	if !showScan(agent.ScanNow{Active: true, Since: now.Add(-2 * time.Second)}, now) {
+		t.Error("a scan 2 s old is not shown")
+	}
+	if showScan(agent.ScanNow{Since: now.Add(-time.Hour)}, now) {
+		t.Error("an inactive scan is shown")
+	}
+}
+
+// The tray reads the mount and engine maps twice a second while mounts come
+// and go on other goroutines; every access goes through mapsMu (run with
+// -race).
+func TestMountAndSecondaryMapsAreSafeToReadWhileWritten(t *testing.T) {
+	a := &App{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			dir := filepath.Join("x", strconv.Itoa(i%7))
+			m := &odMount{accountID: "a"}
+			a.addMount(dir, m)
+			a.setWatcher(m, nil)
+			a.addSecondary(strconv.Itoa(i%5), &secondaryEngine{})
+			a.dropMount(dir)
+			a.dropSecondary(strconv.Itoa(i % 3))
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		for _, m := range a.mounts() {
+			_ = a.watcherOf(m)
+		}
+		_ = len(a.secs()) + a.secondaryCount()
+		_ = a.mount("x") != nil || a.secondary("1") != nil || a.mountsReady()
 	}
 }

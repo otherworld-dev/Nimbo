@@ -191,6 +191,8 @@ type Watcher struct {
 	firstPassDone bool // a full (skip-free) pass has completed since start
 	fullSweep     bool // the running pass ignores the ETag subtree skip
 	serverDown    bool // the last root listing failed (see retryNow)
+	// nowServerDown mirrors serverDown for Now, which must not wait on reconMu.
+	nowServerDown atomic.Bool
 	// sweepOwed holds the folders (sync-root-relative) a full sweep could not
 	// reconcile. Each is swept in full whenever a pass reaches it, until it
 	// succeeds, instead of the whole account being swept again on every pass
@@ -3328,6 +3330,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		w.ops.Log("vfs reconcile list %q: %v", rel, err)
 		if rel == "" {
 			w.serverDown = true
+			w.nowServerDown.Store(true)
 		}
 		return false // unknown listing — never treat as "all deleted"
 	}
@@ -3336,6 +3339,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		// deletes that failed during it sit in a backoff of up to half an
 		// hour; without this they wait it out (Deck #991).
 		w.serverDown = false
+		w.nowServerDown.Store(false)
 		w.retryNow()
 	}
 	remote = w.dropUnholdable(rel, remote)
@@ -4178,6 +4182,7 @@ func (w *Watcher) Now() WatcherNow {
 		Folder:          w.nowFolder,
 		LastFullCheck:   w.nowLastFull,
 		CheckIncomplete: w.nowIncomplete,
+		ServerDown:      w.nowServerDown.Load(),
 	}
 	for _, p := range w.nowUploading {
 		n.Uploading = append(n.Uploading, p)

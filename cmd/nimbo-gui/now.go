@@ -80,8 +80,10 @@ type nowInput struct {
 	// Holding is the engine's "Waiting — Report.docx is open in another
 	// program" line: nothing is moving, but not everything is up yet.
 	Holding string
-	// OtherOffline: OtherBusy can't reach its server (rather than syncing).
+	// OtherOffline: OtherBusy can't reach its server (rather than syncing);
+	// OtherProblem: its sync stopped or failed.
 	OtherOffline bool
+	OtherProblem bool
 }
 
 // composeNow picks the status line: needs you, then paused, then offline,
@@ -238,9 +240,12 @@ func composeNow(in nowInput, brandName string) NowStatusDTO {
 	}
 	parts = append(parts, extras...)
 	if in.OtherBusy != "" {
-		if in.OtherOffline {
+		switch {
+		case in.OtherOffline:
 			parts = append(parts, in.OtherBusy+" account can't reach its server")
-		} else {
+		case in.OtherProblem:
+			parts = append(parts, in.OtherBusy+" account needs attention")
+		default:
 			parts = append(parts, in.OtherBusy+" account syncing")
 		}
 	}
@@ -449,9 +454,43 @@ func (a *App) nudgeNow() {
 	a.nowEm.nudge()
 }
 
+// checkQuietPeriod is how long a live scan runs before the line shows it, as
+// the engine's own scan narration waits (agent scanQuietPeriod).
+const checkQuietPeriod = 1500 * time.Millisecond
+
 // NowStatus is the flyout's status line and the Status window's "Right now".
+// The windows call it on every "now" event, so the attention counts (which
+// read files) come from a cache at most two seconds old.
 func (a *App) NowStatus() NowStatusDTO {
-	return a.nowStatus(a.Attention())
+	return a.nowStatus(a.cachedAttention())
+}
+
+// cachedAttention is Attention, reused for up to two seconds. Safe from any
+// goroutine (Wails calls and the tray).
+func (a *App) cachedAttention() AttentionInfo {
+	a.attnMu.Lock()
+	at, fresh, gen := a.attn, !a.attnAt.IsZero() && time.Since(a.attnAt) <= 2*time.Second, a.attnGen
+	a.attnMu.Unlock()
+	if fresh {
+		return at
+	}
+	at = a.Attention() // engines are called outside attnMu
+	a.attnMu.Lock()
+	if a.attnGen == gen { // not invalidated meanwhile: the counts may be stale
+		a.attn, a.attnAt = at, time.Now()
+	}
+	a.attnMu.Unlock()
+	return at
+}
+
+// attentionChanged drops the cached counts (a conflict, blocked file, lock or
+// detached folder came or went) and refreshes the status line.
+func (a *App) attentionChanged() {
+	a.attnMu.Lock()
+	a.attnAt = time.Time{}
+	a.attnGen++
+	a.attnMu.Unlock()
+	a.nudgeNow()
 }
 
 // nowStatus composes the status with the attention counts given (the tray
@@ -470,7 +509,7 @@ func (a *App) nowStatus(att AttentionInfo) NowStatusDTO {
 	}
 	in := a.gatherNow(eng, att, now)
 	out := composeNow(in, brand.Current.Name)
-	if len(a.secondaries) == 0 {
+	if a.secondaryCount() == 0 {
 		// One account: no account column (as LaneList).
 		for i := range out.Jobs {
 			out.Jobs[i].Account = ""
@@ -489,6 +528,7 @@ type nowEngine struct {
 	shown  bool
 	status string
 	mounts map[string]*odMount // this account's on-demand mounts by local dir
+	down   bool                // one of its mounts can't list the server's root
 }
 
 // gatherNow collects every account's jobs and checks, deduped by local path,
@@ -496,14 +536,15 @@ type nowEngine struct {
 // calling an engine or a watcher.
 func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) nowInput {
 	engines := []*nowEngine{{eng: shown, login: shown.Account.LoginName, shown: true, status: a.status}}
-	ids := make([]string, 0, len(a.secondaries))
-	for id := range a.secondaries {
+	secs := a.secs()
+	ids := make([]string, 0, len(secs))
+	for id := range secs {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	a.acctMu.Lock()
 	for _, id := range ids {
-		if se := a.secondaries[id]; se != nil && se.eng != nil {
+		if se := secs[id]; se != nil && se.eng != nil {
 			engines = append(engines, &nowEngine{eng: se.eng, login: se.eng.Account.LoginName, status: a.acctStatus[id]})
 		}
 	}
@@ -513,7 +554,7 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 		ne.mounts = map[string]*odMount{}
 		byID[ne.eng.Account.ID] = ne
 	}
-	for dir, m := range a.onDemandMounts {
+	for dir, m := range a.mounts() {
 		if ne := byID[m.accountID]; ne != nil {
 			ne.mounts[dir] = m
 		}
@@ -569,10 +610,12 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 		var incomplete, haveCheck bool
 		var oldest time.Time // the least recent mount's last full check (zero = one never finished)
 		for _, m := range ne.mounts {
-			if m.watcher == nil {
+			w := a.watcherOf(m)
+			if w == nil {
 				continue
 			}
-			wn := m.watcher.Now()
+			wn := w.Now()
+			ne.down = ne.down || wn.ServerDown
 			for _, p := range wn.Uploading {
 				add(p, NowJobDTO{Account: ne.login, Kind: "upload", Path: mountPath(ne.mounts, p), State: "running"})
 			}
@@ -590,7 +633,7 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 				haveCheck = true
 			}
 		}
-		if sn := ne.eng.ScanNow(); sn.Active {
+		if sn := ne.eng.ScanNow(); showScan(sn, now) {
 			c := NowCheckDTO{Account: ne.login, Folder: sn.Folder}
 			if sn.Phase == "server" {
 				c.Dirs = sn.Count // the other stages count files, not folders
@@ -624,7 +667,7 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 
 	ps := shown.PauseState()
 	in.Paused, in.PauseUntil = ps.Paused, ps.Until
-	in.Offline, in.Problem, in.Working, in.Holding = classifyStatus(engines[0].status)
+	in.Offline, in.Problem, in.Working, in.Holding = accountState(engines[0].status, engines[0].down)
 	if p := shown.Progress(); p.Active && len(p.Clones) > 0 {
 		chosen := 0
 		for _, c := range p.Clones {
@@ -635,7 +678,7 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 
 	// Another account working while this one rests: say so on the second line.
 	for _, ne := range engines[1:] {
-		off, prob, working, _ := classifyStatus(ne.status)
+		off, prob, working, _ := accountState(ne.status, ne.down)
 		busy := working != ""
 		for _, j := range in.Jobs {
 			busy = busy || (j.Account == ne.login && j.State == "running")
@@ -644,7 +687,9 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 			busy = busy || c.Account == ne.login
 		}
 		if busy || off || prob != "" {
-			in.OtherBusy, in.OtherOffline = ne.login, !busy
+			in.OtherBusy = ne.login
+			in.OtherProblem = !busy && prob != "" && !off
+			in.OtherOffline = !busy && off
 			break
 		}
 	}
@@ -653,21 +698,42 @@ func (a *App) gatherNow(shown *agent.Engine, att AttentionInfo, now time.Time) n
 
 // classifyStatus reads an engine status line: the server unreachable, sync
 // stopped or failed (the line itself), working on something (the line), or
-// holding uploads back for a program (the line).
+// holding uploads back (the line). It matches the exact lines their producers
+// set (internal/agent: status(), heldStatus, waitingStatus,
+// heldDamagedStatus, the damage guard; the GUI's own start-up lines), never
+// words anywhere in them: the "Waiting —" lines carry file names, and
+// "error-log.xlsx is open in another program" is not an error.
 func classifyStatus(s string) (offline bool, problem, working, holding string) {
-	l := strings.ToLower(s)
 	switch {
-	case s == "Offline" || strings.HasPrefix(s, "Can't reach"):
-		return true, "", "", ""
-	case strings.Contains(l, "error") || strings.Contains(l, "stopped") ||
-		strings.Contains(l, "needs review") || strings.Contains(l, "sign in"):
-		return false, s, "", ""
-	case strings.HasPrefix(s, "Waiting"):
+	case strings.HasPrefix(s, "Waiting —"):
 		return false, "", "", s
+	case s == "Offline" || strings.HasPrefix(s, "Can't reach your server"):
+		return true, "", "", ""
+	case s == "Error" || s == "Sign in again" || strings.HasPrefix(s, "Sync stopped —") ||
+		strings.HasPrefix(s, "Sync paused —") || strings.HasPrefix(s, "Not running:"):
+		return false, s, "", ""
 	case isBusyStatus(s):
 		return false, "", s, ""
 	}
 	return false, "", "", ""
+}
+
+// accountState is classifyStatus for one account, with its on-demand
+// watchers' outage: on-demand mode runs no sync pass, so its engine never
+// says "Offline", but a failed root listing (down) does.
+func accountState(status string, down bool) (offline bool, problem, working, holding string) {
+	offline, problem, working, holding = classifyStatus(status)
+	if down && !offline {
+		return true, "", "", ""
+	}
+	return offline, problem, working, holding
+}
+
+// showScan reports whether a live scan shows as "Checking folders…": only
+// once it has run past the quiet period. A warm pass (every 15 s without
+// notify_push) is over in milliseconds, and the line would flicker.
+func showScan(sn agent.ScanNow, now time.Time) bool {
+	return sn.Active && now.Sub(sn.Since) >= checkQuietPeriod
 }
 
 // pathKey is a local path's identity for deduping: case-insensitive on Windows.
@@ -733,7 +799,7 @@ func mountLocal(mounts map[string]*odMount, acctPath string) string {
 // second. Only animateTray's goroutine calls it.
 func (a *App) trayNow() NowStatusDTO {
 	if a.trayNowAt.IsZero() || time.Since(a.trayNowAt) > 500*time.Millisecond {
-		a.trayNowDTO = a.nowStatus(a.trayAttentionInfo())
+		a.trayNowDTO = a.nowStatus(a.cachedAttention())
 		a.trayNowAt = time.Now()
 	}
 	return a.trayNowDTO

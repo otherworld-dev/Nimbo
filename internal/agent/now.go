@@ -32,6 +32,9 @@ type ScanNow struct {
 	Phase  string // "server" | "local" | "compare" | "moves"
 	Count  int
 	Folder string
+	// Since is when the oldest running scan began (a stage change does not
+	// restart it), so a reader can leave out passes over in a moment.
+	Since time.Time
 }
 
 type nowJob struct {
@@ -220,7 +223,11 @@ func (e *Engine) scanTickCountFor(pk, phase string, count int, folder string) {
 		s.scans = map[string]*scanEntry{}
 	}
 	s.scanSeq++
-	s.scans[pk] = &scanEntry{ScanNow: ScanNow{Active: true, Phase: phase, Count: count, Folder: folder}, seq: s.scanSeq}
+	since := time.Now()
+	if prev := s.scans[pk]; prev != nil {
+		since = prev.Since
+	}
+	s.scans[pk] = &scanEntry{ScanNow: ScanNow{Active: true, Phase: phase, Count: count, Folder: folder, Since: since}, seq: s.scanSeq}
 	s.mu.Unlock()
 }
 
@@ -245,6 +252,9 @@ func (e *Engine) ScanNow() ScanNow {
 		out.Count += en.Count
 		if en.seq >= newest {
 			newest, out.Phase, out.Folder = en.seq, en.Phase, en.Folder
+		}
+		if out.Since.IsZero() || en.Since.Before(out.Since) {
+			out.Since = en.Since
 		}
 	}
 	return out

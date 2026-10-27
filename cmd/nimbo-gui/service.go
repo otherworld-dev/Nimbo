@@ -52,13 +52,16 @@ import (
 // App is the Wails-bound service: its exported methods are callable from the
 // frontend, and it forwards engine changes to the UI as events.
 type App struct {
-	// trayAttnAt/trayAttn cache the tray's attention counts (trayAttentionInfo)
-	// and trayNowAt/trayNowDTO its composed status (trayNow); only
+	// trayNowAt/trayNowDTO cache the tray's composed status (trayNow); only
 	// animateTray's goroutine touches them.
-	trayAttnAt time.Time
-	trayAttn   AttentionInfo
 	trayNowAt  time.Time
 	trayNowDTO NowStatusDTO
+	// attn caches Attention for NowStatus and the tray (cachedAttention);
+	// attnAt zero = refresh on the next read.
+	attnMu  sync.Mutex
+	attn    AttentionInfo
+	attnAt  time.Time
+	attnGen uint64 // bumped by attentionChanged
 
 	// The "what's happening now" status (now.go): on-demand downloads
 	// streamed through the filter, and the throttle for the "now" event.
@@ -99,7 +102,8 @@ type App struct {
 	appsCacheMu     sync.Mutex
 	appsCache       []transport.App // last-fetched navigation apps (flyout refreshes keep it warm)
 	appsCacheAt     time.Time
-	onDemandMounts  map[string]*odMount // local dir -> active mount
+	onDemandMounts  map[string]*odMount // local dir -> active mount; only via mounts()/addMount/… (mapsMu)
+	mapsMu          sync.RWMutex        // guards onDemandMounts, secondaries and odMount.watcher
 	pendingKeep     string              // on-demand path to pin once mounts are ready
 	pendingFree     string              // on-demand path to free up once mounts are ready
 	// "Sync this first" from the Explorer menu (syncfirst.go): the paths asked
@@ -148,7 +152,7 @@ type App struct {
 	// shows; every other configured account runs a secondary engine that syncs
 	// its own pairs concurrently in the background (toasts surface its
 	// conflicts/errors; the Settings account list shows its status).
-	secondaries map[string]*secondaryEngine // account ID -> background engine
+	secondaries map[string]*secondaryEngine // account ID -> background engine; only via secs()/addSecondary/… (mapsMu)
 	acctMu      sync.Mutex
 	acctStatus  map[string]string // account ID -> latest engine status line
 	// Signing in again (signinagain.go), all under acctMu. authLostIDs holds
@@ -186,6 +190,106 @@ type odMount struct {
 	convertCancel context.CancelFunc
 	// healCancel stops the periodic state heal (vfsheal.go) when the mount goes.
 	healCancel context.CancelFunc
+}
+
+// The mount and secondary-engine maps are read from the tray's goroutine
+// (NowStatus, twice a second) as well as Wails calls, so every access goes
+// through these helpers under mapsMu. Readers range over a copy, and nobody
+// holds the lock while calling into an engine or a watcher. setWatcher guards
+// an odMount's watcher field for the same reader.
+
+// mounts returns a copy of the on-demand mounts (local dir -> mount).
+func (a *App) mounts() map[string]*odMount {
+	a.mapsMu.RLock()
+	defer a.mapsMu.RUnlock()
+	out := make(map[string]*odMount, len(a.onDemandMounts))
+	for k, v := range a.onDemandMounts {
+		out[k] = v
+	}
+	return out
+}
+
+// mount returns the mount at dir, or nil.
+func (a *App) mount(dir string) *odMount {
+	a.mapsMu.RLock()
+	defer a.mapsMu.RUnlock()
+	return a.onDemandMounts[dir]
+}
+
+// mountsReady reports whether any mount has ever been registered (the
+// "mounts not ready yet" test of the Explorer verbs).
+func (a *App) mountsReady() bool {
+	a.mapsMu.RLock()
+	defer a.mapsMu.RUnlock()
+	return a.onDemandMounts != nil
+}
+
+func (a *App) addMount(dir string, m *odMount) {
+	a.mapsMu.Lock()
+	defer a.mapsMu.Unlock()
+	if a.onDemandMounts == nil {
+		a.onDemandMounts = map[string]*odMount{}
+	}
+	a.onDemandMounts[dir] = m
+}
+
+func (a *App) dropMount(dir string) {
+	a.mapsMu.Lock()
+	defer a.mapsMu.Unlock()
+	delete(a.onDemandMounts, dir)
+}
+
+// setWatcher sets (or clears, w nil) a mount's write-back watcher.
+func (a *App) setWatcher(m *odMount, w *vfs.Watcher) {
+	a.mapsMu.Lock()
+	defer a.mapsMu.Unlock()
+	m.watcher = w
+}
+
+// watcherOf reads a mount's watcher under the lock setWatcher takes.
+func (a *App) watcherOf(m *odMount) *vfs.Watcher {
+	a.mapsMu.RLock()
+	defer a.mapsMu.RUnlock()
+	return m.watcher
+}
+
+// secs returns a copy of the background engines (account ID -> engine).
+func (a *App) secs() map[string]*secondaryEngine {
+	a.mapsMu.RLock()
+	defer a.mapsMu.RUnlock()
+	out := make(map[string]*secondaryEngine, len(a.secondaries))
+	for k, v := range a.secondaries {
+		out[k] = v
+	}
+	return out
+}
+
+// secondary returns the background engine for an account, or nil.
+func (a *App) secondary(id string) *secondaryEngine {
+	a.mapsMu.RLock()
+	defer a.mapsMu.RUnlock()
+	return a.secondaries[id]
+}
+
+func (a *App) secondaryCount() int {
+	a.mapsMu.RLock()
+	defer a.mapsMu.RUnlock()
+	return len(a.secondaries)
+}
+
+func (a *App) addSecondary(id string, se *secondaryEngine) {
+	a.mapsMu.Lock()
+	defer a.mapsMu.Unlock()
+	if a.secondaries == nil {
+		a.secondaries = map[string]*secondaryEngine{}
+	}
+	a.secondaries[id] = se
+}
+
+func (a *App) dropSecondary(id string) {
+	a.mapsMu.Lock()
+	defer a.mapsMu.Unlock()
+	delete(a.secondaries, id)
 }
 
 // start brings up the sync engine (if an account is configured) and wires its
@@ -303,10 +407,10 @@ func (a *App) start(ctx context.Context) {
 	// when the engine is stopped (sign-out), so they don't leak across sessions.
 	forwardEvents(runCtx, eng.Recorder().Subscribe(), func() { a.emit("activity") })
 	forwardEvents(runCtx, eng.Notifier().Subscribe(), func() { a.emit("notifications") })
-	forwardEvents(runCtx, eng.SubscribeConflicts(), func() { a.emit("conflicts"); a.nudgeNow() })
-	forwardEvents(runCtx, eng.SubscribeBlocked(), func() { a.emit("blocked"); a.nudgeNow() })
-	forwardEvents(runCtx, eng.SubscribeLocked(), func() { a.emit("locks"); a.nudgeNow() })
-	forwardEvents(runCtx, eng.SubscribeDetached(), func() { a.emit("detached"); a.nudgeNow() })
+	forwardEvents(runCtx, eng.SubscribeConflicts(), func() { a.emit("conflicts"); a.attentionChanged() })
+	forwardEvents(runCtx, eng.SubscribeBlocked(), func() { a.emit("blocked"); a.attentionChanged() })
+	forwardEvents(runCtx, eng.SubscribeLocked(), func() { a.emit("locks"); a.attentionChanged() })
+	forwardEvents(runCtx, eng.SubscribeDetached(), func() { a.emit("detached"); a.attentionChanged() })
 
 	var pairs []config.SyncPair
 	if a.GetSyncMode() == "ondemand" {
@@ -370,7 +474,7 @@ func (a *App) start(ctx context.Context) {
 	// entries older versions left behind (GitHub #10).
 	if a.leftoversSwept.CompareAndSwap(false, true) {
 		mounted := map[string]bool{}
-		for dir := range a.onDemandMounts {
+		for dir := range a.mounts() {
 			mounted[filepath.Clean(dir)] = true
 		}
 		go a.sweepLeftovers(mounted)
@@ -405,15 +509,12 @@ func (a *App) startSecondaries(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	if a.secondaries == nil {
-		a.secondaries = map[string]*secondaryEngine{}
-	}
 	primary := a.eng.Account.ID
 	for _, ac := range st.Accounts {
 		if ac.ID == primary {
 			continue
 		}
-		if _, running := a.secondaries[ac.ID]; running {
+		if a.secondary(ac.ID) != nil {
 			continue
 		}
 		// Turned down already: starting it would only send the server another
@@ -463,7 +564,7 @@ func (a *App) startSecondaries(ctx context.Context) {
 		} else {
 			pairs = a.prepareLivePairs(eng)
 		}
-		a.secondaries[id] = &secondaryEngine{eng: eng, cancel: cancel}
+		a.addSecondary(id, &secondaryEngine{eng: eng, cancel: cancel})
 		slog.Info("secondary account syncing", "account", ac.LoginName, "server", ac.ServerURL, "pairs", len(pairs))
 		go func() {
 			_ = eng.Run(runCtx, toAgentPairs(pairs), func(agent.Pair, transfer.Stats) {})
@@ -525,7 +626,7 @@ func (a *App) mountSecondaryOnDemand(eng *agent.Engine) {
 // unmountAccount disconnects one account's on-demand mounts (used when only
 // that account stops, e.g. auth loss or removal).
 func (a *App) unmountAccount(accountID string) {
-	for dir, m := range a.onDemandMounts {
+	for dir, m := range a.mounts() {
 		if m.accountID != accountID {
 			continue
 		}
@@ -540,7 +641,7 @@ func (a *App) unmountAccount(accountID string) {
 		// the whole tree (the #580 flattener). The registration stays; a
 		// re-auth remounts over it (UPDATE flag).
 		cfapi.Disconnect(dir, m.connKey)
-		delete(a.onDemandMounts, dir)
+		a.dropMount(dir)
 		slog.Info("on-demand mount disconnected", "dir", dir, "account", accountID)
 	}
 	a.refreshOverlayRoots()
@@ -560,8 +661,8 @@ func (a *App) refreshOverlayRoots() {
 	if a.eng == nil {
 		return
 	}
-	dirs := make([]string, 0, len(a.onDemandMounts))
-	for dir := range a.onDemandMounts {
+	dirs := make([]string, 0, len(a.mounts()))
+	for dir := range a.mounts() {
 		dirs = append(dirs, dir)
 	}
 	a.eng.SetOverlayRoots(dirs)
@@ -569,16 +670,16 @@ func (a *App) refreshOverlayRoots() {
 
 // stopSecondary stops one background account engine and its on-demand mounts.
 func (a *App) stopSecondary(id string) {
-	if se, ok := a.secondaries[id]; ok {
+	if se := a.secondary(id); se != nil {
 		a.unmountAccount(id)
 		se.cancel()
-		delete(a.secondaries, id)
+		a.dropSecondary(id)
 	}
 }
 
 // stopSecondaries stops all background account engines.
 func (a *App) stopSecondaries() {
-	for id := range a.secondaries {
+	for id := range a.secs() {
 		a.stopSecondary(id)
 	}
 }
@@ -959,7 +1060,7 @@ func (a *App) SetSyncMode(mode string) string {
 	case "live-revert":
 		return a.revertAndSwitch()
 	case "revert-cancel":
-		for _, m := range a.onDemandMounts {
+		for _, m := range a.mounts() {
 			if m.convertCancel != nil {
 				m.convertCancel()
 			}
@@ -1203,7 +1304,7 @@ func (a *App) mountAccountOnDemand() {
 	}
 	a.mountRefused = ""
 	dir := onDemandRootOrder(wholeAccountPair(a.eng), a.eng.OnDemandRoot(), a.eng.StoredBaseDir())
-	if _, already := a.onDemandMounts[dir]; dir != "" && already {
+	if dir != "" && a.mount(dir) != nil {
 		return
 	}
 	if dir == "" {
@@ -1671,11 +1772,8 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		}
 		return w
 	}
-	if a.onDemandMounts == nil {
-		a.onDemandMounts = map[string]*odMount{}
-	}
 	m := &odMount{connKey: connKey, remoteRoot: root, accountID: eng.Account.ID}
-	a.onDemandMounts[localDir] = m
+	a.addMount(localDir, m)
 	if strings.Trim(remoteRoot, "/") == "" {
 		// The account's whole-account root: remember it, so the account
 		// reconnects to this folder next time, primary or background.
@@ -1728,7 +1826,7 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		go a.runAdoptConvert(cctx, m, plan, localDir, root, up, startWatcher, true)
 		return nil
 	}
-	m.watcher = startWatcher()
+	a.setWatcher(m, startWatcher())
 	slog.Info("on-demand mount connected", "dir", localDir, "remoteRoot", root)
 	return nil
 }
@@ -1989,7 +2087,7 @@ func (a *App) SetOfflinePin(rel string, pinned bool) string {
 
 // pokeOnDemand asks every active on-demand mount to reconcile (push-driven).
 func (a *App) pokeOnDemand() {
-	for _, m := range a.onDemandMounts {
+	for _, m := range a.mounts() {
 		if m.watcher != nil {
 			m.watcher.Poke()
 		}
@@ -2000,7 +2098,7 @@ func (a *App) pokeOnDemand() {
 // have flipped: a pause stops their uploads and pinned downloads, a resume
 // starts them again (Deck #723).
 func (a *App) pauseChangedOnDemand() {
-	for _, m := range a.onDemandMounts {
+	for _, m := range a.mounts() {
 		if m.watcher != nil {
 			m.watcher.PauseChanged()
 		}
@@ -2013,7 +2111,7 @@ func (a *App) pauseChangedOnDemand() {
 // (below) unregisters, and Windows then strips the cloud state from the whole
 // tree - correct only when leaving virtual-files mode or signing out.
 func (a *App) disconnectAllOnDemand() {
-	for dir, m := range a.onDemandMounts {
+	for dir, m := range a.mounts() {
 		if m.convertCancel != nil {
 			m.convertCancel()
 		}
@@ -2024,7 +2122,7 @@ func (a *App) disconnectAllOnDemand() {
 			m.healCancel()
 		}
 		cfapi.Disconnect(dir, m.connKey)
-		delete(a.onDemandMounts, dir)
+		a.dropMount(dir)
 		slog.Info("on-demand mount disconnected (registration kept)", "dir", dir)
 	}
 	a.refreshOverlayRoots()
@@ -2034,7 +2132,7 @@ func (a *App) disconnectAllOnDemand() {
 // sign-out). The registration is removed and Windows strips placeholder state
 // from the tree - by design here; use disconnectAllOnDemand everywhere else.
 func (a *App) unmountAllOnDemand() {
-	for dir, m := range a.onDemandMounts {
+	for dir, m := range a.mounts() {
 		if m.convertCancel != nil {
 			m.convertCancel() // stop a background adopt conversion first
 		}
@@ -2052,7 +2150,7 @@ func (a *App) unmountAllOnDemand() {
 		// Nor is the folder a virtual-files root any more: a switch back must
 		// not prefer it over a folder chosen since.
 		forgetOnDemandRoot(m.accountID)
-		delete(a.onDemandMounts, dir)
+		a.dropMount(dir)
 	}
 	a.refreshOverlayRoots()
 }
@@ -2467,17 +2565,6 @@ func trayStateFor(state string) string {
 	}
 }
 
-// trayAttentionInfo is Attention for the tray. The tray redraws every 120 ms
-// and Attention reads files, so it is refreshed at most every two seconds.
-// Only animateTray's goroutine calls it.
-func (a *App) trayAttentionInfo() AttentionInfo {
-	if time.Since(a.trayAttnAt) > 2*time.Second {
-		a.trayAttn = a.Attention()
-		a.trayAttnAt = time.Now()
-	}
-	return a.trayAttn
-}
-
 // trayBadge reports whether there are pending Nextcloud notifications.
 func (a *App) trayBadge() bool {
 	return a.eng != nil && a.eng.Notifier().Count() > 0
@@ -2549,7 +2636,7 @@ func (a *App) Attention() AttentionInfo {
 	// Background accounts' conflicts/blocked count toward the badge so they
 	// can't go unnoticed; their lists live behind a "Show" switch (the resolve
 	// actions operate on the shown account).
-	for _, se := range a.secondaries {
+	for _, se := range a.secs() {
 		info.Conflicts += len(se.eng.PendingConflicts())
 		info.Blocked += len(se.eng.BlockedFiles())
 		info.Locked += len(se.eng.LockedFiles())
@@ -2569,7 +2656,7 @@ type OtherAttention struct {
 // OtherAccountAttention lists background accounts that need attention.
 func (a *App) OtherAccountAttention() []OtherAttention {
 	out := []OtherAttention{}
-	for id, se := range a.secondaries {
+	for id, se := range a.secs() {
 		c, b := len(se.eng.PendingConflicts()), len(se.eng.BlockedFiles())
 		if c+b > 0 {
 			out = append(out, OtherAttention{ID: id, User: se.eng.Account.LoginName, Conflicts: c, Blocked: b})
@@ -2618,7 +2705,7 @@ func (a *App) eachEngine(f func(*agent.Engine)) {
 	if a.eng != nil {
 		f(a.eng)
 	}
-	for _, se := range a.secondaries {
+	for _, se := range a.secs() {
 		if se.eng != nil {
 			f(se.eng)
 		}
@@ -2733,8 +2820,8 @@ func (a *App) Folders() []FolderInfo {
 	for _, p := range pairs {
 		out = append(out, FolderInfo{Name: filepath.Base(p.LocalDir), LocalDir: p.LocalDir})
 	}
-	mounts := make([]string, 0, len(a.onDemandMounts))
-	for dir := range a.onDemandMounts {
+	mounts := make([]string, 0, len(a.mounts()))
+	for dir := range a.mounts() {
 		mounts = append(mounts, dir)
 	}
 	sort.Strings(mounts) // stable order (map iteration is random)
@@ -2930,7 +3017,7 @@ func (a *App) releaseLocksOnExit(timeout time.Duration) {
 	if a.eng != nil {
 		engs = append(engs, a.eng)
 	}
-	for _, se := range a.secondaries {
+	for _, se := range a.secs() {
 		if se != nil && se.eng != nil {
 			engs = append(engs, se.eng)
 		}
@@ -3057,7 +3144,7 @@ func (a *App) RecentActivity() []ActivityItem {
 	if a.eng == nil {
 		return nil
 	}
-	multi := len(a.secondaries) > 0
+	multi := a.secondaryCount() > 0
 	type timed struct {
 		item ActivityItem
 		at   time.Time
@@ -3085,7 +3172,7 @@ func (a *App) RecentActivity() []ActivityItem {
 			// remoteFor()), so the mount's remote root must come off before the
 			// path can be joined to its local dir; live events are pair-relative.
 			mountRoot := ""
-			if m := a.onDemandMounts[e.Local]; m != nil {
+			if m := a.mount(e.Local); m != nil {
 				mountRoot = m.remoteRoot
 			}
 			all = append(all, timed{
@@ -3098,7 +3185,7 @@ func (a *App) RecentActivity() []ActivityItem {
 		}
 	}
 	collect(a.eng)
-	for _, se := range a.secondaries {
+	for _, se := range a.secs() {
 		collect(se.eng)
 	}
 	sort.SliceStable(all, func(i, j int) bool { return all[i].at.After(all[j].at) })
@@ -3119,7 +3206,7 @@ func (a *App) ClearActivity() {
 	if a.eng != nil {
 		a.eng.Recorder().Clear()
 	}
-	for _, se := range a.secondaries {
+	for _, se := range a.secs() {
 		if se.eng != nil {
 			se.eng.Recorder().Clear()
 		}
@@ -3455,7 +3542,7 @@ func (a *App) releaseAllLocks() string {
 		}
 	}
 	rel(a.eng)
-	for _, se := range a.secondaries {
+	for _, se := range a.secs() {
 		rel(se.eng)
 	}
 	if firstErr != nil {
@@ -3497,7 +3584,7 @@ func (a *App) engineForLogin(login string) *agent.Engine {
 	if a.eng != nil && a.eng.Account.LoginName == login {
 		return a.eng
 	}
-	for _, se := range a.secondaries {
+	for _, se := range a.secs() {
 		if se.eng != nil && se.eng.Account.LoginName == login {
 			return se.eng
 		}
@@ -3557,7 +3644,7 @@ func (a *App) Diagnostics() DiagnosticsDTO {
 	}
 	collectLocks(a.eng)
 	// Background accounts too, or a lock held under one is invisible.
-	for _, se := range a.secondaries {
+	for _, se := range a.secs() {
 		collectLocks(se.eng)
 	}
 	sort.Slice(dto.ObservedLocks, func(i, j int) bool {
@@ -3580,7 +3667,7 @@ func (a *App) Diagnostics() DiagnosticsDTO {
 		}
 	}
 	collectHeld(a.eng)
-	for _, se := range a.secondaries {
+	for _, se := range a.secs() {
 		collectHeld(se.eng)
 	}
 	sort.Slice(dto.HeldLocks, func(i, j int) bool { return dto.HeldLocks[i].Path < dto.HeldLocks[j].Path })
@@ -3748,7 +3835,7 @@ func (a *App) engineFor(acct string) *agent.Engine {
 	if a.eng != nil && (acct == "" || a.eng.Account.ID == acct) {
 		return a.eng
 	}
-	if se, ok := a.secondaries[acct]; ok {
+	if se := a.secondary(acct); se != nil {
 		return se.eng
 	}
 	return a.eng
@@ -4299,7 +4386,7 @@ func (a *App) onSecondInstance(args []string) {
 // then live sync pairs. Used by Share / Version history.
 func (a *App) remotePathForLocal(localAbs string) (string, bool) {
 	c := filepath.Clean(localAbs)
-	for dir, m := range a.onDemandMounts {
+	for dir, m := range a.mounts() {
 		rel, err := filepath.Rel(filepath.Clean(dir), c)
 		if err != nil {
 			continue
@@ -4327,7 +4414,7 @@ func (a *App) remotePathForLocal(localAbs string) (string, bool) {
 // onDemandMountFor returns the mount root containing localAbs, if any.
 func (a *App) onDemandMountFor(localAbs string) (string, bool) {
 	c := filepath.Clean(localAbs)
-	for dir := range a.onDemandMounts {
+	for dir := range a.mounts() {
 		rel, err := filepath.Rel(filepath.Clean(dir), c)
 		if err != nil {
 			continue
@@ -4356,7 +4443,7 @@ func (a *App) keepLocalPath(localAbs string) {
 		return
 	}
 	if _, ok := a.onDemandMountFor(localAbs); !ok {
-		if a.onDemandMounts == nil { // mounts not ready yet — queue it
+		if !a.mountsReady() { // mounts not ready yet — queue it
 			a.pendingKeep = localAbs
 			return
 		}
@@ -4379,7 +4466,7 @@ func (a *App) freeLocalPath(localAbs string) {
 		return
 	}
 	if _, ok := a.onDemandMountFor(localAbs); !ok {
-		if a.onDemandMounts == nil {
+		if !a.mountsReady() {
 			a.pendingFree = localAbs
 			return
 		}

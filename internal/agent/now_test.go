@@ -36,7 +36,12 @@ func TestScanNowCarriesTheCount(t *testing.T) {
 	e.scanBegin()
 	e.scanTickCount("server", 1240, "TerraVia/Clients")
 	want := ScanNow{Active: true, Phase: "server", Count: 1240, Folder: "TerraVia/Clients"}
-	if got := e.ScanNow(); got != want {
+	got := e.ScanNow()
+	if got.Since.IsZero() {
+		t.Fatal("Since is zero for an active scan")
+	}
+	got.Since = time.Time{}
+	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
 	e.scanEnd()
@@ -109,6 +114,7 @@ func TestScanNowStaysActiveWhileAnotherPairScans(t *testing.T) {
 	e.scanTickCountFor("B", "server", 7, "x")
 	e.scanEndFor("A")
 	got := e.ScanNow()
+	got.Since = time.Time{}
 	want := ScanNow{Active: true, Phase: "server", Count: 7, Folder: "x"}
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
@@ -116,5 +122,24 @@ func TestScanNowStaysActiveWhileAnotherPairScans(t *testing.T) {
 	e.scanEndFor("B")
 	if e.ScanNow().Active {
 		t.Fatal("should be idle once every pair ended")
+	}
+}
+
+// Since is when the oldest running scan began, and a stage change within one
+// pair's scan does not restart it: the GUI hides passes shorter than the
+// quiet period by it (Deck #988).
+func TestScanNowSinceIsWhenTheScanBegan(t *testing.T) {
+	e := newNowTestEngine()
+	e.scanTickCountFor("A", "server", 0, "")
+	first := e.ScanNow().Since
+	time.Sleep(5 * time.Millisecond)
+	e.scanTickCountFor("A", "local", 10, "")
+	e.scanTickCountFor("B", "server", 1, "")
+	if got := e.ScanNow().Since; !got.Equal(first) {
+		t.Fatalf("Since = %v, want the first start %v", got, first)
+	}
+	e.scanEndFor("A")
+	if got := e.ScanNow().Since; !got.After(first) {
+		t.Fatalf("Since = %v after A ended, want B's later start", got)
 	}
 }
