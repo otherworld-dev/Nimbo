@@ -78,6 +78,13 @@ All notable changes to Nimbo are recorded here. The format follows
   somewhere Nimbo can't follow, no longer takes with it any file you changed that
   hadn't finished uploading: that file is kept and uploaded, and only what can be
   downloaded again is removed (#986).
+- In on-demand mode, a file that failed to upload while the server couldn't be
+  reached is sent within seconds of the connection coming back, instead of
+  waiting up to half an hour for its next retry (#991).
+- The activity lists say "Renamed" for a rename, "Moved" for a move and "New
+  folder" for a folder that appeared on the server. A rename showed as "move", a
+  new folder as "Downloaded", and the Status window's Activity tab showed internal
+  names such as "delete-local" (#987).
 - A folder or file renamed on the server where only the capitals changed (for
   example "14 days" to "14 Days") is now renamed on this PC too, and online-only
   files in it still open. Before, Nimbo kept looking for the old name, which also
