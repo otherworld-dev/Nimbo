@@ -111,6 +111,10 @@ type Engine struct {
 	pairHealthOnce  sync.Once
 	pairHealthState *pairHealthState
 
+	// Live snapshots for the flyout's status line (see now.go); lazily created.
+	nowOnce sync.Once
+	now     *nowState
+
 	// moveExcl enforces move/sync mutual exclusion. A sync pass holds it for
 	// reading (many may run concurrently); a "Move sync folder" holds it for
 	// writing (exclusive). Both use the non-blocking Try variants: a move that
@@ -615,8 +619,10 @@ func (e *Engine) Upload(ctx context.Context, localPath, remotePath string) (stri
 	e.progStart(1, size)
 	defer e.progEnd()
 	e.progCurrent(filepath.Base(localPath))
+	jobDone := e.jobStart(localPath, "upload", size)
 	res, err := transfer.UploadProgress(ctx, e.client, localPath, remotePath,
-		func(n int64) { e.progBytes.Add(n) })
+		func(n int64) { e.progBytes.Add(n); e.jobProgress(localPath, n) })
+	jobDone(err)
 	if err == nil {
 		e.progComplete()
 	}
@@ -3163,6 +3169,7 @@ func (e *Engine) computePlan(ctx context.Context, st *state.Store, p Pair) ([]en
 	// Nothing is emitted until the pass outlives scanQuietPeriod, so the warm
 	// 15-second poll stays silent (see scanstatus.go).
 	e.scanBegin()
+	defer e.scanEnd()
 	e.scanPhase("Reading your file list…")
 	base, err := st.LoadBaseline(pk)
 	if err != nil {
@@ -3175,10 +3182,12 @@ func (e *Engine) computePlan(ctx context.Context, st *state.Store, p Pair) ([]en
 	ig := e.ignoreFor(p)
 	cp := newScanCheckpoint(st, pk)
 	e.scanPhase("Checking server…")
+	e.scanTickCount("server", 0, "")
 	remote, err := engine.RemoteScan(ctx, e.client, p.RemoteRoot, engine.ScanOpts{
 		Base: base, Skip: ig.Match, OnEncrypted: e.noteEncrypted, Esc: e.escaper.Load(),
 		Checkpoint: cp, OnUnholdable: e.unholdableFor(p),
 		Progress: func(dirs int) {
+			e.scanTickCount("server", dirs, "")
 			e.scanTick("Checking server… " + commas(dirs) + " folders")
 		},
 	})
@@ -3190,7 +3199,9 @@ func (e *Engine) computePlan(ctx context.Context, st *state.Store, p Pair) ([]en
 		return nil, nil, nil, fmt.Errorf("remote scan: %w", err)
 	}
 	e.scanPhase("Checking your files…")
+	e.scanTickCount("local", 0, "")
 	local, err := engine.LocalScanProgress(p.LocalDir, "", func(files int) {
+		e.scanTickCount("local", files, "")
 		e.scanTick("Checking your files… " + commas(files))
 	})
 	if err != nil {
@@ -3200,6 +3211,7 @@ func (e *Engine) computePlan(ctx context.Context, st *state.Store, p Pair) ([]en
 	ig.FilterRemote(remote)
 
 	e.scanPhase("Comparing changes…")
+	e.scanTickCount("compare", 0, "")
 	actions := engine.Diff(base, remote, local)
 	pruneDeadBaselines(st, pk, base, remote, local)
 
@@ -3208,9 +3220,11 @@ func (e *Engine) computePlan(ctx context.Context, st *state.Store, p Pair) ([]en
 	// now completely invisible. CoalesceRenames drives hashLocal from its own
 	// sequential loop, so a plain counter is safe here.
 	e.scanPhase("Matching moved files…")
+	e.scanTickCount("moves", 0, "")
 	hashed := 0
 	hashLocal := func(rel string) (string, error) {
 		hashed++
+		e.scanTickCount("moves", hashed, "")
 		e.scanTick("Matching moved files… " + commas(hashed))
 		return transfer.SHA1File(filepath.Join(p.LocalDir, filepath.FromSlash(rel)))
 	}
@@ -3566,13 +3580,15 @@ func (e *Engine) cloneRemote(ctx context.Context, st *state.Store, p Pair) (tran
 			LocalRoot: p.LocalDir, RemoteRoot: p.RemoteRoot, Remote: remote, Escaper: e.escaper.Load(),
 			Workers: 1, Policy: e.policy,
 			OnBegin: func(a engine.Action) {
+				e.jobActionBegin(p, a, remote)
 				e.markInflight(filepath.Join(p.LocalDir, filepath.FromSlash(a.Path)), true)
 				if a.Kind == engine.ActDownload {
 					e.progCurrent(filepath.Base(a.Path))
 				}
 			},
-			OnProgress: func(a engine.Action, d int64) { e.progBytes.Add(d) },
+			OnProgress: func(a engine.Action, d int64) { e.progBytes.Add(d); e.jobActionProgress(p, a, d) },
 			OnEvent: func(a engine.Action, aerr error) {
+				e.jobActionEnd(p, a)
 				e.markInflight(filepath.Join(p.LocalDir, filepath.FromSlash(a.Path)), false)
 				if a.Kind == engine.ActDownload {
 					e.progComplete()
@@ -4498,9 +4514,10 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 		Escaper:    e.escaper.Load(),
 		Workers:    4,
 		Policy:     e.policy,
-		OnBegin:    func(a engine.Action) { e.beginAction(p, a) },
+		OnBegin:    func(a engine.Action) { e.jobActionBegin(p, a, remote); e.beginAction(p, a) },
 		OnProgress: func(a engine.Action, delta int64) {
 			e.progBytes.Add(delta)
+			e.jobActionProgress(p, a, delta)
 		},
 		OnMovedAside: func(rel, dest string) {
 			probMu.Lock()
@@ -4508,6 +4525,7 @@ func (e *Engine) applyPlan(ctx context.Context, st *state.Store, p Pair, actions
 			probMu.Unlock()
 		},
 		OnEvent: func(a engine.Action, aerr error) {
+			e.jobActionEnd(p, a)
 			probs, busy := e.finishAction(p, pk, remote, a, aerr)
 			if len(probs) == 0 {
 				return
@@ -5325,6 +5343,10 @@ func (e *Engine) startWatcher(p Pair) {
 			// string is global, so this is the only place a UI can learn that
 			// THIS folder stopped syncing while others are fine.
 			e.notePairResult(p, err)
+			if _, scoped := relsFor(p.LocalDir, changed); !scoped {
+				// A full pass: the last complete look at the server and disk.
+				e.noteFullCheck(time.Now(), len(e.PairHealths()) == 0)
+			}
 			if err != nil {
 				slog.Error("sync failed", "local", p.LocalDir, "err", err)
 				return err
