@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { kindLabel } from "./kinds";
   import { Events } from "@wailsio/runtime";
   import { App } from "../bindings/github.com/otherworld/nimbo/cmd/nimbo-gui";
   import { ask, tell, askText } from "./dialogs.svelte";
@@ -377,7 +378,7 @@
     {#if tab === "activity"}
       {#if activity.length === 0}<p class="empty">Nothing yet.</p>{/if}
       {#each activity as e}
-        <div class="line" class:hl={(e.path + NL + e.kind) === highlight}><span class="t">{e.time}</span>{#if e.account}<span class="acct">{e.account}</span>{/if}<span class="k">{e.kind}</span><span class="p">{e.path}</span>{#if e.err}<span class="err">⚠ {e.err}</span>{/if}</div>
+        <div class="line" class:hl={(e.path + NL + e.kind) === highlight}><span class="t">{e.time}</span>{#if e.account}<span class="acct">{e.account}</span>{/if}<span class="k">{kindLabel(e.kind)}</span><span class="p">{e.path}</span>{#if e.err}<span class="err">⚠ {e.err}</span>{/if}</div>
       {/each}
 
     {:else if tab === "conflicts"}

@@ -178,6 +178,7 @@ type Watcher struct {
 	// guarded by reconMu (only reconcile passes touch them):
 	firstPassDone bool // a full (skip-free) pass has completed since start
 	fullSweep     bool // the running pass ignores the ETag subtree skip
+	serverDown    bool // the last root listing failed (see retryNow)
 	// sweepOwed holds the folders (sync-root-relative) a full sweep could not
 	// reconcile. Each is swept in full whenever a pass reaches it, until it
 	// succeeds, instead of the whole account being swept again on every pass
@@ -1494,7 +1495,7 @@ func (w *Watcher) pullRename(localDir, oldFull string, y cfapi.PlaceholderInfo, 
 	w.recordFileID(string(y.Identity), fileid)
 	w.dropFileID(oldRemote)
 	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(y.Identity))
-	w.report("move", w.localName(string(y.Identity)), nil) // user-visible name
+	w.report(moveKind(oldRemote, string(y.Identity)), w.localName(string(y.Identity)), nil) // user-visible name
 	return true
 }
 
@@ -1519,7 +1520,7 @@ func (w *Watcher) pullCaseRename(localDir, oldFull string, r cfapi.PlaceholderIn
 	w.moveBaselines(append([][2]string{{oldRemote, string(r.Identity)}}, pairs...))
 	w.uploadAfterSuppression(pending...)
 	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(r.Identity))
-	w.report("move", w.remoteFor(newFull), nil)
+	w.report("rename", w.remoteFor(newFull), nil)
 }
 
 // pullFileCaseRename is pullCaseRename for a FILE. The identity is repointed
@@ -1553,7 +1554,7 @@ func (w *Watcher) pullFileCaseRename(localDir, oldFull string, r cfapi.Placehold
 		w.uploadAfterSuppression(newFull)
 	}
 	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(r.Identity))
-	w.report("move", w.remoteFor(newFull), nil)
+	w.report("rename", w.remoteFor(newFull), nil)
 	return newFull, true
 }
 
@@ -1565,6 +1566,106 @@ func (w *Watcher) uploadAfterSuppression(paths ...string) {
 	for _, p := range paths {
 		p := p
 		w.after(suppressFor+time.Second, func() { w.scheduleUploadIfIdle(p) })
+	}
+}
+
+// pullDirRename applies a server-side rename of a FOLDER, recognised by its
+// fileid (Deck #986): the local folder is renamed with everything in it, every
+// identity beneath it repointed, and its baselines and fileids carried. Files
+// with unsent edits keep them and are sent under the new path. It reports
+// whether the rename happened.
+func (w *Watcher) pullDirRename(localDir, oldFull string, y cfapi.PlaceholderInfo, fileid string) bool {
+	newFull := filepath.Join(localDir, y.Name)
+	if _, err := os.Lstat(newFull); err == nil {
+		return false // something is already there: don't clobber it
+	}
+	oldRemote := w.serverFor(oldFull, true)
+	w.suppressDelete(oldFull)
+	w.suppressDelete(newFull)
+	if err := os.Rename(oldFull, newFull); err != nil {
+		w.ops.Log("vfs pull-rename %s -> %s: %v", oldRemote, string(y.Identity), err)
+		return false
+	}
+	if err := cfUpdateIdentity(newFull, y.Identity); err != nil {
+		w.ops.Log("vfs pull-rename repoint %s: %v", string(y.Identity), err)
+	}
+	pairs, pending := w.repointTree(newFull)
+	all := append([][2]string{{oldRemote, string(y.Identity)}}, pairs...)
+	w.moveBaselines(all)
+	w.moveFileIDs(all)
+	w.recordFileID(string(y.Identity), fileid)
+	w.uploadAfterSuppression(pending...)
+	w.ops.Log("vfs pulled rename %s -> %s", oldRemote, string(y.Identity))
+	w.report(moveKind(oldRemote, string(y.Identity)), w.remoteFor(newFull), nil)
+	return true
+}
+
+// pruneVanished handles a folder the server no longer has (deleted, or moved
+// somewhere this listing can't see): everything that can be fetched again is
+// removed, but a file holding changes this PC never sent is kept where it is
+// and sent, so it comes back on the server rather than being lost (Deck #986).
+// It reports whether anything was kept. A file whose state can't be read is
+// kept too: the delete is the one thing that can't be undone.
+func (w *Watcher) pruneVanished(full string) bool {
+	w.suppressDelete(full)
+	var keep, dirs []string
+	_ = filepath.WalkDir(full, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			dirs = append(dirs, p)
+			return nil
+		}
+		if mod, merr := cfPlaceholderModified(p); merr != nil || mod {
+			keep = append(keep, p)
+			return nil
+		}
+		if rerr := os.Remove(p); rerr != nil && !os.IsNotExist(rerr) {
+			keep = append(keep, p) // still there; don't claim it gone
+		}
+		return nil
+	})
+	for i := len(dirs) - 1; i >= 0; i-- { // deepest first; a folder still holding a kept file stays
+		_ = os.Remove(dirs[i])
+	}
+	server := w.serverFor(full, true)
+	if len(keep) == 0 {
+		w.ops.Log("vfs pulled delete %s", server)
+		w.report("delete-local", w.remoteFor(full), nil)
+		w.dropFileID(server)
+		return false
+	}
+	w.ops.Log("vfs %s is gone from the server, but %d file(s) in it hold changes this PC never sent: kept and sending them", server, len(keep))
+	w.uploadAfterSuppression(keep...)
+	return true
+}
+
+// recordFileIDs records several fileids in one write (see Ops.RecordFileIDs).
+func (w *Watcher) recordFileIDs(m map[string]string) {
+	if len(m) == 0 {
+		return
+	}
+	if w.ops.RecordFileIDs != nil {
+		w.ops.RecordFileIDs(m)
+		return
+	}
+	for k, v := range m {
+		w.recordFileID(k, v)
+	}
+}
+
+// moveFileIDs carries fileids across a rename (see Ops.MoveFileIDs).
+func (w *Watcher) moveFileIDs(pairs [][2]string) {
+	if w.ops.MoveFileIDs != nil {
+		w.ops.MoveFileIDs(pairs)
+		return
+	}
+	for _, p := range pairs {
+		if fid, ok := w.fileIDFor(p[0]); ok && p[0] != p[1] {
+			w.recordFileID(p[1], fid)
+			w.dropFileID(p[0])
+		}
 	}
 }
 
@@ -2298,6 +2399,38 @@ func (w *Watcher) hydratePinned(path string) {
 	}
 }
 
+// retryNowWindow spreads the retries retryNow brings forward, so a long
+// outage's worth of queued uploads doesn't hit the server in one burst (a var
+// so tests can shrink it).
+var retryNowWindow = 10 * time.Second
+
+// retryNow brings every upload and delete that is waiting in a failure backoff
+// forward to within retryNowWindow, spread evenly. Called when the server is
+// reachable again after an outage (Deck #991). Their backoff counts are kept:
+// one that fails again for another reason backs off from where it was.
+func (w *Watcher) retryNow() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var ups, dels []*time.Timer
+	for p, t := range w.upload {
+		if w.attempts[strings.ToLower(p)] > 0 {
+			ups = append(ups, t)
+		}
+	}
+	for p, t := range w.delete {
+		if w.delAttempts[strings.ToLower(p)] > 0 {
+			dels = append(dels, t)
+		}
+	}
+	all := append(ups, dels...)
+	for i, t := range all {
+		t.Reset(retryNowWindow * time.Duration(i+1) / time.Duration(len(all)+1))
+	}
+	if len(all) > 0 {
+		w.ops.Log("vfs server reachable again: retrying %d upload(s) and %d delete(s) now", len(ups), len(dels))
+	}
+}
+
 // retryLater re-arms a failed server op with per-path exponential backoff.
 func (w *Watcher) retryLater(path, key string) {
 	w.mu.Lock()
@@ -2884,6 +3017,23 @@ func (w *Watcher) moveInFlightOrAbove(path string) bool {
 	return false
 }
 
+// moveKind is the activity kind for a completed move between two server
+// paths: "rename" when only the name changed (what Nextcloud's own activity
+// calls it), "move" when it went to another folder (Deck #987).
+func moveKind(from, to string) string {
+	parent := func(p string) string {
+		p = strings.Trim(p, "/")
+		if i := strings.LastIndex(p, "/"); i >= 0 {
+			return p[:i]
+		}
+		return ""
+	}
+	if strings.EqualFold(parent(from), parent(to)) {
+		return "rename"
+	}
+	return "move"
+}
+
 // finishRename records a rename the server now agrees with. src is the RAW
 // server path the item moved from.
 func (w *Watcher) finishRename(src, newPath, dst string) {
@@ -2891,7 +3041,7 @@ func (w *Watcher) finishRename(src, newPath, dst string) {
 	delete(w.mvAttempts, strings.ToLower(newPath))
 	w.mu.Unlock()
 	w.ops.Log("vfs moved %s -> %s", src, dst)
-	w.report("move", w.remoteFor(newPath), nil)
+	w.report(moveKind(src, dst), w.remoteFor(newPath), nil)
 	isDir := false
 	if fi, err := os.Lstat(newPath); err == nil {
 		isDir = fi.IsDir()
@@ -3141,9 +3291,33 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 	remote, err := w.ops.List(rel)
 	if err != nil {
 		w.ops.Log("vfs reconcile list %q: %v", rel, err)
+		if rel == "" {
+			w.serverDown = true
+		}
 		return false // unknown listing — never treat as "all deleted"
 	}
+	if rel == "" && w.serverDown {
+		// The root lists again after failing: the outage is over. Uploads and
+		// deletes that failed during it sit in a backoff of up to half an
+		// hour; without this they wait it out (Deck #991).
+		w.serverDown = false
+		w.retryNow()
+	}
 	remote = w.dropUnholdable(rel, remote)
+	// Folder fileids, so a server-side rename of a folder can be recognised
+	// later (Deck #986; files have long had theirs). Only what is missing or
+	// changed is written, in one batch: the store persists its whole file per
+	// call, and the first pass after an update lists every folder.
+	dirFIDs := map[string]string{}
+	for _, r := range remote {
+		if !r.IsDir || r.FileID == "" {
+			continue
+		}
+		if cur, ok := w.fileIDFor(string(r.Identity)); !ok || cur != r.FileID {
+			dirFIDs[string(r.Identity)] = r.FileID
+		}
+	}
+	w.recordFileIDs(dirFIDs)
 	// nameKey normalises a name for MATCHING only — never for an actual operation,
 	// which always uses the name verbatim. Windows filenames are case-insensitive,
 	// so a server entry differing only in case IS the local file; matching it
@@ -3179,8 +3353,14 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		}
 	}
 	addByFileID := map[string]cfapi.PlaceholderInfo{}
+	addDirByFileID := map[string]cfapi.PlaceholderInfo{}
 	for _, r := range remote {
-		if !r.IsDir && r.FileID != "" && !localByName[nameKey(r.Name)] {
+		if r.FileID == "" || localByName[nameKey(r.Name)] {
+			continue
+		}
+		if r.IsDir {
+			addDirByFileID[r.FileID] = r
+		} else {
 			addByFileID[r.FileID] = r
 		}
 	}
@@ -3352,8 +3532,32 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 						}
 					}
 				}
+			} else if fid, ok := w.fileIDFor(w.serverFor(full, true)); ok {
+				// The same for a FOLDER (Deck #986): renamed on the server,
+				// it was deleted here and its contents fetched again, unsent
+				// edits inside it lost. It is renamed here instead, contents
+				// and all, and its new path is reconciled in this pass.
+				if y, isRename := addDirByFileID[fid]; isRename && !consumed[nameKey(y.Name)] {
+					if w.pullDirRename(localDir, full, y, fid) {
+						consumed[nameKey(y.Name)] = true
+						child := y.Name
+						if rel != "" {
+							child = rel + "/" + y.Name
+						}
+						subdirs = append(subdirs, subdir{rel: child, etag: y.ETag})
+						continue
+					}
+				}
 			}
-			// Not a rename — propagate the server-side delete locally.
+			// Not a rename — propagate the server-side delete locally. A
+			// folder is pruned, not removed whole: a file in it with changes
+			// this PC never sent is kept and sent (Deck #986).
+			if ch.IsDir {
+				if w.pruneVanished(full) {
+					dirOK = false // look again once the kept files are up
+				}
+				continue
+			}
 			w.suppressDelete(full)
 			if rerr := os.RemoveAll(full); rerr != nil {
 				w.ops.Log("vfs reconcile remove %s: %v", name, rerr)
@@ -3653,7 +3857,11 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 				// name. Not in a pinned folder: its files are about to be
 				// downloaded, and the download reports itself.
 				if !pinned {
-					w.report("download", w.localName(string(r.Identity)), nil)
+					kind := "download"
+					if r.IsDir {
+						kind = "mkdir-local" // nothing was downloaded: "New folder" (Deck #987)
+					}
+					w.report(kind, w.localName(string(r.Identity)), nil)
 				}
 			}
 			w.recordBaselines(base)

@@ -86,6 +86,11 @@ type Ops struct {
 	RecordFileID func(remotePath, fileid string)
 	FileID       func(remotePath string) (string, bool)
 	DropFileID   func(remotePath string)
+	// RecordFileIDs records several at once (one write: the store persists its
+	// whole file per call), and MoveFileIDs carries them across a rename
+	// (pairs of old, new remote path). Nil falls back to the one-item hooks.
+	RecordFileIDs func(fileidByRemotePath map[string]string)
+	MoveFileIDs   func(pairs [][2]string)
 	// MountRoot reports whether a RAW server path was, when last listed, the
 	// ROOT of a share received from someone else or of a mount (Deck #557).
 	// Such a path vanishing from a listing means it was detached from the

@@ -623,6 +623,8 @@ type recorder struct {
 
 	logs []string // Ops.Log lines (formatted)
 
+	fileidBatches int // Ops.RecordFileIDs calls
+
 	// unholdable records Ops.Unholdable calls as (parent, child) pairs; a
 	// clean listing is recorded as (parent, "").
 	unholdable [][2]string
@@ -920,6 +922,24 @@ func (r *recorder) ops() Ops {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			delete(r.fileids, remote)
+		},
+		RecordFileIDs: func(m map[string]string) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.fileidBatches++
+			for k, v := range m {
+				r.fileids[k] = v
+			}
+		},
+		MoveFileIDs: func(pairs [][2]string) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			for _, p := range pairs {
+				if v, ok := r.fileids[p[0]]; ok {
+					r.fileids[p[1]] = v
+					delete(r.fileids, p[0])
+				}
+			}
 		},
 	}
 }
@@ -3653,9 +3673,18 @@ func TestDeleteDuringUploadCancelsIt(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("delete never reached the server")
 	}
-	rec.mu.Lock()
-	cancelled := len(rec.cancelled)
-	rec.mu.Unlock()
+	// The cancelled upload records itself on its own goroutine, which can run
+	// after the DELETE lands: wait for it rather than read the count at once
+	// (it failed this way under load).
+	cancelled := 0
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		rec.mu.Lock()
+		cancelled = len(rec.cancelled)
+		rec.mu.Unlock()
+		if cancelled != 0 {
+			break
+		}
+	}
 	if cancelled != 1 {
 		t.Fatalf("in-flight upload not cancelled by the delete (cancelled=%d)", cancelled)
 	}

@@ -1466,12 +1466,14 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		fids := make(map[string]string, len(items))
 		keys := make(map[string]string, len(items))
 		for _, it := range items {
+			// Folders' fileids too, so a server rename of one is recognised
+			// later rather than read as a delete (Deck #986).
+			if it.FileID != "" {
+				fids[string(it.Identity)] = it.FileID
+			}
 			if !it.IsDir {
 				base[string(it.Identity)] = it.ETag
 				keys[string(it.Identity)] = transport.ContentKey(it.Size, it.ModTime, it.UploadTime)
-				if it.FileID != "" {
-					fids[string(it.Identity)] = it.FileID
-				}
 			}
 		}
 		etags.setMany(base)
@@ -1586,6 +1588,8 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			RecordFileID:    func(remote, fid string) { fileids.set(remote, fid) },
 			FileID:          func(remote string) (string, bool) { f := fileids.get(remote); return f, f != "" },
 			DropFileID:      func(remote string) { fileids.del(remote) },
+			RecordFileIDs:   func(m map[string]string) { fileids.setMany(m) },
+			MoveFileIDs:     func(pairs [][2]string) { fileids.moveMany(pairs) },
 			MountRoot:       func(remote string) bool { return mountroots.get(remote) != "" },
 			// A vanished share's salvaged copy (Deck #557): park it beside the
 			// sync folder and tell the user. The watcher then calls Forget; the
