@@ -735,6 +735,18 @@ export function NotificationsEnabled() {
 }
 
 /**
+ * NowStatus is the flyout's status line and the Status window's "Right now".
+ * The windows call it on every "now" event, so the attention counts (which
+ * read files) come from a cache at most two seconds old.
+ * @returns {$CancellablePromise<$models.NowStatusDTO>}
+ */
+export function NowStatus() {
+    return $Call.ByID(964228537).then(/** @type {($result: any) => any} */(($result) => {
+        return $$createType35($result);
+    }));
+}
+
+/**
  * OnDemandSupported reports whether on-demand files can be configured here.
  * @returns {$CancellablePromise<boolean>}
  */
@@ -842,7 +854,7 @@ export function OpenVersions(remotePath) {
  */
 export function OtherAccountAttention() {
     return $Call.ByID(3107861882).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType36($result);
+        return $$createType37($result);
     }));
 }
 
@@ -861,7 +873,7 @@ export function PauseFor(minutes) {
  */
 export function PauseInfo() {
     return $Call.ByID(3615706181).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType37($result);
+        return $$createType38($result);
     }));
 }
 
@@ -906,7 +918,7 @@ export function PinApp(id) {
  */
 export function PolicyInfo() {
     return $Call.ByID(4136447139).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType38($result);
+        return $$createType39($result);
     }));
 }
 
@@ -916,7 +928,7 @@ export function PolicyInfo() {
  */
 export function Progress() {
     return $Call.ByID(1801045022).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType39($result);
+        return $$createType40($result);
     }));
 }
 
@@ -936,7 +948,7 @@ export function Quit() {
  */
 export function RecentActivity() {
     return $Call.ByID(3561310187).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType41($result);
+        return $$createType42($result);
     }));
 }
 
@@ -1098,7 +1110,7 @@ export function SaveLocalAddress(addr, pin) {
  */
 export function Search(term) {
     return $Call.ByID(3097496321, term).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType43($result);
+        return $$createType44($result);
     }));
 }
 
@@ -1360,7 +1372,7 @@ export function SetVerbose(on) {
  */
 export function ShareList() {
     return $Call.ByID(427148648).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType45($result);
+        return $$createType46($result);
     }));
 }
 
@@ -1458,7 +1470,7 @@ export function SignInSomeoneElse() {
  */
 export function SignInTarget() {
     return $Call.ByID(2489164518).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType46($result);
+        return $$createType47($result);
     }));
 }
 
@@ -1536,7 +1548,7 @@ export function TailLog() {
  */
 export function TestLocalAddress(addr, pin) {
     return $Call.ByID(176774928, addr, pin).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType47($result);
+        return $$createType48($result);
     }));
 }
 
@@ -1563,7 +1575,7 @@ export function TogglePause() {
  */
 export function TrashList() {
     return $Call.ByID(2716350569).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType49($result);
+        return $$createType50($result);
     }));
 }
 
@@ -1610,7 +1622,7 @@ export function Version() {
  */
 export function VersionList() {
     return $Call.ByID(3868762695).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType51($result);
+        return $$createType52($result);
     }));
 }
 
@@ -1658,20 +1670,21 @@ const $$createType31 = $models.AccountEntryDTO.createFrom;
 const $$createType32 = $Create.Array($$createType31);
 const $$createType33 = $models.NotifItem.createFrom;
 const $$createType34 = $Create.Array($$createType33);
-const $$createType35 = $models.OtherAttention.createFrom;
-const $$createType36 = $Create.Array($$createType35);
-const $$createType37 = $models.PauseDTO.createFrom;
-const $$createType38 = $models.PolicyDTO.createFrom;
-const $$createType39 = $models.ProgressDTO.createFrom;
-const $$createType40 = $models.ActivityItem.createFrom;
-const $$createType41 = $Create.Array($$createType40);
-const $$createType42 = $models.SearchItem.createFrom;
-const $$createType43 = $Create.Array($$createType42);
-const $$createType44 = $models.ShareDTO.createFrom;
-const $$createType45 = $Create.Array($$createType44);
-const $$createType46 = $models.SignInTargetDTO.createFrom;
-const $$createType47 = $models.LocalTestDTO.createFrom;
-const $$createType48 = $models.TrashDTO.createFrom;
-const $$createType49 = $Create.Array($$createType48);
-const $$createType50 = $models.VersionDTO.createFrom;
-const $$createType51 = $Create.Array($$createType50);
+const $$createType35 = $models.NowStatusDTO.createFrom;
+const $$createType36 = $models.OtherAttention.createFrom;
+const $$createType37 = $Create.Array($$createType36);
+const $$createType38 = $models.PauseDTO.createFrom;
+const $$createType39 = $models.PolicyDTO.createFrom;
+const $$createType40 = $models.ProgressDTO.createFrom;
+const $$createType41 = $models.ActivityItem.createFrom;
+const $$createType42 = $Create.Array($$createType41);
+const $$createType43 = $models.SearchItem.createFrom;
+const $$createType44 = $Create.Array($$createType43);
+const $$createType45 = $models.ShareDTO.createFrom;
+const $$createType46 = $Create.Array($$createType45);
+const $$createType47 = $models.SignInTargetDTO.createFrom;
+const $$createType48 = $models.LocalTestDTO.createFrom;
+const $$createType49 = $models.TrashDTO.createFrom;
+const $$createType50 = $Create.Array($$createType49);
+const $$createType51 = $models.VersionDTO.createFrom;
+const $$createType52 = $Create.Array($$createType51);

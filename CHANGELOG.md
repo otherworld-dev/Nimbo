@@ -10,8 +10,8 @@ All notable changes to Nimbo are recorded here. The format follows
 - Large files (64 MB or more) sync two at a time per account, alongside the rest of
   the sync, and have a tab of their own: Status → Large files lists each one
   running with its progress, waiting with its place in the queue, paused, or set
-  aside with when it's due back. The flyout shows a line while any are syncing,
-  waiting or set aside, and clicking it opens the tab. "Sync first" moves a
+  aside with when it's due back. The flyout's status line mentions them while any
+  are syncing, waiting or set aside. "Sync first" moves a
   waiting file to the front of the queue, it never interrupts one that's already
   running. "Set aside" stops one for an hour, four hours, until tomorrow at 8am, or
   until you bring it back yourself, so a file that keeps failing or is crawling
@@ -21,8 +21,8 @@ All notable changes to Nimbo are recorded here. The format follows
 - When setting up Nimbo on a new computer you can choose folders to download first,
   so the folder you need today doesn't end up last behind hundreds of GB. The
   setup window has a "Choose folders to download first" link under Synchronize
-  everything, and while the first sync runs there is a line in the flyout and a
-  First sync tab in Status to choose, change or clear them. Chosen folders are
+  everything, and while the first sync runs the flyout's status line offers it
+  (clicking opens the First sync tab in Status) to choose, change or clear them. Chosen folders are
   listed and downloaded before everything else, even one deep inside a bigger
   folder, a change counts straight away, and the choice is kept if Nimbo is
   restarted part way through (#766).
@@ -45,6 +45,20 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ### Changed
 
+- The flyout says what Nimbo is doing right now, in one line under your account:
+  the file it is uploading or downloading with a progress bar, "Checking folders…"
+  while it looks for changes, "Can't reach the server" with how many changes are
+  waiting, Paused, or "Up to date" with when it last finished checking everything.
+  Anything that needs you (conflicts, files that can't sync, folders no longer
+  shared) takes the line over in amber, and clicking the line opens the matching
+  tab. The tray icon and its tooltip follow the same line. Status → Activity now
+  starts with a "Right now" list of every upload, download and folder check in
+  progress, with the full path and progress, and the history below it is headed
+  "Earlier". The flyout is tidier as a result: the separate bars for items that
+  need you, files in use, large files and the first sync are gone (their details
+  now show on the status line's second line), each recent item is one line, and
+  your Nextcloud status ("Online" and so on) has moved into the menu you get by
+  clicking your account name. Your Appearance settings all still apply (#988).
 - The first time this version runs, Nimbo checks every folder in each of your sync
   folders once. Earlier versions could leave a file out for good if its download
   failed during the first sync, and this is how the ones already missing are

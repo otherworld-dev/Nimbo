@@ -29,3 +29,6 @@ func (*Watcher) NotifyRenamed(string, string) {}
 
 // SyncFirst does nothing off Windows.
 func (*Watcher) SyncFirst(string) SyncFirstResult { return SyncFirstResult{} }
+
+// Now reports nothing off Windows.
+func (*Watcher) Now() WatcherNow { return WatcherNow{} }

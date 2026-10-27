@@ -2,16 +2,44 @@ package vfs
 
 import (
 	"context"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/cfapi"
 )
 
+// WatcherNow is a snapshot of what the on-demand watcher is doing right now.
+type WatcherNow struct {
+	Uploading []string // absolute local paths being uploaded
+	Hydrating []string // absolute local paths being downloaded (keep on this device)
+	Queued    int      // downloads waiting for a worker
+	Checking  bool     // a reconcile pass is running
+	// CheckingSince is when the running pass started (zero when none runs),
+	// so a routine sub-second pass can be kept off the status line.
+	CheckingSince time.Time
+	DirsChecked   int    // folders listed so far by the running (or last) pass
+	Folder        string // sync-root-relative folder most recently listed
+	LastFullCheck time.Time
+	// CheckIncomplete: the last pass did not reach everywhere (server down,
+	// folders owed a sweep, cancelled), so LastFullCheck is older than it.
+	CheckIncomplete bool
+	// ServerDown: the last root listing failed (the server is unreachable);
+	// cleared when the root lists again.
+	ServerDown bool
+	// Pending counts the uploads waiting to start: debounced, waiting out a
+	// failure backoff, or held by a pause (each path once).
+	Pending int
+}
+
 // Ops are the server-side actions the watcher performs (backed by the engine).
 type Ops struct {
-	Upload func(ctx context.Context, localPath, remotePath string) error
-	Mkdir  func(ctx context.Context, remotePath string) error
-	Delete func(ctx context.Context, remotePath string) error
-	Move   func(ctx context.Context, srcRemote, dstRemote string) error
+	// Changed is called when an upload, a hydration or a reconcile pass starts
+	// or ends, so the GUI can refresh its status. It must be cheap and is never
+	// called with the watcher's lock held. Nil is fine.
+	Changed func()
+	Upload  func(ctx context.Context, localPath, remotePath string) error
+	Mkdir   func(ctx context.Context, remotePath string) error
+	Delete  func(ctx context.Context, remotePath string) error
+	Move    func(ctx context.Context, srcRemote, dstRemote string) error
 	// List returns the children of a sync-root-relative directory ("" = root)
 	// as placeholders, for down-sync reconciliation. A non-nil error means the
 	// listing is unknown (e.g. a network failure) and must NOT be treated as an

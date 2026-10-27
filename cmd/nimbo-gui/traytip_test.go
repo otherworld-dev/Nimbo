@@ -3,20 +3,19 @@ package main
 import "testing"
 
 // The tray tooltip names the app and says what it is doing, the way OneDrive's
-// does, rather than the bare name (GitHub #9 follow-up).
+// does, rather than the bare name (GitHub #9 follow-up). The second line is
+// the flyout's status line (Deck #988).
 func TestTrayTooltip(t *testing.T) {
 	for _, tc := range []struct {
-		status string
-		paused bool
-		want   string
+		line string
+		want string
 	}{
-		{"Syncing…", false, "Nimbo\nSyncing…"},
-		{"Up to date", false, "Nimbo\nUp to date"},
-		{"  ", false, "Nimbo"},
-		{"Syncing…", true, "Nimbo\nPaused"},
+		{"Uploading Survey-North.tif", "Nimbo\nUploading Survey-North.tif"},
+		{"Up to date", "Nimbo\nUp to date"},
+		{"  ", "Nimbo"},
 	} {
-		if got := trayTooltip("Nimbo", tc.status, tc.paused); got != tc.want {
-			t.Errorf("trayTooltip(%q, paused=%v) = %q, want %q", tc.status, tc.paused, got, tc.want)
+		if got := trayTooltip("Nimbo", tc.line); got != tc.want {
+			t.Errorf("trayTooltip(%q) = %q, want %q", tc.line, got, tc.want)
 		}
 	}
 }

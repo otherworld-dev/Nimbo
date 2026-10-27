@@ -1638,6 +1638,223 @@ export class NotifItem {
 }
 
 /**
+ * NowCheckDTO is a folder check (scan or reconcile pass) in progress.
+ */
+export class NowCheckDTO {
+    /**
+     * Creates a new NowCheckDTO instance.
+     * @param {Partial<NowCheckDTO>} [$$source = {}] - The source object to create the NowCheckDTO.
+     */
+    constructor($$source = {}) {
+        if (!("account" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["account"] = "";
+        }
+        if (!("folder" in $$source)) {
+            /**
+             * the folder being listed now, "" when unknown
+             * @member
+             * @type {string}
+             */
+            this["folder"] = "";
+        }
+        if (!("dirs" in $$source)) {
+            /**
+             * folders listed so far
+             * @member
+             * @type {number}
+             */
+            this["dirs"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new NowCheckDTO instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {NowCheckDTO}
+     */
+    static createFrom($$source = {}) {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new NowCheckDTO(/** @type {Partial<NowCheckDTO>} */($$parsedSource));
+    }
+}
+
+/**
+ * NowJobDTO is one transfer in flight (or queued), for "Right now".
+ */
+export class NowJobDTO {
+    /**
+     * Creates a new NowJobDTO instance.
+     * @param {Partial<NowJobDTO>} [$$source = {}] - The source object to create the NowJobDTO.
+     */
+    constructor($$source = {}) {
+        if (!("account" in $$source)) {
+            /**
+             * login; "" with a single account
+             * @member
+             * @type {string}
+             */
+            this["account"] = "";
+        }
+        if (!("kind" in $$source)) {
+            /**
+             * "upload" | "download"
+             * @member
+             * @type {string}
+             */
+            this["kind"] = "";
+        }
+        if (!("path" in $$source)) {
+            /**
+             * account-relative, slash-separated
+             * @member
+             * @type {string}
+             */
+            this["path"] = "";
+        }
+        if (!("size" in $$source)) {
+            /**
+             * 0 = unknown
+             * @member
+             * @type {number}
+             */
+            this["size"] = 0;
+        }
+        if (!("sent" in $$source)) {
+            /**
+             * @member
+             * @type {number}
+             */
+            this["sent"] = 0;
+        }
+        if (!("large" in $$source)) {
+            /**
+             * @member
+             * @type {boolean}
+             */
+            this["large"] = false;
+        }
+        if (!("state" in $$source)) {
+            /**
+             * "running" | "waiting" | "paused" | "setaside"
+             * @member
+             * @type {string}
+             */
+            this["state"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new NowJobDTO instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {NowJobDTO}
+     */
+    static createFrom($$source = {}) {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new NowJobDTO(/** @type {Partial<NowJobDTO>} */($$parsedSource));
+    }
+}
+
+/**
+ * NowStatusDTO is the composed status line and the detail behind it.
+ */
+export class NowStatusDTO {
+    /**
+     * Creates a new NowStatusDTO instance.
+     * @param {Partial<NowStatusDTO>} [$$source = {}] - The source object to create the NowStatusDTO.
+     */
+    constructor($$source = {}) {
+        if (!("state" in $$source)) {
+            /**
+             * "attention" | "paused" | "offline" | "busy" | "idle"
+             * @member
+             * @type {string}
+             */
+            this["state"] = "";
+        }
+        if (!("main" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["main"] = "";
+        }
+        if (!("sub" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["sub"] = "";
+        }
+        if (!("progress" in $$source)) {
+            /**
+             * 0..1, -1 = none
+             * @member
+             * @type {number}
+             */
+            this["progress"] = 0;
+        }
+        if (!("tab" in $$source)) {
+            /**
+             * Status tab a click opens
+             * @member
+             * @type {string}
+             */
+            this["tab"] = "";
+        }
+        if (!("jobs" in $$source)) {
+            /**
+             * @member
+             * @type {NowJobDTO[]}
+             */
+            this["jobs"] = [];
+        }
+        if (!("checking" in $$source)) {
+            /**
+             * @member
+             * @type {NowCheckDTO[]}
+             */
+            this["checking"] = [];
+        }
+        if (!("lastCheck" in $$source)) {
+            /**
+             * RFC3339, "" = none yet
+             * @member
+             * @type {string}
+             */
+            this["lastCheck"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new NowStatusDTO instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {NowStatusDTO}
+     */
+    static createFrom($$source = {}) {
+        const $$createField5_0 = $$createType7;
+        const $$createField6_0 = $$createType9;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("jobs" in $$parsedSource) {
+            $$parsedSource["jobs"] = $$createField5_0($$parsedSource["jobs"]);
+        }
+        if ("checking" in $$parsedSource) {
+            $$parsedSource["checking"] = $$createField6_0($$parsedSource["checking"]);
+        }
+        return new NowStatusDTO(/** @type {Partial<NowStatusDTO>} */($$parsedSource));
+    }
+}
+
+/**
  * OfflineEntry is one folder in the "available offline" browser.
  */
 export class OfflineEntry {
@@ -2026,7 +2243,7 @@ export class ProgressDTO {
      * @returns {ProgressDTO}
      */
     static createFrom($$source = {}) {
-        const $$createField9_0 = $$createType7;
+        const $$createField9_0 = $$createType11;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("clones" in $$parsedSource) {
             $$parsedSource["clones"] = $$createField9_0($$parsedSource["clones"]);
@@ -2583,5 +2800,9 @@ const $$createType2 = LockDTO.createFrom;
 const $$createType3 = $Create.Array($$createType2);
 const $$createType4 = NotifAction.createFrom;
 const $$createType5 = $Create.Array($$createType4);
-const $$createType6 = CloneRunDTO.createFrom;
+const $$createType6 = NowJobDTO.createFrom;
 const $$createType7 = $Create.Array($$createType6);
+const $$createType8 = NowCheckDTO.createFrom;
+const $$createType9 = $Create.Array($$createType8);
+const $$createType10 = CloneRunDTO.createFrom;
+const $$createType11 = $Create.Array($$createType10);

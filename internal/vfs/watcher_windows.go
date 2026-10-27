@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -129,6 +130,18 @@ type Watcher struct {
 	hydrateFirst     []string
 	hydrateFirstWake chan struct{}
 	hydrating        map[string]bool
+	// now* back Now(): the paths with an upload / download running right now
+	// (lower-cased key -> path), the folders the current pass has listed, the
+	// folder it listed last, and the outcome of the last pass. Guarded by mu
+	// except the atomics; the maps are created on first use.
+	nowUploading  map[string]string
+	nowHydrating  map[string]string
+	nowChecking   atomic.Bool
+	nowDirs       atomic.Int64
+	nowFolder     string
+	nowSince      time.Time // when the running pass started; zero between passes
+	nowLastFull   time.Time
+	nowIncomplete bool
 	// hydrateFails/hydrateNext back off a repeatedly-failing hydration (a
 	// server outage, a file the server has since deleted) so reconcile
 	// doesn't retry and re-report it on every pass; both keyed lower-cased,
@@ -179,6 +192,8 @@ type Watcher struct {
 	firstPassDone bool // a full (skip-free) pass has completed since start
 	fullSweep     bool // the running pass ignores the ETag subtree skip
 	serverDown    bool // the last root listing failed (see retryNow)
+	// nowServerDown mirrors serverDown for Now, which must not wait on reconMu.
+	nowServerDown atomic.Bool
 	// sweepOwed holds the folders (sync-root-relative) a full sweep could not
 	// reconcile. Each is swept in full whenever a pass reaches it, until it
 	// succeeds, instead of the whole account being swept again on every pass
@@ -2124,7 +2139,10 @@ func (w *Watcher) handleChange(path string) {
 			w.hold(path, forced)
 			return
 		}
-		if err := w.ops.Upload(uctx, path, server); err != nil {
+		w.nowStart(&w.nowUploading, key, path)
+		uerr := w.ops.Upload(uctx, path, server)
+		w.nowEnd(&w.nowUploading, key)
+		if err := uerr; err != nil {
 			switch {
 			case errors.Is(err, ErrHeldByLock):
 				// Somebody else has the file locked. Re-arm rather than report:
@@ -2373,6 +2391,20 @@ func (w *Watcher) hydratePinned(path string) {
 	if backedOff || w.ctx.Err() != nil {
 		return
 	}
+	if !cfPinnedDehydrated(path) {
+		// Nothing to download (unpinned or already here meanwhile): as
+		// cfHydrateIfPinned answering false, without ever listing it as a
+		// download in progress.
+		w.mu.Lock()
+		delete(w.hydrateFails, key)
+		delete(w.hydrateNext, key)
+		w.mu.Unlock()
+		return
+	}
+	// Listed only now it really downloads, so a skipped one never flashes
+	// up as "Downloading" (Deck #988 review).
+	w.nowStart(&w.nowHydrating, key, path)
+	defer w.nowEnd(&w.nowHydrating, key)
 	remote := w.remoteFor(path)
 	ok, err := cfHydrateIfPinned(path)
 	if err != nil {
@@ -3200,7 +3232,25 @@ func (w *Watcher) reconcilePass() {
 	// another reason (the root itself, a cancelled context) is repeated.
 	w.fullSweep = !w.firstPassDone || w.lostEvents.Swap(false)
 	marks := w.owedMarks
+	w.nowDirs.Store(0)
+	w.mu.Lock()
+	w.nowSince = time.Now()
+	w.mu.Unlock()
+	w.nowChecking.Store(true)
+	w.changed()
 	ok := w.reconcileDir("", "")
+	// Complete: the root listed, nothing is owed a sweep and the server is
+	// reachable. Subtrees skipped on an unchanged ETag count as checked.
+	complete := ok && w.ctx.Err() == nil && !w.serverDown && len(w.sweepOwed) == 0
+	w.mu.Lock()
+	w.nowIncomplete = !complete
+	if complete {
+		w.nowLastFull = time.Now()
+	}
+	w.nowSince = time.Time{}
+	w.mu.Unlock()
+	w.nowChecking.Store(false)
+	w.changed()
 	if w.fullSweep && w.ctx.Err() == nil && (ok || w.owedMarks > marks) {
 		w.firstPassDone = true
 	}
@@ -3288,11 +3338,16 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 			pinFill = true
 		}
 	}
+	w.nowDirs.Add(1)
+	w.mu.Lock()
+	w.nowFolder = rel
+	w.mu.Unlock()
 	remote, err := w.ops.List(rel)
 	if err != nil {
 		w.ops.Log("vfs reconcile list %q: %v", rel, err)
 		if rel == "" {
 			w.serverDown = true
+			w.nowServerDown.Store(true)
 		}
 		return false // unknown listing — never treat as "all deleted"
 	}
@@ -3301,6 +3356,7 @@ func (w *Watcher) reconcileDir(rel, knownETag string) bool {
 		// deletes that failed during it sit in a backoff of up to half an
 		// hour; without this they wait it out (Deck #991).
 		w.serverDown = false
+		w.nowServerDown.Store(false)
 		w.retryNow()
 	}
 	remote = w.dropUnholdable(rel, remote)
@@ -4104,4 +4160,63 @@ func (w *Watcher) salvage(full string) (kept bool, err error) {
 		}
 	}
 	return kept, nil
+}
+
+// changed tells the owner that something Now() reports has moved. Never call
+// it with w.mu held.
+func (w *Watcher) changed() {
+	if w.ops.Changed != nil {
+		w.ops.Changed()
+	}
+}
+
+// nowStart and nowEnd record a path in one of the Now() maps around a transfer.
+func (w *Watcher) nowStart(m *map[string]string, key, path string) {
+	w.mu.Lock()
+	if *m == nil {
+		*m = map[string]string{}
+	}
+	(*m)[key] = path
+	w.mu.Unlock()
+	w.changed()
+}
+
+func (w *Watcher) nowEnd(m *map[string]string, key string) {
+	w.mu.Lock()
+	delete(*m, key)
+	w.mu.Unlock()
+	w.changed()
+}
+
+// Now is a snapshot of the uploads, downloads and reconcile pass in progress.
+func (w *Watcher) Now() WatcherNow {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := WatcherNow{
+		Queued:          len(w.hydrateFirst) + len(w.hydratePending),
+		Checking:        w.nowChecking.Load() && !w.nowSince.IsZero(),
+		CheckingSince:   w.nowSince,
+		DirsChecked:     int(w.nowDirs.Load()),
+		Folder:          w.nowFolder,
+		LastFullCheck:   w.nowLastFull,
+		CheckIncomplete: w.nowIncomplete,
+		ServerDown:      w.nowServerDown.Load(),
+	}
+	pending := make(map[string]bool, len(w.upload)+len(w.held))
+	for p := range w.upload {
+		pending[strings.ToLower(p)] = true
+	}
+	for k := range w.held {
+		pending[k] = true
+	}
+	n.Pending = len(pending)
+	for _, p := range w.nowUploading {
+		n.Uploading = append(n.Uploading, p)
+	}
+	for _, p := range w.nowHydrating {
+		n.Hydrating = append(n.Hydrating, p)
+	}
+	sort.Strings(n.Uploading)
+	sort.Strings(n.Hydrating)
+	return n
 }

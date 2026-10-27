@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { kindLabel } from "./kinds";
+  import { kindIcon, kindLabel } from "./kinds";
   import { Events } from "@wailsio/runtime";
   import { App } from "../bindings/github.com/otherworld/nimbo/cmd/nimbo-gui";
   import { ask, tell, askText } from "./dialogs.svelte";
@@ -241,6 +241,69 @@
   Events.On("detached", loadDetached);
   Events.On("lane", loadLaneSoon);
 
+  // "Right now": every job in progress, in full (Deck #988).
+  type NowJob = { account: string; kind: string; path: string; size: number; sent: number; large: boolean; state: string };
+  type NowCheck = { account: string; folder: string; dirs: number };
+  type Now = { jobs: NowJob[]; checking: NowCheck[] };
+  let now = $state<Now>({ jobs: [], checking: [] });
+  // Speed comes from two samples of the same job at least 2 s apart; between
+  // samples the last figure is kept so it doesn't flicker.
+  const samples = new Map<string, { t: number; sent: number; rate: number }>();
+  let rates = $state<Record<string, number>>({});
+  const jobKey = (j: NowJob) => j.account + NL + j.kind + NL + j.path;
+  // Calls can overlap (a "now" event during a slow one): only the latest
+  // answer is drawn or sampled for speed, and a failed call changes nothing.
+  let nowSeq = 0;
+  async function loadNow() {
+    const seq = ++nowSeq;
+    let n: Now;
+    try {
+      n = ((await App.NowStatus()) as unknown as Now | null) ?? { jobs: [], checking: [] };
+    } catch { return; }
+    if (seq !== nowSeq) return;
+    const t = Date.now(), live = new Set<string>(), next: Record<string, number> = {};
+    for (const j of n.jobs ?? []) {
+      const k = jobKey(j); live.add(k);
+      const s = samples.get(k);
+      if (j.state !== "running" || j.size <= 0) { samples.delete(k); continue; }
+      if (!s || j.sent < s.sent) { samples.set(k, { t, sent: j.sent, rate: 0 }); continue; }
+      if (t - s.t >= 2000) {
+        s.rate = (j.sent - s.sent) * 1000 / (t - s.t);
+        s.t = t; s.sent = j.sent;
+      }
+      if (s.rate > 0) next[k] = s.rate;
+    }
+    for (const k of [...samples.keys()]) if (!live.has(k)) samples.delete(k);
+    rates = next;
+    now = { jobs: n.jobs ?? [], checking: n.checking ?? [] };
+  }
+  const nowAccounts = $derived(new Set([...now.jobs.map(j => j.account), ...now.checking.map(c => c.account)].filter(Boolean)));
+  const nowMulti = $derived(nowAccounts.size > 1);
+  const nowVerb = (k: string) => k === "upload" ? "Uploading" : k === "download" ? "Downloading" : kindLabel(k);
+  const nowState = (s: string) =>
+    s === "waiting" ? "Waiting" : s === "paused" ? "Paused" : s === "setaside" ? "Set aside" : "";
+  const jobPct = (j: NowJob) => j.size > 0 ? Math.max(0, Math.min(100, Math.floor(j.sent * 100 / j.size))) : 0;
+  function jobDetail(j: NowJob): string {
+    const parts: string[] = [];
+    const st = nowState(j.state);
+    parts.push(st || nowVerb(j.kind));
+    if (j.size > 0) {
+      parts.push(`${humanBytes(j.sent) === "—" ? "0 B" : humanBytes(j.sent)} of ${humanBytes(j.size)} (${jobPct(j)}%)`);
+      const r = rates[jobKey(j)];
+      if (r && !st) parts.push(`${humanBytes(r)}/s`);
+    }
+    return parts.join(" · ");
+  }
+  const fmtNum = (n: number) => n.toLocaleString("en-US");
+  function checkText(c: NowCheck): string {
+    let s = "Checking folders for changes";
+    if (c.dirs > 0) s += ` · ${fmtNum(c.dirs)}`;
+    if (c.folder) s += ` · now in ${c.folder}`;
+    return s;
+  }
+  loadNow();
+  Events.On("now", loadNow);
+
   const conflictDesc = (k: string) =>
     k === "deleted-locally" ? "You deleted this; it changed on the server."
     : k === "deleted-remotely" ? "Deleted on the server; you changed it here."
@@ -376,6 +439,27 @@
 
   <div class="body">
     {#if tab === "activity"}
+      <div class="nowhead">Right now</div>
+      {#if now.jobs.length === 0 && now.checking.length === 0}<p class="empty">Nothing in progress</p>{/if}
+      {#each now.checking as c}
+        <div class="nowrow">
+          <span class="ni">⟳</span>
+          <div class="nb">
+            <div class="np">{#if nowMulti && c.account}<span class="nacct">{c.account} · </span>{/if}{checkText(c)}</div>
+          </div>
+        </div>
+      {/each}
+      {#each now.jobs as j (jobKey(j))}
+        <div class="nowrow">
+          <span class="ni">{kindIcon(j.kind)}</span>
+          <div class="nb">
+            <div class="np">{#if nowMulti && j.account}<span class="nacct">{j.account} · </span>{/if}{j.path}</div>
+            <div class="ns">{jobDetail(j)}</div>
+            {#if j.size > 0}<div class="nbar"><div style:width="{jobPct(j)}%"></div></div>{/if}
+          </div>
+        </div>
+      {/each}
+      <div class="nowhead earlier">Earlier</div>
       {#if activity.length === 0}<p class="empty">Nothing yet.</p>{/if}
       {#each activity as e}
         <div class="line" class:hl={(e.path + NL + e.kind) === highlight}><span class="t">{e.time}</span>{#if e.account}<span class="acct">{e.account}</span>{/if}<span class="k">{kindLabel(e.kind)}</span><span class="p">{e.path}</span>{#if e.err}<span class="err">⚠ {e.err}</span>{/if}</div>
@@ -687,6 +771,16 @@
   .lanesub { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
   .lanesub .acct { color: var(--accent); border: 1px solid var(--border); border-radius: 8px; padding: 0 6px; }
   .lanebar { height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; margin: -4px 0 10px; }
+  .nowhead { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 0 0 6px; }
+  .nowhead.earlier { margin-top: 16px; }
+  .nowrow { display: flex; gap: 10px; padding: 6px 0; font-size: 13px; border-bottom: 1px solid var(--border-soft); }
+  .nowrow .ni { color: var(--accent); width: 16px; text-align: center; flex: none; }
+  .nowrow .nb { flex: 1; min-width: 0; }
+  .nowrow .np { overflow-wrap: anywhere; word-break: break-word; }
+  .nowrow .np .nacct { color: var(--muted); }
+  .nowrow .ns { font-size: 11.5px; color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .nbar { height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; margin-top: 4px; }
+  .nbar div { height: 100%; background: var(--accent); }
   .lanebar div { height: 100%; background: var(--accent); }
   .asidemenu { margin-top: 8px; }
   .frow { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0;

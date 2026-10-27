@@ -271,7 +271,7 @@ func (a *App) runAdoptConvert(ctx context.Context, m *odMount, plan vfs.Plan, di
 		}
 		return
 	}
-	m.watcher = w
+	a.setWatcher(m, w)
 	slog.Info("on-demand mount connected", "dir", dir, "remoteRoot", root)
 	if w != nil {
 		w.Poke() // placeholder the replaced stubs and anything server-only

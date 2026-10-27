@@ -107,7 +107,7 @@ func (a *App) scanRevert() string {
 		return revertError("Not signed in.")
 	}
 	dir := a.GetBaseDir()
-	if _, mounted := a.onDemandMounts[dir]; !mounted {
+	if a.mount(dir) == nil {
 		// Nothing mounted: a plain switch is all that's needed.
 		return revertError("")
 	}
@@ -142,7 +142,8 @@ func (a *App) revertAndSwitch() string {
 	pending := a.pendingRevert
 	a.pendingRevert = nil
 	dir := a.GetBaseDir()
-	m, mounted := a.onDemandMounts[dir]
+	m := a.mount(dir)
+	mounted := m != nil
 	// Mark BEFORE switching either way: the first live pass must not read an
 	// unpopulated folder as a user deletion (Deck #571).
 	if d, derr := config.Resolve(); derr == nil {
@@ -158,9 +159,9 @@ func (a *App) revertAndSwitch() string {
 	// closing it FIRST also stops reconcile creating new placeholders, which is
 	// why the pass re-scans below: the dialog's plan goes stale within minutes
 	// on a live mount (reconcile pulled ~1.8k new stubs while one sat open).
-	if m.watcher != nil {
-		m.watcher.Close()
-		m.watcher = nil
+	if w := a.watcherOf(m); w != nil {
+		w.Close()
+		a.setWatcher(m, nil)
 	}
 	slog.Info("leaving virtual files: reverting placeholders in the background", "dir", dir)
 	go a.runRevert(cctx, dir)

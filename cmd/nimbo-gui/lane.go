@@ -63,7 +63,7 @@ func setAsideUntil(now time.Time, minutes int) time.Time {
 // queue order, then set aside.
 func (a *App) LaneList() []LaneEntryDTO {
 	out := []LaneEntryDTO{}
-	multi := len(a.secondaries) > 0
+	multi := a.secondaryCount() > 0
 	a.eachEngine(func(e *agent.Engine) {
 		acct := ""
 		if multi {

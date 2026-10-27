@@ -227,7 +227,12 @@ func main() {
 			slog.Debug("could not re-anchor the flyout to the tray", "err", err)
 		}
 	}
-	flyout.OnWindowEvent(events.Common.WindowShow, reanchor)
+	flyout.OnWindowEvent(events.Common.WindowShow, func(e *application.WindowEvent) {
+		reanchor(e)
+		// "Checked N min ago" has aged while the panel was hidden: have it
+		// look again (Flyout.svelte also refreshes on focus).
+		svc.nudgeNow()
+	})
 	flyout.OnWindowEvent(events.Common.WindowDPIChanged, reanchor)
 
 	svc.refreshLicence() // load any installed business licence
@@ -241,7 +246,7 @@ func main() {
 	if !signedIn {
 		// First run: show the sign-in window. The engine starts after login.
 		// Set directly, not via setStatus: nothing can hear an event yet.
-		svc.status = "Not signed in"
+		svc.status.set("Not signed in", time.Now())
 		svc.showLogin()
 	}
 	// The right-click menu exists from launch, not only once an engine is up:
