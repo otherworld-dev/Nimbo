@@ -3673,9 +3673,18 @@ func TestDeleteDuringUploadCancelsIt(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("delete never reached the server")
 	}
-	rec.mu.Lock()
-	cancelled := len(rec.cancelled)
-	rec.mu.Unlock()
+	// The cancelled upload records itself on its own goroutine, which can run
+	// after the DELETE lands: wait for it rather than read the count at once
+	// (it failed this way under load).
+	cancelled := 0
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		rec.mu.Lock()
+		cancelled = len(rec.cancelled)
+		rec.mu.Unlock()
+		if cancelled != 0 {
+			break
+		}
+	}
 	if cancelled != 1 {
 		t.Fatalf("in-flight upload not cancelled by the delete (cancelled=%d)", cancelled)
 	}
