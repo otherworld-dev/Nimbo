@@ -52,10 +52,19 @@ import (
 // App is the Wails-bound service: its exported methods are callable from the
 // frontend, and it forwards engine changes to the UI as events.
 type App struct {
-	// trayAttnAt/trayAttnN cache the tray's attention count (trayAttention);
-	// only animateTray's goroutine touches them.
+	// trayAttnAt/trayAttn cache the tray's attention counts (trayAttentionInfo)
+	// and trayNowAt/trayNowDTO its composed status (trayNow); only
+	// animateTray's goroutine touches them.
 	trayAttnAt time.Time
-	trayAttnN  int
+	trayAttn   AttentionInfo
+	trayNowAt  time.Time
+	trayNowDTO NowStatusDTO
+
+	// The "what's happening now" status (now.go): on-demand downloads
+	// streamed through the filter, and the throttle for the "now" event.
+	hjobs     hydrateJobs
+	nowEmOnce sync.Once
+	nowEm     *nowEmitter
 
 	app             *application.App
 	ctx             context.Context
@@ -259,9 +268,10 @@ func (a *App) start(ctx context.Context) {
 		if a.app != nil {
 			a.app.Event.Emit("progress", toProgressDTO(p))
 		}
+		a.nudgeNow()
 	})
 	// The large-file queue changed (Status → Large files, the flyout's line).
-	eng.SetLaneFunc(func() { a.emit("lane") })
+	eng.SetLaneFunc(func() { a.emit("lane"); a.nudgeNow() })
 	// Desktop toasts for conflicts, can't-sync files and sync errors (subject to
 	// the user's notifications preference).
 	eng.SetToastFunc(notify.Toast)
@@ -275,7 +285,7 @@ func (a *App) start(ctx context.Context) {
 			eng.SetPauseSchedule(agent.PauseSchedule{Enabled: s.PauseScheduleEnabled, FromMin: s.PauseFromMin, ToMin: s.PauseToMin})
 		}
 	}
-	eng.SetPauseChangeFunc(func() { a.emit("activity"); a.rebuildTrayMenu(); a.pauseChangedOnDemand() })
+	eng.SetPauseChangeFunc(func() { a.emit("activity"); a.rebuildTrayMenu(); a.pauseChangedOnDemand(); a.nudgeNow() })
 	// notify_push file changes → reconcile on-demand placeholders immediately.
 	eng.SetFilesChangedFunc(a.pokeOnDemand)
 
@@ -293,10 +303,10 @@ func (a *App) start(ctx context.Context) {
 	// when the engine is stopped (sign-out), so they don't leak across sessions.
 	forwardEvents(runCtx, eng.Recorder().Subscribe(), func() { a.emit("activity") })
 	forwardEvents(runCtx, eng.Notifier().Subscribe(), func() { a.emit("notifications") })
-	forwardEvents(runCtx, eng.SubscribeConflicts(), func() { a.emit("conflicts") })
-	forwardEvents(runCtx, eng.SubscribeBlocked(), func() { a.emit("blocked") })
-	forwardEvents(runCtx, eng.SubscribeLocked(), func() { a.emit("locks") })
-	forwardEvents(runCtx, eng.SubscribeDetached(), func() { a.emit("detached") })
+	forwardEvents(runCtx, eng.SubscribeConflicts(), func() { a.emit("conflicts"); a.nudgeNow() })
+	forwardEvents(runCtx, eng.SubscribeBlocked(), func() { a.emit("blocked"); a.nudgeNow() })
+	forwardEvents(runCtx, eng.SubscribeLocked(), func() { a.emit("locks"); a.nudgeNow() })
+	forwardEvents(runCtx, eng.SubscribeDetached(), func() { a.emit("detached"); a.nudgeNow() })
 
 	var pairs []config.SyncPair
 	if a.GetSyncMode() == "ondemand" {
@@ -425,8 +435,8 @@ func (a *App) startSecondaries(ctx context.Context) {
 		}
 		runCtx, cancel := context.WithCancel(ctx)
 		id := ac.ID
-		eng.SetStatusFunc(func(s string) { a.recordAcctStatus(id, s); a.emit("account") })
-		eng.SetLaneFunc(func() { a.emit("lane") })
+		eng.SetStatusFunc(func(s string) { a.recordAcctStatus(id, s); a.emit("account"); a.nudgeNow() })
+		eng.SetLaneFunc(func() { a.emit("lane"); a.nudgeNow() })
 		eng.SetToastFunc(notify.Toast)
 		eng.SetAuthLostFunc(func() {
 			// Only this account's sync stops — don't sign the whole app out.
@@ -599,6 +609,7 @@ func (a *App) setStatus(s string) {
 	if a.app != nil {
 		a.app.Event.Emit("status", s)
 	}
+	a.nudgeNow()
 }
 
 // --- Methods bound to the frontend ---
@@ -1288,11 +1299,14 @@ type hydrateReadCloser struct {
 	got        int64
 	report     func(kind, remotePath string, err error)
 	reported   bool
+	job        *hjob  // this request's place in "Right now" (nil = not listed)
+	changed    func() // told when the job ends (nil = nobody)
 }
 
 func (r *hydrateReadCloser) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	r.got += int64(n)
+	r.job.add(int64(n))
 	switch {
 	case err == nil, errors.Is(err, context.Canceled):
 		// Still going, or withdrawn — neither is a failure.
@@ -1308,6 +1322,15 @@ func (r *hydrateReadCloser) Read(p []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// Close ends the request's job in "Right now", then closes the stream.
+func (r *hydrateReadCloser) Close() error {
+	r.job.end()
+	if r.changed != nil {
+		r.changed()
+	}
+	return r.ReadCloser.Close()
 }
 
 // mountOnDemandWith connects localDir as a cloud sync root mirroring remoteRoot
@@ -1371,7 +1394,16 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 		// The report above only covers the open; wrap so a body failure — or a
 		// clean end short of length — reports too (see hydrateReadCloser's doc
 		// comment, above mountOnDemandWith).
-		return &hydrateReadCloser{ReadCloser: rc, remotePath: string(identity), length: length, report: report}, nil
+		// Listed in "Right now" until the filter closes the stream; ranges of
+		// one file merge into one job, sized by the furthest range.
+		reach := int64(0)
+		if length > 0 {
+			reach = offset + length
+		}
+		job := a.hjobs.begin(eng.Account.ID, string(identity), reach)
+		a.nudgeNow()
+		return &hydrateReadCloser{ReadCloser: rc, remotePath: string(identity), length: length, report: report,
+			job: job, changed: a.nudgeNow}, nil
 	}
 	// listRemote returns a directory's children as placeholders (rel is
 	// sync-root-relative, "" = root). Each entry's identity is its remote path so
@@ -1623,7 +1655,10 @@ func (a *App) mountOnDemandWith(eng *agent.Engine, etags, fileids, mountroots *e
 			// tray's Pause stops every account's mount, not just this one's
 			// (Deck #723). pauseChangedOnDemand tells the watcher when it flips.
 			Paused: a.Paused,
-			Log:    func(f string, args ...any) { slog.Info("vfs", "msg", fmt.Sprintf(f, args...)) },
+			// Uploads, hydrations and passes starting or ending: refresh the
+			// status line. nudgeNow never blocks (called on transfer goroutines).
+			Changed: a.nudgeNow,
+			Log:     func(f string, args ...any) { slog.Info("vfs", "msg", fmt.Sprintf(f, args...)) },
 		})
 		if werr != nil {
 			slog.Warn("vfs write-back watcher not started", "dir", localDir, "err", werr)
@@ -2347,12 +2382,11 @@ func (a *App) animateTray() {
 		case <-a.ctx.Done():
 			return
 		case <-t.C:
-			state := a.trayState()
+			// The tray follows the flyout's status line (Deck #988).
+			now := a.trayNow()
+			state := trayStateFor(now.State)
 			badge := a.trayBadge()
-			tip := trayTooltip(brand.Current.Name, a.status, a.eng != nil && a.eng.Paused())
-			if state == "warning" {
-				tip += "\n" + trayAttentionLine(a.trayAttnN)
-			}
+			tip := trayTooltip(brand.Current.Name, now.Main)
 			key := state
 			if badge {
 				key += "+badge"
@@ -2374,13 +2408,11 @@ func (a *App) animateTray() {
 }
 
 // trayTooltip is the tray icon's hover text: the app's name, and on a second
-// line what it is doing, as OneDrive's does. The name alone said nothing about
-// whether it was syncing (GitHub #9 follow-up).
-func trayTooltip(name, status string, paused bool) string {
-	if paused {
-		return name + "\nPaused"
-	}
-	if s := strings.TrimSpace(status); s != "" {
+// line what it is doing (the status line's main text), as OneDrive's does.
+// The name alone said nothing about whether it was syncing (GitHub #9
+// follow-up).
+func trayTooltip(name, line string) string {
+	if s := strings.TrimSpace(line); s != "" {
 		return name + "\n" + s
 	}
 	return name
@@ -2417,49 +2449,33 @@ func isBusyStatus(status string) bool {
 	return false
 }
 
-func (a *App) trayState() string {
-	return trayStateFor(a.eng != nil && a.eng.Paused(), a.status, a.trayAttention())
-}
-
-// trayStateFor picks the tray state: paused, syncing and a real error first,
-// then "warning" while anything needs the user (can't sync, conflicts, no
-// longer shared) so it can't go unnoticed with the flyout closed (Deck #984).
-func trayStateFor(paused bool, status string, attention int) string {
-	if paused {
-		return "paused"
-	}
-	s := strings.ToLower(status)
-	switch {
-	case isBusyStatus(s):
+// trayStateFor maps the composed status (NowStatusDTO.State) to the tray
+// icon: anything that needs the user shows the amber warning so it can't go
+// unnoticed with the flyout closed (Deck #984).
+func trayStateFor(state string) string {
+	switch state {
+	case "busy":
 		return "sync"
-	case strings.Contains(s, "error"):
-		return "error"
-	case attention > 0:
+	case "attention":
 		return "warning"
+	case "offline":
+		return "error"
+	case "paused":
+		return "paused"
 	default:
 		return "idle"
 	}
 }
 
-// trayAttention is how many items need the user, the count the flyout's amber
-// bar shows (locks are informational, not counted). The tray redraws every
-// 120 ms and Attention reads files, so the count is refreshed at most every two
-// seconds. Only animateTray's goroutine calls it.
-func (a *App) trayAttention() int {
+// trayAttentionInfo is Attention for the tray. The tray redraws every 120 ms
+// and Attention reads files, so it is refreshed at most every two seconds.
+// Only animateTray's goroutine calls it.
+func (a *App) trayAttentionInfo() AttentionInfo {
 	if time.Since(a.trayAttnAt) > 2*time.Second {
-		at := a.Attention()
-		a.trayAttnN = at.Conflicts + at.Blocked + at.Detached
+		a.trayAttn = a.Attention()
 		a.trayAttnAt = time.Now()
 	}
-	return a.trayAttnN
-}
-
-// trayAttentionLine is the tooltip's line for the warning state.
-func trayAttentionLine(n int) string {
-	if n == 1 {
-		return "1 item needs attention"
-	}
-	return fmt.Sprintf("%d items need attention", n)
+	return a.trayAttn
 }
 
 // trayBadge reports whether there are pending Nextcloud notifications.

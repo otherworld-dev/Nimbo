@@ -6,34 +6,22 @@ import (
 	"testing"
 )
 
-// Items that need the user (can't sync, conflicts, no longer shared) put the
-// tray in a warning state, so they can't go unnoticed with the flyout closed
-// (Deck #984). Paused, syncing and a real error still take priority.
+// The tray follows the flyout's composed status line (Deck #988), so it never
+// says idle while the flyout says "Checking folders…". Items that need the
+// user (can't sync, conflicts, no longer shared) put it in a warning state, so
+// they can't go unnoticed with the flyout closed (Deck #984).
 func TestTrayStateFor(t *testing.T) {
-	for _, tc := range []struct {
-		paused    bool
-		status    string
-		attention int
-		want      string
-	}{
-		{false, "Up to date", 0, "idle"},
-		{false, "Up to date", 2, "warning"},
-		{false, "Syncing…", 2, "sync"},
-		{false, "Error: server unreachable", 2, "error"},
-		{true, "Up to date", 2, "paused"},
+	for state, want := range map[string]string{
+		"idle":      "idle",
+		"busy":      "sync",
+		"attention": "warning",
+		"offline":   "error",
+		"paused":    "paused",
+		"":          "idle",
 	} {
-		if got := trayStateFor(tc.paused, tc.status, tc.attention); got != tc.want {
-			t.Errorf("trayStateFor(paused=%v, %q, %d) = %q, want %q", tc.paused, tc.status, tc.attention, got, tc.want)
+		if got := trayStateFor(state); got != want {
+			t.Errorf("trayStateFor(%q) = %q, want %q", state, got, want)
 		}
-	}
-}
-
-func TestTrayAttentionLine(t *testing.T) {
-	if got := trayAttentionLine(1); got != "1 item needs attention" {
-		t.Errorf("1 -> %q", got)
-	}
-	if got := trayAttentionLine(3); got != "3 items need attention" {
-		t.Errorf("3 -> %q", got)
 	}
 }
 
