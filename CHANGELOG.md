@@ -45,6 +45,13 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ### Changed
 
+- Nimbo now runs on Windows 10 (version 2004 or later) as well as Windows 11.
+  Until now Setup failed on Windows 10 with "step returned 1" and then said it had
+  finished anyway. The right-click menu entry shows in the classic menu there.
+  One gap remains on Windows 10: shortcuts for Nextcloud apps opened as their own
+  windows don't appear in the Start menu yet (#985).
+- When Setup can't install Nimbo, it now stops with Windows' own reason instead of
+  a bare "step returned 1" followed by the finish page (#985).
 - The flyout says what Nimbo is doing right now, in one line under your account:
   the file it is uploading or downloading with a progress bar, "Checking folders…"
   while it looks for changes, "Can't reach the server" with how many changes are
@@ -86,6 +93,9 @@ All notable changes to Nimbo are recorded here. The format follows
 
 ### Fixed
 
+- Choosing virtual files for a folder that doesn't exist yet, at sign-in or in
+  Settings, stopped with "Couldn't read that folder ... cannot find the file".
+  Nimbo now creates the folder and carries on (#985).
 - In on-demand mode, a folder renamed on the server is now renamed on this PC
   too, with everything in it, instead of being deleted here and created again, so
   files you had downloaded stay downloaded. A folder deleted on the server, or moved
