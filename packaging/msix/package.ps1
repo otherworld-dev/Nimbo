@@ -265,8 +265,8 @@ if ($AzureSign -or $Store) {
 # the signing runbook before doing it on installed machines.
 $manifest = Get-Content (Join-Path $here "AppxManifest.xml") -Raw
 # Stamp ONLY the <Identity> Version. The (?<![A-Za-z]) lookbehind stops this also
-# matching the Version= inside TargetDeviceFamily MinVersion="10.0.22000.0" (which
-# would drop the Win11 floor and let the package look installable on Win10).
+# matching the Version= inside TargetDeviceFamily MinVersion / MaxVersionTested
+# (which would overwrite the OS floor with the app's own version).
 $manifest = $manifest -replace '(?<![A-Za-z])Version="\d+\.\d+\.\d+\.\d+"', "Version=`"$pkgVersion`""
 $pub = if ($Store) { $StorePublisher } else { $SignSubject }
 $manifest = $manifest -replace 'Publisher="[^"]*"', "Publisher=`"$pub`""

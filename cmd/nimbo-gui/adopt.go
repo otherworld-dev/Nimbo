@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -71,6 +72,15 @@ func (a *App) scanAdopt() string {
 	dir := a.GetBaseDir()
 	if dir == "" {
 		return adoptError("No folder is configured yet.")
+	}
+	// A folder that doesn't exist yet has nothing to adopt: say so straight
+	// away (no server crawl), and the switch creates it. Scanning it failed with
+	// "cannot find the file" and blocked the switch, from both setup and
+	// Settings (Deck #985, found on a fresh Windows 10 PC).
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		a.pendingAdopt = nil
+		b, _ := json.Marshal(adoptSummary{Dir: dir})
+		return string(b)
 	}
 	// The crawl can run for minutes on a big account, so it is cancellable
 	// (via "ondemand-cancel" from the scanning overlay) and publishes a live

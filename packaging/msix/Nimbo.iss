@@ -2,7 +2,7 @@
 ;
 ; It's a bootstrapper, not a traditional file-install: it bundles the signed MSIX
 ; and, on install (elevated), runs Add-AppxPackage so the real app is the MSIX
-; (which owns the Win11 context menu, auto-data container, etc.). The app is
+; (which owns the Explorer context menu, auto-data container, etc.). The app is
 ; removed via Settings > Apps, so this installer creates no Program Files app
 ; dir and no uninstaller of its own.
 ;
@@ -51,6 +51,9 @@ VersionInfoDescription=Nimbo Setup
 VersionInfoOriginalFileName=Nimbo-Setup.exe
 WizardStyle=modern
 PrivilegesRequired=admin
+; Matches the MSIX's TargetDeviceFamily MinVersion (Windows 10 2004), so an
+; older PC gets Setup's own "requires Windows ..." message up front.
+MinVersion=10.0.19041
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 CreateAppDir=no
@@ -65,11 +68,13 @@ SetupIconFile=..\..\cmd\nimbo-gui\assets\nimbo.ico
 AppMutex=Nimbo
 
 [Files]
-Source: "Nimbo.msix";       DestDir: "{tmp}"; Flags: deleteafterinstall
+; dontcopy: PrepareToInstall extracts these itself (ExtractTemporaryFile), because
+; the package install runs there - the last point Setup can still fail cleanly.
+Source: "Nimbo.msix";       Flags: dontcopy
 ; NoDevCert (Azure Trusted Signing builds): the MSIX chains to a public root, so
 ; no cert is bundled or trusted on the user's machine.
 #ifndef NoDevCert
-Source: "NimboDev.cer";     DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "NimboDev.cer";     Flags: dontcopy
 #endif
 ; Explorer overlay badges: the icon-overlay DLL cannot be loaded from inside the
 ; MSIX (Windows refuses to map WindowsApps DLLs into identity-less processes and
@@ -123,14 +128,19 @@ end;
 // would DOWNGRADE a machine that already has a newer build). Falls back to the
 // bundled MSIX only when the feed is unreachable; that copy won't auto-update
 // until it's next installed online.
-function InstallPackage(var rc: Integer): Boolean;
+//
+// When both fail, Windows' own reasons go to ErrFile so Setup can show them:
+// a bare "returned 1" told nobody that the PC was simply too old (Deck #985).
+function InstallPackage(const ErrFile: String; var rc: Integer): Boolean;
 var
   Cmd: String;
 begin
   Cmd := '$ErrorActionPreference = ''Stop''; ' +
     'Get-Process -Name nimbo-gui -ErrorAction SilentlyContinue | Stop-Process -Force; ' +
     'try { Add-AppxPackage -AppInstallerFile ' + PSQuote('{#FeedUrl}') + ' -ForceTargetApplicationShutdown } ' +
-    'catch { Add-AppxPackage -Path ' + PSQuote(ExpandConstant('{tmp}\Nimbo.msix')) + ' -ForceApplicationShutdown -ForceUpdateFromAnyVersion }';
+    'catch { $feed = $_.Exception.Message; ' +
+      'try { Add-AppxPackage -Path ' + PSQuote(ExpandConstant('{tmp}\Nimbo.msix')) + ' -ForceApplicationShutdown -ForceUpdateFromAnyVersion } ' +
+      'catch { Set-Content -LiteralPath ' + PSQuote(ErrFile) + ' -Value @($_.Exception.Message, '''', (''Online install: '' + $feed)); exit 1 } }';
   Result := Exec('powershell.exe', '-NoProfile -NonInteractive -Command "' + Cmd + '"', '', SW_HIDE, ewWaitUntilTerminated, rc);
 end;
 
@@ -205,24 +215,45 @@ begin
   end;
 end;
 
-procedure CurStepChanged(CurStep: TSetupStep);
+// The package install runs here rather than at ssPostInstall: by then Inno has
+// committed to its "Setup has finished" page, so a failed install showed an
+// error box and then reported success anyway (Deck #985). A non-empty result
+// here stops Setup on the Preparing page with the reason.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   rc: Integer;
+  ErrFile: String;
+  Err: AnsiString;
+begin
+  Result := '';
+  ExtractTemporaryFile('Nimbo.msix');
+#ifndef NoDevCert
+  ExtractTemporaryFile('NimboDev.cer');
+  if not TrustDevCert then
+  begin
+    Result := 'Nimbo could not be installed: its development certificate could not be trusted.';
+    Exit;
+  end;
+#endif
+  ErrFile := ExpandConstant('{tmp}\install-error.txt');
+  rc := -1;
+  if not InstallPackage(ErrFile, rc) then
+    rc := -1;
+  Log('Package install returned ' + IntToStr(rc));
+  if rc = 0 then Exit;
+
+  Result := 'Nimbo could not be installed.';
+  if LoadStringFromFile(ErrFile, Err) and (Trim(String(Err)) <> '') then
+  begin
+    Log('Package install error: ' + String(Err));
+    Result := Result + #13#10#13#10 + 'Windows said: ' + Trim(String(Err));
+  end
+  else
+    Result := Result + ' (step returned ' + IntToStr(rc) + ')';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
-  begin
-    WizardForm.StatusLabel.Caption := 'Installing Nimbo...';
-    rc := -1;
-#ifndef NoDevCert
-    if TrustDevCert then
-#endif
-    if not InstallPackage(rc) then
-      rc := -1;
-    Log('Package install returned ' + IntToStr(rc));
-    if rc = 0 then
-      InstallBadges
-    else
-      MsgBox('Nimbo could not be installed (step returned ' + IntToStr(rc) + ').' + #13#10 +
-             'Try running Setup again, or install Nimbo.msix manually.', mbError, MB_OK);
-  end;
+    InstallBadges;
 end;
