@@ -5773,7 +5773,14 @@ func (a *App) completeSetup(localDir, mode string) string {
 		// summary JSON goes back to the setup UI, which shows the same confirm
 		// dialog and then calls SetSyncMode("ondemand-adopt"). JSON is
 		// distinguishable from this method's plain error strings by its shape.
-		raw := a.scanAdopt()
+		// A folder that doesn't exist yet has nothing to adopt, and scanning it
+		// fails ("cannot find the file"), which folderEmpty can't excuse: it
+		// reads a missing folder as not empty. So skip straight to the switch,
+		// which creates the folder (Deck #985, found on a fresh Windows 10 PC).
+		raw := "{}"
+		if _, err := os.Stat(localDir); !errors.Is(err, os.ErrNotExist) {
+			raw = a.scanAdopt()
+		}
 		var sum adoptSummary
 		if json.Unmarshal([]byte(raw), &sum) == nil {
 			if sum.Error != "" && !folderEmpty(localDir) {
