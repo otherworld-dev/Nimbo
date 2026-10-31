@@ -201,8 +201,10 @@ func (s *etagStore) moveMany(pairs [][2]string) {
 		src, dst := etagKey(p[0]), etagKey(p[1])
 		// A blank end, or the same path twice, cannot move anything — and
 		// must not be read as "forget src": a dropped baseline costs a
-		// spurious conflict the next time that file is edited.
-		if src == "" || dst == "" || strings.EqualFold(src, dst) {
+		// spurious conflict the next time that file is edited. "The same"
+		// is exact: server paths are case-sensitive, so a rename that only
+		// changes case is a real move (Deck #984).
+		if src == "" || dst == "" || src == dst {
 			continue
 		}
 		// The content key travels with the baseline: a move keeps the

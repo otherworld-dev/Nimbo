@@ -127,7 +127,7 @@ func (a *App) applySidebarLabel(id string) {
 		return
 	}
 	exe, _ := os.Executable()
-	for dir, m := range a.onDemandMounts {
+	for dir, m := range a.mounts() {
 		if m.accountID != id {
 			continue
 		}

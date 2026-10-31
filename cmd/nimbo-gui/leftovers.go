@@ -311,7 +311,7 @@ func (a *App) unregisterRecordedRoot(accountID string) {
 		}
 	}
 	for _, dir := range cands {
-		if dir == "" || a.onDemandMounts[dir] != nil || overlapsAny(dir, claimed) || sameFolderAsAny(dir, claimed) || !cfapi.ShellSyncRootRegistered(dir) {
+		if dir == "" || a.mount(dir) != nil || overlapsAny(dir, claimed) || sameFolderAsAny(dir, claimed) || !cfapi.ShellSyncRootRegistered(dir) {
 			continue
 		}
 		slog.Info("unregistering the root of an account that is going", "account", accountID, "dir", dir)

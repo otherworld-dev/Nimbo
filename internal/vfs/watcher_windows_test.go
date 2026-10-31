@@ -552,10 +552,13 @@ func (f *fakeCf) hydrateCallCount(path string) int {
 }
 
 // markHydrateErr makes the hydrate-if-pinned seam fail for path with err.
+// Only a pinned, online-only file is ever downloaded (the real seam checks
+// first, and hydratePinned asks before listing it), so it reads as one.
 func (f *fakeCf) markHydrateErr(path string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hydrateErr[strings.ToLower(path)] = err
+	f.pinned[strings.ToLower(path)] = true
 }
 
 // eventIndex returns the position of the first occurrence of event ("refresh:
@@ -584,6 +587,8 @@ type recorder struct {
 	listCalls map[string]int
 	listing   map[string][]cfapi.PlaceholderInfo
 	listErr   error
+	listErrs  map[string]error // per-directory listing failures (rel -> error)
+	listGate  chan struct{}    // when non-nil, List("") blocks until it closes
 	// checkStrict wires Ops.CheckList, which answers ErrNotFound for any path
 	// the listing does not hold instead of an empty folder, so a guard that
 	// asks for the wrong path cannot pass by accident.
@@ -620,6 +625,12 @@ type recorder struct {
 	uploadSawBase map[string]string   // the baseline each Upload saw at call time
 
 	logs []string // Ops.Log lines (formatted)
+
+	fileidBatches int // Ops.RecordFileIDs calls
+
+	// unholdable records Ops.Unholdable calls as (parent, child) pairs; a
+	// clean listing is recorded as (parent, "").
+	unholdable [][2]string
 }
 
 // logLines returns the log lines the watcher has emitted so far.
@@ -668,7 +679,7 @@ type reportRec struct {
 func newRecorder() *recorder {
 	return &recorder{
 		baselines: map[string]string{}, contents: map[string]string{}, fileids: map[string]string{},
-		listCalls: map[string]int{}, listing: map[string][]cfapi.PlaceholderInfo{},
+		listCalls: map[string]int{}, listing: map[string][]cfapi.PlaceholderInfo{}, listErrs: map[string]error{},
 		uploadSawBase: map[string]string{},
 		uploaded:      make(chan string, 16), deleted: make(chan string, 16), moved: make(chan [2]string, 16),
 	}
@@ -785,14 +796,34 @@ func (r *recorder) ops() Ops {
 			r.moved <- [2]string{src, dst}
 			return nil
 		},
+		Unholdable: func(parent string, items []cfapi.PlaceholderInfo) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if len(items) == 0 {
+				r.unholdable = append(r.unholdable, [2]string{parent, ""})
+			}
+			for _, it := range items {
+				r.unholdable = append(r.unholdable, [2]string{parent, it.Name})
+			}
+		},
 		List: func(rel string) ([]cfapi.PlaceholderInfo, error) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			r.listCalls[rel]++
+			gate := r.listGate
 			if r.listErr != nil {
 				return nil, r.listErr
 			}
-			return r.listing[rel], nil
+			if err := r.listErrs[rel]; err != nil {
+				return nil, err
+			}
+			out := r.listing[rel]
+			if gate != nil && rel == "" {
+				r.mu.Unlock()
+				<-gate
+				r.mu.Lock()
+			}
+			return out, nil
 		},
 		CheckList: func() func(string) ([]cfapi.PlaceholderInfo, error) {
 			if !r.checkStrict {
@@ -894,6 +925,24 @@ func (r *recorder) ops() Ops {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			delete(r.fileids, remote)
+		},
+		RecordFileIDs: func(m map[string]string) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.fileidBatches++
+			for k, v := range m {
+				r.fileids[k] = v
+			}
+		},
+		MoveFileIDs: func(pairs [][2]string) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			for _, p := range pairs {
+				if v, ok := r.fileids[p[0]]; ok {
+					r.fileids[p[1]] = v
+					delete(r.fileids, p[0])
+				}
+			}
 		},
 	}
 }
@@ -3627,9 +3676,18 @@ func TestDeleteDuringUploadCancelsIt(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("delete never reached the server")
 	}
-	rec.mu.Lock()
-	cancelled := len(rec.cancelled)
-	rec.mu.Unlock()
+	// The cancelled upload records itself on its own goroutine, which can run
+	// after the DELETE lands: wait for it rather than read the count at once
+	// (it failed this way under load).
+	cancelled := 0
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		rec.mu.Lock()
+		cancelled = len(rec.cancelled)
+		rec.mu.Unlock()
+		if cancelled != 0 {
+			break
+		}
+	}
 	if cancelled != 1 {
 		t.Fatalf("in-flight upload not cancelled by the delete (cancelled=%d)", cancelled)
 	}

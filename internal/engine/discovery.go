@@ -2,11 +2,14 @@ package engine
 
 import (
 	"context"
+	"path"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/otherworld/nimbo/internal/transport"
+	"github.com/otherworld/nimbo/internal/winname"
 )
 
 // scanWorkers bounds how many directory PROPFINDs run concurrently during a
@@ -61,6 +64,20 @@ type ScanOpts struct {
 	// multi-minute crawl. Called from worker goroutines; must be fast and
 	// safe for concurrent use.
 	Progress func(dirsListed int)
+	// OnUnholdable, when non-nil, is called once per directory listed (cached
+	// or fetched) with that directory's files-root-relative path and the
+	// children it skipped because this OS cannot hold their names (see
+	// unholdable), empty when there were none. The caller keeps them visible
+	// as "can't sync" instead of letting them go missing (Deck #984). Called
+	// from worker goroutines.
+	OnUnholdable func(dir string, items []Unholdable)
+}
+
+// Unholdable is a server item a scan skipped because this OS cannot hold its
+// name.
+type Unholdable struct {
+	Remote string // files-root-relative server path
+	IsDir  bool
 }
 
 // ScanCheckpoint caches raw directory listings across scan attempts (Deck
@@ -161,6 +178,15 @@ func RemoteScan(ctx context.Context, c PropFinder, root string, opts ScanOpts) (
 		if err == nil && opts.Progress != nil {
 			opts.Progress(int(listed.Add(1)))
 		}
+		if err == nil && opts.OnUnholdable != nil {
+			var bad []Unholdable
+			for _, e := range entries {
+				if full := strings.Trim(e.Path, "/"); full != it.dir && unholdable(path.Base(full)) {
+					bad = append(bad, Unholdable{Remote: full, IsDir: e.IsDir})
+				}
+			}
+			opts.OnUnholdable(it.dir, bad)
+		}
 
 		mu.Lock()
 		defer mu.Unlock()
@@ -189,6 +215,9 @@ func RemoteScan(ctx context.Context, c PropFinder, root string, opts ScanOpts) (
 				continue // the directory itself, not a child
 			}
 			rel := relTo(full, root)
+			if unholdable(path.Base(full)) {
+				continue // reported through OnUnholdable; don't record it, don't descend
+			}
 			// Decode an escaped server name (X.nimboesc -> X) so the remote map is
 			// keyed by LOCAL names; the diff, baseline and ignore rules then all match
 			// on X as normal. No-op when escaping is inactive. Files only: a folder
@@ -265,7 +294,24 @@ func RemoteScan(ctx context.Context, c PropFinder, root string, opts ScanOpts) (
 	if failed != nil {
 		return nil, failed
 	}
+	// A subtree reused from the baseline can still carry such a name, recorded
+	// by a version that let it through.
+	if runtime.GOOS == "windows" {
+		for k := range out {
+			if winname.PathCannotHold(k) {
+				delete(out, k)
+			}
+		}
+	}
 	return out, nil
+}
+
+// unholdable reports whether a server name has no faithful local counterpart
+// on this OS (Deck #984): on Windows a trailing space or dot is stripped from
+// every path, so the item would be written over, or read from, another one.
+// Both scans skip such names so the diff never sees one side of them.
+func unholdable(name string) bool {
+	return runtime.GOOS == "windows" && winname.CannotHold(name)
 }
 
 // childrenOnly strips the directory's own row from a depth-1 response (the

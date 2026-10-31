@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { kindIcon, kindLabel } from "./kinds";
   import { Events } from "@wailsio/runtime";
   import { App } from "../bindings/github.com/otherworld/nimbo/cmd/nimbo-gui";
 
@@ -13,27 +14,6 @@
   };
 
   type Activity = { time: string; kind: string; path: string; remotePath: string; localPath: string; err: string };
-  type Attention = { conflicts: number; blocked: number; locked: number; detached: number };
-  type Progress = { active: boolean; current: string; done: number; total: number; speed: number; avgSpeed: number; doneBytes: number; totalBytes: number; enumerating: boolean;
-                   clones?: { localDir: string; remoteRoot: string; first: string[] }[] };
-
-  function etaText(p: Progress): string {
-    // ETA off the cumulative average rate, not the jumpy instantaneous speed.
-    if (!p.avgSpeed || p.totalBytes <= 0) return "";
-    const remain = p.totalBytes - p.doneBytes;
-    if (remain <= 0) return "";
-    const s = remain / p.avgSpeed;
-    if (s < 90) return `~${Math.max(1, Math.ceil(s))}s left`;
-    if (s < 5400) return `~${Math.round(s / 60)}m left`;
-    return `~${(s / 3600).toFixed(1)}h left`;
-  }
-  const syncPct = (p: Progress) =>
-    p.totalBytes > 0 ? Math.round((p.doneBytes / p.totalBytes) * 100)
-    : p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
-
-  let status = $state("Starting…");
-  let paused = $state(false);
-  let progress = $state<Progress>({ active: false, current: "", done: 0, total: 0, speed: 0, avgSpeed: 0, doneBytes: 0, totalBytes: 0, enumerating: false });
   let recent = $state<Activity[]>([]);
   let apps = $state<AppInfo[]>([]);
   let editApps = $state(false);
@@ -42,32 +22,25 @@
   let showSearch = $state(true);
   let notifCount = $state(0);
   let header = $state<Header>({ user: "", server: "", statusType: "", statusMsg: "", statusIcon: "", quotaUsed: 0, quotaTotal: 0, quotaPct: 0, unlimited: false });
-  let attention = $state<Attention>({ conflicts: 0, blocked: 0, locked: 0, detached: 0 });
-  // The large-file queue (Deck #702): one quiet line while it holds anything.
-  let laneRunning = $state(0), laneWaiting = $state(0), laneAside = $state(0);
-  async function loadLane() {
-    const l = ((await App.LaneList()) ?? []) as unknown as { state: string }[];
-    laneRunning = l.filter(x => x.state === "running").length;
-    laneWaiting = l.filter(x => x.state === "waiting" || x.state === "paused").length;
-    laneAside = l.filter(x => x.state === "setaside").length;
+  // The one "what's happening" line under the account row (Deck #988). The Go
+  // side composes it across accounts and modes; we only draw it.
+  type Now = { state: string; main: string; sub: string; progress: number; tab: string };
+  let now = $state<Now | null>(null);
+  // Calls can overlap (a "now" event during a slow one): only the latest
+  // answer is drawn, and a failed call keeps the line as it was.
+  let nowSeq = 0;
+  async function loadNow() {
+    const s = ++nowSeq;
+    try {
+      const n = (await App.NowStatus()) as unknown as Now;
+      if (s === nowSeq) now = n;
+    } catch {}
   }
-  let lanePending = false;
-  function loadLaneSoon() {
-    if (lanePending) return;
-    lanePending = true;
-    setTimeout(() => { lanePending = false; loadLane(); }, 250);
-  }
-  const largeFiles = (n: number) => `${n} large file${n === 1 ? "" : "s"}`;
-  let laneText = $derived.by(() => {
-    const parts: string[] = [];
-    if (laneRunning) parts.push(`${largeFiles(laneRunning)} syncing`);
-    if (laneWaiting) parts.push(parts.length ? `${laneWaiting} waiting` : `${largeFiles(laneWaiting)} waiting`);
-    if (laneAside) parts.push(parts.length ? `${laneAside} set aside` : `${largeFiles(laneAside)} set aside`);
-    return parts.join(", ");
-  });
+  const nowGlyph = (st: string) =>
+    st === "busy" ? "⟳" : st === "attention" ? "!" : st === "paused" ? "❚❚" : st === "offline" ? "⚠" : "✓";
   let pauseInfo = $state<{ paused: boolean; reason: string; until: string }>({ paused: false, reason: "", until: "" });
   let pauseMenu = $state(false);
-  let editStatus = $state(false);
+  let acctMenu = $state(false);
   let moreMenu = $state(false);
   let msgInput = $state("");
 
@@ -78,13 +51,12 @@
   let acctBusy = $state(false);
   const hostOf = (s: string) => { try { return new URL(s).host; } catch { return s; } };
   async function loadAccounts() { accounts = (await App.ListAccounts()) ?? []; }
-  // The header names the shown account on a strip of its own: in Compact width
-  // the name beside the tool buttons only had room for a few letters, which
-  // didn't say which account it was (GitHub #14). With more than one account the
-  // strip is a button that opens the account list.
+  // The header names the shown account on a strip of its own (GitHub #14). The
+  // strip is a button for everyone: it opens a menu with the Nextcloud presence
+  // status and editor, plus the account list when there is more than one.
   let shownAcct = $derived(accounts.find(a => a.active) ?? { user: header.user, server: header.server });
-  let multiAcct = $derived(accounts.length > 1);
-  function toggleMore() { moreMenu = !moreMenu; pauseMenu = false; if (moreMenu) loadAccounts(); }
+  function toggleMore() { moreMenu = !moreMenu; pauseMenu = false; acctMenu = false; if (moreMenu) loadAccounts(); }
+  function toggleAcct() { acctMenu = !acctMenu; moreMenu = false; pauseMenu = false; if (acctMenu) loadAccounts(); }
   // Errors render inline — a raw alert() in the flyout draws the browser's
   // "wails.localhost says" dialog over the panel, which looks broken.
   let acctError = $state("");
@@ -173,12 +145,10 @@
       const accts = (await App.ListAccounts()) ?? [];
       const cur = accts.find(a => a.active) ?? accts[0];
       signInHost = cur ? hostOf(cur.server) : "";
-      editStatus = false; moreMenu = false; pauseMenu = false; editApps = false;
+      acctMenu = false; moreMenu = false; pauseMenu = false; editApps = false;
     }
-    status = await App.Status();
     pauseInfo = await App.PauseInfo();
-    paused = pauseInfo.paused;
-    progress = await App.Progress();
+    loadNow();
     recent = (await App.RecentActivity()) ?? [];
     const a = (await App.Apps()) ?? [];
     if (a.length || !apps.length) apps = a; // don't blank a populated rail on a transient empty fetch
@@ -187,8 +157,6 @@
     // when a sign-in really is needed, the old identity has to go.
     if (needsLogin) header = h;
     else if (h.user || !header.user) header = h;
-    attention = await fetchAttention();
-    loadLane();
     notifCount = await App.NotificationCount();
     showDock = await App.ShowAppDock();
     dockSide = await App.AppDockSide();
@@ -198,13 +166,6 @@
     msgInput = header.statusMsg;
   }
 
-  function humanBytes(n: number): string {
-    if (!n || n < 0) return "0 B";
-    const u = ["B", "KB", "MB", "GB", "TB", "PB"];
-    let i = 0;
-    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-    return `${n < 10 && i > 0 ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
-  }
   // Split bytes into number + unit so the storage strip can render them as
   // separate spans with a guaranteed gap (a plain space wasn't showing).
   function bytesParts(n: number): { n: string; u: string } {
@@ -215,36 +176,9 @@
     return { n: n < 10 && i > 0 ? n.toFixed(1) : String(Math.round(n)), u: u[i] };
   }
 
-  // cast: the Go AttentionInfo carries `locked` (added without a bindings
-  // regen), so the generated type is a subset of our Attention at runtime.
-  const fetchAttention = async (): Promise<Attention> =>
-    (await App.Attention()) as unknown as Attention;
-
-  let attentionTotal = $derived(attention.conflicts + attention.blocked + attention.detached);
-  let attentionText = $derived(
-    [attention.conflicts && `${attention.conflicts} conflict${attention.conflicts > 1 ? "s" : ""}`,
-     attention.blocked && `${attention.blocked} can’t sync`,
-     attention.detached && `${attention.detached} folder${attention.detached > 1 ? "s" : ""} no longer shared`].filter(Boolean).join(" · ")
-  );
-  // Where "Review →" lands: the most urgent kind first.
-  let attentionTab = $derived(attention.conflicts > 0 ? "conflicts" : attention.blocked > 0 ? "blocked" : "detached");
-
   const basename = (p: string) => p.replace(/\/+$/, "").split("/").pop() || p;
-  const kindIcon = (k: string) =>
-    ({ download: "↓", upload: "↑", "delete-local": "🗑", "delete-remote": "🗑",
-       "move-local": "↪", "move-remote": "↪", "mkdir-local": "📁", "mkdir-remote": "📁",
-       conflict: "⚠", unshared: "🔗", "delete-kept": "↺", waiting: "⏸" } as Record<string, string>)[k] ?? "•";
-  const kindLabel = (k: string) =>
-    ({ download: "Downloaded", upload: "Uploaded", "delete-local": "Deleted locally",
-       "delete-remote": "Deleted on server", "move-local": "Moved", "move-remote": "Moved",
-       "mkdir-local": "New folder", "mkdir-remote": "New folder", conflict: "Conflict",
-       unshared: "No longer shared with you — copy kept",
-       "delete-kept": "Kept on server (not deleted)",
-       waiting: "Waiting — open in another program",
-       "unshared-empty": "No longer shared with you — nothing was downloaded" } as Record<string, string>)[k] ?? k;
   refresh();
-  Events.On("status", async (e: any) => {
-    status = e.data;
+  Events.On("status", async () => {
     // The engine starts asynchronously; the first refresh() at mount may run
     // before it's ready (empty header/folders/apps). Re-fetch once it comes up.
     // Signing out or losing the sign-in leaves the identity on screen, so ask
@@ -262,8 +196,14 @@
     const cur = list.find(a => a.active);
     if (!needsLogin && cur && (cur.user !== header.user || cur.server !== header.server)) refresh();
   });
-  Events.On("progress", (e: any) => { progress = e.data; });
-  Events.On("lane", loadLaneSoon);
+  // Everything the status line shows (sync state, attention counts, lanes,
+  // first sync) is composed in Go; it fires "now" whenever that changes.
+  Events.On("now", loadNow);
+  // "Checked N min ago" ages with nothing changing: look again whenever the
+  // panel is shown (the Go side also nudges on show) and every 30 s while it
+  // is up. It hides as soon as it loses focus, so focus means shown.
+  window.addEventListener("focus", loadNow);
+  setInterval(() => { if (document.hasFocus()) loadNow(); }, 30_000);
   // Activity fires per file — hundreds/sec during a big sync. Coalesce into a
   // light refresh (just the recent list) at most ~2×/sec, so the panel doesn't
   // thrash re-fetching/re-rendering the whole header + app rail on every file.
@@ -282,10 +222,6 @@
   Events.On("searchbar", (e: any) => { showSearch = e.data; if (!showSearch) clearSearch(); });
   Events.On("appearance", async () => { appearance = await App.FlyoutAppearance(); });
   Events.On("notifications", async () => { notifCount = await App.NotificationCount(); });
-  Events.On("conflicts", async () => { attention = await fetchAttention(); });
-  Events.On("blocked", async () => { attention = await fetchAttention(); });
-  Events.On("locks", async () => { attention = await fetchAttention(); });
-  Events.On("detached", async () => { attention = await fetchAttention(); });
 
   const presenceLabel = (s: string) =>
     s === "online" ? "Online" : s === "away" ? "Away" : s === "dnd" ? "Do not disturb"
@@ -297,7 +233,7 @@
   // "activity" event it emits refreshes both.
   async function clearActivity() { recent = []; await App.ClearActivity(); }
 
-  async function setType(t: string) { editStatus = false; await App.SetStatusType(t); await refresh(); }
+  async function setType(t: string) { acctMenu = false; await App.SetStatusType(t); await refresh(); }
   async function setMsg() { await App.SetStatusMessage(msgInput.trim()); await refresh(); }
   async function clearMsg() { await App.ClearStatusMessage(); msgInput = ""; await refresh(); }
 
@@ -367,48 +303,23 @@
   }
 
   let pinned = $derived(apps.filter(a => a.pinned));
-  // Status-text fragments meaning "the engine is working". KEEP IN STEP with
-  // busyStatusWords in service.go — the scan reports itself in stages
-  // ("Checking server…", "Comparing changes…"), none of which contain "sync" or
-  // "scan", so a new stage word must be added in BOTH places or the dot goes
-  // grey mid-scan.
-  const busy = /sync|scan|reading|checking|comparing|matching|moving/;
-  let dotClass = $derived(
-    paused ? "dot paused"
-    : busy.test(status.toLowerCase()) ? "dot syncing"
-    : "dot ok"
-  );
 </script>
 
 <div class="panel" class:dock-left={showDock && dockSide === "left"} class:dock-bottom={showDock && dockSide === "bottom"}
      class:dense={appearance.density === "compact"} class:narrow={appearance.panelWidth === "compact"} class:icons-sm={appearance.dockIconSize === "small"} class:icons-lg={appearance.dockIconSize === "large"}>
   <div class="main">
   <header>
-    {#if header.user}
-      {#if multiAcct}
-        <button class="acctstrip multi" class:on={moreMenu} onclick={toggleMore}
-                title="{shownAcct.user} on {hostOf(shownAcct.server)} · switch account">
-          <span class="asname">{shownAcct.user} <span class="ashost">· {hostOf(shownAcct.server)}</span></span>
-          <span class="caret">{moreMenu ? "▴" : "▾"}</span>
-        </button>
-      {:else}
-        <div class="acctstrip" title="{shownAcct.user} on {hostOf(shownAcct.server)}">
-          <span class="asname">{shownAcct.user} <span class="ashost">· {hostOf(shownAcct.server)}</span></span>
-        </div>
-      {/if}
-    {/if}
-    <div class="idrow">
+    <div class="acctrow">
       {#if header.user}
-        <button class="user" onclick={() => (editStatus = !editStatus)}
-                title="Set status · {header.statusMsg || presenceLabel(header.statusType)}">
+        <button class="acctstrip" class:on={acctMenu} onclick={toggleAcct}
+                title="{shownAcct.user} on {hostOf(shownAcct.server)} · status{accounts.length > 1 ? ' and accounts' : ''}">
           <span class="presence {header.statusType || 'offline'}"></span>
-          <span class="ustatus">{header.statusIcon} {header.statusMsg || presenceLabel(header.statusType)}</span>
-          <span class="caret">{editStatus ? "▴" : "▾"}</span>
+          <span class="asbody">
+            <span class="asname">{shownAcct.user}</span>
+            <span class="ashost">{hostOf(shownAcct.server)}</span>
+          </span>
+          <span class="caret">{acctMenu ? "▴" : "▾"}</span>
         </button>
-      {:else}
-        <div class="brand">{brandName}</div>
-      {/if}
-      {#if header.user}
         <div class="tools">
           <button class="tool notif" onclick={() => App.OpenStatusTab("notifications")}
                   title={notifCount > 0 ? `${notifCount} notification${notifCount === 1 ? "" : "s"}` : "Notifications"}>
@@ -419,10 +330,12 @@
           {#if pauseInfo.paused}
             <button class="tool on" onclick={resume} title={pauseInfo.until ? `Paused until ${pauseInfo.until} — resume` : "Resume syncing"}>▶</button>
           {:else}
-            <button class="tool" class:on={pauseMenu} onclick={() => { pauseMenu = !pauseMenu; moreMenu = false; }} title="Pause syncing">❚❚</button>
+            <button class="tool" class:on={pauseMenu} onclick={() => { pauseMenu = !pauseMenu; moreMenu = false; acctMenu = false; }} title="Pause syncing">❚❚</button>
           {/if}
           <button class="tool" class:on={moreMenu} onclick={toggleMore} title="More">⋯</button>
         </div>
+      {:else}
+        <div class="brand">{brandName}</div>
       {/if}
     </div>
 
@@ -458,21 +371,51 @@
       <div class="accterror">{acctError}</div>
     {/if}
 
-    {#if header.user && editStatus}
-      <div class="statusedit">
-        <div class="types">
-          <button class:sel={header.statusType==="online"} onclick={() => setType("online")}><span class="presence online"></span>Online</button>
-          <button class:sel={header.statusType==="away"} onclick={() => setType("away")}><span class="presence away"></span>Away</button>
-          <button class:sel={header.statusType==="dnd"} onclick={() => setType("dnd")}><span class="presence dnd"></span>Busy</button>
-          <button class:sel={header.statusType==="invisible"} onclick={() => setType("invisible")}><span class="presence invisible"></span>Invisible</button>
-        </div>
-        <div class="msgrow">
-          <input placeholder="What is your status?" bind:value={msgInput}
-                 onkeydown={(e) => e.key === "Enter" && setMsg()} />
-          <button onclick={setMsg}>Set</button>
-          <button onclick={clearMsg}>Clear</button>
+    {#if header.user && acctMenu}
+      <div class="acctmenu">
+        {#if accounts.length > 1}
+          <div class="acctlist">
+            {#each accounts as ac}
+              <button class="acctitem" class:cur={ac.active} disabled={acctBusy}
+                      title={ac.active ? "Shown account" : "Show this account"}
+                      onclick={() => { if (!ac.active) { acctMenu = false; switchAccount(ac.id); } }}>
+                <span class="acctmain">{ac.active ? "✓ " : ""}{ac.user} <span class="accthost">· {hostOf(ac.server)}</span></span>
+                {#if ac.status}<span class="acctstat">{ac.status}</span>{/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
+        <div class="statusedit">
+          <div class="types">
+            <button class:sel={header.statusType==="online"} onclick={() => setType("online")}><span class="presence online"></span>Online</button>
+            <button class:sel={header.statusType==="away"} onclick={() => setType("away")}><span class="presence away"></span>Away</button>
+            <button class:sel={header.statusType==="dnd"} onclick={() => setType("dnd")}><span class="presence dnd"></span>Busy</button>
+            <button class:sel={header.statusType==="invisible"} onclick={() => setType("invisible")}><span class="presence invisible"></span>Invisible</button>
+          </div>
+          <div class="msgrow">
+            <input placeholder="What is your status?" bind:value={msgInput}
+                   onkeydown={(e) => e.key === "Enter" && setMsg()} />
+            <button onclick={setMsg}>Set</button>
+            <button onclick={clearMsg}>Clear</button>
+          </div>
         </div>
       </div>
+    {/if}
+
+    <!-- The one status line. Always shown (it is not a hideable section): it is
+         where problems announce themselves. Click opens the matching Status tab. -->
+    {#if header.user && !needsLogin && now}
+      <button class="nowline {now.state}" onclick={() => App.OpenStatusTab(now?.tab || "activity")}>
+        <span class="nicon" class:spinning={now.state === "busy"}>{nowGlyph(now.state)}</span>
+        <span class="nbody">
+          <span class="nmain">{now.main}</span>
+          {#if now.sub}<span class="nsub">{now.sub}</span>{/if}
+          {#if now.progress >= 0}
+            <span class="nbar"><span class="nfill" style="width:{Math.min(100, Math.max(0, now.progress * 100))}%"></span></span>
+          {/if}
+        </span>
+        <span class="nchev">›</span>
+      </button>
     {/if}
   </header>
 
@@ -512,44 +455,6 @@
       {/if}
     </div>
   {:else}
-  {#if attentionTotal > 0}
-    <button class="alert" onclick={() => App.OpenStatusTab(attentionTab)}>
-      <span class="warn">⚠</span>
-      <span class="atext">{attentionText} need{attentionTotal === 1 ? "s" : ""} attention</span>
-      <span class="go">Review →</span>
-    </button>
-  {/if}
-
-  <!-- Files someone else has open. Informational, NOT a fault, so it is a quiet
-       line of its own rather than part of the amber "needs attention" bar. -->
-  {#if attention.locked > 0}
-    <button class="inuse" onclick={() => App.OpenStatusTab("inuse")}>
-      <span class="iicon">🔒</span>
-      <span class="atext">{attention.locked} file{attention.locked === 1 ? "" : "s"} in use by someone else</span>
-      <span class="go">View →</span>
-    </button>
-  {/if}
-
-  <!-- Large files syncing in their own lane: informational, like the line above. -->
-  {#if laneText}
-    <button class="inuse" onclick={() => App.OpenStatusTab("large")}>
-      <span class="iicon">⇅</span>
-      <span class="atext">{laneText}</span>
-      <span class="go">View →</span>
-    </button>
-  {/if}
-
-  <!-- A first sync (the whole account downloading for the first time) can
-       take hours: let the user pick what comes down first (Deck #766). -->
-  {#if progress.active && progress.clones?.length}
-    {@const chosen = progress.clones.reduce((n, c) => n + c.first.length, 0)}
-    <button class="inuse" onclick={() => App.OpenStatusTab("first")}>
-      <span class="iicon">⇣</span>
-      <span class="atext">{chosen ? `First sync: ${chosen} folder${chosen === 1 ? "" : "s"} downloading first` : "First sync: choose folders to download first"}</span>
-      <span class="go">{chosen ? "Change →" : "Choose →"}</span>
-    </button>
-  {/if}
-
   <!-- The three flyout sections render in the order the user set (Settings →
        Appearance); hidden ones are simply absent from appearance.sections. -->
   {#snippet searchSection()}
@@ -589,49 +494,9 @@
 
   {#snippet activitySection()}
   <div class="acthead">
-    <div class="acttop">
-      <h2>Recent activity</h2>
-      {#if recent.length > 0}
-        <button class="actclear" onclick={clearActivity} title="Clear the recent activity list">Clear</button>
-      {/if}
-      <!-- The status text truncates hard in this narrow row, and the scan's live
-           count sits at the END of it — so expose the full string on hover. -->
-      <div class="syncstat" title={progress.active && !paused ? progress.current : status}>
-        {#if progress.active && !paused}
-          <span class="dot syncing"></span>
-          {#if progress.enumerating}
-            <span class="sstext">Scanning…</span>
-          {:else}
-            <span class="sstext">Syncing {syncPct(progress)}%</span>
-          {/if}
-        {:else}
-          <span class={dotClass}></span>
-          <span class="sstext">{pauseInfo.paused ? (pauseInfo.until ? "Paused · " + pauseInfo.until : "Paused") : status}</span>
-        {/if}
-      </div>
-    </div>
-    {#if progress.active && !paused}
-      {#if progress.enumerating}
-        <!-- Total not final yet — show an indeterminate bar, not a misleading % -->
-        <div class="syncbar"><div class="syncfill indet"></div></div>
-        <div class="syncmeta">
-          {progress.done.toLocaleString()} downloaded{#if progress.speed > 0} · {humanBytes(progress.speed)}/s{/if} · still counting…
-        </div>
-      {:else}
-        {@const eta = etaText(progress)}
-        <div class="syncbar"><div class="syncfill" style="width:{syncPct(progress)}%"></div></div>
-        {#if progress.total > 0}
-          <div class="syncmeta">
-            {progress.done.toLocaleString()} / {progress.total.toLocaleString()}{#if progress.speed > 0} · {humanBytes(progress.speed)}/s{/if}{#if eta} · {eta}{/if}
-          </div>
-        {/if}
-      {/if}
-      {#if progress.current}
-        <div class="synccur" title={progress.current}>
-          <span class="curspin"></span>
-          <span class="curfile">{basename(progress.current)}</span>
-        </div>
-      {/if}
+    <h2>Recent</h2>
+    {#if recent.length > 0}
+      <button class="actclear" onclick={clearActivity} title="Clear the recent activity list">Clear</button>
     {/if}
   </div>
 
@@ -645,10 +510,7 @@
                   oncontextmenu={(e) => { e.preventDefault(); openInStatus(r); }}
                   title={activityTitle(r)}>
             <span class="aicon {r.kind}">{kindIcon(r.kind)}</span>
-            <span class="abody">
-              <span class="apath">{basename(r.path)}</span>
-              <span class="akind">{kindLabel(r.kind)}</span>
-            </span>
+            <span class="apath">{basename(r.path)}</span>
             <span class="atime">{r.err ? "failed" : r.time}</span>
           </button>
         {/each}
@@ -733,24 +595,18 @@
   .panel.dock-bottom { flex-direction: column; }       /* rail as a bottom strip */
   .main { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
   header { padding: 12px 16px; border-bottom: 1px solid var(--border); }
-  .idrow { display: flex; align-items: center; gap: 10px; }
+  .acctrow { display: flex; align-items: center; gap: 8px; }
   .brand { font-weight: 700; font-size: 16px; color: var(--fg); flex: 1; }
-  .user { flex: 1; min-width: 0; display: flex; align-items: center; gap: 9px; background: none; border: none;
-          padding: 3px; margin: -3px; border-radius: 8px; cursor: pointer; text-align: left; }
-  .user:hover { background: var(--hover); }
-  .user:hover .ustatus { color: var(--accent); }
-  /* The account is named on the strip above, so the button is just the status. */
-  .ustatus { flex: 1; min-width: 0; color: var(--fg); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .caret { color: var(--muted); font-size: 11px; flex: 0 0 auto; }
-  /* The shown account, on its own line above the status and tool buttons. A
-     button (opens the account list) only when there is more than one account. */
-  .acctstrip { display: flex; align-items: baseline; gap: 6px; width: 100%; box-sizing: border-box; margin: 0 0 8px;
-               padding: 4px 7px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel);
-               color: var(--fg); text-align: left; font-size: 13px; }
-  .acctstrip.multi { cursor: pointer; }
-  .acctstrip.multi:hover, .acctstrip.on { background: var(--tint); border-color: var(--accent); }
-  .asname { flex: 1; min-width: 0; font-weight: 600; text-transform: capitalize; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ashost { color: var(--muted); font-weight: 400; text-transform: none; }
+  /* The shown account: name over server, a presence dot, and a caret. A button
+     for everyone; it opens the presence editor (and the account list). */
+  .acctstrip { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; box-sizing: border-box;
+               padding: 3px 6px; margin: -3px -6px; border: none; border-radius: 8px; background: none;
+               color: var(--fg); text-align: left; cursor: pointer; }
+  .acctstrip:hover, .acctstrip.on { background: var(--hover); }
+  .asbody { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .asname { font-weight: 600; font-size: 13px; text-transform: capitalize; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ashost { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .presence { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
   .tools { flex: 0 0 auto; display: flex; gap: 5px; }
   .tool { width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center;
@@ -768,7 +624,9 @@
   .presence.away { background: #f0a020; }
   .presence.dnd { background: #d63939; }
   .presence.invisible, .presence.offline { background: #b0b0b0; }
-  .statusedit { margin-top: 8px; padding: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  .acctmenu { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+  .acctlist { display: flex; flex-direction: column; gap: 4px; }
+  .statusedit { padding: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
   .types { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 6px; }
   .types button { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border: 1px solid transparent;
                   background: none; border-radius: 6px; cursor: pointer; font-size: 12px; color: var(--fg); }
@@ -778,10 +636,6 @@
   .msgrow input { flex: 1; min-width: 0; padding: 5px 7px; border: 1px solid var(--border-2); border-radius: 5px; font-size: 12px; background: var(--bg); color: var(--fg); }
   .msgrow button { padding: 5px 8px; border: 1px solid var(--border-2); border-radius: 5px; background: var(--bg); color: var(--fg); cursor: pointer; font-size: 12px; }
   .msgrow button:hover { background: var(--hover); }
-  .syncbar { height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
-  .syncfill { height: 100%; background: var(--accent); border-radius: 3px; transition: width .25s; }
-  .syncfill.indet { width: 35%; transition: none; animation: indet 1.3s ease-in-out infinite; }
-  @keyframes indet { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
   /* Compact storage strip above the footer (was a 2-line block in the header). */
   .storage { display: flex; align-items: center; gap: 9px; padding: 7px 16px; border-top: 1px solid var(--border-soft); }
   .stxt { flex: 0 0 auto; font-size: 11px; color: var(--muted); white-space: nowrap; }
@@ -792,22 +646,28 @@
   .sfill.full { background: #d63939; }
   .spct { flex: 0 0 auto; font-size: 11px; font-weight: 600; color: var(--muted); }
   .spct.full { color: #d63939; }
-  .alert { display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 16px; border: none;
-           border-bottom: 1px solid #f5e3b0; background: #fff8e6; color: #8a6d1a; cursor: pointer; font-size: 12.5px; text-align: left; }
-  .alert:hover { background: #fdf2d4; }
-  .alert .warn { font-size: 14px; }
-  .alert .atext { flex: 1; font-weight: 500; }
-  .alert .go { color: #8a6d1a; font-weight: 600; white-space: nowrap; }
-  /* Deliberately not amber: a locked file is information, not a problem. */
-  .inuse { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 16px; border: none;
-           border-bottom: 1px solid var(--border); background: var(--tint); color: var(--muted);
-           font-size: 12.5px; text-align: left; cursor: pointer; }
-  .inuse:hover { background: var(--border); }
-  .inuse .iicon { font-size: 13px; }
-  .inuse .atext { flex: 1; }
-  .inuse .go { font-weight: 600; white-space: nowrap; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
-  .dot.ok { background: #2e7d32; } .dot.syncing { background: var(--accent); } .dot.paused { background: var(--muted); }
+  /* The one status line: round state icon, main line, quieter second line, a
+     3px bar when progress is measurable. No boxes or chips; amber matches the
+     tray warning. */
+  .nowline { display: flex; align-items: flex-start; gap: 10px; box-sizing: border-box;
+             margin: 10px -6px 0; padding: 4px 6px; width: calc(100% + 12px);
+             border: none; border-radius: 8px; background: none; color: var(--fg); text-align: left; cursor: pointer; }
+  .nowline:hover { background: var(--hover); }
+  .nicon { flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%; display: inline-flex; align-items: center;
+           justify-content: center; font-size: 12px; line-height: 1; background: rgba(46, 125, 50, .15); color: #2e7d32; }
+  .nowline.busy .nicon { background: var(--tint); color: var(--accent); }
+  .nowline.attention .nicon { background: rgba(232, 138, 0, .16); color: #E88A00; font-weight: 700; font-size: 14px; }
+  .nowline.paused .nicon, .nowline.offline .nicon { background: var(--hover); color: var(--fg2); }
+  .nowline.paused .nicon { font-size: 9px; letter-spacing: -1px; }
+  .nicon.spinning { animation: spin 1.6s linear infinite; }
+  .nbody { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .nmain { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nowline.attention .nmain { color: #E88A00; font-weight: 600; }
+  .nsub { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nbar { display: block; height: 3px; margin-top: 4px; border-radius: 2px; background: var(--border); overflow: hidden; }
+  .nfill { display: block; height: 100%; background: var(--accent); border-radius: 2px; transition: width .25s; }
+  .nchev { flex: 0 0 auto; align-self: center; color: var(--muted); font-size: 16px; }
+  .nowline:hover .nchev { color: var(--accent); }
   .pausemenu { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
   .pausemenu button { flex: 1 1 auto; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px;
                       background: var(--bg); color: var(--fg); cursor: pointer; font-size: 12px; white-space: nowrap; }
@@ -817,11 +677,14 @@
   .moremenu .quit:hover { background: #fdeceb; border-color: #f0c0bb; }
   /* Account rows in the ⋯ menu: full-width, name left + live status right. */
   /* A status too long to sit beside the name wraps onto its own line below it. */
-  .moremenu .acctitem { flex: 1 1 100%; min-width: 0; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 8px; text-align: left; }
-  .moremenu .acctitem.cur { font-weight: 600; cursor: default; }
-  .moremenu .acctmain { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .moremenu .accthost { color: var(--muted, #888); font-weight: 400; }
-  .moremenu .acctstat { color: var(--muted, #888); font-size: 11px; min-width: 0; overflow-wrap: anywhere; }
+  .moremenu .acctitem, .acctmenu .acctitem { flex: 1 1 100%; min-width: 0; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 8px; text-align: left; }
+  .acctmenu .acctitem { width: 100%; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px;
+                        background: var(--bg); color: var(--fg); cursor: pointer; font-size: 12px; }
+  .acctmenu .acctitem:hover { background: var(--tint); border-color: var(--accent); }
+  .acctitem.cur { font-weight: 600; cursor: default; }
+  .acctmain { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .accthost { color: var(--muted, #888); font-weight: 400; }
+  .acctstat { color: var(--muted, #888); font-size: 11px; min-width: 0; overflow-wrap: anywhere; }
   .accterror { margin-top: 8px; padding: 6px 10px; border: 1px solid #e6b8b2; border-radius: 6px;
                color: #c0392b; font-size: 12px; }
   .search { padding: 8px 16px 4px; position: relative; }
@@ -845,39 +708,26 @@
   .sresult:hover { background: var(--tint); }
   .sresult .rtitle { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sresult .rsub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .acthead { flex: 0 0 auto; padding: 12px 16px 8px; }
-  .acttop { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
-  .acthead h2 { margin: 0; }
-  .actclear { flex: 0 0 auto; margin-right: auto; padding: 0 4px; border: 0; background: none;
+  .acthead { flex: 0 0 auto; display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 12px 16px 4px; }
+  .acthead h2 { margin: 0; white-space: nowrap; }
+  .actclear { flex: 0 0 auto; padding: 0 4px; border: 0; background: none;
               color: var(--fg2); font-size: 12px; cursor: pointer; }
   .actclear:hover { color: var(--accent); text-decoration: underline; }
-  .acttop h2 { flex: 0 0 auto; white-space: nowrap; }   /* never wrap "Recent activity" */
-  .acthead .syncbar { margin-top: 8px; }
-  .syncmeta { margin-top: 4px; font-size: 11px; color: var(--muted); }
-  /* The file currently in flight — names what's syncing right now (the count/speed line above doesn't). */
-  .synccur { display: flex; align-items: center; gap: 6px; margin-top: 4px; min-width: 0; }
-  .curspin { flex: 0 0 auto; width: 9px; height: 9px; border: 2px solid var(--border); border-top-color: var(--accent);
-             border-radius: 50%; animation: spin .7s linear infinite; }
-  .curfile { font-size: 11.5px; color: var(--fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .syncstat { flex: 0 1 auto; display: flex; align-items: center; gap: 6px; min-width: 0; }
-  .syncstat .sstext { font-size: 12px; color: var(--fg2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .scroll { flex: 1; min-height: 0; padding: 0 16px 8px; overflow-y: auto; }
   /* Apps sit at the bottom and grow upward as more are pinned (capped, then scroll). */
   h2 { font-size: 12px; text-transform: uppercase; color: var(--muted); margin: 14px 0 8px; }
   .activity { display: flex; flex-direction: column; }
-  .act { display: flex; align-items: center; gap: 10px; width: 100%; padding: 7px 4px; border: 0;
+  .act { display: flex; align-items: center; gap: 10px; width: 100%; padding: 6px 4px; border: 0;
          border-bottom: 1px solid var(--border-soft); background: none; color: inherit; font: inherit;
          text-align: left; cursor: pointer; border-radius: 6px; }
   .act:hover { background: var(--hover); }
   .act:last-child { border-bottom: none; }
-  .aicon { flex: 0 0 auto; width: 24px; height: 24px; border-radius: 50%; display: inline-flex;
-           align-items: center; justify-content: center; font-size: 12px; background: var(--hover); color: var(--fg2); }
-  .aicon.download { background: var(--tint); color: var(--accent); }
-  .aicon.upload { background: #e8f5ea; color: #2e7d32; }
-  .aicon.conflict { background: #fdeceb; color: #c0392b; }
-  .abody { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-  .apath { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .akind { font-size: 11px; color: var(--muted); }
+  /* One line per item: a plain symbol, the name (ellipsis), the time. */
+  .aicon { flex: 0 0 auto; width: 16px; text-align: center; font-size: 12px; color: var(--fg2); }
+  .aicon.download { color: var(--accent); }
+  .aicon.upload { color: #2e7d32; }
+  .aicon.conflict { color: #c0392b; }
+  .apath { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .atime { flex: 0 0 auto; font-size: 11px; color: var(--muted); }
   .act.err .apath { color: #e06b6b; }
   .act.err .atime { color: #e06b6b; }
@@ -949,19 +799,25 @@
      width is handled by resizing the window (Go). It used to change only 1-4px
      here, too little to see (GitHub #14), so it now shrinks the header too. */
   .panel.dense header { padding: 7px 12px; }
-  .panel.dense .acctstrip { padding: 3px 6px; margin-bottom: 6px; font-size: 12.5px; }
+  .panel.dense .acctstrip { padding: 2px 6px; margin: -2px -6px; }
+  .panel.dense .asname { font-size: 12.5px; }
+  .panel.dense .nowline { margin-top: 6px; padding: 2px 6px; }
+  .panel.dense .nicon { width: 22px; height: 22px; font-size: 11px; }
+  .panel.dense .nmain { font-size: 12.5px; }
+  .panel.dense .nsub { font-size: 11px; }
   .panel.dense .tool { width: 28px; height: 28px; font-size: 13px; }
   .panel.dense .search { padding: 6px 12px 2px; }
   .panel.dense .searchbar { padding: 4px 8px; }
-  .panel.dense .acthead { padding: 6px 12px 4px; }
+  .panel.dense .acthead { padding: 6px 12px 2px; }
   .panel.dense h2 { margin: 8px 0 5px; }
   .panel.dense .scroll { padding: 0 12px 5px; }
   .panel.dense .act { padding: 3px 4px; gap: 8px; }
-  .panel.dense .aicon { width: 18px; height: 18px; font-size: 10px; }
+  .panel.dense .aicon { width: 14px; font-size: 10px; }
   .panel.dense .apath { font-size: 12px; }
-  .panel.dense .akind, .panel.dense .atime { font-size: 10px; }
+  .panel.dense .atime { font-size: 10px; }
   .panel.dense .storage { padding: 5px 12px; }
-  /* Compact width: slimmer tool buttons leave the name/status some room. */
+  /* Compact width: slimmer tool buttons leave the account name some room. */
+  .panel.narrow .acctrow { gap: 6px; }
   .panel.narrow .tools { gap: 4px; }
   .panel.narrow .tool { width: 28px; height: 28px; font-size: 13px; }
   .panel.icons-sm .railapp { width: 30px; height: 30px; }

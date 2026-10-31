@@ -16,6 +16,7 @@ func blockedItem(b agent.BlockedFile, canEscape func(base string) bool) BlockedI
 	return BlockedItem{
 		Abs: b.Abs, Path: b.Path, Reason: b.Reason,
 		Ext:       filepath.Ext(base),
-		Escapable: !b.IsDir && canEscape(base),
+		Escapable: b.Remote == "" && !b.IsDir && canEscape(base),
+		Remote:    b.Remote,
 	}
 }

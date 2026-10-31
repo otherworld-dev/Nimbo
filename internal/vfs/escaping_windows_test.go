@@ -474,9 +474,10 @@ func TestReconcileReportsAPulledRenameUnderItsLocalName(t *testing.T) {
 
 	w.Reconcile()
 
-	got := rec.reportsOf("move")
+	// Same folder, so it is a rename (Deck #987).
+	got := rec.reportsOf("rename")
 	if len(got) != 1 || got[0].path != ".htaccess" {
-		t.Fatalf("move reports = %+v, want one for .htaccess (the local name)", got)
+		t.Fatalf("rename reports = %+v, want one for .htaccess (the local name)", got)
 	}
 }
 

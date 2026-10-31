@@ -2,16 +2,44 @@ package vfs
 
 import (
 	"context"
+	"time"
 
 	"github.com/otherworld/nimbo/internal/cfapi"
 )
 
+// WatcherNow is a snapshot of what the on-demand watcher is doing right now.
+type WatcherNow struct {
+	Uploading []string // absolute local paths being uploaded
+	Hydrating []string // absolute local paths being downloaded (keep on this device)
+	Queued    int      // downloads waiting for a worker
+	Checking  bool     // a reconcile pass is running
+	// CheckingSince is when the running pass started (zero when none runs),
+	// so a routine sub-second pass can be kept off the status line.
+	CheckingSince time.Time
+	DirsChecked   int    // folders listed so far by the running (or last) pass
+	Folder        string // sync-root-relative folder most recently listed
+	LastFullCheck time.Time
+	// CheckIncomplete: the last pass did not reach everywhere (server down,
+	// folders owed a sweep, cancelled), so LastFullCheck is older than it.
+	CheckIncomplete bool
+	// ServerDown: the last root listing failed (the server is unreachable);
+	// cleared when the root lists again.
+	ServerDown bool
+	// Pending counts the uploads waiting to start: debounced, waiting out a
+	// failure backoff, or held by a pause (each path once).
+	Pending int
+}
+
 // Ops are the server-side actions the watcher performs (backed by the engine).
 type Ops struct {
-	Upload func(ctx context.Context, localPath, remotePath string) error
-	Mkdir  func(ctx context.Context, remotePath string) error
-	Delete func(ctx context.Context, remotePath string) error
-	Move   func(ctx context.Context, srcRemote, dstRemote string) error
+	// Changed is called when an upload, a hydration or a reconcile pass starts
+	// or ends, so the GUI can refresh its status. It must be cheap and is never
+	// called with the watcher's lock held. Nil is fine.
+	Changed func()
+	Upload  func(ctx context.Context, localPath, remotePath string) error
+	Mkdir   func(ctx context.Context, remotePath string) error
+	Delete  func(ctx context.Context, remotePath string) error
+	Move    func(ctx context.Context, srcRemote, dstRemote string) error
 	// List returns the children of a sync-root-relative directory ("" = root)
 	// as placeholders, for down-sync reconciliation. A non-nil error means the
 	// listing is unknown (e.g. a network failure) and must NOT be treated as an
@@ -32,6 +60,11 @@ type Ops struct {
 	// (kind e.g. "upload"/"delete-remote"/"move"/"delete-local"; err non-nil on
 	// failure).
 	Report func(kind, remotePath string, err error)
+	// Unholdable is called for every server folder reconcile lists, with its
+	// files-root-relative path and the children skipped because Windows cannot
+	// hold their names (a trailing space or dot, Deck #984), empty when there
+	// were none. The receiver keeps them in "Can't sync". Nil: not reported.
+	Unholdable func(parentRemote string, items []cfapi.PlaceholderInfo)
 	// RecordBaseline records the server ETag a placeholder now mirrors (the
 	// conflict baseline), set when we create/refresh an in-sync placeholder.
 	RecordBaseline func(remotePath, etag string)
@@ -81,6 +114,11 @@ type Ops struct {
 	RecordFileID func(remotePath, fileid string)
 	FileID       func(remotePath string) (string, bool)
 	DropFileID   func(remotePath string)
+	// RecordFileIDs records several at once (one write: the store persists its
+	// whole file per call), and MoveFileIDs carries them across a rename
+	// (pairs of old, new remote path). Nil falls back to the one-item hooks.
+	RecordFileIDs func(fileidByRemotePath map[string]string)
+	MoveFileIDs   func(pairs [][2]string)
 	// MountRoot reports whether a RAW server path was, when last listed, the
 	// ROOT of a share received from someone else or of a mount (Deck #557).
 	// Such a path vanishing from a listing means it was detached from the
